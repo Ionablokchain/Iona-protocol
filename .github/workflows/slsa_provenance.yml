@@ -1,0 +1,21 @@
+name: slsa-provenance
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+jobs:
+  provenance:
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2
+    with:
+      # The binary built by the workflow can be uploaded as an artifact; the provenance will attest to the build.
+      # This is a "starter" template; tune subjects/artifacts to your release process.
+      base64-subjects: |
+        cGtnOmdlbmVyaWMvaW9uYUAke3sgZ2l0aHViLnNoYSB9fQ==

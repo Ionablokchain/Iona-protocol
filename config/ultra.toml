@@ -1,0 +1,24 @@
+# Ultra profile: aggressive safety defaults for open Internet.
+[security]
+max_message_size = 1048576          # 1 MiB
+max_inflight_requests_per_peer = 32
+request_timeout_ms = 5000
+handshake_timeout_ms = 3000
+idle_connection_timeout_ms = 30_000
+max_connections = 200
+max_connections_per_ip = 20
+
+[rpc]
+bind = "127.0.0.1:8080"
+# For public exposure, put a reverse proxy with auth and rate limiting in front.
+# Or enable the in-app API key middleware (see docs).
+enable_api_key = true
+api_key_header = "x-api-key"
+api_key_value = "CHANGE_ME"
+cors_allowed_origins = ["http://localhost:3000"]
+max_body_bytes = 1048576
+
+[netem]
+# default chaos profile used by scripts
+delay = "200ms 50ms"
+loss = "5%"

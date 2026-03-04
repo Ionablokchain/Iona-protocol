@@ -1,0 +1,178 @@
+[package]
+name = "iona"
+version = "28.1.0"
+edition = "2021"
+license = "Apache-2.0"
+autobins = false
+
+[features]
+# Enable OpenTelemetry OTLP tracing export.
+otel = [
+  "dep:opentelemetry",
+  "dep:opentelemetry-otlp",
+  "dep:tracing-opentelemetry"
+]
+
+# Optional binaries (disabled by default). This prevents unfinished tooling in
+# src/bin from breaking `cargo build` / CI / release builds.
+bin-cli = []
+bin-chaos = []
+bin-remote-signer = []
+bin-evm-rpc = []
+bin-chaindb-tool = []
+bin-block-store = []
+
+[dependencies]
+memory-db = { version = "0.32", optional = true }
+trie-db = { version = "0.28", optional = true }
+hash-db = { version = "0.16", optional = true }
+keccak-hasher = "0.16"
+triehash = "0.8"
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"
+rlp = "0.5"
+
+revm = { version = "9", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+rand = "0.8"
+blake3 = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+clap = { version = "4", features = ["derive"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# TLS server (remote signer)
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+
+# Crypto
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+aes-gcm = "0.10"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+zeroize = "1"
+
+# Compression (snapshots)
+zstd = "0.13"
+
+# libp2p
+libp2p = { version = "0.54", features = [
+  "tokio",
+  "tcp",
+  "dns",
+  "noise",
+  "yamux",
+  "gossipsub",
+  "mdns",
+  "identify",
+  "request-response",
+  "kad",
+  "macros"
+] }
+
+bytes = "1"
+bincode = "1"
+
+anyhow = "1"
+futures = "0.3"
+
+hex = "0.4"
+
+async-trait = "0.1"
+
+base64 = "0.22"
+
+# Remote signer (HTTP)
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"] }
+
+serde_with = "3"
+
+parking_lot = "0.12"
+
+# Production observability
+prometheus = { version = "0.13", features = ["process"] }
+
+# LRU block cache
+lru = "0.12"
+
+# Rate limiting
+governor = "0.6"
+nonzero_ext = "0.3"
+
+# Config file support
+toml = "0.8"
+
+# CLI HTTP client
+ureq = { version = "2", features = ["json"] }
+
+# Parallelism
+rayon = "1.8"
+
+# Optional OpenTelemetry
+opentelemetry = { version = "0.24", optional = true }
+opentelemetry-otlp = { version = "0.17", optional = true, features = ["tonic"] }
+tracing-opentelemetry = { version = "0.25", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+ureq = { version = "2", features = ["json"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "core_benchmarks"
+harness = false
+
+[[bin]]
+name = "iona-node"
+path = "src/bin/iona-node.rs"
+
+[[bin]]
+name = "iona-cli"
+path = "src/bin/iona-cli.rs"
+required-features = ["bin-cli"]
+
+[[bin]]
+name = "iona-chaos"
+path = "src/bin/iona-chaos.rs"
+required-features = ["bin-chaos"]
+
+[[bin]]
+name = "iona-remote-signer"
+path = "src/bin/iona-remote-signer.rs"
+required-features = ["bin-remote-signer"]
+
+[[bin]]
+name = "iona-evm-rpc"
+path = "src/bin/iona-evm-rpc.rs"
+required-features = ["bin-evm-rpc"]
+
+[[bin]]
+name = "iona-chaindb-tool"
+path = "src/bin/iona-chaindb-tool.rs"
+required-features = ["bin-chaindb-tool"]
+
+[[bin]]
+name = "block_store"
+path = "src/bin/block_store.rs"
+required-features = ["bin-block-store"]
+
+
+# ── Release profile hardening ──────────────────────────────────────────────
+# panic="abort" eliminates unwinding code (smaller binary, no catch_unwind for
+# adversaries to exploit). lto="thin" catches dead code across crates.
+# overflow-checks=true keeps integer overflow detection in release builds.
+[profile.release]
+panic           = "abort"
+lto             = "thin"
+codegen-units   = 1
+overflow-checks = true
+
+# ── Test profile: keep overflow checks, fast build ────────────────────────
+[profile.test]
+overflow-checks = true

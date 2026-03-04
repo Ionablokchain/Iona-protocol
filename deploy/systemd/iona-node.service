@@ -1,0 +1,19 @@
+[Unit]
+Description=Iona Node
+After=network.target
+
+[Service]
+User=iona
+Group=iona
+ExecStart=/usr/local/bin/iona-node --config /etc/iona/config.toml
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/iona
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

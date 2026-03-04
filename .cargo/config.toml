@@ -1,0 +1,7 @@
+[build]
+# NOTE: The upstream project used `-Dwarnings` (treat warnings as errors).
+# That is great for CI, but it frequently breaks student/lab environments
+# where dependency versions differ slightly (causing new warnings/deprecations).
+#
+# Keep builds resilient by allowing warnings here.
+rustflags = ["-Awarnings"]

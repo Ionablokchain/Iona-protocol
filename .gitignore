@@ -1,0 +1,28 @@
+# Rust
+target/
+**/*.rs.bk
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets / env
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Runtime / node data
+data/
+data/**
+
+# Local configs
+deploy/configs/*local*.toml
+config/*.local.toml
+
+# Logs
+*.log

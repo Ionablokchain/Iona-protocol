@@ -1,0 +1,18 @@
+groups:
+  - name: iona-alerts
+    rules:
+      - alert: IonaNodeDown
+        expr: up{job="iona-node"} == 0
+        for: 30s
+        labels:
+          severity: page
+        annotations:
+          summary: "Iona node is down"
+
+      - alert: HighFinalityLag
+        expr: iona_finality_lag_seconds > 10
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Finality lag is high"

@@ -1,0 +1,22 @@
+# cargo-deny configuration (minimal defaults).
+
+[licenses]
+# Allow common permissive licenses; tighten as needed.
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-DFS-2016",
+  "Zlib",
+]
+
+deny = ["GPL-2.0", "GPL-3.0", "AGPL-3.0"]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

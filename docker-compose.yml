@@ -1,0 +1,27 @@
+services:
+  iona1:
+    build: .
+    command: ["--config", "/data/config.toml"]
+    ports:
+      - "7001:7001"
+      - "9001:9001"
+    volumes:
+      - ./data/node1:/data
+
+  iona2:
+    build: .
+    command: ["--config", "/data/config.toml"]
+    ports:
+      - "7002:7001"
+      - "9002:9001"
+    volumes:
+      - ./data/node2:/data
+
+  iona3:
+    build: .
+    command: ["--config", "/data/config.toml"]
+    ports:
+      - "7003:7001"
+      - "9003:9001"
+    volumes:
+      - ./data/node3:/data

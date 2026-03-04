@@ -1,0 +1,28 @@
+[Unit]
+Description=IONA Validator 2 (Producer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=iona
+Group=iona
+ExecStart=/usr/local/bin/iona-node --config /etc/iona/val2.toml
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/iona/val2
+LimitNOFILE=1048576
+
+# Environment
+Environment=RUST_LOG=info
+EnvironmentFile=-/etc/iona/val2.env
+
+[Install]
+WantedBy=multi-user.target

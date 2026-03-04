@@ -1,0 +1,74 @@
+name: slsa-provenance-release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+  actions: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      subjects: ${{ steps.subjects.outputs.base64 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85.0"
+          components: rustfmt, clippy
+      - name: Build (release)
+        run: |
+          cargo build --release --locked --bin iona-node
+          mkdir -p dist
+          cp target/release/iona-node dist/iona-node
+          cp target/release/iona-remote-signer dist/iona-remote-signer || true
+          cp target/release/iona-chaos dist/iona-chaos || true
+      - name: Checksums
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/iona-node
+            dist/iona-remote-signer
+            dist/iona-chaos
+            dist/SHA256SUMS.txt
+
+      - name: Prepare SLSA subjects
+        id: subjects
+        shell: bash
+        run: |
+          set -euo pipefail
+          b64=$(python - <<'PY'
+import base64, hashlib, json, os
+from pathlib import Path
+
+dist = Path('dist')
+subjects = []
+for name in ['iona-node','iona-remote-signer','iona-chaos','SHA256SUMS.txt']:
+    p = dist / name
+    if not p.exists():
+        continue
+    h = hashlib.sha256(p.read_bytes()).hexdigest()
+    subjects.append({"name": name, "digest": {"sha256": h}})
+
+data = json.dumps(subjects, separators=(',',':')).encode()
+print(base64.b64encode(data).decode())
+PY
+)
+          echo "base64=$b64" >> "$GITHUB_OUTPUT"
+        
+  provenance:
+    needs: build
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2
+    with:
+      base64-subjects: ${{ needs.build.outputs.subjects }}
+    permissions:
+      actions: read
+      id-token: write
+      contents: write

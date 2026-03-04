@@ -1,0 +1,510 @@
+openapi: 3.0.3
+info:
+  title: IONA Node API
+  description: |
+    Complete API documentation for the IONA blockchain node.
+    
+    The node exposes two main interfaces:
+    - **JSON-RPC** (Ethereum-compatible): Standard eth_* methods via POST /rpc
+    - **REST endpoints**: Health, status, metrics, VM operations
+    
+    ## Rate Limiting
+    Built-in rate limiting applies to P2P connections. RPC rate limiting should be
+    configured via reverse proxy (nginx/caddy).
+  version: 27.0.0
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local node (default)
+
+tags:
+  - name: JSON-RPC
+    description: Ethereum-compatible JSON-RPC methods
+  - name: Node
+    description: Node status and health endpoints
+  - name: VM
+    description: IONA VM contract operations
+  - name: Metrics
+    description: Prometheus metrics and observability
+
+paths:
+  /rpc:
+    post:
+      tags: [JSON-RPC]
+      summary: JSON-RPC endpoint (eth_* methods)
+      description: |
+        Standard Ethereum JSON-RPC endpoint supporting:
+        
+        **Chain State:** eth_chainId, eth_blockNumber, eth_getBalance, eth_getCode,
+        eth_getStorageAt, eth_getTransactionCount
+        
+        **Transactions:** eth_sendRawTransaction, eth_getTransactionByHash,
+        eth_getTransactionReceipt, eth_call, eth_estimateGas
+        
+        **Blocks:** eth_getBlockByNumber, eth_getBlockByHash,
+        eth_getBlockTransactionCountByNumber, eth_getBlockTransactionCountByHash,
+        eth_getTransactionByBlockHashAndIndex, eth_getTransactionByBlockNumberAndIndex
+        
+        **Logs & Filters:** eth_getLogs, eth_newFilter, eth_newBlockFilter,
+        eth_newPendingTransactionFilter, eth_getFilterChanges, eth_uninstallFilter
+        
+        **Network:** net_version, net_listening, net_peerCount, web3_clientVersion
+        
+        **Gas:** eth_gasPrice, eth_maxPriorityFeePerGas
+        
+        **Proof:** eth_getProof (Merkle proof for account state)
+        
+        **IONA-specific:** iona_mine (mine pending transactions in dev mode)
+        
+        **Misc:** eth_syncing, eth_mining, eth_accounts, eth_protocolVersion,
+        eth_hashrate, eth_getUncleCountByBlockHash, eth_getUncleCountByBlockNumber
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JsonRpcRequest'
+            examples:
+              eth_blockNumber:
+                summary: Get latest block number
+                value:
+                  jsonrpc: "2.0"
+                  method: "eth_blockNumber"
+                  params: []
+                  id: 1
+              eth_getBalance:
+                summary: Get account balance
+                value:
+                  jsonrpc: "2.0"
+                  method: "eth_getBalance"
+                  params: ["0x742d35Cc6634C0532925a3b844Bc9e7595f2bD28", "latest"]
+                  id: 1
+              eth_sendRawTransaction:
+                summary: Send signed transaction
+                value:
+                  jsonrpc: "2.0"
+                  method: "eth_sendRawTransaction"
+                  params: ["0xf86c...signed_tx_hex"]
+                  id: 1
+              eth_call:
+                summary: Execute call (read-only)
+                value:
+                  jsonrpc: "2.0"
+                  method: "eth_call"
+                  params:
+                    - to: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD28"
+                      data: "0x70a08231000000000000000000000000..."
+                    - "latest"
+                  id: 1
+              eth_getLogs:
+                summary: Get filtered logs
+                value:
+                  jsonrpc: "2.0"
+                  method: "eth_getLogs"
+                  params:
+                    - fromBlock: "0x1"
+                      toBlock: "latest"
+                      address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD28"
+                      topics: [null]
+                  id: 1
+              eth_getProof:
+                summary: Get Merkle proof for account
+                value:
+                  jsonrpc: "2.0"
+                  method: "eth_getProof"
+                  params: ["0x742d35Cc6634C0532925a3b844Bc9e7595f2bD28", ["0x0"], "latest"]
+                  id: 1
+      responses:
+        '200':
+          description: JSON-RPC response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JsonRpcResponse'
+              examples:
+                blockNumber:
+                  summary: Block number response
+                  value:
+                    jsonrpc: "2.0"
+                    result: "0xa"
+                    id: 1
+                error:
+                  summary: Error response
+                  value:
+                    jsonrpc: "2.0"
+                    error:
+                      code: -32601
+                      message: "Method not found: eth_unsupported"
+                    id: 1
+
+  /health:
+    get:
+      tags: [Node]
+      summary: Health check
+      description: Returns HTTP 200 if the node is running and healthy.
+      responses:
+        '200':
+          description: Node is healthy
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "ok"
+
+  /status:
+    get:
+      tags: [Node]
+      summary: Node status
+      description: |
+        Returns detailed node status including current block height,
+        finalized height, peer count, protocol/schema versions, and sync status.
+      responses:
+        '200':
+          description: Node status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeStatus'
+              example:
+                height: 1000
+                finalized_height: 998
+                peers: 5
+                protocol_version: 1
+                schema_version: 4
+                node_version: "27.0.0"
+                syncing: false
+                chain_id: 1
+
+  /metrics:
+    get:
+      tags: [Metrics]
+      summary: Prometheus metrics
+      description: |
+        Returns all node metrics in Prometheus text exposition format.
+        
+        Categories: consensus, finality, network, mempool, RPC, storage,
+        protocol, migrations, snapshots, audit (70+ metrics total).
+      responses:
+        '200':
+          description: Prometheus metrics (text exposition format)
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP blocks_produced Total blocks produced
+                # TYPE blocks_produced counter
+                blocks_produced 42
+                # HELP peers_connected Number of connected peers
+                # TYPE peers_connected gauge
+                peers_connected 5
+                # HELP finality_latency_ms Time to finality in milliseconds
+                # TYPE finality_latency_ms histogram
+                finality_latency_ms_bucket{le="100"} 10
+                finality_latency_ms_bucket{le="1000"} 42
+                finality_latency_ms_bucket{le="+Inf"} 42
+
+  /vm/deploy:
+    post:
+      tags: [VM]
+      summary: Deploy IONA VM contract
+      description: Deploy a new smart contract on the IONA VM.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bytecode]
+              properties:
+                bytecode:
+                  type: string
+                  description: Hex-encoded contract bytecode
+                  example: "0x6080604052..."
+                constructor_args:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: Contract deployed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  address:
+                    type: string
+                    example: "0x1234567890abcdef1234567890abcdef12345678"
+                  tx_hash:
+                    type: string
+                    example: "0xabc..."
+
+  /vm/call:
+    post:
+      tags: [VM]
+      summary: Call IONA VM contract
+      description: Execute a read-only call on a deployed contract.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, data]
+              properties:
+                to:
+                  type: string
+                  description: Contract address
+                  example: "0x1234567890abcdef1234567890abcdef12345678"
+                data:
+                  type: string
+                  description: Hex-encoded call data
+                  example: "0x70a08231..."
+                from:
+                  type: string
+                  description: Caller address (optional)
+      responses:
+        '200':
+          description: Call result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: string
+                    example: "0x0000000000000000000000000000000000000000000000000000000000000001"
+                  gas_used:
+                    type: integer
+                    example: 21000
+
+  /tx:
+    post:
+      tags: [JSON-RPC]
+      summary: Submit transaction (IONA native format)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, to, value]
+              properties:
+                from:
+                  type: string
+                  example: "0xabc..."
+                to:
+                  type: string
+                  example: "0xdef..."
+                value:
+                  type: integer
+                  example: 1000000
+                data:
+                  type: string
+                  example: "0x"
+                nonce:
+                  type: integer
+                  example: 0
+      responses:
+        '200':
+          description: Transaction accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tx_hash:
+                    type: string
+                    example: "0x..."
+
+components:
+  schemas:
+    JsonRpcRequest:
+      type: object
+      required: [jsonrpc, method, id]
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        method:
+          type: string
+          description: RPC method name
+          example: "eth_blockNumber"
+        params:
+          type: array
+          items: {}
+          default: []
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+          example: 1
+
+    JsonRpcResponse:
+      type: object
+      required: [jsonrpc, id]
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        result:
+          description: Successful result (absent on error)
+        error:
+          $ref: '#/components/schemas/JsonRpcError'
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+
+    JsonRpcError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: integer
+          example: -32601
+        message:
+          type: string
+          example: "Method not found"
+
+    NodeStatus:
+      type: object
+      properties:
+        height:
+          type: integer
+          example: 1000
+        finalized_height:
+          type: integer
+          example: 998
+        peers:
+          type: integer
+          example: 5
+        protocol_version:
+          type: integer
+          example: 1
+        schema_version:
+          type: integer
+          example: 4
+        node_version:
+          type: string
+          example: "27.0.0"
+        syncing:
+          type: boolean
+          example: false
+        chain_id:
+          type: integer
+          example: 1
+
+    Block:
+      type: object
+      properties:
+        number:
+          type: integer
+          example: 100
+        hash:
+          type: string
+          example: "0xabc..."
+        parent_hash:
+          type: string
+          example: "0xdef..."
+        timestamp:
+          type: integer
+          example: 1700000000
+        state_root:
+          type: string
+        transactions_root:
+          type: string
+        receipts_root:
+          type: string
+        gas_used:
+          type: integer
+          example: 210000
+        gas_limit:
+          type: integer
+          example: 30000000
+        transactions:
+          type: array
+          items:
+            type: string
+          example: ["0x..."]
+
+    Transaction:
+      type: object
+      properties:
+        hash:
+          type: string
+          example: "0xabc..."
+        from:
+          type: string
+        to:
+          type: string
+        value:
+          type: string
+          description: Transfer value in wei (hex)
+          example: "0xde0b6b3a7640000"
+        nonce:
+          type: integer
+        gas:
+          type: integer
+          example: 21000
+        gas_price:
+          type: string
+          example: "0x3b9aca00"
+        input:
+          type: string
+          example: "0x"
+        block_hash:
+          type: string
+        block_number:
+          type: integer
+        transaction_index:
+          type: integer
+
+    Receipt:
+      type: object
+      properties:
+        transaction_hash:
+          type: string
+          example: "0xabc..."
+        block_hash:
+          type: string
+        block_number:
+          type: integer
+        status:
+          type: integer
+          description: "1 = success, 0 = failure"
+          example: 1
+        gas_used:
+          type: integer
+          example: 21000
+        cumulative_gas_used:
+          type: integer
+        logs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Log'
+
+    Log:
+      type: object
+      properties:
+        address:
+          type: string
+          example: "0x..."
+        topics:
+          type: array
+          items:
+            type: string
+          example: ["0xddf252ad..."]
+        data:
+          type: string
+          example: "0x..."
+        block_number:
+          type: integer
+        transaction_hash:
+          type: string
+        log_index:
+          type: integer
