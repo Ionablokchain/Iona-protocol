@@ -2,318 +2,382 @@
 
 ## Overview
 
-Iona is a blockchain protocol under active development, designed around deterministic execution, validator reliability, upgrade safety, and structured operational testing.
+Iona is a blockchain protocol under active development, designed around deterministic execution, validator reliability, upgrade safety, and controlled testnet deployment.
 
-The architecture is currently oriented toward four practical goals:
+The architecture is currently optimized for:
 
-- deterministic and reproducible protocol execution
-- safe validator-driven network operation
-- controlled protocol evolution through upgrade validation
-- repeatable testnet deployment and recovery procedures
+- deterministic and reproducible state transitions
+- safe validator-based network operation
+- explicit upgrade validation before deployment
+- structured storage, recovery, and operational testing
+- staged testnet rollout with clear acceptance criteria
 
-This document describes the current architectural direction of the project, the main system components, and the validation layers required to move the protocol toward a stable multi-validator testnet phase.
+This document describes the current architectural direction of the protocol, the main system layers, and the validation model used to improve protocol safety and testnet readiness.
 
-## Design Goals
+## Architectural Goals
 
-The system is being developed with the following architectural goals:
+The current architecture is designed to support the following goals:
 
-- **Deterministic execution**  
-  The same input must produce the same resulting state across nodes and environments.
+### Deterministic Execution
+The same input must produce the same resulting state across nodes and environments.
 
-- **Operational reliability**  
-  Nodes must start, connect, recover, and continue execution safely under normal operational conditions.
+### Validator Reliability
+Validator nodes must start cleanly, maintain connectivity, process state transitions consistently, and recover safely after restart.
 
-- **Upgrade safety**  
-  Protocol evolution must be validated explicitly through version transition, rollback, and schema migration testing.
+### Upgrade Safety
+Protocol evolution must be tested explicitly through version transition validation, rollback checks, and schema migration safety.
 
-- **Structured validation**  
-  The protocol should be testable through reproducible workflows, state comparison, and documented acceptance checks.
+### Reproducible Validation
+Core protocol behavior must be testable through deterministic replay, state comparison, and structured testnet checks.
 
-- **Deployment discipline**  
-  The network should be deployable in controlled stages using consistent binaries, genesis files, and node configuration patterns.
+### Deployment Discipline
+Multi-node deployment must be consistent, documented, and repeatable across validator infrastructure.
 
-## High-Level System Model
+## High-Level Architecture
 
-At a high level, Iona consists of the following layers:
+At a high level, Iona is composed of the following layers:
 
-1. **Protocol Core**  
-   Core state transition logic, block processing, validator logic, and execution rules.
+1. **Protocol Core**
+2. **Execution Layer**
+3. **Node Runtime**
+4. **Networking Layer**
+5. **Persistence Layer**
+6. **RPC Layer**
+7. **Validation & Safety Layer**
+8. **Operational Tooling**
 
-2. **Execution Layer**  
-   EVM-oriented transaction execution and associated environment/state handling.
-
-3. **Node Runtime**  
-   Networking, validator participation, storage coordination, RPC serving, and operational lifecycle.
-
-4. **Persistence Layer**  
-   Chain data storage, receipts/logs persistence, state snapshots, and recovery support.
-
-5. **Validation & Safety Layer**  
-   Deterministic replay, state root reproducibility checks, upgrade simulation, rollback validation, and schema migration safety.
-
-6. **Operational Tooling**  
-   Testnet planning, deployment flow, node role separation, and observability-oriented documentation.
-
-## Architectural Principles
-
-The current architecture follows these principles:
-
-- one canonical chain state per node
-- explicit separation between runtime behavior and validation workflows
-- deterministic state comparison as a first-class validation tool
-- minimal operational assumptions during early testnet phases
-- documentation-driven deployment and upgrade discipline
-
-## Core Components
+Each layer contributes to protocol correctness, network stability, and readiness for structured testnet deployment.
 
 ## 1. Protocol Core
 
-The protocol core is responsible for:
+The protocol core defines the canonical state transition behavior of the system.
 
-- block/state progression
+It is responsible for:
+
+- block and state progression
 - validator-driven chain advancement
-- transaction inclusion and processing
-- canonical state updates
-- state root consistency across execution environments
-
-This layer defines the rules that all validator nodes are expected to follow.
+- transaction inclusion rules
+- execution ordering
+- resulting state consistency
 
 ### Responsibilities
-- maintain canonical protocol state
-- validate and apply transactions
-- produce deterministic outputs
-- maintain consistent block/state transitions
+- apply canonical protocol rules
+- define valid state transitions
+- maintain consistent block progression
+- ensure deterministic post-execution state
+
+### Architectural Requirement
+The protocol core must behave identically across validator nodes given the same input history and configuration.
 
 ## 2. Execution Layer
 
-The execution layer is responsible for transaction execution and state mutation under the configured protocol environment.
+The execution layer handles transaction execution and state mutation.
 
-Current design direction includes:
+This includes:
 
 - transaction decoding
-- execution environment construction
-- state application through a memory-backed or persistence-backed database
-- result generation for receipts, logs, and block inclusion
+- execution environment setup
+- transaction application
+- gas accounting
+- receipt and log generation
+- execution result formatting
 
 ### Responsibilities
 - decode supported transaction types
-- execute transactions deterministically
-- return execution results, logs, gas usage, and status
-- integrate with state and receipt generation
+- construct the execution environment
+- mutate state through execution
+- produce receipts, logs, and execution outcomes
 
-## 3. RPC Layer
+### Architectural Requirement
+Execution must remain deterministic and reproducible across environments.
 
-The RPC layer exposes protocol and execution state to clients and operational tooling.
+## 3. Node Runtime
 
-Its current role is to provide a practical interface for:
+The node runtime coordinates the active behavior of a running Iona node.
 
-- chain inspection
-- transaction submission
-- balance and state queries
-- block and receipt retrieval
-- operational checks during testnet deployment
+This layer is responsible for:
+
+- startup and shutdown behavior
+- loading configuration and chain state
+- coordinating network participation
+- exposing RPC interfaces
+- managing persistence interactions
+- supporting restart and recovery flows
 
 ### Responsibilities
-- expose a stable query surface for development and testnet use
-- support core transaction and block queries
-- return chain state in a consistent and inspectable format
-- support limited Ethereum-style JSON-RPC compatibility where relevant
+- initialize node services
+- maintain local chain state
+- coordinate execution and persistence
+- support validator or observer node roles
 
-### Current Direction
-The current RPC work is focused on stabilization rather than full feature completeness.  
-The priority is to support the methods required for controlled testing, execution validation, and operational visibility.
+### Architectural Requirement
+Nodes must restart safely and return to a valid operational state without introducing corruption or divergence.
 
 ## 4. Networking Layer
 
-The networking layer is responsible for:
+The networking layer is responsible for peer connectivity and validator communication.
 
-- peer connectivity
-- validator communication
-- node discovery/bootstrap flow
-- resilience under disconnects or partial partitioning
-- peer quality management
+It supports:
+
+- node discovery
+- peer establishment
+- bootstrap and seed node flows
+- peer stability and isolation
+- resilience to partial network faults
 
 ### Responsibilities
 - establish and maintain peer connections
-- support validator communication across nodes
-- isolate unstable or low-quality peers when necessary
-- provide a foundation for testnet-scale network behavior
+- support validator-to-validator communication
+- manage peer quality and isolation
+- provide the basis for distributed block/state progression
 
-### Current Direction
+### Current Focus
 Networking maturity is currently tied to:
 
 - validator peer scoring
+- peer isolation
 - partition simulation
-- connectivity stability
-- bootstrap/seed node planning
+- bootstrap stability
+- multi-node connectivity under testnet conditions
 
-These areas are especially important for multi-validator testnet readiness.
+## 5. Persistence Layer
 
-## 5. Validator Runtime
+The persistence layer stores the data required for chain continuity and operational recovery.
 
-Validator nodes are the core execution participants in the network.
+This includes:
 
-A validator node is expected to:
-
-- join the network using a consistent genesis and build
-- maintain canonical state
-- participate in chain progression
-- recover safely after restart
-- remain consistent with other validators
+- block data
+- transaction records
+- receipts and logs
+- chain metadata
+- local state required for restart and recovery
 
 ### Responsibilities
-- run the active protocol implementation
-- maintain local chain state and persistence
-- participate in block lifecycle
-- recover and resynchronize after restarts or temporary faults
+- persist protocol-relevant data safely
+- support reload after node restart
+- preserve consistency across runtime restarts
+- support migration-aware storage validation
 
-## 6. Persistence Layer
+### Architectural Requirement
+Persistence must be safe, inspectable, and resilient to corruption or incomplete migration scenarios.
 
-The persistence layer provides the storage foundation for:
+## 6. RPC Layer
 
-- chain data
-- block and receipt persistence
-- logs and indexed query support
-- snapshots or stored state required for validation workflows
-- restart and recovery operations
+The RPC layer provides an external interface for chain inspection, transaction submission, and operational visibility.
+
+Its current purpose is to support:
+
+- chain status inspection
+- transaction submission
+- state queries
+- block and receipt retrieval
+- testnet diagnostics
 
 ### Responsibilities
-- persist chain state safely
-- store receipts and logs consistently
-- support reload after restart
-- support validation-oriented data comparison where needed
+- expose chain state to clients and operators
+- support testnet-grade query functionality
+- provide stable inspection endpoints
+- reflect canonical chain state consistently
 
 ### Current Direction
-The persistence layer is also tied to:
-
-- storage corruption detection
-- recovery flows
-- schema migration safety
-- upgrade-oriented data validation
+The current RPC surface is focused on correctness and stabilization rather than complete feature parity.
 
 ## 7. Validation & Safety Layer
 
-This is one of the most important architectural areas for Iona.
+This is one of the most important layers in the current architecture.
 
-The validation layer exists to ensure that protocol behavior remains safe, reproducible, and testable as the codebase evolves.
+The validation and safety layer exists to ensure that Iona remains testable, reproducible, and safe to evolve.
 
 It includes work related to:
 
 - deterministic build verification
-- state root reproducibility across environments
-- structured logging for diagnosis and reproducibility
-- upgrade simulation and rollback validation
-- schema migration validation
-- fuzz coverage and failure discovery
+- state root reproducibility
+- protocol upgrade simulation
+- rollback validation
+- schema migration checks
+- structured logging
+- fuzz coverage expansion
+- storage recovery validation
 
 ### Responsibilities
 - detect nondeterministic behavior
-- compare state progression across runs or environments
-- validate upgrade behavior before deployment
+- validate reproducibility across environments
+- verify upgrade safety before deployment
 - identify divergence points and failure conditions
-- improve confidence before larger testnet rollout
+- improve confidence before larger-scale rollout
 
-## Execution Flow
+### Architectural Requirement
+Validation must be treated as a first-class engineering concern, not an afterthought.
+
+## 8. Operational Tooling
+
+Operational tooling supports deployment, observation, and repeatable test execution.
+
+This includes:
+
+- testnet planning
+- node role mapping
+- binary/genesis verification workflows
+- structured operational documentation
+- issue grouping and engineering planning
+
+### Responsibilities
+- make deployment repeatable
+- make failures easier to diagnose
+- support clear validator and observer roles
+- provide operational evidence for testnet runs
+
+## Execution Model
 
 A simplified execution flow is:
 
 1. a node starts from configured genesis and local persisted state
-2. the networking layer establishes peer connectivity
-3. transactions enter the system through RPC or peer propagation
+2. networking establishes peer connectivity
+3. transactions enter through RPC or network propagation
 4. transactions are decoded and prepared for execution
-5. the protocol core applies state transitions
-6. execution results produce updated state, receipts, and logs
-7. updated chain data is persisted
-8. RPC and observer components expose current chain state
+5. protocol rules are applied
+6. state is updated
+7. receipts, logs, and block metadata are generated
+8. data is persisted
+9. current state is exposed through RPC and observation tooling
 
-This flow must remain deterministic and stable across validator nodes.
+This flow must remain deterministic across validator nodes.
 
-## Storage and State Model
+## Storage Model
 
-The storage model is currently centered around:
+The storage model currently centers on:
 
 - canonical chain state
 - block metadata
 - transaction records
 - receipts and logs
-- validator-relevant runtime state
-- persisted data required for restart and recovery
+- runtime persistence for restart and recovery
+- migration-sensitive persisted structures
 
-Architecturally, the important requirement is not only persistence, but **safe persistence**:
+The main architectural requirement is not just persistence, but **safe persistence**:
 
 - no silent corruption
-- no partial migration ambiguity
-- no unsafe rollback behavior
-- no divergence introduced by storage-layer inconsistencies
+- no unsafe partial migration
+- no hidden divergence introduced by storage-layer inconsistencies
+- no ambiguous rollback state
+
+## Validator Model
+
+The current architecture assumes validator-led network operation.
+
+A validator node is expected to:
+
+- run the selected release candidate build
+- load the correct genesis
+- maintain canonical state
+- participate in block/state progression
+- recover safely after restart
+- remain consistent with the validator set
+
+### Validator Priorities
+- state consistency
+- reliable restart behavior
+- stable peer participation
+- predictable execution behavior
+
+## Observer / RPC Node Model
+
+The architecture also distinguishes a non-validator operational role.
+
+An observer or RPC node is useful for:
+
+- chain visibility
+- query access
+- sync validation
+- monitoring network state
+- supporting bootstrap or seed behavior where appropriate
+
+This separation improves testnet clarity and simplifies operational diagnostics.
+
+## Testnet Architecture
+
+The current testnet direction is intentionally staged and controlled.
+
+### Initial Topology
+- 4 validator nodes
+- 1 RPC / observer / seed node
+
+### Initial Purpose
+The first testnet phase is intended to validate:
+
+- peer connectivity
+- block production
+- deterministic state progression
+- node restart and recovery
+- sync behavior for joining or restarted nodes
+- reproducible deployment flow
+
+### Deployment Rules
+- all nodes run the same selected build
+- all nodes use the same genesis file
+- chain ID is identical across nodes
+- configuration is standardized
+- deployment steps are documented and repeatable
+
+See [`docs/testnet-plan.md`](testnet-plan.md) for the deployment plan.
 
 ## Upgrade Architecture
 
 Protocol upgrades are treated as a dedicated architectural concern.
 
-Upgrades are not considered safe merely because code compiles or starts successfully.  
-They must be validated through explicit simulation and comparison workflows.
+An upgrade is not considered safe simply because the new code builds or starts.  
+It must be validated explicitly.
 
-### Upgrade validation requirements
+### Upgrade Validation Areas
 - version transition testing
 - backward compatibility checks
-- rollback safety validation
-- schema migration verification
-- deterministic post-upgrade state comparison
+- rollback validation
+- schema migration validation
+- deterministic post-upgrade state verification
 
-### Architectural goal
-Upgrades should be testable as controlled transitions from one supported protocol version to another, with clear success/failure criteria and explicit divergence detection.
+### Architectural Requirement
+Supported upgrade paths must be reproducible, testable, and safe to evaluate before deployment.
 
-See [`docs/upgrade.md`](upgrade.md) for the formal upgrade safety process.
+See [`docs/upgrade.md`](upgrade.md) for the current upgrade safety process.
 
-## Testnet Architecture
+## Determinism Requirements
 
-The current testnet direction is intentionally controlled and staged.
+Determinism is a core architectural property.
 
-### Initial topology
-- 4 validator nodes
-- 1 RPC / observer / seed node
+The protocol should support validation through:
 
-### Architectural purpose of the initial testnet
-- validate multi-node operation
-- confirm peer connectivity
-- validate block production and state progression
-- test restart and recovery
-- verify sync behavior for joining nodes
-- prepare for larger-scale staged rollout
+- deterministic build verification
+- state root reproducibility across environments
+- replay-based validation
+- structured execution comparison
+- divergence detection and reporting
 
-### Testnet assumptions
-- all nodes run the same release candidate build
-- all nodes use the same genesis file
-- configuration is standardized
-- deployment steps are documented and reproducible
+This is especially important before larger-scale testnet expansion.
 
-See [`docs/testnet-plan.md`](testnet-plan.md) for the deployment and validation plan.
+## Reliability Requirements
 
-## Operational Separation of Roles
+The architecture must also support operational reliability.
 
-The architecture distinguishes between node roles even in an early testnet phase.
+This includes:
 
-### Validator nodes
-Responsible for:
-- chain participation
-- state progression
-- consensus-related behavior
-- validator lifecycle stability
+- startup correctness
+- restart safety
+- storage recovery behavior
+- stable validator participation
+- observable runtime behavior through logs and status checks
 
-### RPC / observer node
-Responsible for:
-- query access
-- network observation
-- chain health inspection
-- sync/bootstrap support where appropriate
+Reliability work is closely tied to:
 
-This separation improves test visibility and reduces operational ambiguity during deployment and recovery testing.
+- storage corruption detection and recovery
+- structured logging
+- validator peer scoring and isolation
+- network partition simulation
 
-## Repository Architecture Areas
+## Current Repository Workstreams
 
-The repository currently reflects several architectural workstreams:
+The repository currently maps to several architectural work areas.
 
-### Build & Determinism
+### Build & Reproducibility
 - deterministic build verification
 - state root reproducibility across environments
 
@@ -325,7 +389,7 @@ The repository currently reflects several architectural workstreams:
 - storage corruption detection and recovery
 - structured logging framework
 
-### Security & Isolation
+### Security & Environment Control
 - keystore hardening
 - environment isolation
 
@@ -341,62 +405,62 @@ See [`docs/issue-map.md`](issue-map.md) for grouped issue tracking.
 
 ## Current Architectural Priorities
 
-The most important priorities right now are:
+The current priorities are:
 
-1. stabilize the build across RPC, storage, and protocol-support modules
-2. improve deterministic validation of state progression
-3. implement upgrade safety workflows
-4. strengthen networking and validator reliability
-5. prepare a controlled, repeatable testnet rollout
+1. stabilize the build across protocol-support modules
+2. improve deterministic execution validation
+3. strengthen networking and validator reliability
+4. validate upgrade and migration safety
+5. prepare a clean and repeatable multi-validator testnet rollout
 
-## What This Architecture Is Optimized For
+## Scope of the Current Phase
 
 At the current stage, the architecture is optimized for:
 
-- correctness over premature complexity
-- validation over feature breadth
-- operational clarity over hidden automation
-- reproducibility over ad hoc deployment
-- safety-oriented protocol evolution
+- correctness over premature feature expansion
+- validation over interface breadth
+- reproducibility over ad hoc operation
+- safe protocol evolution over rapid unvalidated change
+- testnet readiness over production-scale assumptions
 
 ## What Is Not Yet the Primary Goal
 
-At this phase, the architecture is **not** primarily optimized for:
+At this phase, the architecture is not primarily optimized for:
 
-- full production-scale network deployment
-- maximum RPC surface completeness
-- broad ecosystem integration
-- aggressive feature expansion before validation layers are in place
+- full production-scale deployment
+- maximum RPC completeness
+- wide ecosystem integration
+- aggressive feature expansion before validation maturity
 
-The current emphasis is on building a stable base for safe protocol iteration and structured network testing.
+The current focus is to build a solid and testable foundation.
 
 ## Success Criteria for the Current Phase
 
-The current architectural phase is considered successful when:
+The current phase is considered successful when:
 
 - the project builds cleanly and reproducibly
 - validator nodes can run consistently in a controlled testnet
-- chain execution remains deterministic across environments
+- state progression remains deterministic across environments
 - upgrade paths can be simulated safely
 - rollback and schema migration behavior are validated
-- recovery and sync behavior are documented and repeatable
+- restart and sync behavior are documented and repeatable
 
 ## Related Documentation
 
-- [`README.md`](../README.md) — repository overview and current priorities
-- [`docs/upgrade.md`](upgrade.md) — protocol upgrade safety process
+- [`README.md`](../README.md) — repository overview and priorities
 - [`docs/testnet-plan.md`](testnet-plan.md) — initial testnet deployment plan
-- [`docs/issue-map.md`](issue-map.md) — issue grouping by engineering area
-- [`docs/TESTNET.md`](TESTNET.md) — operational testnet notes
+- [`docs/upgrade.md`](upgrade.md) — upgrade safety process
+- [`docs/issue-map.md`](issue-map.md) — grouped engineering work
+- [`docs/TESTNET.md`](TESTNET.md) — operational testnet guide
 
 ## Status
 
-This architecture should be considered **active and evolving**.
+This architecture should be considered active and evolving.
 
-Some components are already scaffolded or partially implemented, while others are still being stabilized or expanded.  
-The immediate goal is not architectural sprawl, but disciplined convergence toward:
+Some layers are already scaffolded or partially implemented, while others are still being stabilized. The immediate architectural objective is disciplined convergence toward:
 
 - reproducible execution
 - reliable validator operation
 - safe upgrade workflows
+- structured validation
 - controlled testnet deployment
