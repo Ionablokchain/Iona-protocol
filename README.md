@@ -2,29 +2,42 @@
 
 Iona is a blockchain protocol under active development, focused on deterministic execution, validator reliability, upgrade safety, and structured testnet deployment.
 
-This repository is the active development line for the Iona protocol and contains the current implementation, supporting documentation, and validation work for protocol hardening and testnet readiness.
+This repository contains the active implementation and supporting documentation for the current Iona development line.
+
+## Overview
+
+The current development phase is centered on protocol hardening and testnet readiness.
+
+The main focus areas are:
+
+- deterministic and reproducible execution
+- validator networking and operational reliability
+- upgrade safety and schema migration validation
+- structured storage and recovery behavior
+- controlled multi-node testnet deployment
+
+The immediate goal is to reach a clean, reproducible build and validate core protocol behavior in a controlled validator testnet environment.
 
 ## Current Status
 
 The project is currently focused on:
 
 - build and RPC stabilization
-- protocol upgrade safety
 - deterministic validation workflows
-- testnet preparation and deployment planning
-- validator networking and recovery readiness
-
-The immediate objective is to reach a clean, reproducible build and validate core protocol behavior in a controlled multi-node testnet environment.
+- protocol upgrade safety
+- validator reliability and peer behavior
+- recovery and storage safety
+- testnet planning and deployment readiness
 
 ## Current Priorities
 
 The current engineering priorities are:
 
-1. stabilize the build across RPC, storage, and protocol-support modules
-2. validate protocol upgrade safety through simulation and migration checks
-3. improve deterministic execution and reproducibility across environments
+1. stabilize the build across protocol-support modules
+2. improve deterministic execution validation
+3. validate upgrade safety through simulation and migration checks
 4. prepare and document controlled multi-validator testnet deployment
-5. strengthen operational reliability around recovery, logging, and peer behavior
+5. strengthen operational reliability around restart, recovery, and peer behavior
 
 ## Repository Direction
 
@@ -32,31 +45,57 @@ This repository is being prepared to demonstrate:
 
 - protocol engineering maturity
 - deterministic execution awareness
-- upgrade safety planning
+- upgrade safety discipline
 - structured validation workflows
 - testnet deployment readiness
 
-The current phase is centered on making the protocol easier to validate, safer to evolve, and more reproducible under controlled testing conditions.
+The current phase emphasizes correctness, reproducibility, safety, and operational clarity over premature feature expansion.
 
-## Testnet Readiness
+## Architecture
 
-The current testnet plan is focused on an initial controlled deployment with:
+At a high level, Iona is organized around the following architectural areas:
 
-- validator nodes
-- an RPC / observer node
-- shared genesis validation
-- reproducible deployment flow
-- restart, sync, and recovery checks
+- protocol core
+- execution layer
+- node runtime
+- networking layer
+- persistence layer
+- RPC layer
+- validation and safety tooling
+- operational documentation and deployment guidance
 
-The goal of the first testnet phase is to validate:
+The architecture is currently optimized for:
 
-- block production
+- deterministic state progression
+- reliable validator operation
+- safe protocol evolution
+- repeatable deployment procedures
+- controlled multi-node testing
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full architecture overview.
+
+## Testnet
+
+The current testnet direction is intentionally controlled and staged.
+
+Initial target topology:
+
+- 4 validator nodes
+- 1 RPC / observer / seed node
+
+The first testnet phase is intended to validate:
+
 - peer connectivity
-- node restart safety
+- block production
+- restart and recovery safety
 - sync correctness
+- deployment reproducibility
 - operational consistency across nodes
 
-See [`docs/testnet-plan.md`](docs/testnet-plan.md) for details.
+See:
+
+- [`docs/testnet-plan.md`](docs/testnet-plan.md) — initial deployment plan
+- [`docs/TESTNET.md`](docs/TESTNET.md) — operational testnet guide
 
 ## Upgrade Safety
 
@@ -72,39 +111,64 @@ Upgrade-related work is focused on:
 
 See [`docs/upgrade.md`](docs/upgrade.md) for the current upgrade safety process.
 
-## Project Documentation
+## Roadmap
 
-Key project documents:
+The current roadmap is focused on protocol stabilization, deterministic validation, upgrade safety, and controlled testnet rollout.
 
-- [`docs/upgrade.md`](docs/upgrade.md) — protocol upgrade safety process
-- [`docs/testnet-plan.md`](docs/testnet-plan.md) — initial testnet deployment plan
-- [`docs/issue-map.md`](docs/issue-map.md) — issue grouping by engineering area
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — protocol and system architecture
-- [`docs/TESTNET.md`](docs/TESTNET.md) — testnet-related notes and operational details
+Main roadmap areas include:
+
+- build and reproducibility
+- core reliability
+- networking and validator stability
+- storage and recovery
+- RPC and execution stabilization
+- upgrade safety
+- testnet readiness
+- validation and testing
+- documentation and operational clarity
+
+See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap.
 
 ## Open Engineering Areas
 
-Current open work includes:
+Current engineering work includes:
 
 - deterministic build verification
 - state root reproducibility across environments
 - validator peer scoring and isolation
 - network partition simulation
 - storage corruption detection and recovery
-- structured logging improvements
+- structured logging framework
 - fuzz coverage expansion
 - keystore hardening and environment isolation
 - protocol upgrade simulation and rollback validation
 
-See [`docs/issue-map.md`](docs/issue-map.md) for a structured overview.
+See [`docs/issue-map.md`](docs/issue-map.md) for grouped issue tracking.
 
+## Project Documentation
+
+Key project documents:
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — protocol and system architecture
+- [`docs/TESTNET.md`](docs/TESTNET.md) — operational testnet guide
+- [`docs/testnet-plan.md`](docs/testnet-plan.md) — initial testnet deployment plan
+- [`docs/upgrade.md`](docs/upgrade.md) — protocol upgrade safety process
+- [`docs/roadmap.md`](docs/roadmap.md) — project roadmap
+- [`docs/issue-map.md`](docs/issue-map.md) — grouped engineering work
 
 ## Development Note
 
-This repository is under active development.  
-Interfaces, internal modules, and validation tooling may continue to evolve as the protocol moves toward a more stable testnet phase.
+This repository is under active development.
 
-The current emphasis is on correctness, safety, reproducibility, and deployment discipline rather than premature feature completeness.
+Interfaces, internal modules, and validation tooling may continue to evolve as the protocol moves toward a more stable multi-validator testnet phase.
+
+The current emphasis is on:
+
+- correctness
+- reproducibility
+- safety
+- operational discipline
+- controlled protocol evolution
 
 ## License
 
