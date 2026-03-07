@@ -1,73 +1,110 @@
-# IONA Protocol (v28.1)
+# Iona Protocol
 
-IONA is a security-first, **deterministic settlement** research protocol focused on:
+Iona is a blockchain protocol under active development, focused on deterministic execution, validator reliability, upgrade safety, and structured testnet deployment.
 
-- Deterministic state transitions and **state root reproducibility**
-- Replay-based execution verification (divergence detection)
-- Upgrade safety simulation (ProtocolVersion transitions + schema migrations)
-- Validator hardening and operational hygiene
+This repository is the active development line for the Iona protocol and contains the current implementation, supporting documentation, and validation work for protocol hardening and testnet readiness.
 
-> **Status:** Early-stage research prototype (not intended for production deployments).
+## Current Status
 
----
+The project is currently focused on:
 
-## Key goals
+- build and RPC stabilization
+- protocol upgrade safety
+- deterministic validation workflows
+- testnet preparation and deployment planning
+- validator networking and recovery readiness
 
-- **Determinism-first execution:** identical results across nodes/environments
-- **Replay as a primitive:** verify historical blocks/state roots
-- **Upgrade safety before activation:** simulate and validate upgrade paths
-- **Security discipline:** no secrets, no runtime data in the repository
+The immediate objective is to reach a clean, reproducible build and validate core protocol behavior in a controlled multi-node testnet environment.
 
----
+## Current Priorities
 
-## Quickstart (local)
+The current engineering priorities are:
 
-```bash
-cargo build --release
-./scripts/run_3nodes_local.sh
+1. stabilize the build across RPC, storage, and protocol-support modules
+2. validate protocol upgrade safety through simulation and migration checks
+3. improve deterministic execution and reproducibility across environments
+4. prepare and document controlled multi-validator testnet deployment
+5. strengthen operational reliability around recovery, logging, and peer behavior
 
-# health check (example)
-curl -s http://127.0.0.1:9001/health | jq .
-```
+## Repository Direction
 
-## Quickstart (Docker)
+This repository is being prepared to demonstrate:
 
-```bash
-# Prepare node configs under ./data/node{1,2,3}/config.toml (start from config/example.toml)
-docker compose up --build
-```
+- protocol engineering maturity
+- deterministic execution awareness
+- upgrade safety planning
+- structured validation workflows
+- testnet deployment readiness
 
----
+The current phase is centered on making the protocol easier to validate, safer to evolve, and more reproducible under controlled testing conditions.
 
-## Repository layout
+## Testnet Readiness
 
-- `src/` – core protocol implementation
-- `api/` – RPC and external interfaces
-- `config/` – configuration templates
-- `deploy/` – deployment templates (**no secrets**)
-- `docs/` – architecture, security model, research notes
-- `tests/` – integration & determinism-related tests
-- `fuzz/` – fuzzing targets
-- `monitoring/` – ops dashboards and metrics
+The current testnet plan is focused on an initial controlled deployment with:
 
----
+- validator nodes
+- an RPC / observer node
+- shared genesis validation
+- reproducible deployment flow
+- restart, sync, and recovery checks
 
-## Documentation
+The goal of the first testnet phase is to validate:
 
-- Architecture: `docs/ARCHITECTURE.md`
-- Security model: `docs/SECURITY_MODEL.md` and `docs/threat_model.md`
-- Replay / determinism notes: `docs/overview.md`
-- Upgrade notes: `docs/migrations.md` and `UPGRADE.md`
-- Whitepaper: `docs/WHITEPAPER.md`
-- Research objectives: `docs/RESEARCH_OBJECTIVES.md`
+- block production
+- peer connectivity
+- node restart safety
+- sync correctness
+- operational consistency across nodes
 
----
+See [`docs/testnet-plan.md`](docs/testnet-plan.md) for details.
 
-## Security
+## Upgrade Safety
 
-See `SECURITY.md`. Please **do not** include private keys, passwords, or runtime chain data in commits.
+Protocol upgrades are treated as a high-risk operation and are being approached with explicit validation requirements.
 
----
+Upgrade-related work is focused on:
+
+- version transition testing
+- backward compatibility checks
+- rollback validation
+- schema migration validation
+- deterministic post-upgrade state verification
+
+See [`docs/upgrade.md`](docs/upgrade.md) for the current upgrade safety process.
+
+## Project Documentation
+
+Key project documents:
+
+- [`docs/upgrade.md`](docs/upgrade.md) — protocol upgrade safety process
+- [`docs/testnet-plan.md`](docs/testnet-plan.md) — initial testnet deployment plan
+- [`docs/issue-map.md`](docs/issue-map.md) — issue grouping by engineering area
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — protocol and system architecture
+- [`docs/TESTNET.md`](docs/TESTNET.md) — testnet-related notes and operational details
+
+## Open Engineering Areas
+
+Current open work includes:
+
+- deterministic build verification
+- state root reproducibility across environments
+- validator peer scoring and isolation
+- network partition simulation
+- storage corruption detection and recovery
+- structured logging improvements
+- fuzz coverage expansion
+- keystore hardening and environment isolation
+- protocol upgrade simulation and rollback validation
+
+See [`docs/issue-map.md`](docs/issue-map.md) for a structured overview.
+
+
+## Development Note
+
+This repository is under active development.  
+Interfaces, internal modules, and validation tooling may continue to evolve as the protocol moves toward a more stable testnet phase.
+
+The current emphasis is on correctness, safety, reproducibility, and deployment discipline rather than premature feature completeness.
 
 ## License
 
