@@ -1,14 +1,15 @@
 //! STEP 3 — Strict config + genesis validation at boot.
 //!
 //! Node MUST NOT start if any of these fail:
-//! - Bootnodes invalid (malformed multiaddr)
+//! - Bootnodes invalid (malformed multiaddr, missing peer ID)
 //! - Chain ID mismatch (config vs genesis)
-//! - Stake config invalid (zero or negative)
+//! - Stake config invalid (zero, negative, or exceeding maximum)
 //! - simple_producer conflict (follower/RPC running as producer)
 //! - Genesis mismatch (hash differs from expected)
 //! - Genesis hash check at boot
-//!
-//! All failures are **fatal** — not warnings.
+//! - Duplicate validator seeds in genesis
+//! - Empty validator set
+//
 
 use std::collections::BTreeSet;
 use std::path::Path;
