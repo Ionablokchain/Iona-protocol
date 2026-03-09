@@ -10,7 +10,7 @@
 //! |----------------|-------------------------------------------------|
 //! | System time    | Use `block.timestamp` only                      |
 //! | Thread races   | Single-threaded execution per block              |
-//! | Random seed    | Deterministic seed from `block_hash`             |
+//! | Random seed    | Deterministic seed from `block_hash` and `height`|
 //! | Iteration order| BTreeMap/BTreeSet only (no HashMap)              |
 //! | Map order      | Sorted iteration guaranteed                      |
 //! | Float math     | Integer/fixed-point arithmetic only              |
@@ -25,7 +25,7 @@ use crate::types::{Hash32, Height};
 ///
 /// Passed into block execution to replace system calls:
 /// - `timestamp()` → block.timestamp (not wall clock)
-/// - `random_seed()` → deterministic seed from block hash
+/// - `random_seed()` → deterministic seed from block hash and height
 /// - `block_hash()` → block's hash
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
@@ -33,7 +33,7 @@ pub struct ExecutionContext {
     pub height: Height,
     /// Block timestamp (the ONLY valid time source during execution).
     pub timestamp: u64,
-    /// Deterministic random seed (derived from block hash).
+    /// Deterministic random seed (derived from block hash and height).
     pub deterministic_seed: [u8; 32],
     /// Block hash (for contracts that need randomness).
     pub block_hash: Hash32,
@@ -47,6 +47,10 @@ pub struct ExecutionContext {
 
 impl ExecutionContext {
     /// Create a new execution context from block data.
+    ///
+    /// The deterministic seed is derived by mixing the block hash with the
+    /// full 64-bit height to avoid collisions when heights differ only in
+    /// higher-order bytes.
     pub fn from_block(
         height: Height,
         timestamp: u64,
@@ -55,11 +59,20 @@ impl ExecutionContext {
         base_fee_per_gas: u64,
         proposer: String,
     ) -> Self {
-        // Derive deterministic seed from block hash using simple mixing.
-        let mut seed = [0u8; 32];
-        for (i, b) in block_hash.0.iter().enumerate() {
-            seed[i] = b.wrapping_add(height as u8).wrapping_mul(0x9E);
+        // Start with a copy of the block hash.
+        let mut seed = block_hash.0;
+
+        // Mix in the full height (8 bytes) using XOR and addition,
+        // ensuring that heights differing only in high bytes affect the seed.
+        let height_bytes = height.to_le_bytes();
+        for i in 0..8 {
+            seed[i] = seed[i].wrapping_add(height_bytes[i]).wrapping_mul(0x9E);
         }
+        // Spread the influence further by a simple mixing step.
+        for i in 1..32 {
+            seed[i] = seed[i].wrapping_add(seed[i - 1]).wrapping_mul(0x6D);
+        }
+
         Self {
             height,
             timestamp,
@@ -76,14 +89,17 @@ impl ExecutionContext {
         self.timestamp
     }
 
-    /// Get a deterministic random byte sequence derived from block hash + index.
+    /// Get a deterministic random byte sequence derived from block data + index.
+    ///
+    /// Different indices produce different outputs; same index → same output.
+    /// The mixing is not cryptographically secure but is fully deterministic.
     pub fn deterministic_random(&self, index: u64) -> [u8; 32] {
         let mut out = self.deterministic_seed;
         let idx_bytes = index.to_le_bytes();
         for i in 0..8 {
             out[i] ^= idx_bytes[i];
         }
-        // Simple mixing (not cryptographic, but deterministic).
+        // Simple avalanche: propagate changes.
         for i in 1..32 {
             out[i] = out[i].wrapping_add(out[i - 1]).wrapping_mul(0x6D);
         }
@@ -302,6 +318,20 @@ mod tests {
 
         // Same index → same value (deterministic).
         assert_eq!(ctx.deterministic_random(5), ctx.deterministic_random(5));
+    }
+
+    #[test]
+    fn test_height_affects_seed_fully() {
+        // Two blocks with same hash but different heights should have different seeds.
+        let hash = Hash32([0x42; 32]);
+        let ctx_low = ExecutionContext::from_block(100, 0, hash, 0, 0, "".into());
+        let ctx_high = ExecutionContext::from_block(300, 0, hash, 0, 0, "".into());
+        assert_ne!(ctx_low.deterministic_seed, ctx_high.deterministic_seed);
+
+        // Also test heights that differ only in high byte (e.g., 0x100 vs 0x200).
+        let ctx_a = ExecutionContext::from_block(0x100, 0, hash, 0, 0, "".into());
+        let ctx_b = ExecutionContext::from_block(0x200, 0, hash, 0, 0, "".into());
+        assert_ne!(ctx_a.deterministic_seed, ctx_b.deterministic_seed);
     }
 
     #[test]
