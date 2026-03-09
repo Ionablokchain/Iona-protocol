@@ -71,6 +71,7 @@ pub fn vm_deploy(
         0,
     );
 
+    // Extract logs regardless of outcome (they will be discarded on error/revert)
     let logs = tmp_state.logs.drain(..).collect::<Vec<_>>();
 
     match result {
@@ -152,7 +153,7 @@ pub fn vm_call(
             error: Some(e.to_string()),
         },
         Ok(r) if r.reverted => {
-            // On revert: discard state changes, keep gas used
+            // On revert: discard state changes, keep gas used and return_data
             VmExecResult {
                 success: false, reverted: true, gas_used: r.gas_used,
                 return_data: r.return_data, contract: None, logs: vec![],
@@ -209,7 +210,7 @@ pub fn parse_vm_payload(payload: &str) -> Option<VmTxPayload> {
             if cb.len() != 32 { return None; }
             let mut contract = [0u8; 32];
             contract.copy_from_slice(&cb);
-            let calldata = hex::decode(calldata_hex.trim_start_matches("0x")).unwrap_or_default();
+            let calldata = hex::decode(calldata_hex.trim_start_matches("0x")).ok()?;
             Some(VmTxPayload::Call { contract, calldata })
         }
         _ => None,
@@ -244,22 +245,16 @@ mod tests {
         ]
     }
 
-    /// Build simple storage contract:
-    /// Deploy: stores 99 at slot 0, returns empty
-    /// Call:   loads slot 0, stores in memory, returns it
-    fn counter_contract_init() -> Vec<u8> {
+    /// Build init code that stores 99 at slot 0 and returns empty runtime.
+    /// This is used for testing revert scenarios.
+    fn init_with_storage_and_revert() -> Vec<u8> {
         vec![
-            // init: SSTORE slot 0 = 99, then return empty bytecode (the runtime code)
             0x60, 99,   // PUSH1 99 (value)
             0x60, 0,    // PUSH1 0  (slot)
             0x55,       // SSTORE
-            // return empty (deployed code = empty, so call will fail with "no code")
-            // Actually return the runtime bytecode below
-            // For test simplicity: return the SLOAD+RETURN bytecode
-            // PUSH1 0, SLOAD, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
-            0x60, 0,    // PUSH1 0 (offset for RETURN)
-            0x60, 0,    // PUSH1 0 (size for RETURN)
-            0xF3,       // RETURN (returns 0 bytes = empty deployed code)
+            0x60, 0,    // PUSH1 0 (size)
+            0x60, 0,    // PUSH1 0 (offset)
+            0xFD,       // REVERT
         ]
     }
 
@@ -321,8 +316,7 @@ mod tests {
         let mut state = KvState::default();
         let s = sender();
 
-        // Deploy a contract that on init: SSTOREs 42 at slot 7, returns runtime code
-        // Runtime: SLOADs slot 7, MSTOREs at 0, RETURNs 32 bytes from 0
+        // Runtime code: SLOAD slot 7, MSTORE at 0, RETURN 32 bytes from 0
         let runtime: Vec<u8> = vec![
             0x60, 7,    // PUSH1 7   — slot
             0x54,       // SLOAD
@@ -339,14 +333,11 @@ mod tests {
             0x60, 7,    // PUSH1 7
             0x55,       // SSTORE
         ];
-        // RETURN the runtime code: need MSTORE it first
-        // Simpler: store runtime in memory then RETURN it
-        // Use PUSH+MSTORE8 to write each byte
-        let runtime_offset: usize = 0;
+        // Store runtime bytes in memory at offset 0
         for (i, &byte) in runtime.iter().enumerate() {
             init_code.extend_from_slice(&[
                 0x60, byte,                 // PUSH1 <byte>
-                0x60, (runtime_offset + i) as u8, // PUSH1 <offset>
+                0x60, i as u8,               // PUSH1 <offset>
                 0x53,                       // MSTORE8
             ]);
         }
@@ -377,21 +368,51 @@ mod tests {
         let mut state = KvState::default();
         let s = sender();
 
-        // Deploy: SSTORE slot 0 = 99, then REVERT
-        let init_code: Vec<u8> = vec![
+        let init_code = init_with_storage_and_revert();
+
+        let result = vm_deploy(&mut state, &s, &init_code, 100_000);
+        assert!(!result.success, "Reverted deploy should not succeed");
+        assert!(result.reverted, "Should be marked as reverted");
+        // State must not be modified
+        assert!(state.vm.code.is_empty(), "No code should be stored after revert");
+        assert!(state.vm.storage.is_empty(), "No storage should be stored after revert");
+    }
+
+    #[test]
+    fn test_call_revert_does_not_persist_state() {
+        let mut state = KvState::default();
+        let s = sender();
+
+        // First deploy a simple contract that can be called
+        let init = push1_stop(0); // just stop, no runtime code
+        let deploy_result = vm_deploy(&mut state, &s, &init, 100_000);
+        assert!(deploy_result.success);
+        let contract = deploy_result.contract.unwrap();
+
+        // Now call a contract that reverts after SSTORE
+        // We'll use a custom call: first store 99 at slot 0, then revert
+        let call_code: Vec<u8> = vec![
             0x60, 99,   // PUSH1 99
             0x60, 0,    // PUSH1 0
-            0x55,       // SSTORE (slot 0 = 99)
+            0x55,       // SSTORE
             0x60, 0,    // PUSH1 0 (size)
             0x60, 0,    // PUSH1 0 (offset)
             0xFD,       // REVERT
         ];
 
-        let result = vm_deploy(&mut state, &s, &init_code, 100_000);
-        assert!(!result.success, "Reverted deploy should not succeed");
-        // State must not be modified
-        assert!(state.vm.code.is_empty(), "No code should be stored after revert");
-        assert!(state.vm.storage.is_empty(), "No storage should be stored after revert");
+        // But we need to run this code as a call. We can't directly pass code to vm_call.
+        // Instead, we can deploy a contract with that code and call it.
+        // For simplicity, we'll modify the contract's code via set_code (for testing only)
+        state.vm.set_code(&contract, call_code);
+
+        let call_result = vm_call(&mut state, &s, &contract, &[], 100_000);
+        assert!(!call_result.success);
+        assert!(call_result.reverted);
+
+        // Verify storage did not change
+        let mut key = [0u8; 32];
+        let stored = state.vm.sload(&contract, &key).unwrap_or([0u8; 32]);
+        assert_eq!(stored, [0u8; 32], "Storage should not be modified after revert");
     }
 
     #[test]
@@ -401,6 +422,7 @@ mod tests {
         let init_code = return_42();
         let result = vm_deploy(&mut state, &sender(), &init_code, 3); // way too low
         assert!(!result.success, "Should fail with insufficient gas");
+        assert!(result.error.as_deref().map(|e| e.contains("out of gas")).unwrap_or(false));
     }
 
     #[test]
@@ -427,6 +449,18 @@ mod tests {
             }
             other => panic!("Expected Call, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_parse_vm_payload_invalid_hex_returns_none() {
+        let payload = "vm deploy 0xZZZ";
+        assert!(parse_vm_payload(payload).is_none());
+
+        let payload = "vm call 0x1234 0x5678"; // contract length wrong
+        assert!(parse_vm_payload(payload).is_none());
+
+        let payload = "vm call 0x" + &hex::encode([0xABu8; 32]) + " 0xZZZ";
+        assert!(parse_vm_payload(&payload).is_none());
     }
 
     #[test]
