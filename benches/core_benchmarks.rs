@@ -16,15 +16,20 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Benchmark
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+/// Generate a deterministic keypair from a seed.
+/// The seed determines the private key; the public key and address are derived.
 fn make_keypair(seed: u64) -> (Ed25519Signer, Vec<u8>, String) {
     let mut seed_bytes = [0u8; 32];
     seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
+    // The rest of the bytes are zero, which is fine for deterministic benchmarks.
     let signer = Ed25519Signer::from_seed(&seed_bytes);
     let pk = signer.public_key_bytes();
     let addr = derive_address(&pk);
     (signer, pk, addr)
 }
 
+/// Create a signed transaction for benchmark purposes.
+/// The signature is valid and consistent across runs.
 fn make_signed_tx(signer: &Ed25519Signer, pk: &[u8], addr: &str, nonce: u64, payload: &str) -> Tx {
     let mut tx = Tx {
         from: addr.to_string(),
@@ -43,6 +48,7 @@ fn make_signed_tx(signer: &Ed25519Signer, pk: &[u8], addr: &str, nonce: u64, pay
     tx
 }
 
+/// Create a state with a given balance for the specified address.
 fn make_state_with_balance(addr: &str, balance: u64) -> KvState {
     let mut state = KvState::default();
     state.balances.insert(addr.to_string(), balance);
@@ -67,7 +73,8 @@ fn bench_finality_tracker(c: &mut Criterion) {
                     for i in 0..threshold {
                         tracker.record_precommit(black_box(1), black_box(block_id), i as usize);
                     }
-                    tracker.check_finality(1)
+                    // Use black_box to ensure the result is not optimized away.
+                    black_box(tracker.check_finality(1))
                 });
             },
         );
@@ -92,8 +99,11 @@ fn bench_execute_block(c: &mut Criterion) {
                     .map(|i| make_signed_tx(&signer, &pk, &addr, i as u64, &format!("set key{i} val{i}")))
                     .collect();
 
+                // Execute_block should not mutate the input state; we clone inside the loop
+                // to ensure each iteration starts from the same pristine state.
                 b.iter(|| {
-                    execute_block(black_box(&state), black_box(&txs), 1, "proposer")
+                    let state_clone = state.clone();
+                    execute_block(black_box(&state_clone), black_box(&txs), 1, "proposer")
                 });
             },
         );
@@ -135,7 +145,9 @@ fn bench_signature_verify(c: &mut Criterion) {
 
     group.bench_function("verify_single", |b| {
         b.iter(|| {
-            iona::execution::verify_tx_signature(black_box(&tx))
+            // Ensure the verification result is used.
+            let result = iona::execution::verify_tx_signature(black_box(&tx));
+            black_box(result)
         });
     });
 
@@ -147,7 +159,8 @@ fn bench_signature_verify(c: &mut Criterion) {
 fn bench_mempool(c: &mut Criterion) {
     let mut group = c.benchmark_group("mempool");
 
-    group.bench_function("add_100_txs", |b| {
+    // Benchmark: add 100 transactions and then fetch pending.
+    group.bench_function("add_100_txs_and_pending", |b| {
         let (signer, pk, addr) = make_keypair(7);
         let txs: Vec<Tx> = (0..100)
             .map(|i| make_signed_tx(&signer, &pk, &addr, i, &format!("set k{i} v{i}")))
@@ -162,6 +175,7 @@ fn bench_mempool(c: &mut Criterion) {
         });
     });
 
+    // Benchmark: fetch pending from a pre-filled pool of 1000 transactions.
     group.bench_function("pending_from_1000", |b| {
         let mut pool = Mempool::new(10_000);
         for i in 0..1000u64 {
@@ -200,7 +214,7 @@ fn bench_merkle(c: &mut Criterion) {
             .collect();
 
         b.iter(|| {
-            iona::types::tx_root(black_box(&txs))
+            black_box(iona::types::tx_root(black_box(&txs)))
         });
     });
 
