@@ -1,162 +1,256 @@
-# IONA v24 node configuration
-# All values shown are defaults.
+# IONA v24 node configuration — enhanced version
+# All values shown are defaults. Adjust according to your deployment.
 
 [node]
-data_dir  = "./data/node1"
-seed      = 1             # deterministic key seed (change per node)
-chain_id  = 6126151
-log_level = "info"        # trace | debug | info | warn | error
-keystore = "plain"  # plain | encrypted
-keystore_password     = ""  # password for encrypted keystore (fallback if env not set)
+# Base directory for node data (database, snapshots, quarantines, keys)
+data_dir = "./data/node1"
+
+# Deterministic key seed (change per node). Used for local signing mode only.
+# WARNING: Keep this secret in production. For testnet, any value works.
+seed = 1
+
+# Unique chain identifier (must match genesis)
+chain_id = 6126151
+
+# Log level: trace | debug | info | warn | error
+log_level = "info"
+
+# Keystore mode: plain (insecure) | encrypted (recommended for production)
+keystore = "encrypted"
+
+# Password for encrypted keystore (fallback if env var not set)
+keystore_password = ""
+
+# Environment variable name containing the keystore password
 keystore_password_env = "IONA_KEYSTORE_PASSWORD"
+
+# Maximum number of concurrent background tasks (e.g., snapshot generation)
+max_concurrent_tasks = 256
 
 
 [consensus]
-propose_timeout_ms   = 300   # ms to wait for proposal before nil-voting
-prevote_timeout_ms   = 200   # ms timeout for prevote phase (fallback)
-precommit_timeout_ms = 200   # ms timeout for precommit phase (fallback)
-max_txs_per_block    = 4096  # max transactions per block
-gas_target           = 43000000  # EIP-1559 target gas per block
-fast_quorum          = true  # advance immediately when 2/3+ votes received
-initial_base_fee     = 1
-stake_each           = 1000  # stake assigned to each demo validator
+# Timeouts (milliseconds) for each consensus step
+propose_timeout_ms   = 300
+prevote_timeout_ms   = 200
+precommit_timeout_ms = 200
+
+# Maximum number of transactions included in a block
+max_txs_per_block = 4096
+
+# EIP-1559 target gas per block
+gas_target = 43000000
+
+# If true, advance to next round as soon as 2/3+ votes are received (faster finality).
+# In unstable networks, consider setting to false to avoid premature commits.
+fast_quorum = true
+
+# Initial base fee for EIP-1559
+initial_base_fee = 1
+
+# Stake assigned to each demo validator (only used in testnets with static validator sets)
+stake_each = 1000
+
+# Maximum age (in seconds) of evidence that will be accepted
+max_evidence_age_s = 3600
+
+# Minimum number of validators required to produce a block (safety threshold)
+min_validator_count = 4
+
 
 [network]
+# Listen address for P2P (multiaddr format)
 listen = "/ip4/0.0.0.0/tcp/7001"
-peers  = [
-  # "/ip4/1.2.3.4/tcp/7001",  # static peer 1
-  # "/ip4/1.2.3.5/tcp/7002",  # static peer 2
+
+# Static peers (multiaddrs)
+peers = [
+  # "/ip4/1.2.3.4/tcp/7001/p2p/12D3KooW...",
 ]
+
+# Bootnodes for peer discovery (must include peer ID)
 bootnodes = [
   # "/dns4/node.example/tcp/7001/p2p/12D3KooW...",
 ]
+
+# Enable mDNS for local network discovery (useful only for testing)
 enable_mdns = false
-enable_kad  = true
-reconnect_s = 30  # seconds between reconnect attempts to static peers
+
+# Enable Kademlia DHT for peer discovery
+enable_kad = true
+
+# Reconnect interval to static peers (seconds)
+reconnect_s = 30
 
 # Connection limits
-max_connections_total = 200
-max_connections_per_peer = 8
+max_connections_total = 200               # total inbound + outbound
+max_connections_per_peer = 8               # prevent sybil from single IP
 
-# Request-response protection (per-peer, per-protocol)
-rr_max_req_per_sec_block  = 15
-rr_max_req_per_sec_status = 30
-rr_max_req_per_sec_range  = 5
+# Request-response protocol limits (per-peer, per-protocol)
+[network.rr_limits]
+max_req_per_sec_block  = 15
+max_req_per_sec_status = 30
+max_req_per_sec_range  = 5
 
-# Inbound per-peer bandwidth caps (bytes/sec)
-rr_max_bytes_per_sec_block  = 2000000
-rr_max_bytes_per_sec_status = 200000
-rr_max_bytes_per_sec_range  = 4000000
+max_bytes_per_sec_block  = 2_000_000       # 2 MB/s
+max_bytes_per_sec_status = 200_000         # 200 KB/s
+max_bytes_per_sec_range  = 4_000_000       # 4 MB/s
 
-# Global bandwidth caps (bytes/sec) for request-response
-rr_global_in_bytes_per_sec  = 10000000
-rr_global_out_bytes_per_sec = 10000000
+# Global bandwidth caps for request-response (bytes/sec)
+global_in_bytes_per_sec  = 10_000_000      # 10 MB/s
+global_out_bytes_per_sec = 10_000_000
 
-# Peer scoring hardening
-peer_strike_decay_s = 30      # strikes decay every N seconds
-peer_score_decay_s  = 60      # peer_score moves toward 0 every N seconds
-peer_quarantine_s   = 60      # temporary quarantine duration
+# Peer scoring and quarantine settings
+peer_strike_decay_s = 30                    # strikes decay every N seconds
+peer_score_decay_s  = 60                    # score moves toward zero every N seconds
+peer_quarantine_s   = 60                    # temporary quarantine duration
+
 rr_strikes_before_quarantine = 2
 rr_strikes_before_ban        = 3
 rr_quarantines_before_ban    = 2
-
-# Gossipsub caps
-# Local publish caps
-gs_max_publish_msgs_per_sec  = 30
-gs_max_publish_bytes_per_sec = 2000000
-# Per-peer inbound caps
-gs_max_in_msgs_per_sec       = 60
-gs_max_in_bytes_per_sec      = 4000000
 
 # Persist quarantine list to disk (data_dir/quarantine.json)
 persist_quarantine = true
 
 
+# Diversity and eclipse protection
+[network.diversity]
+# Bucket peers by /16 (IPv4) or first 4 bytes of IPv6 to resist Sybil attacks.
+bucket_kind = "ip16"           # ip16 | ip24 | asn (ASN requires external mapping)
+max_inbound_per_bucket = 4
+max_outbound_per_bucket = 4
+eclipse_detection_min_buckets = 3   # if we have fewer buckets, trigger reseed
+reseed_cooldown_s = 60
+
+
+# Gossipsub configuration
+[network.gossipsub]
+# Topic allowlist – messages on other topics are dropped
+allowed_topics = ["iona/tx", "iona/blocks", "iona/evidence"]
+deny_unknown_topics = true
+
+# Local node publish limits
+max_publish_msgs_per_sec = 50
+max_publish_bytes_per_sec = 5_242_880      # 5 MiB/s
+
+# Per-peer inbound limits (messages they forward to us)
+max_in_msgs_per_sec = 100
+max_in_bytes_per_sec = 10_485_760          # 10 MiB/s
+
+# Optional per-topic overrides (uncomment and adjust as needed)
+# [[network.gossipsub.topic_limits]]
+# topic = "iona/tx"
+# max_in_msgs_per_sec = 200
+# max_in_bytes_per_sec = 10_485_760
+
+
+# State sync security
+[network.state_sync_security]
+# Bind snapshot attestations to validator-set hash and epoch to prevent replay.
+bind_validator_set = true
+bind_epoch = true
+attestation_epoch_s = 60                    # epoch length for attestation nonce
+
+# If true, reject unsigned snapshots (required for mainnet)
+require_attestation = false
+
+# Use aggregated BLS signatures (requires feature flag "bls")
+use_aggregated_signatures = false
+
+
 # P2P state sync
 enable_p2p_state_sync = true
-state_sync_chunk_bytes = 1048576
+state_sync_chunk_bytes = 1_048_576          # 1 MiB
 state_sync_timeout_s = 15
 
-# Snapshot attestation (threshold collection)
+# Snapshot attestation collection
 enable_snapshot_attestation = true
-snapshot_attestation_threshold = 2
+snapshot_attestation_threshold = 2          # number of validators required
 snapshot_attestation_collect_s = 8
 
+
 [mempool]
-capacity = 200000
+# Maximum number of pending transactions
+capacity = 200_000
+
+# Maximum size of a single transaction (in bytes)
+max_tx_size = 65_536                         # 64 KB
+
+# Minimum and maximum gas prices (to prevent spam)
+min_gas_price = 1
+max_gas_price = 1_000_000
+
+# Maximum priority fee per gas
+max_priority_fee_per_gas = 100
+
 
 [rpc]
 # SECURITY: bind to loopback by default.
 # To expose publicly, set listen = "0.0.0.0:9001" AND pass --unsafe-rpc-public at startup.
-# The node will refuse to start if it detects a public bind without the explicit flag.
-listen        = "127.0.0.1:9001"
-enable_faucet = false  # set true ONLY for testnets
+listen = "127.0.0.1:9001"
 
-# CORS policy.
-# false (default) = restrictive — no cross-origin requests allowed.
-# true            = permissive (allow-all) — for dev/testnet UI only.
+# Enable faucet endpoint (ONLY for testnets)
+enable_faucet = false
+
+# CORS policy: false = restrictive (no cross-origin), true = allow-all (dev only)
 cors_allow_all = false
 
+# Rate limiting for RPC calls (requests per second, per IP)
+rate_limit_per_ip = 100
+rate_limit_burst = 200
+
+# Maximum request size (bytes)
+max_request_size = 10_485_760                # 10 MiB
+
+# Timeout for RPC calls (seconds)
+timeout_s = 30
+
+
 [storage]
+# Enable snapshot generation
 enable_snapshots = true
+
+# Generate snapshot every N blocks
 snapshot_every_n_blocks = 500
+
+# Number of recent snapshots to keep
 snapshot_keep = 10
+
+# Zstd compression level (1-22, higher = better compression but slower)
 snapshot_zstd_level = 3
+
+# Database cache size (in MB) – adjust based on available RAM
+db_cache_size_mb = 512
+
+# Maximum number of concurrent I/O tasks
 max_concurrent_tasks = 256
 
+# Path to the block store (if separate from data_dir)
+# block_store_path = "./data/node1/blocks"
+
+
 [observability]
+# Enable OpenTelemetry tracing (requires "otel" feature)
 enable_otel = false
+
+# OTLP endpoint (gRPC)
 otel_endpoint = "http://127.0.0.1:4317"
+
+# Service name for traces/metrics
 service_name = "iona-node"
 
+# Metrics export (Prometheus) – if enabled, expose /metrics on this address
+# metrics_listen = "127.0.0.1:9100"
+
+
 [signing]
-mode = "local"               # local | remote
+# Signing mode: local (use seed) | remote (external signer)
+mode = "local"
+
+# Remote signer URL (only if mode = "remote")
 remote_url = "https://127.0.0.1:9100"
 remote_timeout_s = 10
 
-# Remote signer mTLS (optional but recommended)
+# mTLS certificates for remote signer (recommended)
 remote_tls_client_cert_pem = "./deploy/tls/client.crt.pem"
 remote_tls_client_key_pem  = "./deploy/tls/client.key.pem"
 remote_tls_ca_cert_pem     = "./deploy/tls/ca.crt.pem"
 remote_tls_server_name     = "iona-remote-signer"
-
-
-# --- v24.12.0 A+B+C hardening ---
-
-[network.diversity]
-# Bucket peers by /16 (IPv4) or by first 4 bytes of IPv6. Limit connections per bucket to resist Sybil/Eclipse.
-bucket_kind = "ip16"           # ip16 | ip24 | asn (asn requires external mapping; scaffold only)
-max_inbound_per_bucket = 4
-max_outbound_per_bucket = 4
-eclipse_detection_min_buckets = 3   # if below, trigger reseed attempt
-reseed_cooldown_s = 60
-
-[network.gossipsub]
-# Topic-level ACL + rate limits.
-allowed_topics = ["iona/tx", "iona/blocks", "iona/evidence"]
-deny_unknown_topics = true
-
-# publish limits (local node)
-max_publish_msgs_per_sec = 50
-max_publish_bytes_per_sec = 5242880  # 5 MiB/s
-
-# inbound per-peer limits (forwarded + published from peers)
-max_in_msgs_per_sec = 100
-max_in_bytes_per_sec = 10485760      # 10 MiB/s
-
-# per-topic overrides (optional)
-# [[network.gossipsub.topic_limits]]
-# topic = "iona/tx"
-# max_in_msgs_per_sec = 200
-# max_in_bytes_per_sec = 10485760
-
-[network.state_sync_security]
-# Bind snapshot attestations to validator-set hash and epoch/nonce to prevent replay across epochs.
-bind_validator_set = true
-bind_epoch = true
-attestation_epoch_s = 60         # epoch length for attestation nonce derivation
-require_attestation = false      # if true, refuse unsigned snapshots (testnet defaults to false)
-
-# Aggregation scaffolding (feature flag "bls" required for real aggregation)
-use_aggregated_signatures = false
-
