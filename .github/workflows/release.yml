@@ -8,8 +8,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    outputs:
-      artifact_name: iona-${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
 
@@ -55,6 +53,7 @@ jobs:
     env:
       COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
       COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+
     steps:
       - uses: actions/download-artifact@v4
         with:
