@@ -8,29 +8,38 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      artifact_name: iona-${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85.0"
           components: rustfmt, clippy
+
       - name: Build
         run: cargo build --release --locked --bin iona-node
+
       - name: Package
         run: |
           mkdir -p dist
-          cp target/release/iona-node dist/ || true
-          tar -czf dist/iona-${GITHUB_REF_NAME}.tar.gz -C dist .
+          cp target/release/iona-node dist/iona-node
+          tar -czf dist/iona-${GITHUB_REF_NAME}.tar.gz -C dist iona-node
+
       - name: Generate SBOM
         run: |
           cargo install cargo-cyclonedx --locked || true
-          cargo cyclonedx --format json --output-file dist/sbom.json || echo '{"bomFormat":"CycloneDX","specVersion":"1.4","components":[]}' > dist/sbom.json
+          cargo cyclonedx --format json --output-file dist/sbom.json || \
+            echo '{"bomFormat":"CycloneDX","specVersion":"1.4","components":[]}' > dist/sbom.json
+
       - name: Generate SHA256 hashes
         run: |
           cd dist
           sha256sum iona-${GITHUB_REF_NAME}.tar.gz > SHA256SUMS.txt
           sha256sum sbom.json >> SHA256SUMS.txt
           cat SHA256SUMS.txt
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -43,27 +52,39 @@ jobs:
   sign:
     runs-on: ubuntu-latest
     needs: [build]
-    # Signing is optional and only runs if secrets are configured.
-    if: ${{ secrets.COSIGN_PRIVATE_KEY != '' && secrets.COSIGN_PASSWORD != '' }}
+    env:
+      COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+      COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: iona-${{ github.ref_name }}
           path: dist
+
       - name: Install cosign
+        if: ${{ env.COSIGN_PRIVATE_KEY != '' && env.COSIGN_PASSWORD != '' }}
         uses: sigstore/cosign-installer@v3
+
       - name: Sign artifact
-        env:
-          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
-          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        if: ${{ env.COSIGN_PRIVATE_KEY != '' && env.COSIGN_PASSWORD != '' }}
         run: |
-          cosign sign-blob --key env://COSIGN_PRIVATE_KEY dist/iona-${GITHUB_REF_NAME}.tar.gz \
+          printf '%s' "$COSIGN_PRIVATE_KEY" > cosign.key
+          cosign sign-blob \
+            --key cosign.key \
             --output-signature dist/iona-${GITHUB_REF_NAME}.tar.gz.sig \
-            --output-certificate dist/iona-${GITHUB_REF_NAME}.tar.gz.cert
+            --output-certificate dist/iona-${GITHUB_REF_NAME}.tar.gz.cert \
+            dist/iona-${GITHUB_REF_NAME}.tar.gz
+          rm -f cosign.key
+
       - name: Upload signatures
+        if: ${{ env.COSIGN_PRIVATE_KEY != '' && env.COSIGN_PASSWORD != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: iona-${{ github.ref_name }}-signatures
           path: |
             dist/*.sig
             dist/*.cert
+
+      - name: Skip signing
+        if: ${{ env.COSIGN_PRIVATE_KEY == '' || env.COSIGN_PASSWORD == '' }}
+        run: echo "Cosign secrets not configured; skipping signing."
