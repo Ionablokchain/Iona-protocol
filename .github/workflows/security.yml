@@ -1,23 +1,5 @@
 name: Security Gate
 
-# ──────────────────────────────────────────────────────────────────────────────
-# IONA Security CI Pipeline
-#
-# This workflow is a BLOCKING gate: every job must pass before a PR can merge.
-# It runs independently from the main CI so that security regressions surface
-# clearly in the GitHub UI.
-#
-# Jobs:
-#   1. supply-chain   — cargo audit + cargo deny (advisory + license + source)
-#   2. locked-build   — cargo build --locked enforcement
-#   3. unsafe-audit   — grep check: no `unsafe` in crypto/ or consensus/
-#   4. unwrap-audit   — grep check: no `.unwrap()` in rpc/ or net/
-#   5. security-tests — dedicated security test suites (adversarial + regression)
-#   6. rpc-hardening  — RPC-specific hardening tests
-#   7. fuzz-replay    — libFuzzer corpus replay (confirm no regressions)
-#   8. clippy-sec     — clippy on security-critical paths with deny-warnings
-# ──────────────────────────────────────────────────────────────────────────────
-
 on:
   push:
     branches: ["**"]
@@ -26,41 +8,28 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Rustup home inside the runner — keeps toolchain caches separate.
   RUSTUP_HOME: /usr/local/rustup
   CARGO_HOME: /usr/local/cargo
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-
-  # ── 1. Supply-chain hygiene ───────────────────────────────────────────────
   supply-chain:
     name: Supply-chain (audit + deny)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85.0"
-
       - uses: Swatinem/rust-cache@v2
-
-      # Install advisories database at a pinned version for reproducibility.
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked --version "^0.21"
-
+        run: cargo install cargo-audit --locked
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked --version "^0.16"
-
-      # BLOCKING: any RUSTSEC advisory → red build.
+        run: cargo install cargo-deny --locked
       - name: cargo audit (advisories)
         run: cargo audit --deny warnings
-
-      # BLOCKING: unlicensed deps, duplicate crates, unknown registries → red build.
-      - name: cargo deny (licenses + bans + sources)
+      - name: cargo deny check
         run: cargo deny check
-
-      # Confirm Cargo.lock is committed and up-to-date.
       - name: Cargo.lock is committed
         run: |
           if [ ! -f Cargo.lock ]; then
@@ -69,36 +38,25 @@ jobs:
           fi
           echo "Cargo.lock present ✓"
 
-  # ── 2. Locked build ───────────────────────────────────────────────────────
   locked-build:
     name: Locked build (--locked)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85.0"
-
       - uses: Swatinem/rust-cache@v2
-
-      # BLOCKING: any dependency drift fails the build.
       - name: cargo build --locked
         run: cargo build --locked --all-targets
-
-      # Verify release profile compiles with panic = "abort" if set.
       - name: Release build --locked
         run: cargo build --release --locked --bin iona-node
 
-  # ── 3. Unsafe code audit in security-critical paths ───────────────────────
   unsafe-audit:
     name: Unsafe code audit (crypto/ + consensus/)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # BLOCKING: `unsafe` blocks are forbidden in crypto and consensus.
-      # These paths must remain provably safe Rust.
       - name: No unsafe in src/crypto/
         run: |
           COUNT=$(grep -rn --include="*.rs" "unsafe" src/crypto/ | grep -v "//.*unsafe" | wc -l)
@@ -109,7 +67,6 @@ jobs:
             exit 1
           fi
           echo "src/crypto/ is unsafe-free ✓"
-
       - name: No unsafe in src/consensus/
         run: |
           COUNT=$(grep -rn --include="*.rs" "unsafe" src/consensus/ | grep -v "//.*unsafe" | wc -l)
@@ -121,18 +78,13 @@ jobs:
           fi
           echo "src/consensus/ is unsafe-free ✓"
 
-  # ── 4. Unwrap audit in error-handling-critical paths ─────────────────────
   unwrap-audit:
     name: Unwrap audit (rpc/ + net/)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # BLOCKING: .unwrap() panics in network-facing code can be crash vectors.
-      # Use expect() with a message, or ? with proper error propagation instead.
       - name: No bare .unwrap() in src/rpc/
         run: |
-          # Allow test modules (cfg(test)) and allow expect()
           COUNT=$(grep -rn --include="*.rs" "\.unwrap()" src/rpc/ \
                   | grep -v "#\[cfg(test)\]" \
                   | grep -v "// unwrap-ok:" \
@@ -144,7 +96,6 @@ jobs:
             exit 1
           fi
           echo "src/rpc/ unwrap-free ✓"
-
       - name: No bare .unwrap() in src/net/
         run: |
           COUNT=$(grep -rn --include="*.rs" "\.unwrap()" src/net/ \
@@ -159,47 +110,34 @@ jobs:
           fi
           echo "src/net/ unwrap-free ✓"
 
-  # ── 5. Security test suites ───────────────────────────────────────────────
   security-tests:
     name: Security test suites
     runs-on: ubuntu-latest
     needs: [supply-chain, locked-build]
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85.0"
-
       - uses: Swatinem/rust-cache@v2
-
-      # BLOCKING: consensus adversarial tests — equivocation, replay, tamper.
       - name: Consensus adversarial tests
         run: cargo test --locked --test consensus_adversarial -- --nocapture
-
-      # BLOCKING: security regression tests — each maps to a known past finding.
       - name: Security regression tests
         run: cargo test --locked --test security_regression -- --nocapture
 
-  # ── 6. RPC hardening tests ────────────────────────────────────────────────
   rpc-hardening:
     name: RPC hardening tests
     runs-on: ubuntu-latest
     needs: [supply-chain, locked-build]
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85.0"
-
       - uses: Swatinem/rust-cache@v2
-
-      # BLOCKING: RPC-layer negative tests (flood, oversized body, invalid input).
       - name: RPC hardening tests
         run: cargo test --locked --test rpc_hardening -- --nocapture
 
-  # ── 7. Fuzz corpus replay ─────────────────────────────────────────────────
   fuzz-replay:
     name: Fuzz corpus replay (${{ matrix.target }})
     runs-on: ubuntu-latest
@@ -215,21 +153,16 @@ jobs:
           - block_header
           - rpc_json
           - state_transition
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly
-
       - uses: Swatinem/rust-cache@v2
         with:
           key: fuzz-replay-${{ matrix.target }}
-
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
-
       - name: Restore fuzz corpus
         uses: actions/cache/restore@v4
         with:
@@ -237,18 +170,13 @@ jobs:
           key: fuzz-corpus-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
-
       - name: Create corpus dir if absent
         run: mkdir -p fuzz/corpus/${{ matrix.target }}
-
-      # Replay all stored corpus items — confirm they do not crash.
-      # Uses -runs=0 (replay-only, no new exploration).
       - name: Replay corpus (no new exploration)
         run: |
           CORPUS_DIR="fuzz/corpus/${{ matrix.target }}"
           SEED_COUNT=$(find "$CORPUS_DIR" -type f | wc -l)
           echo "Replaying $SEED_COUNT corpus entries for ${{ matrix.target }}"
-
           if [ "$SEED_COUNT" -eq "0" ]; then
             echo "No corpus entries — running minimal smoke fuzz (5 s) to seed."
             cargo fuzz run ${{ matrix.target }} \
@@ -259,13 +187,11 @@ jobs:
               "$CORPUS_DIR" \
               -- -runs=0 -max_len=65536 2>&1 | tee fuzz_output.txt
           fi
-
           if grep -qE "CRASH|ERROR|AddressSanitizer" fuzz_output.txt; then
             echo "::error::Corpus replay found a crash in ${{ matrix.target }}"
             exit 1
           fi
           echo "Corpus replay clean ✓"
-
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
@@ -275,27 +201,20 @@ jobs:
             fuzz/artifacts/${{ matrix.target }}/
             fuzz_output.txt
 
-  # ── 8. Clippy on security-critical paths ──────────────────────────────────
   clippy-sec:
     name: Clippy (security paths, deny-warnings)
     runs-on: ubuntu-latest
     needs: locked-build
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85.0"
           components: clippy
-
       - uses: Swatinem/rust-cache@v2
-
-      # BLOCKING: deny all warnings in the full codebase.
-      # Security-critical paths must be lint-clean.
       - name: clippy --all-targets -D warnings
         run: cargo clippy --locked --all-targets -- -D warnings
 
-  # ── Status summary (required check) ──────────────────────────────────────
   security-gate:
     name: "✅ Security Gate"
     runs-on: ubuntu-latest
