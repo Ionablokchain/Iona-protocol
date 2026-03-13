@@ -4,6 +4,9 @@ on:
   release:
     types: [published]
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   contents: write
   actions: read
@@ -44,25 +47,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          b64=$(python - <<'PY'
-import base64, hashlib, json, os
-from pathlib import Path
-
-dist = Path('dist')
-subjects = []
-for name in ['iona-node','iona-remote-signer','iona-chaos','SHA256SUMS.txt']:
-    p = dist / name
-    if not p.exists():
-        continue
-    h = hashlib.sha256(p.read_bytes()).hexdigest()
-    subjects.append({"name": name, "digest": {"sha256": h}})
-
-data = json.dumps(subjects, separators=(',',':')).encode()
-print(base64.b64encode(data).decode())
-PY
-)
+          cd dist
+          # Create a JSON array of subjects with sha256 digests
+          echo -n '[' > subjects.json
+          first=1
+          for f in iona-node iona-remote-signer iona-chaos SHA256SUMS.txt; do
+            if [ -f "$f" ]; then
+              if [ $first -eq 0 ]; then echo -n ',' >> subjects.json; fi
+              first=0
+              hash=$(sha256sum "$f" | cut -d' ' -f1)
+              echo -n "{\"name\":\"$f\",\"digest\":{\"sha256\":\"$hash\"}}" >> subjects.json
+            fi
+          done
+          echo -n ']' >> subjects.json
+          b64=$(base64 -w0 < subjects.json)
           echo "base64=$b64" >> "$GITHUB_OUTPUT"
-        
+
   provenance:
     needs: build
     uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2
