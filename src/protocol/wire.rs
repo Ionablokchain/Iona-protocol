@@ -11,10 +11,22 @@
 //! 4. Session PV = `min(max(local.supported_pv), max(remote.supported_pv))`.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use super::version::{CURRENT_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS};
 use crate::storage::CURRENT_SCHEMA_VERSION;
 use crate::types::Hash32;
+
+/// Bitmask for optional capabilities (for future extensions).
+pub type CapabilityFlags = u64;
+
+/// Capability flags (example).
+pub mod capabilities {
+    pub const SNAPSHOT_SYNC: u64 = 1 << 0;
+    pub const ZSTD_COMPRESSION: u64 = 1 << 1;
+    pub const LIGHT_CLIENT: u64 = 1 << 2;
+    // ... etc.
+}
 
 // ─── Hello handshake ────────────────────────────────────────────────────────
 
@@ -25,6 +37,7 @@ use crate::types::Hash32;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
     /// Protocol versions this node can validate / execute.
+    /// Must be non‑empty and usually sorted.
     pub supported_pv: Vec<u32>,
     /// Schema versions this node can read (informational; not used for gating).
     pub supported_sv: Vec<u32>,
@@ -38,11 +51,24 @@ pub struct Hello {
     pub head_height: u64,
     /// Protocol version of the local chain tip.
     pub head_pv: u32,
+    /// Optional capabilities bitmap (for feature negotiation).
+    #[serde(default)]
+    pub capabilities: CapabilityFlags,
+    /// Optional peer ID (for logging / debugging).
+    #[serde(default)]
+    pub peer_id: Option<String>,
 }
 
 impl Hello {
     /// Build a `Hello` for the local node.
-    pub fn local(chain_id: u64, genesis_hash: Hash32, head_height: u64) -> Self {
+    pub fn local(
+        chain_id: u64,
+        genesis_hash: Hash32,
+        head_height: u64,
+        capabilities: CapabilityFlags,
+        peer_id: Option<String>,
+    ) -> Self {
+        debug_assert!(!SUPPORTED_PROTOCOL_VERSIONS.is_empty(), "supported PV list cannot be empty");
         Self {
             supported_pv: SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
             supported_sv: (0..=CURRENT_SCHEMA_VERSION).collect(),
@@ -51,6 +77,8 @@ impl Hello {
             genesis_hash,
             head_height,
             head_pv: CURRENT_PROTOCOL_VERSION,
+            capabilities,
+            peer_id,
         }
     }
 }
@@ -64,6 +92,8 @@ pub struct CompatResult {
     pub compatible: bool,
     /// Negotiated session PV (only valid if `compatible == true`).
     pub session_pv: u32,
+    /// Intersection of capabilities (bitwise AND).
+    pub common_capabilities: CapabilityFlags,
     /// Human-readable reason for incompatibility (empty if compatible).
     pub reason: String,
 }
@@ -84,6 +114,7 @@ pub fn check_hello_compat(local: &Hello, remote: &Hello) -> CompatResult {
         return CompatResult {
             compatible: false,
             session_pv: 0,
+            common_capabilities: 0,
             reason: format!(
                 "chain_id mismatch: local={}, remote={}",
                 local.chain_id, remote.chain_id
@@ -96,39 +127,56 @@ pub fn check_hello_compat(local: &Hello, remote: &Hello) -> CompatResult {
         return CompatResult {
             compatible: false,
             session_pv: 0,
+            common_capabilities: 0,
             reason: "genesis_hash mismatch".into(),
         };
     }
 
+    // Ensure lists are sorted for deterministic behavior (optional, but good practice).
+    let local_pv = ensure_sorted(&local.supported_pv);
+    let remote_pv = ensure_sorted(&remote.supported_pv);
+
     // PV intersection must be non-empty.
-    let intersection: Vec<u32> = local
-        .supported_pv
+    let intersection: Vec<u32> = local_pv
         .iter()
         .copied()
-        .filter(|pv| remote.supported_pv.contains(pv))
+        .filter(|pv| remote_pv.contains(pv))
         .collect();
 
     if intersection.is_empty() {
         return CompatResult {
             compatible: false,
             session_pv: 0,
+            common_capabilities: 0,
             reason: format!(
                 "no common protocol version: local={:?}, remote={:?}",
-                local.supported_pv, remote.supported_pv
+                local_pv, remote_pv
             ),
         };
     }
 
     // Session PV = min(max(local), max(remote)).
-    let local_max = local.supported_pv.iter().copied().max().unwrap_or(1);
-    let remote_max = remote.supported_pv.iter().copied().max().unwrap_or(1);
+    let local_max = local_pv.iter().copied().max().unwrap_or(1);
+    let remote_max = remote_pv.iter().copied().max().unwrap_or(1);
     let session_pv = local_max.min(remote_max);
+
+    // Common capabilities = bitwise AND.
+    let common_capabilities = local.capabilities & remote.capabilities;
 
     CompatResult {
         compatible: true,
         session_pv,
+        common_capabilities,
         reason: String::new(),
     }
+}
+
+/// Helper to ensure a slice is sorted (returns a sorted Vec).
+fn ensure_sorted(v: &[u32]) -> Vec<u32> {
+    let mut sorted = v.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted
 }
 
 // ─── Message type IDs ───────────────────────────────────────────────────────
@@ -152,7 +200,7 @@ pub mod msg_type {
 mod tests {
     use super::*;
 
-    fn make_hello(chain_id: u64, pvs: Vec<u32>) -> Hello {
+    fn make_hello(chain_id: u64, pvs: Vec<u32>, caps: u64) -> Hello {
         Hello {
             supported_pv: pvs,
             supported_sv: vec![0, 1, 2, 3, 4],
@@ -161,22 +209,25 @@ mod tests {
             genesis_hash: Hash32::zero(),
             head_height: 100,
             head_pv: 1,
+            capabilities: caps,
+            peer_id: None,
         }
     }
 
     #[test]
     fn test_compat_same_pv() {
-        let a = make_hello(1, vec![1]);
-        let b = make_hello(1, vec![1]);
+        let a = make_hello(1, vec![1], 0);
+        let b = make_hello(1, vec![1], 0);
         let r = check_hello_compat(&a, &b);
         assert!(r.compatible);
         assert_eq!(r.session_pv, 1);
+        assert_eq!(r.common_capabilities, 0);
     }
 
     #[test]
     fn test_compat_overlapping_pv() {
-        let a = make_hello(1, vec![1]);
-        let b = make_hello(1, vec![1, 2]);
+        let a = make_hello(1, vec![1], 0);
+        let b = make_hello(1, vec![1, 2], 0);
         let r = check_hello_compat(&a, &b);
         assert!(r.compatible);
         assert_eq!(r.session_pv, 1); // min(max(1), max(2)) = 1
@@ -184,8 +235,17 @@ mod tests {
 
     #[test]
     fn test_compat_both_upgraded() {
-        let a = make_hello(1, vec![1, 2]);
-        let b = make_hello(1, vec![1, 2]);
+        let a = make_hello(1, vec![1, 2], 0);
+        let b = make_hello(1, vec![1, 2], 0);
+        let r = check_hello_compat(&a, &b);
+        assert!(r.compatible);
+        assert_eq!(r.session_pv, 2);
+    }
+
+    #[test]
+    fn test_compat_unsorted() {
+        let a = make_hello(1, vec![2, 1], 0); // unsorted
+        let b = make_hello(1, vec![1, 2], 0);
         let r = check_hello_compat(&a, &b);
         assert!(r.compatible);
         assert_eq!(r.session_pv, 2);
@@ -193,8 +253,8 @@ mod tests {
 
     #[test]
     fn test_incompat_no_overlap() {
-        let a = make_hello(1, vec![1]);
-        let b = make_hello(1, vec![2]);
+        let a = make_hello(1, vec![1], 0);
+        let b = make_hello(1, vec![2], 0);
         let r = check_hello_compat(&a, &b);
         assert!(!r.compatible);
         assert!(r.reason.contains("no common protocol version"));
@@ -202,8 +262,8 @@ mod tests {
 
     #[test]
     fn test_incompat_chain_id() {
-        let a = make_hello(1, vec![1]);
-        let b = make_hello(2, vec![1]);
+        let a = make_hello(1, vec![1], 0);
+        let b = make_hello(2, vec![1], 0);
         let r = check_hello_compat(&a, &b);
         assert!(!r.compatible);
         assert!(r.reason.contains("chain_id mismatch"));
@@ -211,8 +271,8 @@ mod tests {
 
     #[test]
     fn test_incompat_genesis() {
-        let mut a = make_hello(1, vec![1]);
-        let b = make_hello(1, vec![1]);
+        let mut a = make_hello(1, vec![1], 0);
+        let b = make_hello(1, vec![1], 0);
         a.genesis_hash = Hash32([1u8; 32]);
         let r = check_hello_compat(&a, &b);
         assert!(!r.compatible);
@@ -220,10 +280,44 @@ mod tests {
     }
 
     #[test]
+    fn test_capabilities_and() {
+        let a = make_hello(1, vec![1], capabilities::SNAPSHOT_SYNC | capabilities::ZSTD_COMPRESSION);
+        let b = make_hello(1, vec![1], capabilities::ZSTD_COMPRESSION | capabilities::LIGHT_CLIENT);
+        let r = check_hello_compat(&a, &b);
+        assert!(r.compatible);
+        assert_eq!(r.common_capabilities, capabilities::ZSTD_COMPRESSION);
+    }
+
+    #[test]
     fn test_local_hello() {
-        let h = Hello::local(6126151, Hash32::zero(), 42);
+        let caps = capabilities::SNAPSHOT_SYNC;
+        let peer_id = Some("Qm...".into());
+        let h = Hello::local(6126151, Hash32::zero(), 42, caps, peer_id);
         assert_eq!(h.chain_id, 6126151);
         assert_eq!(h.head_height, 42);
+        assert_eq!(h.capabilities, caps);
+        assert_eq!(h.peer_id, Some("Qm...".into()));
         assert!(h.supported_pv.contains(&CURRENT_PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn test_session_pv_formula() {
+        // Test min(max(local), max(remote)) with various combos.
+        let cases = vec![
+            (vec![1], vec![1], 1),
+            (vec![1], vec![1, 2], 1),
+            (vec![1, 2], vec![1], 1),
+            (vec![1, 2], vec![1, 2], 2),
+            (vec![1, 2, 3], vec![2, 3], 3),
+            (vec![2, 3], vec![1, 2, 3], 3),
+            (vec![3], vec![1, 2], 2), // intersection exists (2) but session PV = min(3,2) = 2
+        ];
+        for (local_pv, remote_pv, expected) in cases {
+            let local = make_hello(1, local_pv, 0);
+            let remote = make_hello(1, remote_pv, 0);
+            let r = check_hello_compat(&local, &remote);
+            assert!(r.compatible);
+            assert_eq!(r.session_pv, expected);
+        }
     }
 }
