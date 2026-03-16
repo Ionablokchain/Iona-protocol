@@ -1,6 +1,7 @@
 groups:
   - name: iona-alerts
     rules:
+      # Existing alert improved
       - alert: IonaNodeDown
         expr: up{job="iona-node"} == 0
         for: 30s
@@ -8,11 +9,99 @@ groups:
           severity: page
         annotations:
           summary: "Iona node is down"
+          description: "Node {{ $labels.instance }} has been unreachable for more than 30 seconds."
+          runbook_url: "https://wiki.example.com/runbooks/iona-node-down"
 
+      # Existing alert improved with value and runbook
       - alert: HighFinalityLag
         expr: iona_finality_lag_seconds > 10
         for: 2m
         labels:
           severity: ticket
         annotations:
-          summary: "Finality lag is high"
+          summary: "High finality lag ({{ $value }}s)"
+          description: "Finality lag is {{ $value }} seconds (threshold 10s) on {{ $labels.instance }}."
+          runbook_url: "https://wiki.example.com/runbooks/high-finality-lag"
+
+      # New alerts - system resources (requires node_exporter)
+      - alert: IonaNodeHighCPU
+        expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "High CPU usage on Iona node"
+          description: "CPU usage is above 80% on {{ $labels.instance }} for more than 10 minutes."
+
+      - alert: IonaNodeHighMemory
+        expr: (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100 > 90
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "High memory usage on Iona node"
+          description: "Memory usage is above 90% on {{ $labels.instance }} for more than 5 minutes."
+
+      - alert: IonaNodeDiskSpaceLow
+        expr: node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} * 100 < 10
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Low disk space on Iona node"
+          description: "Less than 10% free disk space on {{ $labels.instance }} (mountpoint /)."
+
+      # New alerts - process and network stability
+      - alert: IonaNodeProcessRestart
+        expr: changes(process_start_time_seconds{job="iona-node"}[15m]) > 2
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Iona process restarted multiple times"
+          description: "The Iona process has restarted {{ $value }} times in the last 15 minutes on {{ $labels.instance }}."
+
+      - alert: IonaNodeNetworkErrors
+        expr: rate(node_network_receive_errs_total[5m]) > 0 or rate(node_network_transmit_errs_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Network errors detected on Iona node"
+          description: "There are network errors on {{ $labels.instance }}. Check interface statistics."
+
+      # New alerts - blockchain specific (custom metrics)
+      - alert: IonaNodeNotSyncing
+        expr: increase(iona_block_height[5m]) == 0
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Iona node is not syncing"
+          description: "Block height has not increased for 10 minutes on {{ $labels.instance }}."
+
+      - alert: IonaNodeLowPeerCount
+        expr: iona_peers_count < 3
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Low peer count on Iona node"
+          description: "Node has only {{ $value }} peers connected (minimum 3 required)."
+
+      - alert: IonaNodeStuckProducing
+        expr: increase(iona_blocks_produced_total[10m]) == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Iona validator is not producing blocks"
+          description: "No blocks have been produced in the last 10 minutes on {{ $labels.instance }}."
+
+      # New alert - certificate expiry (custom metric)
+      - alert: IonaNodeCertificateExpiry
+        expr: (iona_cert_expiry_timestamp - time()) / 86400 < 7
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Iona TLS certificate expires soon"
+          description: "Certificate expires in less than {{ $value | humanizeDuration }} on {{ $labels.instance }}."
