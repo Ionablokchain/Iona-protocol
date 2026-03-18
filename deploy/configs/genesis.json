@@ -1,11 +1,57 @@
 {
+  "_comment": "IONA v28 testnet genesis configuration. See docs/testnet-plan.md for details.",
+  "genesis_version": "1.0",
   "chain_id": 6126151,
   "chain_name": "iona-testnet-1",
+  "initial_height": 0,
   "timestamp": 1772308800,
   "timestamp_human": "2026-03-01T12:00:00Z",
   "protocol_version": 1,
   "schema_version": 5,
+  "note": "3 producers (val2,val3,val4). val1 is a public observer/RPC node. Do NOT add seeds that you won't run.",
+
+  "network": {
+    "_comment": "P2P network configuration",
+    "bootnodes": [
+      "/ip4/10.0.1.2/tcp/30334/p2p/val2",
+      "/ip4/10.0.1.3/tcp/30335/p2p/val3",
+      "/ip4/10.0.1.1/tcp/30333/p2p/val1"
+    ],
+    "max_connections": 50,
+    "allow_private_ips": true,
+    "handshake_timeout_sec": 10
+  },
+
+  "consensus_params": {
+    "_comment": "Tendermint/Cosmos-style consensus parameters",
+    "block": {
+      "max_bytes": 22020096,
+      "max_gas": -1,
+      "time_iota_ms": 1000
+    },
+    "evidence": {
+      "max_age_num_blocks": 100000,
+      "max_age_duration": "48h",
+      "max_bytes": 1048576
+    },
+    "validator": {
+      "pub_key_types": ["ed25519"]
+    },
+    "timeout_propose": "3000ms",
+    "timeout_prevote": "1000ms",
+    "timeout_precommit": "1000ms",
+    "timeout_commit": "5000ms"
+  },
+
   "validators": [
+    {
+      "seed": 1,
+      "role": "observer",
+      "stake": 0,
+      "label": "val1",
+      "public_rpc": true,
+      "_comment": "Public RPC node, does not participate in consensus"
+    },
     {
       "seed": 2,
       "role": "producer",
@@ -25,22 +71,59 @@
       "label": "val4"
     }
   ],
+
   "accounts": [
     {
       "address": "treasury",
-      "balance": 0
+      "balance": 0,
+      "_comment": "Treasury account, initially empty"
+    },
+    {
+      "address": "val1",
+      "balance": 1000000
+    },
+    {
+      "address": "val2",
+      "balance": 1000000
+    },
+    {
+      "address": "val3",
+      "balance": 1000000
+    },
+    {
+      "address": "val4",
+      "balance": 1000000
     }
   ],
-  "economics": {
-    "base_inflation_bps": 500,
-    "treasury_bps": 1000,
+
+  "staking": {
+    "_comment": "Staking and validator management",
+    "bond_denom": "uiona",
     "min_stake": 100,
     "unbonding_epochs": 21,
-    "epoch_length": 100
+    "epoch_length": 100,
+    "max_validators": 100,
+    "max_entries": 7,
+    "historical_entries": 10000
   },
-  "bootnodes": [
-    "/ip4/10.0.1.2/tcp/30334/p2p/val2",
-    "/ip4/10.0.1.3/tcp/30335/p2p/val3"
-  ],
-  "note": "IONA v28 testnet genesis — chain_id=6126151, launch=2026-03-01T12:00:00Z. 3 producers (val2,val3,val4). val1=follower, rpc=public. Do NOT add seeds that you won't run."
+
+  "economics": {
+    "_comment": "Inflation, fees, and gas parameters",
+    "base_inflation_bps": 500,
+    "treasury_bps": 1000,
+    "min_gas_price": "0.01uiona",
+    "max_gas_per_block": 10000000,
+    "fee_denom": "uiona",
+    "min_tx_fee": "1uiona"
+  },
+
+  "gov": {
+    "_comment": "Governance parameters (if governance module is enabled)",
+    "min_deposit": "1000000uiona",
+    "max_deposit_period": "172800s",
+    "voting_period": "172800s",
+    "quorum": "0.334",
+    "threshold": "0.5",
+    "veto_threshold": "0.334"
+  }
 }
