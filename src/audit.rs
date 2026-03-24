@@ -9,13 +9,55 @@
 //! - MIGRATION: schema/protocol upgrades
 //! - NETWORK: peer bans, quarantine, rate limit violations
 //! - ADMIN: config changes, manual overrides, snapshot operations
+//! - STARTUP / SHUTDOWN: node lifecycle events
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::io::Write;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{error, info, warn};
+
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
+
+/// Configuration for the audit logger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    /// Path to the audit log file. If None, file logging is disabled.
+    pub file_path: Option<PathBuf>,
+    /// Maximum size of the audit log file in bytes before rotation (0 = unlimited).
+    pub max_file_size_bytes: u64,
+    /// Number of rotated log files to keep.
+    pub rotate_count: usize,
+    /// Maximum number of events to keep in memory (for `recent()` queries).
+    pub max_memory_events: usize,
+    /// Whether to also emit audit events via `tracing`.
+    pub emit_to_tracing: bool,
+    /// File permissions (Unix only) as an octal string, e.g., "600".
+    pub file_mode: Option<String>,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            file_path: None,
+            max_file_size_bytes: 100 * 1024 * 1024, // 100 MiB
+            rotate_count: 5,
+            max_memory_events: 10_000,
+            emit_to_tracing: true,
+            file_mode: Some("600".into()),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Audit Types
+// -----------------------------------------------------------------------------
 
 /// Audit event severity levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,8 +108,8 @@ impl fmt::Display for AuditCategory {
 /// A structured audit event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
-    /// Unix timestamp (seconds)
-    pub timestamp: u64,
+    /// Unix timestamp (seconds) – millisecond precision stored as float.
+    pub timestamp: f64,
     /// Event severity
     pub level: AuditLevel,
     /// Event category
@@ -83,13 +125,15 @@ pub struct AuditEvent {
 }
 
 impl AuditEvent {
+    /// Create a new event with the current timestamp (with millisecond precision).
     pub fn new(level: AuditLevel, category: AuditCategory, action: impl Into<String>) -> Self {
-        let ts = SystemTime::now()
+        let now = SystemTime::now();
+        let timestamp = now
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_secs_f64();
         Self {
-            timestamp: ts,
+            timestamp,
             level,
             category,
             action: action.into(),
@@ -113,7 +157,7 @@ impl fmt::Display for AuditEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "[AUDIT] {} | {} | {} | {}",
+            "[AUDIT] {:.3} | {} | {} | {}",
             self.timestamp, self.level, self.category, self.action
         )?;
         for (k, v) in &self.details {
@@ -123,48 +167,156 @@ impl fmt::Display for AuditEvent {
     }
 }
 
-/// Audit logger that writes to a file and/or tracing.
+// -----------------------------------------------------------------------------
+// Audit Logger
+// -----------------------------------------------------------------------------
+
+/// Audit logger that writes to a file (with rotation) and/or tracing.
 pub struct AuditLogger {
-    file: Option<Mutex<std::fs::File>>,
+    config: AuditConfig,
+    file_writer: Option<Mutex<BufWriter<File>>>,
+    current_size: Arc<AtomicUsize>,
     events: Mutex<Vec<AuditEvent>>,
+    _drop_guard: Option<Box<dyn Drop>>,
 }
 
 impl AuditLogger {
-    /// Create a new audit logger. If `path` is Some, events are appended to
-    /// the specified file in JSON-lines format.
-    pub fn new(path: Option<PathBuf>) -> std::io::Result<Self> {
-        let file = match path {
-            Some(p) => {
-                let f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(p)?;
-                Some(Mutex::new(f))
-            }
-            None => None,
+    /// Create a new audit logger based on the configuration.
+    pub fn new(config: AuditConfig) -> std::io::Result<Self> {
+        let file_writer = if let Some(ref path) = config.file_path {
+            let file = Self::open_log_file(path, &config)?;
+            let writer = BufWriter::new(file);
+            Some(Mutex::new(writer))
+        } else {
+            None
         };
+
+        let current_size = if let Some(ref path) = config.file_path {
+            let size = Self::get_file_size(path).unwrap_or(0);
+            Arc::new(AtomicUsize::new(size as usize))
+        } else {
+            Arc::new(AtomicUsize::new(0))
+        };
+
         Ok(Self {
-            file,
-            events: Mutex::new(Vec::new()),
+            config,
+            file_writer,
+            current_size,
+            events: Mutex::new(Vec::with_capacity(config.max_memory_events)),
+            _drop_guard: None,
         })
+    }
+
+    /// Open the audit log file with the appropriate permissions.
+    fn open_log_file(path: &Path, config: &AuditConfig) -> std::io::Result<File> {
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            if let Some(mode_str) = &config.file_mode {
+                if let Ok(mode) = u32::from_str_radix(mode_str, 8) {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(mode);
+                }
+            }
+        }
+        opts.open(path)
+    }
+
+    /// Get file size (for rotation).
+    fn get_file_size(path: &Path) -> std::io::Result<u64> {
+        Ok(path.metadata()?.len())
+    }
+
+    /// Rotate the log file if it exceeds max size.
+    fn rotate_if_needed(&self) {
+        let max_size = self.config.max_file_size_bytes;
+        if max_size == 0 {
+            return;
+        }
+        let current = self.current_size.load(Ordering::Relaxed) as u64;
+        if current < max_size {
+            return;
+        }
+
+        // Perform rotation (needs exclusive lock on file_writer)
+        if let Some(writer_lock) = &self.file_writer {
+            if let Ok(mut writer) = writer_lock.try_lock() {
+                // Flush and close the current file
+                let _ = writer.flush();
+
+                // Get the path from the config
+                if let Some(path) = &self.config.file_path {
+                    // Rotate existing files: .1, .2, ...
+                    for i in (1..self.config.rotate_count).rev() {
+                        let src = path.with_extension(format!("{}.{}", path.extension().unwrap_or_default().to_str().unwrap_or("log"), i));
+                        let dst = path.with_extension(format!("{}.{}", path.extension().unwrap_or_default().to_str().unwrap_or("log"), i + 1));
+                        let _ = std::fs::rename(src, dst);
+                    }
+                    let old = path.with_extension("log.1");
+                    let _ = std::fs::rename(path, old);
+
+                    // Reopen the file
+                    match Self::open_log_file(path, &self.config) {
+                        Ok(file) => {
+                            *writer = BufWriter::new(file);
+                            self.current_size.store(0, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            error!("Failed to rotate audit log: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write a JSON event to the file (if enabled).
+    fn write_event_to_file(&self, event: &AuditEvent) {
+        let json = match serde_json::to_string(event) {
+            Ok(j) => j,
+            Err(e) => {
+                error!("Failed to serialize audit event: {}", e);
+                return;
+            }
+        };
+
+        if let Some(writer_lock) = &self.file_writer {
+            if let Ok(mut writer) = writer_lock.lock() {
+                if let Err(e) = writeln!(writer, "{}", json) {
+                    error!("Failed to write audit event to file: {}", e);
+                } else {
+                    let len = json.len();
+                    self.current_size.fetch_add(len, Ordering::Relaxed);
+                    let _ = writer.flush();
+                    // Check rotation after write
+                    self.rotate_if_needed();
+                }
+            }
+        }
     }
 
     /// Log an audit event.
     pub fn log(&self, event: AuditEvent) {
-        // Write to file if configured
-        if let Some(ref file) = self.file {
-            if let Ok(json) = serde_json::to_string(&event) {
-                if let Ok(mut f) = file.lock() {
-                    let _ = writeln!(f, "{}", json);
-                    let _ = f.flush();
-                }
+        // Emit via tracing if configured
+        if self.config.emit_to_tracing {
+            let msg = format!("{}", event);
+            match event.level {
+                AuditLevel::Info => info!("{}", msg),
+                AuditLevel::Warning => warn!("{}", msg),
+                AuditLevel::Critical => error!("{}", msg),
             }
         }
 
-        // Store in memory buffer (capped)
+        // Write to file
+        self.write_event_to_file(&event);
+
+        // Store in memory buffer
         if let Ok(mut events) = self.events.lock() {
-            if events.len() >= 10_000 {
-                events.drain(..1000); // keep last 9000
+            if events.len() >= self.config.max_memory_events {
+                // Remove oldest
+                let to_remove = events.len() - self.config.max_memory_events + 1;
+                events.drain(0..to_remove);
             }
             events.push(event);
         }
@@ -180,7 +332,7 @@ impl AuditLogger {
         }
     }
 
-    /// Get events by category.
+    /// Get events by category (most recent first).
     pub fn by_category(&self, cat: AuditCategory, limit: usize) -> Vec<AuditEvent> {
         if let Ok(events) = self.events.lock() {
             events
@@ -194,9 +346,26 @@ impl AuditLogger {
             Vec::new()
         }
     }
+
+    /// Flush any pending writes to disk.
+    pub fn flush(&self) {
+        if let Some(writer_lock) = &self.file_writer {
+            if let Ok(mut writer) = writer_lock.lock() {
+                let _ = writer.flush();
+            }
+        }
+    }
 }
 
-// ── Convenience functions for common audit events ───────────────────────
+impl Drop for AuditLogger {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Convenience audit functions
+// -----------------------------------------------------------------------------
 
 /// Log a key generation event.
 pub fn audit_key_generated(logger: &AuditLogger, key_type: &str, address: &str) {
@@ -300,9 +469,25 @@ pub fn audit_shutdown(logger: &AuditLogger, reason: &str) {
     );
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    fn test_config() -> AuditConfig {
+        AuditConfig {
+            file_path: None,
+            max_file_size_bytes: 0,
+            rotate_count: 3,
+            max_memory_events: 10,
+            emit_to_tracing: false,
+            file_mode: None,
+        }
+    }
 
     #[test]
     fn test_audit_event_creation() {
@@ -341,8 +526,12 @@ mod tests {
 
     #[test]
     fn test_audit_logger_memory() {
-        let logger = AuditLogger::new(None).unwrap();
-        for i in 0..100 {
+        let config = AuditConfig {
+            max_memory_events: 5,
+            ..test_config()
+        };
+        let logger = AuditLogger::new(config).unwrap();
+        for i in 0..10 {
             logger.log(AuditEvent::new(
                 AuditLevel::Info,
                 AuditCategory::Consensus,
@@ -350,18 +539,28 @@ mod tests {
             ));
         }
         let recent = logger.recent(10);
-        assert_eq!(recent.len(), 10);
-        assert_eq!(recent.last().unwrap().action, "block_99");
+        // Should have only last 5 events
+        assert_eq!(recent.len(), 5);
+        assert_eq!(recent.last().unwrap().action, "block_9");
     }
 
     #[test]
     fn test_audit_logger_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir().unwrap();
         let path = dir.path().join("audit.log");
-        let logger = AuditLogger::new(Some(path.clone())).unwrap();
+        let config = AuditConfig {
+            file_path: Some(path.clone()),
+            max_file_size_bytes: 1024, // small for rotation test
+            rotate_count: 2,
+            ..test_config()
+        };
+        let logger = AuditLogger::new(config).unwrap();
 
         audit_startup(&logger, "27.0.0", 1, 4);
         audit_block_committed(&logger, 1, "abc123", 5);
+
+        // Force flush
+        logger.flush();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -374,7 +573,7 @@ mod tests {
 
     #[test]
     fn test_audit_by_category() {
-        let logger = AuditLogger::new(None).unwrap();
+        let logger = AuditLogger::new(test_config()).unwrap();
         audit_startup(&logger, "27.0.0", 1, 4);
         audit_block_committed(&logger, 1, "abc", 5);
         audit_block_committed(&logger, 2, "def", 3);
@@ -385,5 +584,29 @@ mod tests {
 
         let network = logger.by_category(AuditCategory::Network, 10);
         assert_eq!(network.len(), 1);
+    }
+
+    #[test]
+    fn test_log_rotation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let config = AuditConfig {
+            file_path: Some(path.clone()),
+            max_file_size_bytes: 100, // very small
+            rotate_count: 2,
+            ..test_config()
+        };
+        let logger = AuditLogger::new(config).unwrap();
+
+        // Write events until rotation happens
+        for i in 0..50 {
+            audit_block_committed(&logger, i, &format!("hash_{i}"), 1);
+        }
+
+        logger.flush();
+
+        // Check that rotated files exist
+        let rotated = path.with_extension("log.1");
+        assert!(rotated.exists() || !path.exists() /* rotated away */);
     }
 }
