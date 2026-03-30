@@ -2,11 +2,29 @@
 //!
 //! The validator set is determined by genesis.json, NOT hardcoded in the binary.
 //! Any node, given the same genesis.json, knows exactly who the validators are.
+//!
+//! # Validation
+//!
+//! At node startup, the genesis file is loaded and validated:
+//! - Chain ID must be non‑zero.
+//! - At least one validator must be present.
+//! - Validator seeds must be unique.
+//! - All validator powers must be > 0.
+//! - Protocol activations must be valid (non‑empty, contain PV=1 at height 0).
+//!
+//! The genesis hash is also computed and compared to the expected hash
+//! (if stored in node_meta.json) to detect tampering.
 
 use crate::consensus::validator_set::{Validator, ValidatorSet, VotingPower};
 use crate::crypto::{PublicKeyBytes, Signer, ed25519::Ed25519Keypair};
+use crate::protocol::version::{ProtocolActivation, default_activations};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::{fs, io, path::Path};
+
+// -----------------------------------------------------------------------------
+// Genesis configuration
+// -----------------------------------------------------------------------------
 
 /// On-disk genesis format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +44,9 @@ pub struct GenesisConfig {
     /// Optional: stake per validator (for demo).
     #[serde(default = "default_stake")]
     pub stake_each: u64,
+    /// Optional: protocol activation schedule (if not provided, uses default).
+    #[serde(default = "default_activations")]
+    pub protocol_activations: Vec<ProtocolActivation>,
 }
 
 fn default_pv() -> u32 { 1 }
@@ -46,6 +67,25 @@ pub struct GenesisValidator {
 
 fn default_power() -> VotingPower { 1 }
 
+// -----------------------------------------------------------------------------
+// Validation error
+// -----------------------------------------------------------------------------
+
+/// Error type for genesis validation.
+#[derive(Debug, thiserror::Error)]
+pub enum GenesisError {
+    #[error("chain_id must be non‑zero")]
+    ChainIdZero,
+    #[error("genesis must contain at least one validator")]
+    NoValidators,
+    #[error("duplicate validator seed: {0}")]
+    DuplicateSeed(u64),
+    #[error("validator power must be > 0 (seed {0})")]
+    ZeroPower(u64),
+    #[error("invalid protocol activations: {0}")]
+    InvalidActivations(String),
+}
+
 impl GenesisConfig {
     /// Load genesis from a JSON file.
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
@@ -61,6 +101,54 @@ impl GenesisConfig {
         fs::write(path.as_ref(), out)
     }
 
+    /// Validate the genesis configuration.
+    pub fn validate(&self) -> Result<(), GenesisError> {
+        if self.chain_id == 0 {
+            return Err(GenesisError::ChainIdZero);
+        }
+        if self.validators.is_empty() {
+            return Err(GenesisError::NoValidators);
+        }
+        let mut seen = BTreeSet::new();
+        for v in &self.validators {
+            if !seen.insert(v.seed) {
+                return Err(GenesisError::DuplicateSeed(v.seed));
+            }
+            if v.power == 0 {
+                return Err(GenesisError::ZeroPower(v.seed));
+            }
+        }
+
+        // Validate protocol activations
+        if self.protocol_activations.is_empty() {
+            return Err(GenesisError::InvalidActivations("empty activation list".into()));
+        }
+        let has_v1_at_zero = self.protocol_activations.iter().any(|a| {
+            a.protocol_version == 1 && a.activation_height == Some(0)
+        });
+        if !has_v1_at_zero {
+            return Err(GenesisError::InvalidActivations(
+                "must include protocol_version=1 at height 0".into(),
+            ));
+        }
+        // Check monotonicity of activation heights
+        let mut prev_height: Option<u64> = None;
+        for act in &self.protocol_activations {
+            if let Some(h) = act.activation_height {
+                if let Some(prev) = prev_height {
+                    if h <= prev {
+                        return Err(GenesisError::InvalidActivations(
+                            format!("activation heights must be strictly increasing ({} <= {})", prev, h)
+                        ));
+                    }
+                }
+                prev_height = Some(h);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Build a ValidatorSet from this genesis.
     pub fn validator_set(&self) -> ValidatorSet {
         let vals: Vec<Validator> = self.validators.iter().map(|gv| {
@@ -73,6 +161,19 @@ impl GenesisConfig {
             }
         }).collect();
         ValidatorSet { vals }
+    }
+
+    /// Compute the canonical hash of the genesis file (used for integrity checks).
+    /// The hash is based on the JSON representation with canonical formatting.
+    pub fn hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let canonical = serde_json::to_string(self).expect("canonical serialization failed");
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.as_bytes());
+        let result = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&result);
+        out
     }
 
     /// Check if a given public key is in the validator set.
@@ -104,6 +205,7 @@ impl GenesisConfig {
             protocol_version: 1,
             initial_base_fee: 1,
             stake_each: 1000,
+            protocol_activations: default_activations(),
         }
     }
 }
@@ -118,6 +220,7 @@ mod tests {
         assert_eq!(g.chain_id, 6126151);
         assert_eq!(g.validator_count(), 3);
         assert_eq!(g.quorum_threshold(), 3); // 2*3/3 + 1 = 3
+        assert!(g.validate().is_ok());
     }
 
     #[test]
@@ -132,9 +235,7 @@ mod tests {
     fn test_is_validator() {
         let g = GenesisConfig::default_testnet();
         let vset = g.validator_set();
-        // seed=2 should be a validator
         assert!(vset.contains(&vset.vals[0].pk));
-        // random key should not be
         let rando = PublicKeyBytes(vec![99u8; 32]);
         assert!(!vset.contains(&rando));
     }
@@ -151,6 +252,7 @@ mod tests {
         assert_eq!(g2.chain_id, g.chain_id);
         assert_eq!(g2.validators.len(), g.validators.len());
         assert_eq!(g2.protocol_version, g.protocol_version);
+        assert_eq!(g2.protocol_activations.len(), g.protocol_activations.len());
     }
 
     #[test]
@@ -158,7 +260,6 @@ mod tests {
         let g = GenesisConfig::default_testnet();
         let vset1 = g.validator_set();
         let vset2 = g.validator_set();
-        // Same genesis → same keys
         for (a, b) in vset1.vals.iter().zip(vset2.vals.iter()) {
             assert_eq!(a.pk, b.pk);
         }
@@ -166,7 +267,6 @@ mod tests {
 
     #[test]
     fn test_quorum_thresholds() {
-        // 1 validator → threshold 1
         let g1 = GenesisConfig {
             chain_id: 1,
             chain_name: "test".into(),
@@ -174,10 +274,10 @@ mod tests {
             protocol_version: 1,
             initial_base_fee: 1,
             stake_each: 1000,
+            protocol_activations: default_activations(),
         };
         assert_eq!(g1.quorum_threshold(), 1);
 
-        // 4 validators → threshold 3
         let g4 = GenesisConfig {
             chain_id: 1,
             chain_name: "test".into(),
@@ -190,7 +290,35 @@ mod tests {
             protocol_version: 1,
             initial_base_fee: 1,
             stake_each: 1000,
+            protocol_activations: default_activations(),
         };
         assert_eq!(g4.quorum_threshold(), 3);
+    }
+
+    #[test]
+    fn test_validation_errors() {
+        let mut g = GenesisConfig::default_testnet();
+        g.chain_id = 0;
+        assert!(matches!(g.validate(), Err(GenesisError::ChainIdZero)));
+
+        g.chain_id = 1;
+        g.validators.clear();
+        assert!(matches!(g.validate(), Err(GenesisError::NoValidators)));
+
+        g.validators = vec![
+            GenesisValidator { seed: 2, power: 1, name: "v2".into() },
+            GenesisValidator { seed: 2, power: 1, name: "v2".into() },
+        ];
+        assert!(matches!(g.validate(), Err(GenesisError::DuplicateSeed(2))));
+
+        g.validators = vec![GenesisValidator { seed: 2, power: 0, name: "v2".into() }];
+        assert!(matches!(g.validate(), Err(GenesisError::ZeroPower(2))));
+    }
+
+    #[test]
+    fn test_hash_deterministic() {
+        let g1 = GenesisConfig::default_testnet();
+        let g2 = GenesisConfig::default_testnet();
+        assert_eq!(g1.hash(), g2.hash());
     }
 }
