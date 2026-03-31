@@ -4,12 +4,20 @@
 //!   - missing_quorum: have=2 need=3
 //!   - validators_online: [A,B] missing=[C]
 //!   - p2p_connected_validators=2/3
+//!
+//! It provides detailed diagnostics for quorum analysis and validator
+//! connectivity, helping operators quickly identify the cause of stalls.
 
 use crate::consensus::validator_set::{Validator, ValidatorSet, VotingPower};
 use crate::crypto::PublicKeyBytes;
 use crate::types::Hash32;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+
+// -----------------------------------------------------------------------------
+// QuorumDiagnostic
+// -----------------------------------------------------------------------------
 
 /// Diagnostic information about quorum status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +40,34 @@ pub struct QuorumDiagnostic {
     pub reason: Option<String>,
 }
 
+impl fmt::Display for QuorumDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.has_quorum {
+            write!(
+                f,
+                "quorum_ok: {}/{} power ({}/{} validators)",
+                self.current_power,
+                self.quorum_threshold,
+                self.voted.len(),
+                self.total_validators
+            )
+        } else {
+            write!(
+                f,
+                "NO_QUORUM: have={}/{} power, voted=[{}], missing=[{}]",
+                self.current_power,
+                self.quorum_threshold,
+                self.voted.join(","),
+                self.missing.join(",")
+            )
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// QuorumCalculator
+// -----------------------------------------------------------------------------
+
 /// Enhanced quorum calculator that provides diagnostics.
 #[derive(Debug, Clone)]
 pub struct QuorumCalculator {
@@ -40,6 +76,8 @@ pub struct QuorumCalculator {
 }
 
 impl QuorumCalculator {
+    /// Create a new quorum calculator for the given validator set.
+    #[must_use]
     pub fn new(vset: &ValidatorSet) -> Self {
         let total = vset.total_power();
         let threshold = (total * 2 / 3) + 1;
@@ -49,22 +87,28 @@ impl QuorumCalculator {
         }
     }
 
-    /// Get quorum threshold.
+    /// Get the quorum threshold.
+    #[must_use]
     pub fn threshold(&self) -> VotingPower {
         self.threshold
     }
 
-    /// Total voting power.
+    /// Total voting power in the validator set.
+    #[must_use]
     pub fn total_power(&self) -> VotingPower {
         self.vset.total_power()
     }
 
     /// Number of validators.
+    #[must_use]
     pub fn validator_count(&self) -> usize {
         self.vset.vals.len()
     }
 
     /// Check if a set of voters reaches quorum.
+    ///
+    /// Returns a diagnostic that includes all relevant details.
+    #[must_use]
     pub fn check(&self, voters: &[PublicKeyBytes]) -> QuorumDiagnostic {
         let voter_set: HashSet<&PublicKeyBytes> = voters.iter().collect();
         let mut current_power: VotingPower = 0;
@@ -106,13 +150,18 @@ impl QuorumCalculator {
         }
     }
 
-    /// Check quorum from a vote map (block_id → list of voters).
+    /// Check quorum for a specific block from a vote map.
+    ///
+    /// `votes` maps each validator to the block they voted for (or `None` for nil).
+    /// `target_block` is the block we want to check quorum for.
+    #[must_use]
     pub fn check_for_block(
         &self,
         votes: &HashMap<PublicKeyBytes, Option<Hash32>>,
         target_block: &Hash32,
     ) -> QuorumDiagnostic {
-        let voters: Vec<PublicKeyBytes> = votes.iter()
+        let voters: Vec<PublicKeyBytes> = votes
+            .iter()
             .filter(|(_, bid)| bid.as_ref() == Some(target_block))
             .map(|(pk, _)| pk.clone())
             .collect();
@@ -120,31 +169,25 @@ impl QuorumCalculator {
     }
 
     /// Get a human-readable summary of quorum status (for logging).
+    #[must_use]
     pub fn summary(&self, voters: &[PublicKeyBytes]) -> String {
         let diag = self.check(voters);
-        if diag.has_quorum {
-            format!(
-                "quorum_ok: {}/{} power ({}/{} validators)",
-                diag.current_power, diag.quorum_threshold,
-                diag.voted.len(), diag.total_validators
-            )
-        } else {
-            format!(
-                "NO_QUORUM: have={}/{} power, voted=[{}], missing=[{}]",
-                diag.current_power, diag.quorum_threshold,
-                diag.voted.join(","),
-                diag.missing.join(","),
-            )
-        }
+        diag.to_string()
     }
 
     /// Can quorum still be reached if the given validators come online?
-    pub fn can_reach_quorum(&self, current_voters: &[PublicKeyBytes]) -> bool {
-        // Quorum can be reached if total power >= threshold (always true if vset is valid)
+    /// Always returns `true` for a valid validator set (the total power is always ≥ threshold).
+    #[must_use]
+    pub fn can_reach_quorum(&self, _current_voters: &[PublicKeyBytes]) -> bool {
         self.vset.total_power() >= self.threshold
     }
 
-    /// Minimum number of additional validators needed for quorum.
+    /// Minimum number of additional validators needed to reach quorum.
+    ///
+    /// This returns the smallest number of *distinct* validators that, if they voted,
+    /// would bring the current power to at least the threshold. It picks the highest‑power
+    /// missing validators first.
+    #[must_use]
     pub fn validators_needed(&self, current_voters: &[PublicKeyBytes]) -> usize {
         let diag = self.check(current_voters);
         if diag.has_quorum {
@@ -152,12 +195,13 @@ impl QuorumCalculator {
         }
 
         let voter_set: HashSet<&PublicKeyBytes> = current_voters.iter().collect();
-        let mut remaining: Vec<VotingPower> = self.vset.vals.iter()
+        let mut remaining: Vec<VotingPower> = self.vset.vals
+            .iter()
             .filter(|v| !voter_set.contains(&v.pk))
             .map(|v| v.power)
             .collect();
 
-        // Sort descending — we want to know the minimum count by taking the biggest first.
+        // Sort descending — we want the minimum count by taking the biggest first.
         remaining.sort_unstable_by(|a, b| b.cmp(a));
 
         let deficit = self.threshold.saturating_sub(diag.current_power);
@@ -169,10 +213,14 @@ impl QuorumCalculator {
             }
         }
 
-        // Can't reach quorum (shouldn't happen with valid vset).
+        // This should never happen because total power >= threshold.
         remaining.len() + 1
     }
 }
+
+// -----------------------------------------------------------------------------
+// ValidatorConnectivity
+// -----------------------------------------------------------------------------
 
 /// P2P connectivity diagnostic for validators.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +230,18 @@ pub struct ValidatorConnectivity {
     pub connected: Vec<String>,
     pub disconnected: Vec<String>,
     pub has_quorum_connectivity: bool,
+}
+
+impl fmt::Display for ValidatorConnectivity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "validators: {}/{} connected, quorum_ok={}",
+            self.connected_validators,
+            self.total_validators,
+            self.has_quorum_connectivity
+        )
+    }
 }
 
 /// Check which validators are reachable from a set of connected peer public keys.
@@ -215,6 +275,10 @@ pub fn check_validator_connectivity(
     }
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,7 +293,10 @@ mod tests {
             seed[0] = (i + 1) as u8;
             let kp = Ed25519Keypair::from_seed(seed);
             let pk = kp.public_key();
-            vals.push(Validator { pk: pk.clone(), power: 1 });
+            vals.push(Validator {
+                pk: pk.clone(),
+                power: 1,
+            });
             pks.push(pk);
         }
         (ValidatorSet { vals }, pks)
@@ -248,7 +315,7 @@ mod tests {
     fn test_quorum_3_of_3() {
         let (vset, pks) = make_vset(3);
         let qc = QuorumCalculator::new(&vset);
-        assert_eq!(qc.threshold(), 3); // 2*3/3 + 1 = 3
+        assert_eq!(qc.threshold(), 3);
         assert!(!qc.check(&pks[..1]).has_quorum);
         assert!(!qc.check(&pks[..2]).has_quorum);
         assert!(qc.check(&pks[..3]).has_quorum);
@@ -258,7 +325,7 @@ mod tests {
     fn test_quorum_3_of_4() {
         let (vset, pks) = make_vset(4);
         let qc = QuorumCalculator::new(&vset);
-        assert_eq!(qc.threshold(), 3); // 2*4/3 + 1 = 3
+        assert_eq!(qc.threshold(), 3);
         assert!(!qc.check(&pks[..2]).has_quorum);
         assert!(qc.check(&pks[..3]).has_quorum);
         assert!(qc.check(&pks[..4]).has_quorum);
@@ -280,10 +347,8 @@ mod tests {
     fn test_summary_format() {
         let (vset, pks) = make_vset(3);
         let qc = QuorumCalculator::new(&vset);
-
         let summary_ok = qc.summary(&pks);
         assert!(summary_ok.contains("quorum_ok"));
-
         let summary_fail = qc.summary(&pks[..1]);
         assert!(summary_fail.contains("NO_QUORUM"));
     }
@@ -292,10 +357,10 @@ mod tests {
     fn test_validators_needed() {
         let (vset, pks) = make_vset(4);
         let qc = QuorumCalculator::new(&vset);
-        assert_eq!(qc.validators_needed(&pks), 0);  // all voted
-        assert_eq!(qc.validators_needed(&pks[..2]), 1);  // need 1 more
-        assert_eq!(qc.validators_needed(&pks[..1]), 2);  // need 2 more
-        assert_eq!(qc.validators_needed(&[]), 3);  // need 3
+        assert_eq!(qc.validators_needed(&pks), 0);
+        assert_eq!(qc.validators_needed(&pks[..2]), 1);
+        assert_eq!(qc.validators_needed(&pks[..1]), 2);
+        assert_eq!(qc.validators_needed(&[]), 3);
     }
 
     #[test]
@@ -305,35 +370,54 @@ mod tests {
         assert_eq!(conn.total_validators, 3);
         assert_eq!(conn.connected_validators, 2);
         assert_eq!(conn.disconnected.len(), 1);
-        assert!(!conn.has_quorum_connectivity); // need 3/3 for quorum
+        assert!(!conn.has_quorum_connectivity);
     }
 
     #[test]
     fn test_weighted_quorum() {
-        // Validator with power 10, 5, 5 → total 20, threshold 14
-        let mut seed1 = [0u8; 32]; seed1[0] = 1;
-        let mut seed2 = [0u8; 32]; seed2[0] = 2;
-        let mut seed3 = [0u8; 32]; seed3[0] = 3;
+        let mut seed1 = [0u8; 32];
+        seed1[0] = 1;
+        let mut seed2 = [0u8; 32];
+        seed2[0] = 2;
+        let mut seed3 = [0u8; 32];
+        seed3[0] = 3;
         let pk1 = Ed25519Keypair::from_seed(seed1).public_key();
         let pk2 = Ed25519Keypair::from_seed(seed2).public_key();
         let pk3 = Ed25519Keypair::from_seed(seed3).public_key();
         let vset = ValidatorSet {
             vals: vec![
-                Validator { pk: pk1.clone(), power: 10 },
-                Validator { pk: pk2.clone(), power: 5 },
-                Validator { pk: pk3.clone(), power: 5 },
+                Validator {
+                    pk: pk1.clone(),
+                    power: 10,
+                },
+                Validator {
+                    pk: pk2.clone(),
+                    power: 5,
+                },
+                Validator {
+                    pk: pk3.clone(),
+                    power: 5,
+                },
             ],
         };
         let qc = QuorumCalculator::new(&vset);
-        assert_eq!(qc.threshold(), 14); // 20*2/3 + 1 = 14
+        assert_eq!(qc.threshold(), 14);
 
-        // pk1 alone (10) → no quorum
         assert!(!qc.check(&[pk1.clone()]).has_quorum);
-
-        // pk1 + pk2 (15) → quorum
         assert!(qc.check(&[pk1.clone(), pk2.clone()]).has_quorum);
-
-        // pk2 + pk3 (10) → no quorum
         assert!(!qc.check(&[pk2.clone(), pk3.clone()]).has_quorum);
+    }
+
+    #[test]
+    fn test_display_impls() {
+        let (vset, pks) = make_vset(3);
+        let qc = QuorumCalculator::new(&vset);
+        let diag = qc.check(&pks[..1]);
+        let s = format!("{}", diag);
+        assert!(s.contains("NO_QUORUM"));
+
+        let conn = check_validator_connectivity(&vset, &pks[..2]);
+        let s = format!("{}", conn);
+        assert!(s.contains("connected"));
     }
 }
