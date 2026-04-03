@@ -2,6 +2,19 @@
 //!
 //! Each receipt set is stored as a separate JSON file named by the transaction hash.
 //! Writes are atomic (write to temp file then rename) to prevent corruption.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use iona::storage::receipts::ReceiptsStore;
+//! use iona::data_layout::DataLayout;
+//!
+//! let layout = DataLayout::new("./data");
+//! let store = ReceiptsStore::from_layout(&layout)?;
+//! let receipts = vec![receipt1, receipt2];
+//! store.put(&tx_hash, &receipts)?;
+//! let loaded = store.get(&tx_hash)?;
+//! ```
 
 use crate::data_layout::DataLayout;
 use crate::types::{Hash32, Receipt};
@@ -9,6 +22,11 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use tracing::{debug, error, info, warn};
+
+// -----------------------------------------------------------------------------
+// ReceiptsStore
+// -----------------------------------------------------------------------------
 
 /// Store for transaction receipts, one file per transaction hash.
 ///
@@ -23,6 +41,7 @@ impl ReceiptsStore {
     /// Opens a receipt store at the given directory. Creates the directory if missing.
     pub fn open<P: Into<PathBuf>>(root: P) -> io::Result<Self> {
         let dir = root.into();
+        debug!(path = %dir.display(), "opening receipts store");
         fs::create_dir_all(&dir)?;
         Ok(Self { dir })
     }
@@ -44,16 +63,25 @@ impl ReceiptsStore {
         let path = self.path_for(id);
         let tmp_path = path.with_extension("tmp");
 
+        debug!(hash = %hex::encode(id.0), count = receipts.len(), "storing receipts");
+
         // Serialize to JSON.
         let json = serde_json::to_string_pretty(receipts)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("receipt encode: {e}")))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("receipt encode: {}", e)))?;
 
         // Write to temporary file.
-        fs::write(&tmp_path, &json)?;
+        if let Err(e) = fs::write(&tmp_path, &json) {
+            error!(path = %tmp_path.display(), error = %e, "failed to write temporary receipts file");
+            return Err(e);
+        }
 
         // Atomically replace the target file.
-        fs::rename(&tmp_path, &path)?;
+        if let Err(e) = fs::rename(&tmp_path, &path) {
+            error!(from = %tmp_path.display(), to = %path.display(), error = %e, "failed to rename receipts file");
+            return Err(e);
+        }
 
+        debug!(path = %path.display(), "receipts stored");
         Ok(())
     }
 
@@ -63,9 +91,18 @@ impl ReceiptsStore {
         if !path.exists() {
             return Ok(None);
         }
-        let s = fs::read_to_string(path)?;
-        let receipts = serde_json::from_str(&s)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("receipt decode: {e}")))?;
+
+        let s = fs::read_to_string(&path).map_err(|e| {
+            error!(path = %path.display(), error = %e, "failed to read receipts file");
+            e
+        })?;
+
+        let receipts = serde_json::from_str(&s).map_err(|e| {
+            error!(path = %path.display(), error = %e, "failed to parse receipts JSON");
+            io::Error::new(io::ErrorKind::InvalidData, format!("receipt decode: {}", e))
+        })?;
+
+        debug!(hash = %hex::encode(id.0), count = receipts.len(), "loaded receipts");
         Ok(Some(receipts))
     }
 
@@ -78,43 +115,144 @@ impl ReceiptsStore {
     pub fn delete(&self, id: &Hash32) -> io::Result<()> {
         let path = self.path_for(id);
         if path.exists() {
+            debug!(hash = %hex::encode(id.0), "deleting receipts file");
             fs::remove_file(path)?;
         }
         Ok(())
     }
+
+    /// Returns the number of stored receipt files (not the number of receipts).
+    pub fn len(&self) -> io::Result<usize> {
+        let mut count = 0;
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            if entry.path().extension().map(|ext| ext == "json").unwrap_or(false) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Returns `true` if the store contains no receipt files.
+    pub fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    /// Clears all receipt files from the store.
+    pub fn clear(&self) -> io::Result<()> {
+        debug!(dir = %self.dir.display(), "clearing all receipts");
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map(|ext| ext == "json").unwrap_or(false) {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Iterates over all stored receipt files, returning `(hash, receipts)` pairs.
+    /// This may be expensive for large stores.
+    pub fn iter(&self) -> ReceiptsIter<'_> {
+        ReceiptsIter {
+            store: self,
+            entries: match fs::read_dir(&self.dir) {
+                Ok(entries) => entries.collect::<Result<Vec<_>, _>>().unwrap_or_default(),
+                Err(_) => Vec::new(),
+            },
+            index: 0,
+        }
+    }
 }
+
+// -----------------------------------------------------------------------------
+// Iterator
+// -----------------------------------------------------------------------------
+
+/// Iterator over (hash, receipts) pairs in the store.
+pub struct ReceiptsIter<'a> {
+    store: &'a ReceiptsStore,
+    entries: Vec<fs::DirEntry>,
+    index: usize,
+}
+
+impl<'a> Iterator for ReceiptsIter<'a> {
+    type Item = (Hash32, Vec<Receipt>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < self.entries.len() {
+            let entry = &self.entries[self.index];
+            self.index += 1;
+            let path = entry.path();
+            if path.extension().map(|ext| ext == "json").unwrap_or(false) {
+                let file_stem = path.file_stem()?.to_str()?;
+                let hash_bytes = hex::decode(file_stem).ok()?;
+                if hash_bytes.len() != 32 {
+                    continue;
+                }
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&hash_bytes);
+                let id = Hash32(hash);
+                if let Ok(Some(receipts)) = self.store.get(&id) {
+                    return Some((id, receipts));
+                }
+            }
+        }
+        None
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use crate::types::Hash32;
 
-    // Helper to create a dummy receipt (simplified for test).
-    fn dummy_receipt() -> Receipt {
-        // Replace with actual construction if Receipt is complex.
-        // For now, we use a placeholder. In a real test, you'd create a proper Receipt.
-        unimplemented!("Replace with actual Receipt creation for tests");
+    // Helper to create a dummy receipt for testing.
+    fn dummy_receipt(tx_hash: &Hash32, success: bool) -> Receipt {
+        Receipt {
+            tx_hash: tx_hash.clone(),
+            success,
+            gas_used: 21000,
+            intrinsic_gas_used: 21000,
+            exec_gas_used: 0,
+            vm_gas_used: 0,
+            evm_gas_used: 0,
+            effective_gas_price: 100,
+            burned: 100,
+            tip: 0,
+            error: if success { None } else { Some("test error".into()) },
+            data: None,
+        }
     }
 
     #[test]
     fn test_put_and_get() {
         let dir = tempdir().unwrap();
         let store = ReceiptsStore::open(dir.path()).unwrap();
-        let hash = Hash32([0u8; 32]); // dummy hash
+        let hash = Hash32([0xaa; 32]);
 
-        let receipts = vec![dummy_receipt()]; // in real test, populate
+        let receipts = vec![
+            dummy_receipt(&hash, true),
+            dummy_receipt(&hash, false),
+        ];
 
         store.put(&hash, &receipts).unwrap();
         let loaded = store.get(&hash).unwrap().unwrap();
         assert_eq!(loaded.len(), receipts.len());
-        // Additional equality checks if Receipt implements PartialEq.
+        assert_eq!(loaded[0].success, true);
+        assert_eq!(loaded[1].success, false);
     }
 
     #[test]
     fn test_get_nonexistent() {
         let dir = tempdir().unwrap();
         let store = ReceiptsStore::open(dir.path()).unwrap();
-        let hash = Hash32([1u8; 32]);
+        let hash = Hash32([0xbb; 32]);
         assert!(store.get(&hash).unwrap().is_none());
     }
 
@@ -122,7 +260,7 @@ mod tests {
     fn test_exists() {
         let dir = tempdir().unwrap();
         let store = ReceiptsStore::open(dir.path()).unwrap();
-        let hash = Hash32([2u8; 32]);
+        let hash = Hash32([0xcc; 32]);
         assert!(!store.exists(&hash));
         store.put(&hash, &[]).unwrap();
         assert!(store.exists(&hash));
@@ -132,7 +270,7 @@ mod tests {
     fn test_delete() {
         let dir = tempdir().unwrap();
         let store = ReceiptsStore::open(dir.path()).unwrap();
-        let hash = Hash32([3u8; 32]);
+        let hash = Hash32([0xdd; 32]);
         store.put(&hash, &[]).unwrap();
         assert!(store.exists(&hash));
         store.delete(&hash).unwrap();
@@ -143,9 +281,70 @@ mod tests {
     fn test_atomic_write_does_not_leave_tmp() {
         let dir = tempdir().unwrap();
         let store = ReceiptsStore::open(dir.path()).unwrap();
-        let hash = Hash32([4u8; 32]);
+        let hash = Hash32([0xee; 32]);
         store.put(&hash, &[]).unwrap();
         let tmp_path = store.path_for(&hash).with_extension("tmp");
         assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn test_len_and_is_empty() {
+        let dir = tempdir().unwrap();
+        let store = ReceiptsStore::open(dir.path()).unwrap();
+        assert!(store.is_empty().unwrap());
+        assert_eq!(store.len().unwrap(), 0);
+
+        let hash1 = Hash32([0x11; 32]);
+        let hash2 = Hash32([0x22; 32]);
+        store.put(&hash1, &[]).unwrap();
+        assert_eq!(store.len().unwrap(), 1);
+        assert!(!store.is_empty().unwrap());
+
+        store.put(&hash2, &[]).unwrap();
+        assert_eq!(store.len().unwrap(), 2);
+
+        store.delete(&hash1).unwrap();
+        assert_eq!(store.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_clear() {
+        let dir = tempdir().unwrap();
+        let store = ReceiptsStore::open(dir.path()).unwrap();
+        let hash1 = Hash32([0x33; 32]);
+        let hash2 = Hash32([0x44; 32]);
+        store.put(&hash1, &[]).unwrap();
+        store.put(&hash2, &[]).unwrap();
+        assert_eq!(store.len().unwrap(), 2);
+
+        store.clear().unwrap();
+        assert_eq!(store.len().unwrap(), 0);
+        assert!(store.is_empty().unwrap());
+    }
+
+    #[test]
+    fn test_iter() {
+        let dir = tempdir().unwrap();
+        let store = ReceiptsStore::open(dir.path()).unwrap();
+
+        let hash1 = Hash32([0x55; 32]);
+        let hash2 = Hash32([0x66; 32]);
+        let receipts1 = vec![dummy_receipt(&hash1, true)];
+        let receipts2 = vec![dummy_receipt(&hash2, true), dummy_receipt(&hash2, false)];
+
+        store.put(&hash1, &receipts1).unwrap();
+        store.put(&hash2, &receipts2).unwrap();
+
+        let mut found = 0;
+        for (hash, receipts) in store.iter() {
+            if hash == hash1 {
+                assert_eq!(receipts.len(), 1);
+                found |= 1;
+            } else if hash == hash2 {
+                assert_eq!(receipts.len(), 2);
+                found |= 2;
+            }
+        }
+        assert_eq!(found, 3);
     }
 }
