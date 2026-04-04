@@ -8,9 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  RUSTUP_HOME: /usr/local/rustup
-  CARGO_HOME: /usr/local/cargo
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # RUSTUP_HOME și CARGO_HOME nu mai sunt setate; se folosesc valorile implicite (/home/runner/.rustup, /home/runner/.cargo)
 
 jobs:
   supply-chain:
