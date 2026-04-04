@@ -1,0 +1,20 @@
+name: Update Cargo.lock
+
+on:
+  workflow_dispatch:    # rulează manual
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate fresh Cargo.lock
+        run: cargo generate-lockfile
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git diff --staged --quiet || git commit -m "chore: update Cargo.lock"
+          git push
