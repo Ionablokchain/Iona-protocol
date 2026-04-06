@@ -1,19 +1,3 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# IONA Security Workflow
-#
-# Triggers:
-#   - Every push to main/develop
-#   - Every PR targeting main
-#   - Weekly schedule (Saturday 03:00 UTC) — catches newly published advisories
-#   - Manual dispatch
-#
-# Jobs:
-#   audit    — cargo-audit: check Cargo.lock against RustSec advisory DB
-#   deny     — cargo-deny: license compliance + bans + advisories + sources
-#   fuzz     — fuzz smoke test (30s per target, 4 targets, nightly Rust)
-#   sbom     — generate + validate CycloneDX SBOM
-#   secrets  — gitleaks secret scanning
-# ─────────────────────────────────────────────────────────────────────────────
 name: Security
 
 on:
@@ -22,19 +6,18 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    - cron: "0 3 * * 6"   # Saturday 03:00 UTC — weekly advisory rescan
+    - cron: "0 3 * * 6"
   workflow_dispatch:
 
 permissions:
   contents: read
-  security-events: write   # upload SARIF to GitHub Security tab
+  security-events: write
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # ── 1. cargo-audit ────────────────────────────────────────────────────────
   audit:
     name: cargo-audit (RustSec)
     runs-on: ubuntu-22.04
@@ -45,28 +28,29 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: Run cargo-audit
+        shell: bash
         run: |
+          set -o pipefail
           cargo audit \
             --deny warnings \
             --deny unsound \
             --file Cargo.lock \
             --json 2>&1 | tee audit-output.json || AUDIT_FAILED=1
 
-          # Pretty print summary regardless of exit
           echo "=== Audit Summary ==="
-          if command -v jq &>/dev/null; then
+          if command -v jq >/dev/null 2>&1; then
             jq -r '
-              .vulnerabilities.list[] |
+              .vulnerabilities.list[]? |
               "[\(.advisory.severity // "unknown")] \(.advisory.id): \(.advisory.title)\n  Crate: \(.package.name)@\(.package.version)\n  URL: \(.advisory.url // "n/a")\n"
             ' audit-output.json 2>/dev/null || echo "(no vulnerabilities found)"
           fi
 
           if [ "${AUDIT_FAILED:-0}" = "1" ]; then
-            echo ""
             echo "::error::cargo-audit found vulnerabilities. Review audit-output.json."
             exit 1
           fi
-          echo "::notice::cargo-audit passed — no known vulnerabilities"
+
+          echo "::notice::cargo-audit passed"
 
       - name: Upload audit results
         if: always()
@@ -76,9 +60,8 @@ jobs:
           path: audit-output.json
           retention-days: 30
 
-  # ── 2. cargo-deny ─────────────────────────────────────────────────────────
   deny:
-    name: cargo-deny (licenses + bans + advisories)
+    name: cargo-deny (licenses + bans + advisories + sources)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -89,21 +72,19 @@ jobs:
       - name: cargo deny check — licenses
         run: cargo deny check licenses
 
-      - name: cargo deny check — bans (duplicate crates)
+      - name: cargo deny check — bans
         run: cargo deny check bans
 
       - name: cargo deny check — advisories
         run: cargo deny check advisories
 
-      - name: cargo deny check — sources (registry + git)
+      - name: cargo deny check — sources
         run: cargo deny check sources
 
-      - name: cargo deny check — all (combined, fail-fast off)
+      - name: cargo deny check — combined summary
         if: always()
         run: cargo deny check --exclude-dev || true
-        # Combined run gives full picture even if individual checks pass
 
-  # ── 3. fuzz smoke tests ───────────────────────────────────────────────────
   fuzz:
     name: Fuzz smoke — ${{ matrix.target }}
     runs-on: ubuntu-22.04
@@ -118,7 +99,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install nightly Rust (required for cargo-fuzz)
+      - name: Install nightly Rust
+        shell: bash
         run: |
           rustup toolchain install nightly --component llvm-tools-preview
           rustup override set nightly
@@ -136,7 +118,9 @@ jobs:
           key: ${{ runner.os }}-fuzz-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run fuzz smoke test (30 seconds)
+        shell: bash
         run: |
+          set -o pipefail
           cargo +nightly fuzz run ${{ matrix.target }} \
             -- \
             -max_total_time=30 \
@@ -145,16 +129,14 @@ jobs:
             -print_final_stats=1 \
             2>&1 | tee fuzz-output-${{ matrix.target }}.txt
 
-          # Fail if any crash artefacts were produced
           CRASHES=$(find fuzz/artifacts/${{ matrix.target }}/ -type f 2>/dev/null | wc -l)
           if [ "$CRASHES" -gt 0 ]; then
-            echo "::error::Fuzzer found $CRASHES crash(es) in ${{ matrix.target }}!"
-            echo "Crash files:"
-            ls fuzz/artifacts/${{ matrix.target }}/
-            echo "Re-run with: cargo +nightly fuzz run ${{ matrix.target }} fuzz/artifacts/${{ matrix.target }}/<crash-file>"
+            echo "::error::Fuzzer found $CRASHES crash(es) in ${{ matrix.target }}"
+            ls -la fuzz/artifacts/${{ matrix.target }}/ || true
             exit 1
           fi
-          echo "::notice::Fuzz smoke passed for ${{ matrix.target }} — 0 crashes"
+
+          echo "::notice::Fuzz smoke passed for ${{ matrix.target }}"
 
       - name: Upload fuzz output
         if: always()
@@ -174,7 +156,6 @@ jobs:
           path: fuzz/artifacts/${{ matrix.target }}/
           retention-days: 90
 
-  # ── 4. SBOM generation + validation ──────────────────────────────────────
   sbom:
     name: SBOM (CycloneDX)
     runs-on: ubuntu-22.04
@@ -182,46 +163,55 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
+        shell: bash
         run: |
-          rustup override set $(grep 'channel' rust-toolchain.toml | cut -d'"' -f2)
+          CHANNEL=$(grep 'channel' rust-toolchain.toml | cut -d'"' -f2)
+          rustup toolchain install "$CHANNEL"
+          rustup override set "$CHANNEL"
 
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --locked
 
       - name: Generate SBOM
+        shell: bash
         run: |
-          cargo cyclonedx \
-            --format json \
-            --output sbom.cdx.json
-          echo "SBOM generated: $(wc -c < sbom.cdx.json) bytes"
+          cargo cyclonedx --format json --verbose
+          test -f iona.cdx.json
+          echo "SBOM generated: $(wc -c < iona.cdx.json) bytes"
 
       - name: Validate SBOM structure
+        shell: bash
         run: |
-          python3 -c "
-          import json, sys
-          with open('sbom.cdx.json') as f:
+          python3 - <<'PY'
+          import json
+          with open("iona.cdx.json", "r", encoding="utf-8") as f:
               sbom = json.load(f)
-          assert sbom.get('bomFormat') == 'CycloneDX', 'bomFormat must be CycloneDX'
-          assert sbom.get('specVersion') in ['1.4', '1.5', '1.6'], f'Unexpected specVersion: {sbom.get(\"specVersion\")}'
-          comps = sbom.get('components', [])
-          assert len(comps) > 0, 'No components found in SBOM'
-          print(f'SBOM valid: {len(comps)} components, specVersion={sbom[\"specVersion\"]}')
-          # Check each component has required fields
-          for c in comps:
-              assert 'name' in c, f'Component missing name: {c}'
-              assert 'version' in c, f'Component missing version: {c}'
-          print('All component fields valid.')
-          "
 
-      - name: Scan SBOM for CVEs (grype)
+          assert sbom.get("bomFormat") == "CycloneDX", "bomFormat must be CycloneDX"
+          assert sbom.get("specVersion") in ["1.3", "1.4", "1.5"], f"Unexpected specVersion: {sbom.get('specVersion')}"
+          comps = sbom.get("components", [])
+          assert len(comps) > 0, "No components found in SBOM"
+
+          for c in comps:
+              assert "name" in c, f"Component missing name: {c}"
+              assert "version" in c, f"Component missing version: {c}"
+
+          print(f"SBOM valid: {len(comps)} components, specVersion={sbom['specVersion']}")
+          PY
+
+      - name: Install grype
+        shell: bash
         run: |
-          # Install grype
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
             | sh -s -- -b /usr/local/bin
-          # Scan (non-blocking in CI — report only)
-          grype sbom:sbom.cdx.json --output table 2>&1 | tee grype-results.txt || true
-          # Fail on critical CVEs
-          if grype sbom:sbom.cdx.json --fail-on critical --quiet 2>/dev/null; then
+
+      - name: Scan SBOM for CVEs
+        shell: bash
+        run: |
+          set -o pipefail
+          grype sbom:iona.cdx.json --output table 2>&1 | tee grype-results.txt || true
+
+          if grype sbom:iona.cdx.json --fail-on critical --quiet 2>/dev/null; then
             echo "::notice::No critical CVEs found in SBOM"
           else
             echo "::error::Critical CVEs found! Review grype-results.txt"
@@ -233,26 +223,24 @@ jobs:
         with:
           name: sbom-${{ github.sha }}
           path: |
-            sbom.cdx.json
+            iona.cdx.json
             grype-results.txt
           retention-days: 90
 
-  # ── 5. Secret scanning (gitleaks) ────────────────────────────────────────
   secrets:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # Full history for complete scan
+          fetch-depth: 0
 
       - name: Run gitleaks
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}  # optional for org repos
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
 
-  # ── Summary gate ──────────────────────────────────────────────────────────
   security-gate:
     name: Security gate
     needs: [audit, deny, sbom, secrets]
@@ -260,6 +248,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Check all security jobs passed
+        shell: bash
         run: |
           AUDIT="${{ needs.audit.result }}"
           DENY="${{ needs.deny.result }}"
@@ -278,4 +267,5 @@ jobs:
             echo "::error::One or more security checks failed. Blocking merge."
             exit 1
           fi
-          echo "::notice::All security checks passed ✓"
+
+          echo "::notice::All security checks passed"
