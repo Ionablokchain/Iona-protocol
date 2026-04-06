@@ -2,13 +2,13 @@
 
 IONA is an experimental open-source framework for deterministic execution verification, reproducibility testing, and upgrade safety in distributed systems.
 
-It provides a Rust-based protocol implementation, controlled multi-node test environments, replay-oriented validation workflows, operator-focused tooling, and technical documentation designed to help developers and infrastructure operators validate behavior before broader deployment.
+It provides a Rust-based protocol implementation, controlled multi-node test environments, replay-oriented validation workflows, operator-focused tooling, and technical documentation designed to help developers and infrastructure operators validate system behavior before broader deployment.
 
 > Research and engineering repository for reproducible, upgrade-safe distributed infrastructure.
 
 ## Overview
 
-Many distributed systems depend on deterministic execution and safe protocol evolution, but often lack practical tooling for reproducibility testing, replay verification, compatibility validation, and structured upgrade simulation.
+Many distributed systems rely on deterministic execution and coordinated protocol evolution, yet often lack practical tooling for reproducibility testing, replay verification, compatibility validation, and structured upgrade simulation.
 
 IONA explores these challenges through an engineering-first framework that prioritizes:
 
@@ -17,37 +17,40 @@ IONA explores these challenges through an engineering-first framework that prior
 - explicit protocol and schema versioning
 - safer upgrade and migration workflows
 - operator-first observability and recovery tooling
-- controlled multi-node test environments
+- controlled multi-node validation environments
+
+The project is intended as an open research and engineering environment for studying reliability improvements in distributed state machine infrastructure.
 
 ## Why IONA
 
-Distributed infrastructure is often expected to behave deterministically, yet the workflows needed to validate that assumption are frequently incomplete or fragmented.
+Distributed infrastructure is frequently expected to behave deterministically, but the workflows needed to verify that assumption are often incomplete or difficult to inspect in practice.
 
-IONA focuses on practical mechanisms that help answer questions such as:
+IONA focuses on practical questions such as:
 
 - can state transitions be reproduced across environments?
-- can protocol changes be activated safely and predictably?
-- can schema evolution be validated before rollout?
-- can failures be replayed and inspected deterministically?
-- can operators verify system behavior before and after upgrades?
+- can protocol changes be introduced with explicit compatibility handling?
+- can schema evolution be validated before broader rollout?
+- can observed behavior be replayed and compared deterministically?
+- can operators verify upgrade outcomes before and after transition?
 
-Rather than presenting itself as a finalized production deployment, IONA is designed as an open research and engineering environment for studying reliability and upgrade safety in distributed state machine infrastructure.
+Rather than presenting itself as a finalized production deployment, IONA is designed as an open framework for validating reliability-critical workflows around execution, compatibility, and protocol evolution.
 
 ## What the Repository Includes
 
 This repository currently includes:
 
 - a Rust-based distributed node implementation
-- local multi-node and multi-validator testing environments
-- reproducible development and validation workflows
-- deterministic replay and verification tooling
-- release verification and artifact integrity checks
+- controlled local multi-node and multi-validator test environments
+- deterministic replay and validation workflows
+- reproducibility-oriented testing and verification assets
+- protocol and schema upgrade documentation
+- release verification and artifact integrity workflows
 - monitoring and observability assets
-- operational runbooks and supporting documentation
-- TypeScript SDK assets
+- operator-facing runbooks and technical documentation
 - deployment and configuration templates
+- TypeScript SDK assets
 
-## What You Can Evaluate Today
+## What Can Be Evaluated Today
 
 At its current stage, the repository is best evaluated as an infrastructure and reliability project.
 
@@ -55,16 +58,14 @@ Reviewers and contributors can use it to:
 
 - inspect the protocol and node implementation
 - run controlled local multi-node environments
-- review reproducibility and replay verification workflows
-- examine upgrade-safety and migration documentation
-- assess observability, monitoring, and operator-facing assets
+- review replay and reproducibility workflows
+- examine upgrade-safety and compatibility documentation
+- inspect observability and operator-facing assets
 - evaluate the project as an open engineering framework for deterministic infrastructure research
 
 ## Quick Start
 
-The exact commands and workflows may evolve, but the repository is intended to support a straightforward local development and validation flow.
-
-Typical evaluation steps include:
+The exact workflows may evolve, but a typical local evaluation flow is intended to look like this:
 
 ```bash
 git clone https://github.com/Ionablokchain/iona-protocol.git
