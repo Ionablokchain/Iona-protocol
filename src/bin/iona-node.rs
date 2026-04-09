@@ -60,6 +60,8 @@ use iona::storage::DataDir;
 use iona::types::{Hash32, Tx};
 use iona::wal::{Wal, WalEvent};
 use libp2p::{Multiaddr, PeerId};
+use std::option::Option::None;
+use std::result::Result::Ok;
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
@@ -71,8 +73,6 @@ use tokio::{sync::Mutex, time::Instant};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use std::option::Option::None;
-use std::result::Result::Ok;
 
 // ── Startup security gate: key-file and data-directory permissions ─────────
 
