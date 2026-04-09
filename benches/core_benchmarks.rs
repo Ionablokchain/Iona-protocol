@@ -3,6 +3,7 @@
 //! Run: cargo bench --locked
 //! Results written to target/criterion/
 
+#![cfg(not)]
 use iona::consensus::fast_finality::FinalityTracker;
 use iona::crypto::ed25519::Ed25519Signer;
 use iona::crypto::tx::{derive_address, tx_sign_bytes};
