@@ -44,10 +44,20 @@ pub struct BatchReproducibilityResult {
 
 impl std::fmt::Display for BatchReproducibilityResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "State Root Reproducibility: {}",
-            if self.all_reproducible { "ALL REPRODUCIBLE" } else { "NONDETERMINISM DETECTED" })?;
-        writeln!(f, "  blocks={}, iterations_per_block={}",
-            self.total_blocks, self.total_iterations)?;
+        writeln!(
+            f,
+            "State Root Reproducibility: {}",
+            if self.all_reproducible {
+                "ALL REPRODUCIBLE"
+            } else {
+                "NONDETERMINISM DETECTED"
+            }
+        )?;
+        writeln!(
+            f,
+            "  blocks={}, iterations_per_block={}",
+            self.total_blocks, self.total_iterations
+        )?;
         if let Some(h) = self.first_failure {
             writeln!(f, "  FIRST FAILURE at height {h}")?;
         }
@@ -71,17 +81,15 @@ pub fn verify_block_reproducibility(
     let mut roots = Vec::with_capacity(iterations);
 
     for _ in 0..iterations {
-        let (new_state, _gas, _receipts) = execute_block(
-            initial_state,
-            &block.txs,
-            base_fee_per_gas,
-            &proposer_addr,
-        );
+        let (new_state, _gas, _receipts) =
+            execute_block(initial_state, &block.txs, base_fee_per_gas, &proposer_addr);
         roots.push(new_state.root());
     }
 
     let canonical = roots[0].clone();
-    let diverged_at = roots.iter().enumerate()
+    let diverged_at = roots
+        .iter()
+        .enumerate()
         .find(|(_, r)| **r != canonical)
         .map(|(i, _)| i);
 
@@ -109,24 +117,15 @@ pub fn verify_chain_reproducibility(
     let proposer_addr = "0000000000000000000000000000000000000000".to_string();
 
     for block in blocks {
-        let result = verify_block_reproducibility(
-            block,
-            &state,
-            base_fee_per_gas,
-            iterations_per_block,
-        );
+        let result =
+            verify_block_reproducibility(block, &state, base_fee_per_gas, iterations_per_block);
 
         if !result.all_match && first_failure.is_none() {
             first_failure = Some(block.header.height);
         }
 
         // Advance state using first execution's result.
-        let (new_state, _, _) = execute_block(
-            &state,
-            &block.txs,
-            base_fee_per_gas,
-            &proposer_addr,
-        );
+        let (new_state, _, _) = execute_block(&state, &block.txs, base_fee_per_gas, &proposer_addr);
         state = new_state;
 
         results.push(result);
@@ -155,12 +154,8 @@ pub fn verify_against_golden(
         crate::crypto::tx::derive_address(&block.header.proposer_pk)
     };
 
-    let (new_state, _, _) = execute_block(
-        initial_state,
-        &block.txs,
-        base_fee_per_gas,
-        &proposer_addr,
-    );
+    let (new_state, _, _) =
+        execute_block(initial_state, &block.txs, base_fee_per_gas, &proposer_addr);
 
     let computed = new_state.root();
     if computed != golden_root {
@@ -229,7 +224,11 @@ mod tests {
         let block = empty_block(1, root.clone());
 
         let result = verify_block_reproducibility(&block, &state, 1, 5);
-        assert!(result.all_match, "not reproducible at iteration {:?}", result.diverged_at);
+        assert!(
+            result.all_match,
+            "not reproducible at iteration {:?}",
+            result.diverged_at
+        );
         assert_eq!(result.iterations, 5);
         assert_eq!(result.roots.len(), 5);
     }
@@ -238,10 +237,7 @@ mod tests {
     fn test_chain_reproducibility() {
         let state = KvState::default();
         let root = state.root();
-        let blocks = vec![
-            empty_block(1, root.clone()),
-            empty_block(2, root.clone()),
-        ];
+        let blocks = vec![empty_block(1, root.clone()), empty_block(2, root.clone())];
 
         let result = verify_chain_reproducibility(&blocks, &state, 1, 3);
         assert!(result.all_reproducible, "result: {result}");

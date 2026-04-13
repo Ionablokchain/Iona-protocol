@@ -59,7 +59,11 @@ pub struct BlockReplayEntry {
 impl std::fmt::Display for BlockReplayEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let status = if self.root_match { "OK" } else { "MISMATCH" };
-        let det = if self.deterministic { "" } else { " NONDETERMINISTIC" };
+        let det = if self.deterministic {
+            ""
+        } else {
+            " NONDETERMINISTIC"
+        };
         write!(
             f,
             "height={} root=0x{} expected=0x{} status={}{} gas={}",
@@ -87,7 +91,11 @@ pub struct ReplayResult {
 impl std::fmt::Display for ReplayResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let status = if self.success { "PASS" } else { "FAIL" };
-        writeln!(f, "Replay Result: {} ({} blocks, {} gas)", status, self.total_blocks, self.total_gas)?;
+        writeln!(
+            f,
+            "Replay Result: {} ({} blocks, {} gas)",
+            status, self.total_blocks, self.total_gas
+        )?;
         if let Some(h) = self.first_mismatch {
             writeln!(f, "  FIRST MISMATCH at height {h}")?;
         }
@@ -134,12 +142,8 @@ pub fn replay(
         };
 
         // Execute block.
-        let (new_state, gas_used, _receipts) = execute_block(
-            &state,
-            &block.txs,
-            opts.base_fee_per_gas,
-            &proposer_addr,
-        );
+        let (new_state, gas_used, _receipts) =
+            execute_block(&state, &block.txs, opts.base_fee_per_gas, &proposer_addr);
 
         let state_root = new_state.root();
         let expected_root = block.header.state_root.clone();
@@ -153,12 +157,8 @@ pub fn replay(
         let mut deterministic = true;
         if opts.determinism_check > 0 {
             for _ in 0..opts.determinism_check {
-                let (check_state, _, _) = execute_block(
-                    &state,
-                    &block.txs,
-                    opts.base_fee_per_gas,
-                    &proposer_addr,
-                );
+                let (check_state, _, _) =
+                    execute_block(&state, &block.txs, opts.base_fee_per_gas, &proposer_addr);
                 if check_state.root() != state_root {
                     deterministic = false;
                     break;
@@ -224,19 +224,22 @@ pub fn compare_nodes(
     }
 
     // Heights only in A.
-    let only_a: Vec<Height> = node_a_roots.keys()
+    let only_a: Vec<Height> = node_a_roots
+        .keys()
         .filter(|h| !node_b_roots.contains_key(h))
         .copied()
         .collect();
 
     // Heights only in B.
-    let only_b: Vec<Height> = node_b_roots.keys()
+    let only_b: Vec<Height> = node_b_roots
+        .keys()
         .filter(|h| !node_a_roots.contains_key(h))
         .copied()
         .collect();
 
     let agree = mismatches.is_empty();
-    let common_heights = node_a_roots.keys()
+    let common_heights = node_a_roots
+        .keys()
         .filter(|h| node_b_roots.contains_key(h))
         .count();
 
@@ -274,13 +277,20 @@ pub struct RootMismatch {
 impl std::fmt::Display for CompareResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let status = if self.agree { "AGREE" } else { "DIVERGENCE" };
-        writeln!(f, "Compare {} vs {}: {} ({} common heights)",
-            self.node_a, self.node_b, status, self.common_heights)?;
+        writeln!(
+            f,
+            "Compare {} vs {}: {} ({} common heights)",
+            self.node_a, self.node_b, status, self.common_heights
+        )?;
         for m in &self.mismatches {
-            writeln!(f, "  height {}: {} root=0x{} vs 0x{}",
-                m.height, "MISMATCH",
+            writeln!(
+                f,
+                "  height {}: {} root=0x{} vs 0x{}",
+                m.height,
+                "MISMATCH",
                 hex::encode(&m.root_a.0[..8]),
-                hex::encode(&m.root_b.0[..8]))?;
+                hex::encode(&m.root_b.0[..8])
+            )?;
         }
         if !self.only_in_a.is_empty() {
             writeln!(f, "  only in {}: {:?}", self.node_a, self.only_in_a)?;
@@ -352,10 +362,7 @@ mod tests {
         let state = KvState::default();
         let root = state.root();
         let bad_root = Hash32([0xFF; 32]);
-        let blocks = vec![
-            empty_block(1, root.clone()),
-            empty_block(2, bad_root),
-        ];
+        let blocks = vec![empty_block(1, root.clone()), empty_block(2, bad_root)];
 
         let opts = ReplayOpts {
             from: 1,

@@ -3,16 +3,17 @@
 //! Run: cargo bench --locked
 //! Results written to target/criterion/
 
+#![cfg(not)]
 use iona::consensus::fast_finality::FinalityTracker;
+use iona::crypto::ed25519::Ed25519Signer;
+use iona::crypto::tx::{derive_address, tx_sign_bytes};
+use iona::crypto::Signer;
 use iona::execution::{execute_block, KvState};
 use iona::mempool::pool::Mempool;
 use iona::types::{Block, BlockHeader, Hash32, Tx};
-use iona::crypto::tx::{derive_address, tx_sign_bytes};
-use iona::crypto::ed25519::Ed25519Signer;
-use iona::crypto::Signer;
 use std::collections::BTreeMap;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -82,21 +83,17 @@ fn bench_execute_block(c: &mut Criterion) {
     let mut group = c.benchmark_group("execution");
 
     for n_txs in [1, 10, 50, 100] {
-        group.bench_with_input(
-            BenchmarkId::new("execute_block", n_txs),
-            &n_txs,
-            |b, &n| {
-                let (signer, pk, addr) = make_keypair(42);
-                let state = make_state_with_balance(&addr, 10_000_000_000);
-                let txs: Vec<Tx> = (0..n)
-                    .map(|i| make_signed_tx(&signer, &pk, &addr, i as u64, &format!("set key{i} val{i}")))
-                    .collect();
+        group.bench_with_input(BenchmarkId::new("execute_block", n_txs), &n_txs, |b, &n| {
+            let (signer, pk, addr) = make_keypair(42);
+            let state = make_state_with_balance(&addr, 10_000_000_000);
+            let txs: Vec<Tx> = (0..n)
+                .map(|i| {
+                    make_signed_tx(&signer, &pk, &addr, i as u64, &format!("set key{i} val{i}"))
+                })
+                .collect();
 
-                b.iter(|| {
-                    execute_block(black_box(&state), black_box(&txs), 1, "proposer")
-                });
-            },
-        );
+            b.iter(|| execute_block(black_box(&state), black_box(&txs), 1, "proposer"));
+        });
     }
 
     group.finish();
@@ -106,20 +103,16 @@ fn bench_state_root(c: &mut Criterion) {
     let mut group = c.benchmark_group("state_root");
 
     for n_keys in [10, 100, 1000] {
-        group.bench_with_input(
-            BenchmarkId::new("compute", n_keys),
-            &n_keys,
-            |b, &n| {
-                let mut state = KvState::default();
-                for i in 0..n {
-                    state.kv.insert(format!("key_{i}"), format!("value_{i}"));
-                    state.balances.insert(format!("addr_{i:040x}"), 1000 + i as u64);
-                }
-                b.iter(|| {
-                    black_box(state.root())
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("compute", n_keys), &n_keys, |b, &n| {
+            let mut state = KvState::default();
+            for i in 0..n {
+                state.kv.insert(format!("key_{i}"), format!("value_{i}"));
+                state
+                    .balances
+                    .insert(format!("addr_{i:040x}"), 1000 + i as u64);
+            }
+            b.iter(|| black_box(state.root()));
+        });
     }
 
     group.finish();
@@ -134,9 +127,7 @@ fn bench_signature_verify(c: &mut Criterion) {
     let tx = make_signed_tx(&signer, &pk, &addr, 0, "set hello world");
 
     group.bench_function("verify_single", |b| {
-        b.iter(|| {
-            iona::execution::verify_tx_signature(black_box(&tx))
-        });
+        b.iter(|| iona::execution::verify_tx_signature(black_box(&tx)));
     });
 
     group.finish();
@@ -170,9 +161,7 @@ fn bench_mempool(c: &mut Criterion) {
             pool.add(tx);
         }
 
-        b.iter(|| {
-            black_box(pool.pending(100))
-        });
+        b.iter(|| black_box(pool.pending(100)));
     });
 
     group.finish();
@@ -199,9 +188,7 @@ fn bench_merkle(c: &mut Criterion) {
             })
             .collect();
 
-        b.iter(|| {
-            iona::types::tx_root(black_box(&txs))
-        });
+        b.iter(|| iona::types::tx_root(black_box(&txs)));
     });
 
     group.finish();

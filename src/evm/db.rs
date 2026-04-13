@@ -19,7 +19,10 @@ impl Database for MemDb {
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        self.code.get(&code_hash).cloned().ok_or_else(|| "code not found".to_string())
+        self.code
+            .get(&code_hash)
+            .cloned()
+            .ok_or_else(|| "code not found".to_string())
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
@@ -35,17 +38,17 @@ impl DatabaseCommit for MemDb {
     fn commit(&mut self, changes: revm::primitives::State) {
         // Simplistic commit implementation; REVM provides changes with accounts/storage/code.
         for (addr, acc) in changes {
-			// `acc.info` is `AccountInfo` in newer REVM versions and `Option<AccountInfo>`
-			// in older ones. We keep compatibility by using a small helper closure.
-			#[allow(clippy::needless_option_as_deref)]
-			{
-				// Newer REVM (AccountInfo)
-				//
-				// This compiles because `AccountInfo` implements `Clone`.
-				// If your REVM version uses `Option<AccountInfo>`, change the dependency
-				// to REVM v9 (as in Cargo.toml) or adjust this block accordingly.
-				self.accounts.insert(addr, acc.info.clone());
-			}
+            // `acc.info` is `AccountInfo` in newer REVM versions and `Option<AccountInfo>`
+            // in older ones. We keep compatibility by using a small helper closure.
+            #[allow(clippy::needless_option_as_deref)]
+            {
+                // Newer REVM (AccountInfo)
+                //
+                // This compiles because `AccountInfo` implements `Clone`.
+                // If your REVM version uses `Option<AccountInfo>`, change the dependency
+                // to REVM v9 (as in Cargo.toml) or adjust this block accordingly.
+                self.accounts.insert(addr, acc.info.clone());
+            }
             for (k, v) in acc.storage {
                 self.storage.insert((addr, k), v.present_value);
             }

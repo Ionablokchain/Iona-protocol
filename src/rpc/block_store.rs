@@ -1,6 +1,6 @@
 use crate::rpc::bloom::Bloom;
-use sha3::{Digest, Keccak256};
 use crate::rpc::rlp_encode::keccak_rlp_root;
+use sha3::{Digest, Keccak256};
 
 pub fn keccak_hex(data: &[u8]) -> String {
     let mut h = Keccak256::new();
@@ -27,7 +27,6 @@ pub fn bloom_or_hex(blooms: &[Bloom]) -> String {
     }
     out.to_hex()
 }
-
 
 /// Convenience wrapper to compute keccak(rlp(list(items))) root.
 pub fn rlp_root_hex(items: &[Vec<u8>]) -> String {

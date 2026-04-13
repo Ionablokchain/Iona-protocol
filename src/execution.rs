@@ -1,32 +1,34 @@
-pub mod vm_executor;
 pub mod parallel;
 pub mod sandbox;
+pub mod vm_executor;
 
-use crate::crypto::{PublicKeyBytes, SignatureBytes, Verifier};
 use crate::crypto::ed25519::Ed25519Verifier;
+use crate::crypto::tx::derive_address;
 use crate::crypto::tx::tx_sign_bytes;
-use crate::merkle::state_merkle_root;
-use crate::types::{receipts_root, tx_hash, tx_root, Block, BlockHeader, Hash32, Height, Receipt, Round, Tx};
-use crate::economics::staking::StakingState;
-use crate::economics::staking_tx::try_apply_staking_tx;
+use crate::crypto::{PublicKeyBytes, SignatureBytes, Verifier};
 use crate::economics::params::EconomicsParams;
 use crate::economics::rewards::epoch_at;
+use crate::economics::staking::StakingState;
+use crate::economics::staking_tx::try_apply_staking_tx;
+use crate::execution::vm_executor::{parse_vm_payload, vm_call, vm_deploy, VmTxPayload};
+use crate::merkle::state_merkle_root;
+use crate::types::{
+    receipts_root, tx_hash, tx_root, Block, BlockHeader, Hash32, Height, Receipt, Round, Tx,
+};
 use crate::vm::state::VmStorage;
-use crate::execution::vm_executor::{vm_deploy, vm_call, parse_vm_payload, VmTxPayload};
+use bincode;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use crate::crypto::tx::derive_address;
-use bincode;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct KvState {
-    pub kv:       BTreeMap<String, String>,
+    pub kv: BTreeMap<String, String>,
     pub balances: BTreeMap<String, u64>,
-    pub nonces:   BTreeMap<String, u64>,
-    pub burned:   u64,
+    pub nonces: BTreeMap<String, u64>,
+    pub burned: u64,
     /// VM contract state (storage slots + bytecode + nonces)
-    pub vm:       VmStorage,
+    pub vm: VmStorage,
 }
 
 impl KvState {
@@ -53,7 +55,10 @@ impl KvState {
         for (contract, code) in &self.vm.code {
             use sha2::{Digest, Sha256};
             let hash = Sha256::digest(code);
-            combined.insert(format!("vm_code:{}", hex::encode(contract)), hex::encode(hash));
+            combined.insert(
+                format!("vm_code:{}", hex::encode(contract)),
+                hex::encode(hash),
+            );
         }
 
         Hash32(state_merkle_root(&combined))
@@ -66,7 +71,9 @@ pub fn intrinsic_gas(tx: &Tx) -> u64 {
 
 fn apply_payload_kv(kv: &mut BTreeMap<String, String>, payload: &str) -> Result<(), String> {
     let parts: Vec<&str> = payload.split_whitespace().collect();
-    if parts.is_empty() { return Err("invalid tx".into()); }
+    if parts.is_empty() {
+        return Err("invalid tx".into());
+    }
     match parts[0] {
         "set" if parts.len() >= 3 => {
             let key = parts[1].to_string();
@@ -91,7 +98,9 @@ fn apply_payload_kv(kv: &mut BTreeMap<String, String>, payload: &str) -> Result<
 
 pub fn verify_tx_signature(tx: &Tx) -> Result<String, String> {
     let addr = derive_address(&tx.pubkey);
-    if tx.from != addr { return Err("from != derived address".into()); }
+    if tx.from != addr {
+        return Err("from != derived address".into());
+    }
     let pk = PublicKeyBytes(tx.pubkey.clone());
     let sig = SignatureBytes(tx.signature.clone());
     let msg = tx_sign_bytes(tx);
@@ -123,7 +132,10 @@ pub fn apply_tx(
 
     let from_addr = match verify_tx_signature(tx) {
         Ok(a) => a,
-        Err(e) => { receipt.error = Some(e); return (receipt, state.clone()); }
+        Err(e) => {
+            receipt.error = Some(e);
+            return (receipt, state.clone());
+        }
     };
 
     let mut working = state.clone();
@@ -170,21 +182,23 @@ pub fn apply_tx(
     working.balances.insert(from_addr.clone(), bal - total);
     working.burned = working.burned.saturating_add(burned);
     let pb = *working.balances.get(proposer_addr).unwrap_or(&0);
-    working.balances.insert(proposer_addr.to_string(), pb.saturating_add(tip));
+    working
+        .balances
+        .insert(proposer_addr.to_string(), pb.saturating_add(tip));
     working.nonces.insert(from_addr.clone(), expected + 1);
 
     // Apply payload; revert payload-only changes on failure (keep fee+nonce)
-//
-// NOTE: VM transactions ("vm ...") are executed later in `execute_block_with_staking`.
-// Here we intentionally *skip* KV payload execution for them, to avoid treating a VM
-// payload as a KV op. Intrinsic gas has already been charged above.
-if tx.payload.trim_start().starts_with("vm ") {
-    receipt.success = true; // execution outcome is set by the VM executor later
-    receipt.error = None;
-    return (receipt, working);
-}
+    //
+    // NOTE: VM transactions ("vm ...") are executed later in `execute_block_with_staking`.
+    // Here we intentionally *skip* KV payload execution for them, to avoid treating a VM
+    // payload as a KV op. Intrinsic gas has already been charged above.
+    if tx.payload.trim_start().starts_with("vm ") {
+        receipt.success = true; // execution outcome is set by the VM executor later
+        receipt.error = None;
+        return (receipt, working);
+    }
 
-// Apply payload; revert payload-only changes on failure (keep fee+nonce)
+    // Apply payload; revert payload-only changes on failure (keep fee+nonce)
     let mut after = working.clone();
     match apply_payload_kv(&mut after.kv, &tx.payload) {
         Ok(()) => {
@@ -207,22 +221,24 @@ if tx.payload.trim_start().starts_with("vm ") {
 /// Txs with invalid signatures are still passed to execute_block but will fail there too
 /// (verify_tx_signature is called again). The pre-verification is an optimization, not a gate.
 fn parallel_verify_sigs(txs: &[Tx]) -> Vec<bool> {
-    txs.par_iter().map(|tx| {
-        verify_tx_signature(tx).is_ok()
-    }).collect()
+    txs.par_iter()
+        .map(|tx| verify_tx_signature(tx).is_ok())
+        .collect()
 }
 
 pub fn execute_block(
-    prev_state:       &KvState,
-    txs:              &[Tx],
+    prev_state: &KvState,
+    txs: &[Tx],
     base_fee_per_gas: u64,
-    proposer_addr:    &str,
+    proposer_addr: &str,
 ) -> (KvState, u64, Vec<Receipt>) {
     // Phase 1: verify signatures in parallel (CPU-bound, no state dependency)
     let sig_valid = if txs.len() > 16 {
         parallel_verify_sigs(txs)
     } else {
-        txs.iter().map(|tx| verify_tx_signature(tx).is_ok()).collect()
+        txs.iter()
+            .map(|tx| verify_tx_signature(tx).is_ok())
+            .collect()
     };
 
     // Phase 2: apply transactions serially (state is sequential)
@@ -241,7 +257,6 @@ pub fn execute_block(
         receipts.push(rcpt);
     }
     (st, gas_total, receipts)
-
 }
 
 /// Extended execute_block that also processes staking transactions.
@@ -250,20 +265,22 @@ pub fn execute_block(
 ///
 /// This variant is used by `iona-node` in production.
 pub fn execute_block_with_staking(
-    prev_state:       &KvState,
-    txs:              &[Tx],
+    prev_state: &KvState,
+    txs: &[Tx],
     base_fee_per_gas: u64,
-    proposer_addr:    &str,
-    staking:          &mut StakingState,
-    params:           &EconomicsParams,
-    height:           u64,
+    proposer_addr: &str,
+    staking: &mut StakingState,
+    params: &EconomicsParams,
+    height: u64,
 ) -> (KvState, u64, Vec<Receipt>) {
     let epoch = epoch_at(height);
 
     let sig_valid = if txs.len() > 16 {
         parallel_verify_sigs(txs)
     } else {
-        txs.iter().map(|tx| verify_tx_signature(tx).is_ok()).collect()
+        txs.iter()
+            .map(|tx| verify_tx_signature(tx).is_ok())
+            .collect()
     };
 
     let mut st = prev_state.clone();
@@ -281,14 +298,8 @@ pub fn execute_block_with_staking(
 
             // apply_payload_kv will fail on "stake " — re-apply staking logic
             let from_addr = crate::crypto::tx::derive_address(&tx.pubkey);
-            let staking_result = try_apply_staking_tx(
-                &tx.payload,
-                &from_addr,
-                &mut after,
-                staking,
-                params,
-                epoch,
-            );
+            let staking_result =
+                try_apply_staking_tx(&tx.payload, &from_addr, &mut after, staking, params, epoch);
             match staking_result {
                 Some(r) => {
                     rcpt.success = r.success;
@@ -330,7 +341,7 @@ pub fn execute_block_with_staking(
                 Some(VmTxPayload::Deploy { init_code }) => {
                     let vm_result = vm_deploy(&mut after, &from_bytes, &init_code, VM_GAS_LIMIT);
                     rcpt.success = vm_result.success;
-                    rcpt.error   = vm_result.error;
+                    rcpt.error = vm_result.error;
                     rcpt.vm_gas_used = vm_result.gas_used;
                     rcpt.exec_gas_used = rcpt.vm_gas_used;
                     // Total gas = intrinsic tx cost + VM execution cost (intentional)
@@ -341,9 +352,10 @@ pub fn execute_block_with_staking(
                     }
                 }
                 Some(VmTxPayload::Call { contract, calldata }) => {
-                    let vm_result = vm_call(&mut after, &from_bytes, &contract, &calldata, VM_GAS_LIMIT);
+                    let vm_result =
+                        vm_call(&mut after, &from_bytes, &contract, &calldata, VM_GAS_LIMIT);
                     rcpt.success = vm_result.success;
-                    rcpt.error   = vm_result.error;
+                    rcpt.error = vm_result.error;
                     rcpt.vm_gas_used = vm_result.gas_used;
                     rcpt.exec_gas_used = rcpt.vm_gas_used;
                     // Total gas = intrinsic tx cost + VM execution cost (intentional)
@@ -354,7 +366,7 @@ pub fn execute_block_with_staking(
                 }
                 None => {
                     rcpt.success = false;
-                    rcpt.error   = Some("vm: malformed payload".into());
+                    rcpt.error = Some("vm: malformed payload".into());
                 }
             }
 
@@ -372,7 +384,9 @@ pub fn execute_block_with_staking(
                 apply_tx(&st, tx, base_fee_per_gas, proposer_addr)
             };
 
-            let hex_payload = tx.payload.trim_start()
+            let hex_payload = tx
+                .payload
+                .trim_start()
                 .strip_prefix("evm_unified ")
                 .unwrap_or("")
                 .trim();
@@ -431,10 +445,10 @@ pub fn execute_block_with_staking(
 
 /// Variant of apply_tx that skips signature verification (already done in parallel).
 fn apply_tx_presig_verified(
-    state:            &KvState,
-    tx:               &Tx,
+    state: &KvState,
+    tx: &Tx,
     base_fee_per_gas: u64,
-    proposer_addr:    &str,
+    proposer_addr: &str,
 ) -> (Receipt, KvState) {
     let txh = tx_hash(tx);
     let from_addr = crate::crypto::tx::derive_address(&tx.pubkey);
@@ -484,10 +498,10 @@ fn apply_tx_presig_verified(
     let effective_gas_price = base_fee_per_gas.saturating_add(priority_fee_per_gas);
     receipt.effective_gas_price = effective_gas_price;
     let burned = base_fee_per_gas.saturating_mul(intrinsic);
-    let tip    = priority_fee_per_gas.saturating_mul(intrinsic);
-    let total  = burned.saturating_add(tip);
+    let tip = priority_fee_per_gas.saturating_mul(intrinsic);
+    let total = burned.saturating_add(tip);
     receipt.burned = burned;
-    receipt.tip    = tip;
+    receipt.tip = tip;
     let bal = *working.balances.get(&from_addr).unwrap_or(&0);
     if bal < total {
         receipt.error = Some("insufficient balance".into());
@@ -496,12 +510,20 @@ fn apply_tx_presig_verified(
     working.balances.insert(from_addr.clone(), bal - total);
     working.burned = working.burned.saturating_add(burned);
     let pb = *working.balances.get(proposer_addr).unwrap_or(&0);
-    working.balances.insert(proposer_addr.to_string(), pb.saturating_add(tip));
+    working
+        .balances
+        .insert(proposer_addr.to_string(), pb.saturating_add(tip));
     working.nonces.insert(from_addr.clone(), expected + 1);
     let mut after = working.clone();
     match apply_payload_kv(&mut after.kv, &tx.payload) {
-        Ok(()) => { receipt.success = true; (receipt, after) }
-        Err(e) => { receipt.error = Some(e); (receipt, working) }
+        Ok(()) => {
+            receipt.success = true;
+            (receipt, after)
+        }
+        Err(e) => {
+            receipt.error = Some(e);
+            (receipt, working)
+        }
     }
 }
 
@@ -515,7 +537,9 @@ fn apply_tx_presig_verified(
 /// The tradeoff: more volatile base fee, but with sub-second blocks
 /// the price signal updates fast enough that wallets can follow it.
 pub fn next_base_fee(prev_base: u64, gas_used: u64, gas_target: u64) -> u64 {
-    if gas_target == 0 { return prev_base.max(1); }
+    if gas_target == 0 {
+        return prev_base.max(1);
+    }
     let prev_base = prev_base.max(1);
     // Elasticity denominator: 4 (vs ETH's 8) for faster price discovery
     const ELASTICITY_DENOM: u64 = 4;
@@ -524,7 +548,9 @@ pub fn next_base_fee(prev_base: u64, gas_used: u64, gas_target: u64) -> u64 {
         (prev_base + (prev_base * excess / gas_target / ELASTICITY_DENOM).max(1)).max(1)
     } else {
         let short = gas_target - gas_used;
-        prev_base.saturating_sub((prev_base * short / gas_target / ELASTICITY_DENOM).max(1)).max(1)
+        prev_base
+            .saturating_sub((prev_base * short / gas_target / ELASTICITY_DENOM).max(1))
+            .max(1)
     }
 }
 
@@ -571,29 +597,46 @@ pub fn build_block(
 /// 2. tx_root must match
 /// 3. execution must produce matching gas_used, receipts_root, state_root
 pub fn verify_block(
-    prev_state:    &KvState,
-    block:         &Block,
+    prev_state: &KvState,
+    block: &Block,
     proposer_addr: &str,
 ) -> Option<(KvState, Vec<Receipt>)> {
     // proposer_pk length sanity (ed25519 = 32 bytes)
-    if block.header.proposer_pk.len() != 32 { return None; }
-    if tx_root(&block.txs) != block.header.tx_root { return None; }
-    let (st, gas_used, receipts) = execute_block(prev_state, &block.txs, block.header.base_fee_per_gas, proposer_addr);
-    if gas_used != block.header.gas_used { return None; }
-    if receipts_root(&receipts) != block.header.receipts_root { return None; }
-    if st.root() != block.header.state_root { return None; }
+    if block.header.proposer_pk.len() != 32 {
+        return None;
+    }
+    if tx_root(&block.txs) != block.header.tx_root {
+        return None;
+    }
+    let (st, gas_used, receipts) = execute_block(
+        prev_state,
+        &block.txs,
+        block.header.base_fee_per_gas,
+        proposer_addr,
+    );
+    if gas_used != block.header.gas_used {
+        return None;
+    }
+    if receipts_root(&receipts) != block.header.receipts_root {
+        return None;
+    }
+    if st.root() != block.header.state_root {
+        return None;
+    }
     Some((st, receipts))
 }
 
 /// Verify block WITH validator set check on proposer_pk.
 /// Use this from the consensus engine (has access to vset).
 pub fn verify_block_with_vset(
-    prev_state:    &KvState,
-    block:         &Block,
+    prev_state: &KvState,
+    block: &Block,
     proposer_addr: &str,
-    expected_pk:   &crate::crypto::PublicKeyBytes,
+    expected_pk: &crate::crypto::PublicKeyBytes,
 ) -> Option<(KvState, Vec<Receipt>)> {
     // Block's proposer_pk must match the expected proposer from vset
-    if block.header.proposer_pk != expected_pk.0 { return None; }
+    if block.header.proposer_pk != expected_pk.0 {
+        return None;
+    }
     verify_block(prev_state, block, proposer_addr)
 }

@@ -219,48 +219,68 @@ pub fn audit_key_imported(logger: &AuditLogger, source: &str, address: &str) {
 /// Log a block committed event.
 pub fn audit_block_committed(logger: &AuditLogger, height: u64, hash: &str, txs: usize) {
     logger.log(
-        AuditEvent::new(AuditLevel::Info, AuditCategory::Consensus, "block_committed")
-            .with_detail("height", height.to_string())
-            .with_detail("hash", hash)
-            .with_detail("tx_count", txs.to_string()),
+        AuditEvent::new(
+            AuditLevel::Info,
+            AuditCategory::Consensus,
+            "block_committed",
+        )
+        .with_detail("height", height.to_string())
+        .with_detail("hash", hash)
+        .with_detail("tx_count", txs.to_string()),
     );
 }
 
 /// Log a finality event.
 pub fn audit_finality(logger: &AuditLogger, height: u64, latency_ms: u64) {
     logger.log(
-        AuditEvent::new(AuditLevel::Info, AuditCategory::Consensus, "block_finalized")
-            .with_detail("height", height.to_string())
-            .with_detail("latency_ms", latency_ms.to_string()),
+        AuditEvent::new(
+            AuditLevel::Info,
+            AuditCategory::Consensus,
+            "block_finalized",
+        )
+        .with_detail("height", height.to_string())
+        .with_detail("latency_ms", latency_ms.to_string()),
     );
 }
 
 /// Log an equivocation (double-sign) detection.
 pub fn audit_equivocation(logger: &AuditLogger, validator: &str, height: u64) {
     logger.log(
-        AuditEvent::new(AuditLevel::Critical, AuditCategory::Consensus, "equivocation_detected")
-            .with_detail("validator", validator)
-            .with_detail("height", height.to_string()),
+        AuditEvent::new(
+            AuditLevel::Critical,
+            AuditCategory::Consensus,
+            "equivocation_detected",
+        )
+        .with_detail("validator", validator)
+        .with_detail("height", height.to_string()),
     );
 }
 
 /// Log a schema migration event.
 pub fn audit_migration(logger: &AuditLogger, from_sv: u32, to_sv: u32, status: &str) {
     logger.log(
-        AuditEvent::new(AuditLevel::Warning, AuditCategory::Migration, "schema_migration")
-            .with_detail("from_sv", from_sv.to_string())
-            .with_detail("to_sv", to_sv.to_string())
-            .with_detail("status", status),
+        AuditEvent::new(
+            AuditLevel::Warning,
+            AuditCategory::Migration,
+            "schema_migration",
+        )
+        .with_detail("from_sv", from_sv.to_string())
+        .with_detail("to_sv", to_sv.to_string())
+        .with_detail("status", status),
     );
 }
 
 /// Log a protocol upgrade activation.
 pub fn audit_protocol_upgrade(logger: &AuditLogger, from_pv: u32, to_pv: u32, height: u64) {
     logger.log(
-        AuditEvent::new(AuditLevel::Critical, AuditCategory::Migration, "protocol_upgrade")
-            .with_detail("from_pv", from_pv.to_string())
-            .with_detail("to_pv", to_pv.to_string())
-            .with_detail("activation_height", height.to_string()),
+        AuditEvent::new(
+            AuditLevel::Critical,
+            AuditCategory::Migration,
+            "protocol_upgrade",
+        )
+        .with_detail("from_pv", from_pv.to_string())
+        .with_detail("to_pv", to_pv.to_string())
+        .with_detail("activation_height", height.to_string()),
     );
 }
 
@@ -334,8 +354,7 @@ pub fn blake3_hex(data: &[u8]) -> String {
 }
 
 /// The all-zeros genesis prev_hash used for the first entry.
-pub const GENESIS_HASH: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Tamper-evident audit logger.
 ///
@@ -349,7 +368,7 @@ pub struct HashchainLogger {
 }
 
 struct HashchainState {
-    next_seq:  u64,
+    next_seq: u64,
     prev_hash: String,
 }
 
@@ -386,7 +405,10 @@ impl HashchainLogger {
 
         Ok(Self {
             file: Mutex::new(file),
-            state: Mutex::new(HashchainState { next_seq, prev_hash }),
+            state: Mutex::new(HashchainState {
+                next_seq,
+                prev_hash,
+            }),
         })
     }
 
@@ -427,8 +449,8 @@ impl HashchainLogger {
         }
 
         // Advance chain state.
-        state.next_seq  += 1;
-        state.prev_hash  = blake3_hex(line.as_bytes());
+        state.next_seq += 1;
+        state.prev_hash = blake3_hex(line.as_bytes());
         Ok(())
     }
 }
@@ -439,10 +461,7 @@ pub enum VerifyResult {
     /// All entries verified successfully.
     Ok { entries: u64 },
     /// Chain is broken at the given sequence number.
-    Broken {
-        seq: u64,
-        reason: String,
-    },
+    Broken { seq: u64, reason: String },
     /// File is empty (no entries).
     Empty,
 }
@@ -450,9 +469,11 @@ pub enum VerifyResult {
 impl fmt::Display for VerifyResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            VerifyResult::Ok { entries }          => write!(f, "OK: {entries} entries verified, chain intact"),
-            VerifyResult::Broken { seq, reason }  => write!(f, "BROKEN at seq={seq}: {reason}"),
-            VerifyResult::Empty                   => write!(f, "EMPTY: log file contains no entries"),
+            VerifyResult::Ok { entries } => {
+                write!(f, "OK: {entries} entries verified, chain intact")
+            }
+            VerifyResult::Broken { seq, reason } => write!(f, "BROKEN at seq={seq}: {reason}"),
+            VerifyResult::Empty => write!(f, "EMPTY: log file contains no entries"),
         }
     }
 }
@@ -470,7 +491,7 @@ pub fn verify_hashchain(path: &std::path::Path) -> std::io::Result<VerifyResult>
     }
 
     let mut expected_prev = GENESIS_HASH.to_string();
-    let mut expected_seq  = 0u64;
+    let mut expected_seq = 0u64;
 
     for (line_idx, line) in lines.iter().enumerate() {
         // Parse entry.
@@ -485,10 +506,7 @@ pub fn verify_hashchain(path: &std::path::Path) -> std::io::Result<VerifyResult>
         if entry.seq != expected_seq {
             return Ok(VerifyResult::Broken {
                 seq: entry.seq,
-                reason: format!(
-                    "expected seq={expected_seq}, found seq={}",
-                    entry.seq
-                ),
+                reason: format!("expected seq={expected_seq}, found seq={}", entry.seq),
             });
         }
 
@@ -530,10 +548,12 @@ pub fn verify_hashchain(path: &std::path::Path) -> std::io::Result<VerifyResult>
 
         // Advance: next entry's prev_hash = blake3 of this raw line.
         expected_prev = blake3_hex(line.as_bytes());
-        expected_seq  += 1;
+        expected_seq += 1;
     }
 
-    Ok(VerifyResult::Ok { entries: expected_seq })
+    Ok(VerifyResult::Ok {
+        entries: expected_seq,
+    })
 }
 
 #[cfg(test)]
@@ -555,8 +575,12 @@ mod tests {
 
     #[test]
     fn test_audit_event_display() {
-        let event = AuditEvent::new(AuditLevel::Critical, AuditCategory::Consensus, "equivocation")
-            .with_detail("validator", "abc123");
+        let event = AuditEvent::new(
+            AuditLevel::Critical,
+            AuditCategory::Consensus,
+            "equivocation",
+        )
+        .with_detail("validator", "abc123");
         let s = format!("{}", event);
         assert!(s.contains("CRITICAL"));
         assert!(s.contains("CONSENSUS"));
@@ -640,10 +664,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit_chain.log");
         let logger = HashchainLogger::open(&path).unwrap();
-        logger.append(
-            AuditEvent::new(AuditLevel::Info, AuditCategory::Startup, "node_started")
-                .with_detail("version", "28.2.0"),
-        ).unwrap();
+        logger
+            .append(
+                AuditEvent::new(AuditLevel::Info, AuditCategory::Startup, "node_started")
+                    .with_detail("version", "28.2.0"),
+            )
+            .unwrap();
         let result = verify_hashchain(&path).unwrap();
         assert_eq!(result, VerifyResult::Ok { entries: 1 });
     }
@@ -654,10 +680,16 @@ mod tests {
         let path = dir.path().join("audit_chain.log");
         let logger = HashchainLogger::open(&path).unwrap();
         for i in 0u64..10 {
-            logger.append(
-                AuditEvent::new(AuditLevel::Info, AuditCategory::Consensus, "block_committed")
+            logger
+                .append(
+                    AuditEvent::new(
+                        AuditLevel::Info,
+                        AuditCategory::Consensus,
+                        "block_committed",
+                    )
                     .with_detail("height", i.to_string()),
-            ).unwrap();
+                )
+                .unwrap();
         }
         let result = verify_hashchain(&path).unwrap();
         assert_eq!(result, VerifyResult::Ok { entries: 10 });
@@ -669,10 +701,16 @@ mod tests {
         let path = dir.path().join("audit_chain.log");
         let logger = HashchainLogger::open(&path).unwrap();
         for i in 0u64..5 {
-            logger.append(
-                AuditEvent::new(AuditLevel::Info, AuditCategory::Consensus, "block_committed")
+            logger
+                .append(
+                    AuditEvent::new(
+                        AuditLevel::Info,
+                        AuditCategory::Consensus,
+                        "block_committed",
+                    )
                     .with_detail("height", i.to_string()),
-            ).unwrap();
+                )
+                .unwrap();
         }
         drop(logger);
 
@@ -682,8 +720,10 @@ mod tests {
         std::fs::write(&path, tampered).unwrap();
 
         let result = verify_hashchain(&path).unwrap();
-        assert!(matches!(result, VerifyResult::Broken { .. }),
-            "tampered entry must be detected");
+        assert!(
+            matches!(result, VerifyResult::Broken { .. }),
+            "tampered entry must be detected"
+        );
     }
 
     #[test]
@@ -692,10 +732,12 @@ mod tests {
         let path = dir.path().join("audit_chain.log");
         let logger = HashchainLogger::open(&path).unwrap();
         for i in 0u64..5 {
-            logger.append(
-                AuditEvent::new(AuditLevel::Info, AuditCategory::Consensus, "block")
-                    .with_detail("height", i.to_string()),
-            ).unwrap();
+            logger
+                .append(
+                    AuditEvent::new(AuditLevel::Info, AuditCategory::Consensus, "block")
+                        .with_detail("height", i.to_string()),
+                )
+                .unwrap();
         }
         drop(logger);
 
@@ -706,8 +748,10 @@ mod tests {
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
 
         let result = verify_hashchain(&path).unwrap();
-        assert!(matches!(result, VerifyResult::Broken { .. }),
-            "deleted entry must break the chain");
+        assert!(
+            matches!(result, VerifyResult::Broken { .. }),
+            "deleted entry must break the chain"
+        );
     }
 
     #[test]
@@ -719,10 +763,12 @@ mod tests {
         {
             let logger = HashchainLogger::open(&path).unwrap();
             for i in 0u64..3 {
-                logger.append(
-                    AuditEvent::new(AuditLevel::Info, AuditCategory::Startup, "boot")
-                        .with_detail("seq", i.to_string()),
-                ).unwrap();
+                logger
+                    .append(
+                        AuditEvent::new(AuditLevel::Info, AuditCategory::Startup, "boot")
+                            .with_detail("seq", i.to_string()),
+                    )
+                    .unwrap();
             }
         }
 
@@ -730,17 +776,22 @@ mod tests {
         {
             let logger = HashchainLogger::open(&path).unwrap();
             for i in 3u64..6 {
-                logger.append(
-                    AuditEvent::new(AuditLevel::Info, AuditCategory::Startup, "boot")
-                        .with_detail("seq", i.to_string()),
-                ).unwrap();
+                logger
+                    .append(
+                        AuditEvent::new(AuditLevel::Info, AuditCategory::Startup, "boot")
+                            .with_detail("seq", i.to_string()),
+                    )
+                    .unwrap();
             }
         }
 
         // Verify the combined 6-entry chain.
         let result = verify_hashchain(&path).unwrap();
-        assert_eq!(result, VerifyResult::Ok { entries: 6 },
-            "resumed chain must verify end-to-end");
+        assert_eq!(
+            result,
+            VerifyResult::Ok { entries: 6 },
+            "resumed chain must verify end-to-end"
+        );
     }
 
     #[test]
@@ -752,7 +803,10 @@ mod tests {
 
     #[test]
     fn hashchain_display_broken() {
-        let r = VerifyResult::Broken { seq: 7, reason: "hash mismatch".into() };
+        let r = VerifyResult::Broken {
+            seq: 7,
+            reason: "hash mismatch".into(),
+        };
         let s = r.to_string();
         assert!(s.contains("BROKEN"));
         assert!(s.contains("seq=7"));

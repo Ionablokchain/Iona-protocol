@@ -15,16 +15,18 @@ fn arb_tx() -> impl Strategy<Value = Tx> {
         any::<u64>(),
     )
         .prop_map(
-            |(pubkey, from, nonce, max_fee, max_prio, gas_limit, payload, signature, chain_id)| Tx {
-                pubkey,
-                from,
-                nonce,
-                max_fee_per_gas: max_fee,
-                max_priority_fee_per_gas: max_prio,
-                gas_limit,
-                payload,
-                signature,
-                chain_id,
+            |(pubkey, from, nonce, max_fee, max_prio, gas_limit, payload, signature, chain_id)| {
+                Tx {
+                    pubkey,
+                    from,
+                    nonce,
+                    max_fee_per_gas: max_fee,
+                    max_priority_fee_per_gas: max_prio,
+                    gas_limit,
+                    payload,
+                    signature,
+                    chain_id,
+                }
             },
         )
 }

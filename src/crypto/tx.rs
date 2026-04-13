@@ -15,5 +15,6 @@ pub fn tx_sign_bytes(tx: &Tx) -> Vec<u8> {
         tx.max_priority_fee_per_gas,
         tx.gas_limit,
         &tx.payload,
-    )).unwrap_or_default()
+    ))
+    .unwrap_or_default()
 }

@@ -167,11 +167,7 @@ fn groups_conflict(a: &GroupResult, b: &GroupResult) -> bool {
 /// Merge non-conflicting group results into a single state.
 /// The merge applies deltas from each group onto the base state,
 /// in the original sender order, to maintain determinism.
-fn merge_states(
-    base_state: &KvState,
-    groups: &[GroupResult],
-    proposer_addr: &str,
-) -> KvState {
+fn merge_states(base_state: &KvState, groups: &[GroupResult], proposer_addr: &str) -> KvState {
     let mut merged = base_state.clone();
 
     for group in groups {
@@ -193,11 +189,12 @@ fn merge_states(
             if addr == proposer_addr {
                 // Proposer balance: accumulate tips from all groups
                 let base_bal = base_state.balances.get(addr).copied().unwrap_or(0);
-                let delta = new_bal.saturating_sub(
-                    base_state.balances.get(addr).copied().unwrap_or(0),
-                );
+                let delta =
+                    new_bal.saturating_sub(base_state.balances.get(addr).copied().unwrap_or(0));
                 let current = merged.balances.get(addr).copied().unwrap_or(base_bal);
-                merged.balances.insert(addr.clone(), current.saturating_add(delta));
+                merged
+                    .balances
+                    .insert(addr.clone(), current.saturating_add(delta));
             } else {
                 merged.balances.insert(addr.clone(), *new_bal);
             }
@@ -246,14 +243,15 @@ pub fn execute_block_parallel(
 ) -> (KvState, u64, Vec<Receipt>) {
     // Fall back to sequential for small batches
     let (groups, sender_order) = partition_by_sender(txs);
-    if txs.len() < config.min_txs_for_parallel
-        || groups.len() < config.min_senders_for_parallel
-    {
+    if txs.len() < config.min_txs_for_parallel || groups.len() < config.min_senders_for_parallel {
         return execute_sequential_fallback(prev_state, txs, base_fee_per_gas, proposer_addr);
     }
 
     // Phase 1: Parallel signature verification
-    let sig_valid: Vec<bool> = txs.par_iter().map(|tx| verify_tx_signature(tx).is_ok()).collect();
+    let sig_valid: Vec<bool> = txs
+        .par_iter()
+        .map(|tx| verify_tx_signature(tx).is_ok())
+        .collect();
 
     // Phase 2: Execute each sender group in parallel
     let group_entries: Vec<(&String, &Vec<(usize, &Tx)>)> = sender_order
@@ -264,7 +262,13 @@ pub fn execute_block_parallel(
     let group_results: Vec<GroupResult> = group_entries
         .par_iter()
         .map(|(sender, txs_in_group)| {
-            execute_group(prev_state, txs_in_group, base_fee_per_gas, proposer_addr, sender)
+            execute_group(
+                prev_state,
+                txs_in_group,
+                base_fee_per_gas,
+                proposer_addr,
+                sender,
+            )
         })
         .collect();
 
@@ -362,8 +366,8 @@ impl ParallelExecStats {
 mod tests {
     use super::*;
     use crate::crypto::ed25519::Ed25519Keypair;
-    use crate::crypto::Signer;
     use crate::crypto::tx::{derive_address, tx_sign_bytes};
+    use crate::crypto::Signer;
     use crate::types::Tx;
 
     fn make_signed_tx(seed: u64, nonce: u64, payload: &str) -> Tx {

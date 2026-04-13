@@ -14,7 +14,6 @@
 /// - Fully deterministic across platforms and versions
 /// - Incrementally composable (sort+hash is stable)
 /// - Fast: O(n log n) where n = number of KV entries
-
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
@@ -24,7 +23,8 @@ pub fn state_merkle_root(kv: &BTreeMap<String, String>) -> [u8; 32] {
     }
 
     // Compute leaf hashes (already sorted by BTreeMap)
-    let leaves: Vec<[u8; 32]> = kv.iter()
+    let leaves: Vec<[u8; 32]> = kv
+        .iter()
         .map(|(k, v)| leaf_hash(k.as_bytes(), v.as_bytes()))
         .collect();
 
@@ -53,7 +53,9 @@ fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 
 fn merkle_root_of(leaves: &[[u8; 32]]) -> [u8; 32] {
     assert!(!leaves.is_empty());
-    if leaves.len() == 1 { return leaves[0]; }
+    if leaves.len() == 1 {
+        return leaves[0];
+    }
 
     let mid = leaves.len().next_power_of_two() / 2;
     let (left_leaves, right_leaves) = if leaves.len() > mid {
@@ -64,7 +66,7 @@ fn merkle_root_of(leaves: &[[u8; 32]]) -> [u8; 32] {
 
     let left = merkle_root_of(left_leaves);
     let right = if right_leaves.is_empty() {
-        left  // duplicate left for odd trees (standard Bitcoin-style)
+        left // duplicate left for odd trees (standard Bitcoin-style)
     } else {
         merkle_root_of(right_leaves)
     };

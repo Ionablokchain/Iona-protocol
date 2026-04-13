@@ -16,12 +16,15 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct ApiKeyConfig {
     pub header: String,
-    pub value:  String,
+    pub value: String,
 }
 
 impl ApiKeyConfig {
     pub fn new(header: impl Into<String>, value: impl Into<String>) -> Self {
-        Self { header: header.into(), value: value.into() }
+        Self {
+            header: header.into(),
+            value: value.into(),
+        }
     }
 }
 
@@ -38,7 +41,11 @@ pub async fn require_api_key(
         .and_then(|v| v.to_str().ok())
         .map(|v| v == cfg.value)
         .unwrap_or(false);
-    if ok { Ok(next.run(req).await) } else { Err(StatusCode::UNAUTHORIZED) }
+    if ok {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
 }
 
 /// Convenience: checks Bearer token in Authorization header.
@@ -54,5 +61,9 @@ pub async fn require_bearer(
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|token| token == cfg.value)
         .unwrap_or(false);
-    if ok { Ok(next.run(req).await) } else { Err(StatusCode::UNAUTHORIZED) }
+    if ok {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
 }

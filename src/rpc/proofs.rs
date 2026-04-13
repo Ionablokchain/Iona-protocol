@@ -2,11 +2,11 @@ use crate::evm::db::MemDb;
 use revm::primitives::Address;
 use sha3::{Digest, Keccak256};
 
-fn keccak256(data: &[u8]) -> [u8;32] {
+fn keccak256(data: &[u8]) -> [u8; 32] {
     let mut h = Keccak256::new();
     h.update(data);
     let r = h.finalize();
-    let mut out=[0u8;32];
+    let mut out = [0u8; 32];
     out.copy_from_slice(&r);
     out
 }
@@ -22,47 +22,68 @@ pub struct Proof {
     pub storage_hash: String,
 }
 
-pub fn build_proof(db: &MemDb, addr: Address, storage_keys: Vec<[u8;32]>) -> Proof {
-    #[cfg(feature="state_trie")]
+pub fn build_proof(db: &MemDb, addr: Address, storage_keys: Vec<[u8; 32]>) -> Proof {
+    #[cfg(feature = "state_trie")]
     {
         return build_proof_state_trie(db, addr, storage_keys);
     }
-    #[cfg(not(feature="state_trie"))]
+    #[cfg(not(feature = "state_trie"))]
     {
         let _ = (db, addr, storage_keys);
-        Proof { account_proof: vec![], storage_proofs: vec![], storage_hash: "0x".to_string() }
+        Proof {
+            account_proof: vec![],
+            storage_proofs: vec![],
+            storage_hash: "0x".to_string(),
+        }
     }
 }
 
-
-#[cfg(feature="state_trie")]
-fn build_proof_state_trie(db: &MemDb, addr: Address, storage_keys: Vec<[u8;32]>) -> Proof {
+#[cfg(feature = "state_trie")]
+fn build_proof_state_trie(db: &MemDb, addr: Address, storage_keys: Vec<[u8; 32]>) -> Proof {
     use hash_db::Hasher;
     use keccak_hasher::KeccakHasher;
-    use memory_db::{MemoryDB, HashKey};
-    use trie_db::{TrieDBMut, TrieMut, TrieDBBuilder, Trie};
+    use memory_db::{HashKey, MemoryDB};
+    use trie_db::{Trie, TrieDBBuilder, TrieDBMut, TrieMut};
 
     // --- helpers ---
-    fn empty_trie_root() -> [u8;32] { keccak256(&[0x80]) } // RLP empty string
+    fn empty_trie_root() -> [u8; 32] {
+        keccak256(&[0x80])
+    } // RLP empty string
     fn u256_to_trimmed_be(v: revm::primitives::U256) -> Vec<u8> {
-        let mut b = [0u8;32];
+        let mut b = [0u8; 32];
         v.to_be_bytes::<32>(&mut b);
-        let t = b.iter().skip_while(|x| **x==0).cloned().collect::<Vec<u8>>();
-        if t.is_empty() { vec![0u8] } else { t }
+        let t = b
+            .iter()
+            .skip_while(|x| **x == 0)
+            .cloned()
+            .collect::<Vec<u8>>();
+        if t.is_empty() {
+            vec![0u8]
+        } else {
+            t
+        }
     }
 
     // Build storage trie for addr and return (root, db, trie)
-    fn build_storage_trie(dbsrc: &MemDb, addr: Address) -> (MemoryDB<KeccakHasher, HashKey<<KeccakHasher as Hasher>::Out>, Vec<u8>>, <KeccakHasher as Hasher>::Out) {
+    fn build_storage_trie(
+        dbsrc: &MemDb,
+        addr: Address,
+    ) -> (
+        MemoryDB<KeccakHasher, HashKey<<KeccakHasher as Hasher>::Out>, Vec<u8>>,
+        <KeccakHasher as Hasher>::Out,
+    ) {
         let mut memdb: MemoryDB<KeccakHasher, HashKey<_>, Vec<u8>> = MemoryDB::default();
         let mut root = <KeccakHasher as Hasher>::Out::default();
         {
             let mut trie = TrieDBMut::<KeccakHasher>::new(&mut memdb, &mut root);
             for ((a, slot), val) in dbsrc.storage.iter() {
-                if *a != addr { continue; }
-                let mut slot_be=[0u8;32];
+                if *a != addr {
+                    continue;
+                }
+                let mut slot_be = [0u8; 32];
                 slot.to_be_bytes::<32>(&mut slot_be);
                 let key = keccak256(&slot_be); // secure trie key
-                // value is RLP(trimmed value bytes)
+                                               // value is RLP(trimmed value bytes)
                 let enc_bytes = u256_to_trimmed_be(*val);
                 let mut s = rlp::RlpStream::new();
                 s.append(&enc_bytes.as_slice());
@@ -85,7 +106,11 @@ fn build_proof_state_trie(db: &MemDb, addr: Address, storage_keys: Vec<[u8;32]>)
             let balance = info.balance;
 
             // compute storage root for this account (empty unless a==addr to avoid rebuilding all)
-            let storage_root = if *a == addr { stor_root.0 } else { empty_trie_root() };
+            let storage_root = if *a == addr {
+                stor_root.0
+            } else {
+                empty_trie_root()
+            };
 
             let code_hash = match info.code_hash {
                 Some(h) => h.0,
@@ -122,7 +147,11 @@ fn build_proof_state_trie(db: &MemDb, addr: Address, storage_keys: Vec<[u8;32]>)
         let proof_nodes = nodes.into_iter().map(|n| hex0x(&n)).collect::<Vec<_>>();
 
         // value from DB if present
-        let val_u = db.storage.get(&(addr, revm::primitives::U256::from_be_bytes(k))).copied().unwrap_or(revm::primitives::U256::ZERO);
+        let val_u = db
+            .storage
+            .get(&(addr, revm::primitives::U256::from_be_bytes(k)))
+            .copied()
+            .unwrap_or(revm::primitives::U256::ZERO);
         let val_hex = format!("0x{:x}", val_u);
 
         storage_proofs.push((key_hex, val_hex, proof_nodes));

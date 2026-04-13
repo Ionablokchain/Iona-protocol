@@ -42,24 +42,33 @@ pub fn migrate(data_dir: &str, meta: &mut SchemaMeta) -> io::Result<()> {
     if Path::new(&blocks_dir).exists() {
         let mut entries: Vec<_> = fs::read_dir(&blocks_dir)?
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map(|ext| ext == "json").unwrap_or(false))
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "json")
+                    .unwrap_or(false)
+            })
             .collect();
         entries.sort_by_key(|e| e.file_name());
 
         for entry in entries {
             if let Ok(content) = fs::read_to_string(entry.path()) {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    let height = val.get("header")
+                    let height = val
+                        .get("header")
                         .and_then(|h| h.get("height"))
                         .and_then(|h| h.as_u64())
                         .unwrap_or(0);
                     if let Some(txs) = val.get("txs").and_then(|t| t.as_array()) {
                         for (pos, tx) in txs.iter().enumerate() {
                             if let Some(hash) = tx.get("hash").and_then(|h| h.as_str()) {
-                                index.insert(hash.to_string(), TxIndexEntry {
-                                    block_height: height,
-                                    tx_position: pos as u32,
-                                });
+                                index.insert(
+                                    hash.to_string(),
+                                    TxIndexEntry {
+                                        block_height: height,
+                                        tx_position: pos as u32,
+                                    },
+                                );
                             }
                         }
                     }

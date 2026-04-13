@@ -65,10 +65,23 @@ Reviewers and contributors can use it to:
 
 ## Quick Start
 
-The exact workflows may evolve, but a typical local evaluation flow is intended to look like this:
+The repository should currently be understood as:
 
-```bash
-git clone https://github.com/Ionablokchain/iona-protocol.git
-cd iona-protocol
-cargo build
-cargo test
+- functional for local development and controlled multi-node testing
+- suitable for infrastructure experimentation and architecture review
+- not a final production deployment claim
+
+Some components are more mature than others. Experimental areas should be treated accordingly.
+
+## Repository Structure
+
+```text
+src/                    Core node implementation
+tests/                  Integration and protocol tests
+docs/                   Architecture, operations, and security documentation
+ops/                    Monitoring, alerts, dashboards, and runbooks
+deploy/                 Deployment-related configuration
+testnet/local4/         Local 4-validator test environment
+scripts/                Verification and automation scripts
+sdk/typescript/         TypeScript SDK assets
+config/                 Configuration templates

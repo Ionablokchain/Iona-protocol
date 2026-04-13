@@ -36,11 +36,15 @@ pub fn recover_sender(
     let recovery_id_byte: u8 = if let Some(cid) = chain_id {
         // EIP-155
         let base = cid * 2 + 35;
-        if v < base { return Err(format!("v={v} < base={base} for chain_id={cid}")); }
+        if v < base {
+            return Err(format!("v={v} < base={base} for chain_id={cid}"));
+        }
         ((v - base) & 1) as u8
     } else {
         // pre-EIP-155
-        if v < 27 { return Err(format!("v={v} < 27")); }
+        if v < 27 {
+            return Err(format!("v={v} < 27"));
+        }
         ((v - 27) & 1) as u8
     };
 
@@ -93,31 +97,31 @@ fn recover_from_components(
 
 #[derive(Debug, Clone)]
 pub struct LegacySignedTx {
-    pub nonce:     u64,
+    pub nonce: u64,
     pub gas_price: u128,
     pub gas_limit: u64,
-    pub to:        Option<[u8; 20]>,
-    pub value:     u128,
-    pub data:      Vec<u8>,
-    pub v:         u64,
-    pub r:         [u8; 32],
-    pub s:         [u8; 32],
-    pub from:      [u8; 20],
+    pub to: Option<[u8; 20]>,
+    pub value: u128,
+    pub data: Vec<u8>,
+    pub v: u64,
+    pub r: [u8; 32],
+    pub s: [u8; 32],
+    pub from: [u8; 20],
     /// Extracted chain_id (None for pre-EIP-155 txs).
-    pub chain_id:  Option<u64>,
+    pub chain_id: Option<u64>,
 }
 
 impl LegacySignedTx {
     pub fn to_evm_tx(&self) -> EvmTx {
         EvmTx::Legacy {
-            from:      self.from,
-            to:        self.to,
-            nonce:     self.nonce,
+            from: self.from,
+            to: self.to,
+            nonce: self.nonce,
             gas_limit: self.gas_limit,
             gas_price: self.gas_price,
-            value:     self.value,
-            data:      self.data.clone(),
-            chain_id:  self.chain_id.unwrap_or(1),
+            value: self.value,
+            data: self.data.clone(),
+            chain_id: self.chain_id.unwrap_or(1),
         }
     }
 }
@@ -132,24 +136,30 @@ pub fn decode_legacy_signed_tx(raw: &[u8]) -> Result<LegacySignedTx, String> {
         return Err("not a legacy tx (need RLP list of 9)".into());
     }
 
-    let nonce:     u64     = rlp.val_at(0).map_err(|_| "nonce")?;
-    let gas_price: u128    = rlp.val_at(1).map_err(|_| "gas_price")?;
-    let gas_limit: u64     = rlp.val_at(2).map_err(|_| "gas_limit")?;
-    let to_bytes:  Vec<u8> = rlp.val_at(3).map_err(|_| "to")?;
+    let nonce: u64 = rlp.val_at(0).map_err(|_| "nonce")?;
+    let gas_price: u128 = rlp.val_at(1).map_err(|_| "gas_price")?;
+    let gas_limit: u64 = rlp.val_at(2).map_err(|_| "gas_limit")?;
+    let to_bytes: Vec<u8> = rlp.val_at(3).map_err(|_| "to")?;
     let to = if to_bytes.is_empty() {
         None
     } else {
-        if to_bytes.len() != 20 { return Err("to: expected 20 bytes".into()); }
-        let mut a = [0u8; 20]; a.copy_from_slice(&to_bytes); Some(a)
+        if to_bytes.len() != 20 {
+            return Err("to: expected 20 bytes".into());
+        }
+        let mut a = [0u8; 20];
+        a.copy_from_slice(&to_bytes);
+        Some(a)
     };
-    let value: u128    = rlp.val_at(4).map_err(|_| "value")?;
-    let data:  Vec<u8> = rlp.val_at(5).map_err(|_| "data")?;
-    let v:     u64     = rlp.val_at(6).map_err(|_| "v")?;
+    let value: u128 = rlp.val_at(4).map_err(|_| "value")?;
+    let data: Vec<u8> = rlp.val_at(5).map_err(|_| "data")?;
+    let v: u64 = rlp.val_at(6).map_err(|_| "v")?;
     let r_vec: Vec<u8> = rlp.val_at(7).map_err(|_| "r")?;
     let s_vec: Vec<u8> = rlp.val_at(8).map_err(|_| "s")?;
 
     let (mut r, mut s) = ([0u8; 32], [0u8; 32]);
-    if r_vec.len() > 32 || s_vec.len() > 32 { return Err("sig component > 32 bytes".into()); }
+    if r_vec.len() > 32 || s_vec.len() > 32 {
+        return Err("sig component > 32 bytes".into());
+    }
     r[32 - r_vec.len()..].copy_from_slice(&r_vec);
     s[32 - s_vec.len()..].copy_from_slice(&s_vec);
 
@@ -169,18 +179,30 @@ pub fn decode_legacy_signed_tx(raw: &[u8]) -> Result<LegacySignedTx, String> {
 
     let from = recover_sender(&sighash, v, r, s, chain_id)?;
 
-    Ok(LegacySignedTx { nonce, gas_price, gas_limit, to, value, data, v, r, s, from, chain_id })
+    Ok(LegacySignedTx {
+        nonce,
+        gas_price,
+        gas_limit,
+        to,
+        value,
+        data,
+        v,
+        r,
+        s,
+        from,
+        chain_id,
+    })
 }
 
 /// Build the signing pre-image for a legacy tx.
 fn legacy_signing_hash(
-    nonce:     u64,
+    nonce: u64,
     gas_price: u128,
     gas_limit: u64,
-    to:        &Option<[u8; 20]>,
-    value:     u128,
-    data:      &[u8],
-    chain_id:  Option<u64>,
+    to: &Option<[u8; 20]>,
+    value: u128,
+    data: &[u8],
+    chain_id: Option<u64>,
 ) -> [u8; 32] {
     let mut s = rlp::RlpStream::new_list(if chain_id.is_some() { 9 } else { 6 });
     s.append(&nonce);
@@ -188,7 +210,7 @@ fn legacy_signing_hash(
     s.append(&gas_limit);
     match to {
         Some(a) => s.append(&a.as_slice()),
-        None    => s.append_empty_data(),
+        None => s.append_empty_data(),
     };
     append_u128(&mut s, value);
     s.append(&data);
@@ -205,36 +227,38 @@ fn legacy_signing_hash(
 
 #[derive(Debug, Clone)]
 pub struct Eip2930SignedTx {
-    pub chain_id:    u64,
-    pub nonce:       u64,
-    pub gas_price:   u128,
-    pub gas_limit:   u64,
-    pub to:          Option<[u8; 20]>,
-    pub value:       u128,
-    pub data:        Vec<u8>,
+    pub chain_id: u64,
+    pub nonce: u64,
+    pub gas_price: u128,
+    pub gas_limit: u64,
+    pub to: Option<[u8; 20]>,
+    pub value: u128,
+    pub data: Vec<u8>,
     pub access_list: Vec<([u8; 20], Vec<[u8; 32]>)>,
-    pub y_parity:    u8,
-    pub r:           [u8; 32],
-    pub s:           [u8; 32],
-    pub from:        [u8; 20],
+    pub y_parity: u8,
+    pub r: [u8; 32],
+    pub s: [u8; 32],
+    pub from: [u8; 20],
 }
 
 impl Eip2930SignedTx {
     pub fn to_evm_tx(&self) -> EvmTx {
         EvmTx::Eip2930 {
-            from:      self.from,
-            to:        self.to,
-            nonce:     self.nonce,
+            from: self.from,
+            to: self.to,
+            nonce: self.nonce,
             gas_limit: self.gas_limit,
             gas_price: self.gas_price,
-            value:     self.value,
-            data:      self.data.clone(),
-            access_list: self.access_list.iter().map(|(a, keys)| {
-                crate::types::tx_evm::AccessListItem {
-                    address:      *a,
+            value: self.value,
+            data: self.data.clone(),
+            access_list: self
+                .access_list
+                .iter()
+                .map(|(a, keys)| crate::types::tx_evm::AccessListItem {
+                    address: *a,
                     storage_keys: keys.iter().copied().collect(),
-                }
-            }).collect(),
+                })
+                .collect(),
             chain_id: self.chain_id,
         }
     }
@@ -244,41 +268,84 @@ impl Eip2930SignedTx {
 /// Caller must strip the `0x01` type byte before passing `payload`.
 pub fn decode_eip2930_signed_tx(payload: &[u8]) -> Result<Eip2930SignedTx, String> {
     let rlp = Rlp::new(payload);
-    if !rlp.is_list() { return Err("EIP-2930: expected RLP list".into()); }
+    if !rlp.is_list() {
+        return Err("EIP-2930: expected RLP list".into());
+    }
 
-    let chain_id: u64  = rlp.val_at(0).map_err(|_| "chain_id")?;
-    let nonce:    u64  = rlp.val_at(1).map_err(|_| "nonce")?;
+    let chain_id: u64 = rlp.val_at(0).map_err(|_| "chain_id")?;
+    let nonce: u64 = rlp.val_at(1).map_err(|_| "nonce")?;
     let gas_price: u128 = rlp.val_at(2).map_err(|_| "gas_price")?;
-    let gas_limit: u64  = rlp.val_at(3).map_err(|_| "gas")?;
+    let gas_limit: u64 = rlp.val_at(3).map_err(|_| "gas")?;
     let to_bytes: Vec<u8> = rlp.val_at(4).map_err(|_| "to")?;
     let to = decode_to(&to_bytes)?;
-    let value: u128    = rlp.val_at(5).map_err(|_| "value")?;
-    let data:  Vec<u8> = rlp.val_at(6).map_err(|_| "data")?;
+    let value: u128 = rlp.val_at(5).map_err(|_| "value")?;
+    let data: Vec<u8> = rlp.val_at(6).map_err(|_| "data")?;
     let access_list = decode_access_list(&rlp.at(7).map_err(|_| "access_list")?)?;
-    let y_parity: u8   = rlp.val_at(8).map_err(|_| "y_parity")?;
+    let y_parity: u8 = rlp.val_at(8).map_err(|_| "y_parity")?;
     let (r, s) = decode_rs(&rlp, 9, 10)?;
 
     // Signing hash: keccak256(0x01 || rlp([chainId,nonce,gasPrice,gas,to,value,data,accessList]))
-    let sighash = eip2930_signing_hash(chain_id, nonce, gas_price, gas_limit, &to, value, &data, &access_list);
+    let sighash = eip2930_signing_hash(
+        chain_id,
+        nonce,
+        gas_price,
+        gas_limit,
+        &to,
+        value,
+        &data,
+        &access_list,
+    );
     let from = recover_sender_typed(&sighash, y_parity, r, s)?;
 
-    Ok(Eip2930SignedTx { chain_id, nonce, gas_price, gas_limit, to, value, data, access_list, y_parity, r, s, from })
+    Ok(Eip2930SignedTx {
+        chain_id,
+        nonce,
+        gas_price,
+        gas_limit,
+        to,
+        value,
+        data,
+        access_list,
+        y_parity,
+        r,
+        s,
+        from,
+    })
 }
 
 fn eip2930_signing_hash(
-    chain_id: u64, nonce: u64, gas_price: u128, gas_limit: u64,
-    to: &Option<[u8; 20]>, value: u128, data: &[u8],
+    chain_id: u64,
+    nonce: u64,
+    gas_price: u128,
+    gas_limit: u64,
+    to: &Option<[u8; 20]>,
+    value: u128,
+    data: &[u8],
     access_list: &[([u8; 20], Vec<[u8; 32]>)],
 ) -> [u8; 32] {
-    let inner = encode_eip2930_body(chain_id, nonce, gas_price, gas_limit, to, value, data, access_list);
+    let inner = encode_eip2930_body(
+        chain_id,
+        nonce,
+        gas_price,
+        gas_limit,
+        to,
+        value,
+        data,
+        access_list,
+    );
     let mut preimage = vec![0x01u8];
     preimage.extend_from_slice(&inner);
     keccak256(&preimage)
 }
 
 fn encode_eip2930_body(
-    chain_id: u64, nonce: u64, gas_price: u128, gas_limit: u64,
-    to: &Option<[u8; 20]>, value: u128, data: &[u8],
+    chain_id: u64,
+    nonce: u64,
+    gas_price: u128,
+    gas_limit: u64,
+    to: &Option<[u8; 20]>,
+    value: u128,
+    data: &[u8],
     access_list: &[([u8; 20], Vec<[u8; 32]>)],
 ) -> Vec<u8> {
     let mut s = rlp::RlpStream::new_list(8);
@@ -297,38 +364,40 @@ fn encode_eip2930_body(
 
 #[derive(Debug, Clone)]
 pub struct Eip1559SignedTx {
-    pub chain_id:                  u64,
-    pub nonce:                     u64,
-    pub max_priority_fee_per_gas:  u128,
-    pub max_fee_per_gas:           u128,
-    pub gas_limit:                 u64,
-    pub to:                        Option<[u8; 20]>,
-    pub value:                     u128,
-    pub data:                      Vec<u8>,
-    pub access_list:               Vec<([u8; 20], Vec<[u8; 32]>)>,
-    pub y_parity:                  u8,
-    pub r:                         [u8; 32],
-    pub s:                         [u8; 32],
-    pub from:                      [u8; 20],
+    pub chain_id: u64,
+    pub nonce: u64,
+    pub max_priority_fee_per_gas: u128,
+    pub max_fee_per_gas: u128,
+    pub gas_limit: u64,
+    pub to: Option<[u8; 20]>,
+    pub value: u128,
+    pub data: Vec<u8>,
+    pub access_list: Vec<([u8; 20], Vec<[u8; 32]>)>,
+    pub y_parity: u8,
+    pub r: [u8; 32],
+    pub s: [u8; 32],
+    pub from: [u8; 20],
 }
 
 impl Eip1559SignedTx {
     pub fn to_evm_tx(&self) -> EvmTx {
         EvmTx::Eip1559 {
-            from:                    self.from,
-            to:                      self.to,
-            nonce:                   self.nonce,
-            gas_limit:               self.gas_limit,
-            max_fee_per_gas:         self.max_fee_per_gas,
+            from: self.from,
+            to: self.to,
+            nonce: self.nonce,
+            gas_limit: self.gas_limit,
+            max_fee_per_gas: self.max_fee_per_gas,
             max_priority_fee_per_gas: self.max_priority_fee_per_gas,
-            value:                   self.value,
-            data:                    self.data.clone(),
-            access_list: self.access_list.iter().map(|(a, keys)| {
-                crate::types::tx_evm::AccessListItem {
-                    address:      *a,
+            value: self.value,
+            data: self.data.clone(),
+            access_list: self
+                .access_list
+                .iter()
+                .map(|(a, keys)| crate::types::tx_evm::AccessListItem {
+                    address: *a,
                     storage_keys: keys.iter().copied().collect(),
-                }
-            }).collect(),
+                })
+                .collect(),
             chain_id: self.chain_id,
         }
     }
@@ -338,37 +407,63 @@ impl Eip1559SignedTx {
 /// Caller must strip the `0x02` type byte before passing `payload`.
 pub fn decode_eip1559_signed_tx(payload: &[u8]) -> Result<Eip1559SignedTx, String> {
     let rlp = Rlp::new(payload);
-    if !rlp.is_list() { return Err("EIP-1559: expected RLP list".into()); }
+    if !rlp.is_list() {
+        return Err("EIP-1559: expected RLP list".into());
+    }
 
-    let chain_id: u64  = rlp.val_at(0).map_err(|_| "chain_id")?;
-    let nonce:    u64  = rlp.val_at(1).map_err(|_| "nonce")?;
+    let chain_id: u64 = rlp.val_at(0).map_err(|_| "chain_id")?;
+    let nonce: u64 = rlp.val_at(1).map_err(|_| "nonce")?;
     let max_priority_fee_per_gas: u128 = rlp.val_at(2).map_err(|_| "max_priority_fee")?;
-    let max_fee_per_gas: u128          = rlp.val_at(3).map_err(|_| "max_fee")?;
-    let gas_limit: u64                 = rlp.val_at(4).map_err(|_| "gas")?;
-    let to_bytes: Vec<u8>              = rlp.val_at(5).map_err(|_| "to")?;
+    let max_fee_per_gas: u128 = rlp.val_at(3).map_err(|_| "max_fee")?;
+    let gas_limit: u64 = rlp.val_at(4).map_err(|_| "gas")?;
+    let to_bytes: Vec<u8> = rlp.val_at(5).map_err(|_| "to")?;
     let to = decode_to(&to_bytes)?;
-    let value: u128    = rlp.val_at(6).map_err(|_| "value")?;
-    let data:  Vec<u8> = rlp.val_at(7).map_err(|_| "data")?;
+    let value: u128 = rlp.val_at(6).map_err(|_| "value")?;
+    let data: Vec<u8> = rlp.val_at(7).map_err(|_| "data")?;
     let access_list = decode_access_list(&rlp.at(8).map_err(|_| "access_list")?)?;
-    let y_parity: u8   = rlp.val_at(9).map_err(|_| "y_parity")?;
+    let y_parity: u8 = rlp.val_at(9).map_err(|_| "y_parity")?;
     let (r, s) = decode_rs(&rlp, 10, 11)?;
 
     // Signing hash: keccak256(0x02 || rlp([chainId,...]))
     let sighash = eip1559_signing_hash(
-        chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas,
-        gas_limit, &to, value, &data, &access_list,
+        chain_id,
+        nonce,
+        max_priority_fee_per_gas,
+        max_fee_per_gas,
+        gas_limit,
+        &to,
+        value,
+        &data,
+        &access_list,
     );
     let from = recover_sender_typed(&sighash, y_parity, r, s)?;
 
     Ok(Eip1559SignedTx {
-        chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas,
-        gas_limit, to, value, data, access_list, y_parity, r, s, from,
+        chain_id,
+        nonce,
+        max_priority_fee_per_gas,
+        max_fee_per_gas,
+        gas_limit,
+        to,
+        value,
+        data,
+        access_list,
+        y_parity,
+        r,
+        s,
+        from,
     })
 }
 
 fn eip1559_signing_hash(
-    chain_id: u64, nonce: u64, max_priority: u128, max_fee: u128,
-    gas_limit: u64, to: &Option<[u8; 20]>, value: u128, data: &[u8],
+    chain_id: u64,
+    nonce: u64,
+    max_priority: u128,
+    max_fee: u128,
+    gas_limit: u64,
+    to: &Option<[u8; 20]>,
+    value: u128,
+    data: &[u8],
     access_list: &[([u8; 20], Vec<[u8; 32]>)],
 ) -> [u8; 32] {
     let mut s = rlp::RlpStream::new_list(9);
@@ -391,7 +486,9 @@ fn eip1559_signing_hash(
 
 /// Decode any supported raw transaction type and return the typed tx + sender.
 pub fn decode_raw_tx(raw: &[u8]) -> Result<(EvmTx, [u8; 20]), String> {
-    if raw.is_empty() { return Err("empty tx".into()); }
+    if raw.is_empty() {
+        return Err("empty tx".into());
+    }
     match raw[0] {
         0x01 => {
             let tx = decode_eip2930_signed_tx(&raw[1..])?;
@@ -415,15 +512,23 @@ pub fn decode_raw_tx(raw: &[u8]) -> Result<(EvmTx, [u8; 20]), String> {
 // ── Shared RLP helpers ────────────────────────────────────────────────────
 
 fn decode_to(bytes: &[u8]) -> Result<Option<[u8; 20]>, String> {
-    if bytes.is_empty() { return Ok(None); }
-    if bytes.len() != 20 { return Err(format!("to: expected 20 bytes, got {}", bytes.len())); }
-    let mut a = [0u8; 20]; a.copy_from_slice(bytes); Ok(Some(a))
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() != 20 {
+        return Err(format!("to: expected 20 bytes, got {}", bytes.len()));
+    }
+    let mut a = [0u8; 20];
+    a.copy_from_slice(bytes);
+    Ok(Some(a))
 }
 
 fn decode_rs(rlp: &Rlp, r_idx: usize, s_idx: usize) -> Result<([u8; 32], [u8; 32]), String> {
     let r_vec: Vec<u8> = rlp.val_at(r_idx).map_err(|_| "r")?;
     let s_vec: Vec<u8> = rlp.val_at(s_idx).map_err(|_| "s")?;
-    if r_vec.len() > 32 || s_vec.len() > 32 { return Err("sig component > 32 bytes".into()); }
+    if r_vec.len() > 32 || s_vec.len() > 32 {
+        return Err("sig component > 32 bytes".into());
+    }
     let (mut r, mut s) = ([0u8; 32], [0u8; 32]);
     r[32 - r_vec.len()..].copy_from_slice(&r_vec);
     s[32 - s_vec.len()..].copy_from_slice(&s_vec);
@@ -432,18 +537,26 @@ fn decode_rs(rlp: &Rlp, r_idx: usize, s_idx: usize) -> Result<([u8; 32], [u8; 32
 
 fn decode_access_list(al: &Rlp) -> Result<Vec<([u8; 20], Vec<[u8; 32]>)>, String> {
     let mut out = vec![];
-    if !al.is_list() { return Ok(out); }
+    if !al.is_list() {
+        return Ok(out);
+    }
     for i in 0..al.item_count().unwrap_or(0) {
         let item = al.at(i).map_err(|_| "al item")?;
         let addr_bytes: Vec<u8> = item.val_at(0).map_err(|_| "al addr")?;
-        if addr_bytes.len() != 20 { return Err("al addr: expected 20 bytes".into()); }
-        let mut addr = [0u8; 20]; addr.copy_from_slice(&addr_bytes);
+        if addr_bytes.len() != 20 {
+            return Err("al addr: expected 20 bytes".into());
+        }
+        let mut addr = [0u8; 20];
+        addr.copy_from_slice(&addr_bytes);
         let keys_rlp = item.at(1).map_err(|_| "al keys")?;
         let mut keys = vec![];
         for j in 0..keys_rlp.item_count().unwrap_or(0) {
             let k: Vec<u8> = keys_rlp.val_at(j).map_err(|_| "key")?;
-            if k.len() > 32 { return Err("storage key > 32 bytes".into()); }
-            let mut hh = [0u8; 32]; hh[32 - k.len()..].copy_from_slice(&k);
+            if k.len() > 32 {
+                return Err("storage key > 32 bytes".into());
+            }
+            let mut hh = [0u8; 32];
+            hh[32 - k.len()..].copy_from_slice(&k);
             keys.push(hh);
         }
         out.push((addr, keys));
@@ -454,7 +567,7 @@ fn decode_access_list(al: &Rlp) -> Result<Vec<([u8; 20], Vec<[u8; 32]>)>, String
 fn encode_to(s: &mut rlp::RlpStream, to: &Option<[u8; 20]>) {
     match to {
         Some(a) => s.append(&a.as_slice()),
-        None    => s.append_empty_data(),
+        None => s.append_empty_data(),
     };
 }
 
@@ -464,7 +577,9 @@ fn encode_access_list(s: &mut rlp::RlpStream, al: &[([u8; 20], Vec<[u8; 32]>)]) 
         s.begin_list(2);
         s.append(&addr.as_slice());
         s.begin_list(keys.len());
-        for k in keys { s.append(&k.as_slice()); }
+        for k in keys {
+            s.append(&k.as_slice());
+        }
     }
 }
 
@@ -476,7 +591,8 @@ fn append_u128(s: &mut rlp::RlpStream, v: u128) {
         let bytes = v.to_be_bytes();
         let trimmed: &[u8] = bytes.as_ref();
         let start = trimmed.iter().position(|&b| b != 0).unwrap_or(15);
-        s.append(&trimmed[start..]);
+        let tail: &[u8] = &trimmed[start..];
+        s.append(&tail);
     }
 }
 
@@ -487,9 +603,9 @@ mod tests {
     #[test]
     fn keccak_known() {
         let h = keccak256(b"");
-        let expected = hex::decode(
-            "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
-        ).unwrap();
+        let expected =
+            hex::decode("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+                .unwrap();
         assert_eq!(&h[..], &expected[..]);
     }
 

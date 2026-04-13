@@ -17,7 +17,9 @@
 //! | UC-7  | No concurrent upgrades   | Only one PV upgrade active at a time              |
 //! | UC-8  | Quorum before activation | Sufficient nodes must be upgraded before activation|
 
-use crate::protocol::version::{ProtocolActivation, SUPPORTED_PROTOCOL_VERSIONS, CURRENT_PROTOCOL_VERSION};
+use crate::protocol::version::{
+    ProtocolActivation, CURRENT_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+};
 use crate::storage::CURRENT_SCHEMA_VERSION;
 
 /// Minimum grace window for any activation (blocks).
@@ -48,22 +50,25 @@ pub struct ConstraintReport {
 
 impl ConstraintReport {
     pub fn from_results(results: Vec<ConstraintResult>) -> Self {
-        let can_upgrade = results.iter()
-            .filter(|r| r.hard)
-            .all(|r| r.passed);
-        Self { results, can_upgrade }
+        let can_upgrade = results.iter().filter(|r| r.hard).all(|r| r.passed);
+        Self {
+            results,
+            can_upgrade,
+        }
     }
 
     /// Get only failed hard constraints.
     pub fn blockers(&self) -> Vec<&ConstraintResult> {
-        self.results.iter()
+        self.results
+            .iter()
             .filter(|r| r.hard && !r.passed)
             .collect()
     }
 
     /// Get soft warnings.
     pub fn warnings(&self) -> Vec<&ConstraintResult> {
-        self.results.iter()
+        self.results
+            .iter()
             .filter(|r| !r.hard && !r.passed)
             .collect()
     }
@@ -71,10 +76,23 @@ impl ConstraintReport {
 
 impl std::fmt::Display for ConstraintReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Upgrade Constraints: {}",
-            if self.can_upgrade { "ALLOWED" } else { "BLOCKED" })?;
+        writeln!(
+            f,
+            "Upgrade Constraints: {}",
+            if self.can_upgrade {
+                "ALLOWED"
+            } else {
+                "BLOCKED"
+            }
+        )?;
         for r in &self.results {
-            let mark = if r.passed { "OK" } else if r.hard { "BLOCK" } else { "WARN" };
+            let mark = if r.passed {
+                "OK"
+            } else if r.hard {
+                "BLOCK"
+            } else {
+                "WARN"
+            };
             writeln!(f, "  [{mark}] {}: {} — {}", r.id, r.name, r.detail)?;
         }
         Ok(())
@@ -94,12 +112,12 @@ pub struct ConstraintChecker {
 }
 
 impl ConstraintChecker {
-    pub fn new(
-        activations: Vec<ProtocolActivation>,
-        current_height: u64,
-        current_sv: u32,
-    ) -> Self {
-        Self { activations, current_height, current_sv }
+    pub fn new(activations: Vec<ProtocolActivation>, current_height: u64, current_sv: u32) -> Self {
+        Self {
+            activations,
+            current_height,
+            current_sv,
+        }
     }
 
     /// Check all constraints for a proposed upgrade.
@@ -148,10 +166,7 @@ impl ConstraintChecker {
             id: "UC-2".into(),
             name: "SV forward-only".into(),
             passed: target_sv >= self.current_sv,
-            detail: format!(
-                "current SV={}, target SV={target_sv}",
-                self.current_sv
-            ),
+            detail: format!("current SV={}, target SV={target_sv}", self.current_sv),
             hard: true,
         }
     }
@@ -202,9 +217,7 @@ impl ConstraintChecker {
             id: "UC-4".into(),
             name: "Grace window minimum".into(),
             passed: grace_blocks >= MIN_GRACE_BLOCKS,
-            detail: format!(
-                "grace_blocks={grace_blocks} (min={MIN_GRACE_BLOCKS})"
-            ),
+            detail: format!("grace_blocks={grace_blocks} (min={MIN_GRACE_BLOCKS})"),
             hard: false, // Advisory; some testnets may use zero grace.
         }
     }
@@ -261,7 +274,8 @@ impl ConstraintChecker {
             a.activation_height
                 .map(|ah| {
                     let end = ah + a.grace_blocks;
-                    self.current_height >= ah && self.current_height < end
+                    self.current_height >= ah
+                        && self.current_height < end
                         && a.protocol_version != target_pv
                 })
                 .unwrap_or(false)
@@ -308,12 +322,11 @@ pub fn can_upgrade(
     current_height: u64,
     activations: &[ProtocolActivation],
 ) -> bool {
-    let checker = ConstraintChecker::new(
-        activations.to_vec(),
-        current_height,
-        CURRENT_SCHEMA_VERSION,
-    );
-    checker.check_upgrade(target_pv, target_sv, activation_height, grace_blocks).can_upgrade
+    let checker =
+        ConstraintChecker::new(activations.to_vec(), current_height, CURRENT_SCHEMA_VERSION);
+    checker
+        .check_upgrade(target_pv, target_sv, activation_height, grace_blocks)
+        .can_upgrade
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -324,11 +337,7 @@ mod tests {
     use crate::protocol::version::default_activations;
 
     fn checker(height: u64) -> ConstraintChecker {
-        ConstraintChecker::new(
-            default_activations(),
-            height,
-            CURRENT_SCHEMA_VERSION,
-        )
+        ConstraintChecker::new(default_activations(), height, CURRENT_SCHEMA_VERSION)
     }
 
     #[test]
@@ -399,7 +408,14 @@ mod tests {
     #[test]
     fn test_can_upgrade_convenience() {
         let activations = default_activations();
-        assert!(can_upgrade(1, CURRENT_SCHEMA_VERSION, None, 0, 100, &activations));
+        assert!(can_upgrade(
+            1,
+            CURRENT_SCHEMA_VERSION,
+            None,
+            0,
+            100,
+            &activations
+        ));
     }
 
     #[test]
@@ -413,13 +429,11 @@ mod tests {
     #[test]
     fn test_no_concurrent_upgrades() {
         // Create activation in progress.
-        let activations = vec![
-            ProtocolActivation {
-                protocol_version: 1,
-                activation_height: Some(50),
-                grace_blocks: 100,
-            },
-        ];
+        let activations = vec![ProtocolActivation {
+            protocol_version: 1,
+            activation_height: Some(50),
+            grace_blocks: 100,
+        }];
         let c = ConstraintChecker::new(activations, 80, CURRENT_SCHEMA_VERSION);
         // Try to start another upgrade while first is in grace.
         let report = c.check_upgrade(1, CURRENT_SCHEMA_VERSION, Some(200), 100);

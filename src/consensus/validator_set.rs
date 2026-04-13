@@ -20,7 +20,11 @@ impl ValidatorSet {
     }
 
     pub fn power_of(&self, pk: &PublicKeyBytes) -> VotingPower {
-        self.vals.iter().find(|v| &v.pk == pk).map(|v| v.power).unwrap_or(0)
+        self.vals
+            .iter()
+            .find(|v| &v.pk == pk)
+            .map(|v| v.power)
+            .unwrap_or(0)
     }
 
     pub fn contains(&self, pk: &PublicKeyBytes) -> bool {
@@ -34,13 +38,12 @@ impl ValidatorSet {
     }
 }
 
-
 impl ValidatorSet {
     /// Deterministic hash of the validator set (used to bind snapshot attestations to a specific epoch).
     pub fn hash_hex(&self) -> String {
         // Canonical: sort by public key bytes
         let mut vals = self.vals.clone();
-        vals.sort_by(|a,b| a.pk.0.cmp(&b.pk.0));
+        vals.sort_by(|a, b| a.pk.0.cmp(&b.pk.0));
         let bytes = bincode::serialize(&vals).unwrap_or_default();
         let h = blake3::hash(&bytes);
         h.to_hex().to_string()

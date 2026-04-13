@@ -42,7 +42,9 @@ fn rlp_account(nonce: u64, balance: U256, storage_root: [u8; 32], code_hash: [u8
 /// Convert U256 to minimal big-endian bytes (trim leading zeros).
 /// Compatible with ruint U256 used in revm v9.
 pub fn u256_to_be_trimmed(v: U256) -> Vec<u8> {
-    if v == U256::ZERO { return vec![]; }
+    if v == U256::ZERO {
+        return vec![];
+    }
     // U256 in ruint has to_be_bytes::<32>() returning [u8;32]
     let bytes: [u8; 32] = v.to_be_bytes();
     let start = bytes.iter().position(|&b| b != 0).unwrap_or(31);
@@ -56,7 +58,9 @@ pub fn compute_storage_root(addr: &Address, db: &MemDb) -> [u8; 32] {
         .iter()
         .filter(|((a, _), _)| a == addr)
         .filter_map(|((_, key), val)| {
-            if *val == U256::ZERO { return None; }
+            if *val == U256::ZERO {
+                return None;
+            }
             let k: [u8; 32] = key.to_be_bytes();
             let v_bytes = u256_to_be_trimmed(*val);
             // RLP encode value as a single-item list for storage trie leaves
@@ -77,7 +81,7 @@ pub fn compute_storage_root(addr: &Address, db: &MemDb) -> [u8; 32] {
     // In production this would be a real secure MPT; here it's a stable placeholder.
     let mut h = Keccak256::new();
     for (k, v) in &entries {
-        h.update(keccak256(k));  // secure MPT: key = keccak(slot)
+        h.update(keccak256(k)); // secure MPT: key = keccak(slot)
         h.update(v);
     }
     h.finalize().into()
@@ -106,9 +110,9 @@ pub fn compute_state_root_hex(db: &MemDb) -> String {
             .iter()
             .map(|(addr, info)| {
                 // revm v9: nonce is u64 (not Option)
-                let nonce      = info.nonce;
-                let balance    = info.balance;
-                let stor_root  = compute_storage_root(addr, db);
+                let nonce = info.nonce;
+                let balance = info.balance;
+                let stor_root = compute_storage_root(addr, db);
                 // revm v9: code_hash is B256 (not Option)
                 let code_hash: [u8; 32] = info.code_hash.0;
                 rlp_account(nonce, balance, stor_root, code_hash)
@@ -117,7 +121,9 @@ pub fn compute_state_root_hex(db: &MemDb) -> String {
 
         items.sort();
         let mut h = Keccak256::new();
-        for it in &items { h.update(it); }
+        for it in &items {
+            h.update(it);
+        }
         return format!("0x{}", hex::encode(h.finalize()));
     }
 }
@@ -135,9 +141,9 @@ fn compute_state_root_hex_mpt(db: &MemDb) -> String {
     {
         let mut trie = TrieDBMut::new(&mut memdb, &mut root);
         for (addr, info) in &db.accounts {
-            let nonce      = info.nonce;
-            let balance    = info.balance;
-            let stor_root  = compute_storage_root(addr, db);
+            let nonce = info.nonce;
+            let balance = info.balance;
+            let stor_root = compute_storage_root(addr, db);
             let code_hash: [u8; 32] = info.code_hash.0;
             let account_rlp = rlp_account(nonce, balance, stor_root, code_hash);
             // Secure trie: key = keccak256(address)

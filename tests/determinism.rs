@@ -11,17 +11,17 @@
 //! 2. Add it as a constant here.
 //! 3. Write a test that asserts the function output matches.
 
-use iona::types::{hash_bytes, tx_hash, tx_root, receipts_root, Hash32, Tx, Receipt, Block, BlockHeader};
+use iona::types::{
+    hash_bytes, receipts_root, tx_hash, tx_root, Block, BlockHeader, Hash32, Receipt, Tx,
+};
 
 // ── Golden vectors ───────────────────────────────────────────────────────────
 
 /// blake3("IONA_DETERMINISM_TEST") — computed once, frozen forever.
-const GOLDEN_HASH_HEX: &str =
-    "a]PLACEHOLDER"; // Will be computed below
+const GOLDEN_HASH_HEX: &str = "a]PLACEHOLDER"; // Will be computed below
 
 /// tx_hash of a canonical test transaction.
-const GOLDEN_TX_HASH_HEX: &str =
-    "b]PLACEHOLDER";
+const GOLDEN_TX_HASH_HEX: &str = "b]PLACEHOLDER";
 
 fn canonical_tx() -> Tx {
     Tx {
@@ -123,7 +123,10 @@ fn determinism_block_id_stable() {
         timestamp: 1000,
         protocol_version: 1,
     };
-    let block = Block { header, txs: vec![] };
+    let block = Block {
+        header,
+        txs: vec![],
+    };
     let id1 = block.id();
     let id2 = block.id();
     assert_eq!(id1, id2, "block.id() is not deterministic");
@@ -146,7 +149,11 @@ fn determinism_state_root_order_independent() {
     s2.kv.insert("a".into(), "1".into());
     s2.kv.insert("b".into(), "2".into());
 
-    assert_eq!(s1.root(), s2.root(), "state root depends on insertion order — NOT deterministic");
+    assert_eq!(
+        s1.root(),
+        s2.root(),
+        "state root depends on insertion order — NOT deterministic"
+    );
 }
 
 // ── Cross-migration equivalence tests (UPGRADE_SPEC section 10.2) ───────────
@@ -169,13 +176,14 @@ fn determinism_migration_root_equivalence() {
 
     // Simulate a "format-only" migration: clone the state (as if re-serialized
     // in a different format) and verify the root is identical.
-    let state_after: KvState = serde_json::from_str(
-        &serde_json::to_string(&state).unwrap()
-    ).unwrap();
+    let state_after: KvState =
+        serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
 
     let root_after = state_after.root();
-    assert_eq!(root_before, root_after,
-        "state root changed after format-only migration (M3 violation)");
+    assert_eq!(
+        root_before, root_after,
+        "state root changed after format-only migration (M3 violation)"
+    );
 }
 
 /// M1 invariant: migration must not lose account keys.
@@ -194,15 +202,19 @@ fn determinism_migration_no_key_loss() {
     let kv_keys_before: Vec<String> = state.kv.keys().cloned().collect();
 
     // Simulate migration via serialize/deserialize
-    let migrated: KvState = serde_json::from_str(
-        &serde_json::to_string(&state).unwrap()
-    ).unwrap();
+    let migrated: KvState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
 
     let keys_after: Vec<String> = migrated.balances.keys().cloned().collect();
     let kv_keys_after: Vec<String> = migrated.kv.keys().cloned().collect();
 
-    assert_eq!(keys_before, keys_after, "account keys lost during migration (M1 violation)");
-    assert_eq!(kv_keys_before, kv_keys_after, "KV keys lost during migration (M1 violation)");
+    assert_eq!(
+        keys_before, keys_after,
+        "account keys lost during migration (M1 violation)"
+    );
+    assert_eq!(
+        kv_keys_before, kv_keys_after,
+        "KV keys lost during migration (M1 violation)"
+    );
 }
 
 /// M2 invariant: total supply must be conserved across a migration.
@@ -218,9 +230,7 @@ fn determinism_migration_value_conservation() {
     let supply_before: u64 = state.balances.values().sum::<u64>() + state.burned;
 
     // Simulate migration
-    let migrated: KvState = serde_json::from_str(
-        &serde_json::to_string(&state).unwrap()
-    ).unwrap();
+    let migrated: KvState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
 
     let supply_after: u64 = migrated.balances.values().sum::<u64>() + migrated.burned;
 
@@ -253,7 +263,10 @@ fn determinism_pv_function_stable() {
         assert_eq!(pv1, pv2, "PV not deterministic at height {height}");
 
         if height < 100 {
-            assert_eq!(pv1, 1, "PV should be 1 before activation at height {height}");
+            assert_eq!(
+                pv1, 1,
+                "PV should be 1 before activation at height {height}"
+            );
         } else {
             assert_eq!(pv1, 2, "PV should be 2 after activation at height {height}");
         }

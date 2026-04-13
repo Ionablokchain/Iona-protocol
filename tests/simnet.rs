@@ -77,7 +77,10 @@ fn make_vset(keys: &[Ed25519Keypair]) -> ValidatorSet {
     ValidatorSet {
         vals: keys
             .iter()
-            .map(|k| Validator { pk: k.public_key(), power: 100 })
+            .map(|k| Validator {
+                pk: k.public_key(),
+                power: 100,
+            })
             .collect(),
     }
 }
@@ -246,7 +249,17 @@ fn simnet_happy_path_multi_block() {
 
     let mut engines: Vec<Engine<Ed25519Verifier>> = keys
         .iter()
-        .map(|_| Engine::new(cfg.clone(), vset.clone(), 1, Hash32::zero(), state.clone(), stakes.clone(), None))
+        .map(|_| {
+            Engine::new(
+                cfg.clone(),
+                vset.clone(),
+                1,
+                Hash32::zero(),
+                state.clone(),
+                stakes.clone(),
+                None,
+            )
+        })
         .collect();
     let mut outboxes: Vec<RecordingOutbox> = (0..n).map(|_| RecordingOutbox::default()).collect();
 
@@ -255,9 +268,9 @@ fn simnet_happy_path_multi_block() {
         tick_all(&mut engines, &mut outboxes, &stores, &keys);
         broadcast_all(&mut engines, &mut outboxes, &stores, &keys);
 
-        let all_committed = outboxes.iter().all(|o| {
-            o.commits.lock().unwrap().len() >= target_height
-        });
+        let all_committed = outboxes
+            .iter()
+            .all(|o| o.commits.lock().unwrap().len() >= target_height);
         if all_committed {
             break;
         }
@@ -296,7 +309,17 @@ fn simnet_partition_and_heal() {
 
     let mut engines: Vec<Engine<Ed25519Verifier>> = keys
         .iter()
-        .map(|_| Engine::new(cfg.clone(), vset.clone(), 1, Hash32::zero(), state.clone(), stakes.clone(), None))
+        .map(|_| {
+            Engine::new(
+                cfg.clone(),
+                vset.clone(),
+                1,
+                Hash32::zero(),
+                state.clone(),
+                stakes.clone(),
+                None,
+            )
+        })
         .collect();
     let mut outboxes: Vec<RecordingOutbox> = (0..n).map(|_| RecordingOutbox::default()).collect();
 
@@ -324,9 +347,9 @@ fn simnet_partition_and_heal() {
         tick_all(&mut engines, &mut outboxes, &stores, &keys);
         broadcast_all(&mut engines, &mut outboxes, &stores, &keys);
 
-        let some_committed = outboxes.iter().any(|o| {
-            !o.commits.lock().unwrap().is_empty()
-        });
+        let some_committed = outboxes
+            .iter()
+            .any(|o| !o.commits.lock().unwrap().is_empty());
         if some_committed {
             // Give others a few more rounds to catch up
             for _ in 0..50 {
@@ -340,7 +363,8 @@ fn simnet_partition_and_heal() {
     assert_safety(&outboxes);
 
     // After heal, at least some validators should have committed
-    let total_commits: usize = outboxes.iter()
+    let total_commits: usize = outboxes
+        .iter()
         .map(|o| o.commits.lock().unwrap().len())
         .sum();
     assert!(total_commits > 0, "No commits after network heal");
@@ -360,7 +384,17 @@ fn simnet_message_drop_resilience() {
 
     let mut engines: Vec<Engine<Ed25519Verifier>> = keys
         .iter()
-        .map(|_| Engine::new(cfg.clone(), vset.clone(), 1, Hash32::zero(), state.clone(), stakes.clone(), None))
+        .map(|_| {
+            Engine::new(
+                cfg.clone(),
+                vset.clone(),
+                1,
+                Hash32::zero(),
+                state.clone(),
+                stakes.clone(),
+                None,
+            )
+        })
         .collect();
     let mut outboxes: Vec<RecordingOutbox> = (0..n).map(|_| RecordingOutbox::default()).collect();
 
@@ -368,9 +402,10 @@ fn simnet_message_drop_resilience() {
         tick_all(&mut engines, &mut outboxes, &stores, &keys);
         broadcast_with_drop(&mut engines, &mut outboxes, &stores, &keys, 0.20);
 
-        let committed = outboxes.iter().filter(|o| {
-            !o.commits.lock().unwrap().is_empty()
-        }).count();
+        let committed = outboxes
+            .iter()
+            .filter(|o| !o.commits.lock().unwrap().is_empty())
+            .count();
         if committed >= n - 1 {
             break;
         }
@@ -378,7 +413,8 @@ fn simnet_message_drop_resilience() {
 
     assert_safety(&outboxes);
 
-    let total_commits: usize = outboxes.iter()
+    let total_commits: usize = outboxes
+        .iter()
         .map(|o| o.commits.lock().unwrap().len())
         .sum();
     assert!(total_commits > 0, "No commits under 20% drop rate");
@@ -399,7 +435,17 @@ fn simnet_one_validator_offline() {
 
     let mut engines: Vec<Engine<Ed25519Verifier>> = keys
         .iter()
-        .map(|_| Engine::new(cfg.clone(), vset.clone(), 1, Hash32::zero(), state.clone(), stakes.clone(), None))
+        .map(|_| {
+            Engine::new(
+                cfg.clone(),
+                vset.clone(),
+                1,
+                Hash32::zero(),
+                state.clone(),
+                stakes.clone(),
+                None,
+            )
+        })
         .collect();
     let mut outboxes: Vec<RecordingOutbox> = (0..n).map(|_| RecordingOutbox::default()).collect();
 
@@ -418,7 +464,8 @@ fn simnet_one_validator_offline() {
         // Only deliver to/from online validators
         broadcast_to_partition(&online, &mut engines, &mut outboxes, &stores, &keys);
 
-        let online_commits: usize = online.iter()
+        let online_commits: usize = online
+            .iter()
             .map(|&i| outboxes[i].commits.lock().unwrap().len())
             .sum();
         if online_commits >= 3 {

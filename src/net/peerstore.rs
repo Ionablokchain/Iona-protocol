@@ -7,7 +7,12 @@
 //! correct bootnode entries.
 
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, io, path::Path, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::BTreeMap,
+    fs, io,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 /// A known peer entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,8 +46,9 @@ impl Peerstore {
             return Ok(Self::default());
         }
         let s = fs::read_to_string(p)?;
-        serde_json::from_str(&s)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("peerstore parse: {e}")))
+        serde_json::from_str(&s).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("peerstore parse: {e}"))
+        })
     }
 
     /// Save to a JSON file (atomic: write tmp then rename).
@@ -52,8 +58,9 @@ impl Peerstore {
             fs::create_dir_all(parent)?;
         }
         let tmp = p.with_extension("json.tmp");
-        let out = serde_json::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("peerstore encode: {e}")))?;
+        let out = serde_json::to_string_pretty(self).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("peerstore encode: {e}"))
+        })?;
         fs::write(&tmp, &out)?;
         fs::rename(&tmp, p)?;
         Ok(())
@@ -66,14 +73,17 @@ impl Peerstore {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let entry = self.peers.entry(peer_id.to_string()).or_insert_with(|| PeerEntry {
-            peer_id: peer_id.to_string(),
-            addrs: Vec::new(),
-            last_seen: 0,
-            success_count: 0,
-            fail_count: 0,
-            label: String::new(),
-        });
+        let entry = self
+            .peers
+            .entry(peer_id.to_string())
+            .or_insert_with(|| PeerEntry {
+                peer_id: peer_id.to_string(),
+                addrs: Vec::new(),
+                last_seen: 0,
+                success_count: 0,
+                fail_count: 0,
+                label: String::new(),
+            });
 
         entry.last_seen = now;
         entry.success_count += 1;
@@ -125,9 +135,8 @@ impl Peerstore {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        self.peers.retain(|_, entry| {
-            now.saturating_sub(entry.last_seen) < max_age_secs
-        });
+        self.peers
+            .retain(|_, entry| now.saturating_sub(entry.last_seen) < max_age_secs);
     }
 }
 
@@ -219,14 +228,17 @@ mod tests {
         ps.record_success("recent", &["/ip4/1.2.3.4/tcp/7001".into()]);
 
         // Manually set an old peer.
-        ps.peers.insert("old".into(), PeerEntry {
-            peer_id: "old".into(),
-            addrs: vec!["/ip4/9.8.7.6/tcp/7001".into()],
-            last_seen: 1000, // very old
-            success_count: 1,
-            fail_count: 0,
-            label: String::new(),
-        });
+        ps.peers.insert(
+            "old".into(),
+            PeerEntry {
+                peer_id: "old".into(),
+                addrs: vec!["/ip4/9.8.7.6/tcp/7001".into()],
+                last_seen: 1000, // very old
+                success_count: 1,
+                fail_count: 0,
+                label: String::new(),
+            },
+        );
 
         assert_eq!(ps.len(), 2);
         ps.prune(3600); // 1 hour max age

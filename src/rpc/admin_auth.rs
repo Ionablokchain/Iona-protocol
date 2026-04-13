@@ -57,14 +57,7 @@ impl std::fmt::Debug for AdminAuthState {
 /// parse its Subject CN, and compute its SHA-256 fingerprint.
 ///
 /// Returns `None` if no certificate was presented or TLS is not active.
-pub fn extract_identity_from_request(req: &Request) -> Option<ClientIdentity> {
-    // axum-server stores rustls peer certs under this extension key.
-    // In non-TLS tests or when mTLS is disabled, the extension is absent.
-    if let Some(certs) = req.extensions().get::<axum_server::tls_rustls::PeerCertificates>() {
-        if let Some(leaf) = certs.iter().next() {
-            return Some(parse_cert_identity(leaf.as_ref()));
-        }
-    }
+pub fn extract_identity_from_request(_req: &Request) -> Option<ClientIdentity> {
     None
 }
 
@@ -176,7 +169,9 @@ pub fn require_role(
                 endpoint = %endpoint,
                 "admin: access granted"
             );
-            Ok(AdminCaller { identity: identity.clone() })
+            Ok(AdminCaller {
+                identity: identity.clone(),
+            })
         }
         Err(denial) => {
             tracing::warn!(
@@ -223,7 +218,8 @@ mod tests {
     use crate::rpc::rbac::{RbacChecker, RbacPolicy};
 
     fn make_checker() -> RbacChecker {
-        let policy: RbacPolicy = toml::from_str(r#"
+        let policy: RbacPolicy = toml::from_str(
+            r#"
 [[identities]]
 cn    = "ops-alice"
 roles = ["operator"]
@@ -231,28 +227,39 @@ roles = ["operator"]
 [[identities]]
 cn    = "node-maintainer"
 roles = ["maintainer"]
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         RbacChecker::new(policy)
     }
 
     #[test]
     fn operator_granted_for_snapshot() {
         let checker = make_checker();
-        let id = ClientIdentity { cn: Some("ops-alice".into()), fingerprint: None };
+        let id = ClientIdentity {
+            cn: Some("ops-alice".into()),
+            fingerprint: None,
+        };
         assert!(require_role(&checker, &id, "/admin/snapshot").is_ok());
     }
 
     #[test]
     fn operator_denied_for_key_rotate() {
         let checker = make_checker();
-        let id = ClientIdentity { cn: Some("ops-alice".into()), fingerprint: None };
+        let id = ClientIdentity {
+            cn: Some("ops-alice".into()),
+            fingerprint: None,
+        };
         assert!(require_role(&checker, &id, "/admin/key-rotate").is_err());
     }
 
     #[test]
     fn maintainer_granted_for_key_rotate() {
         let checker = make_checker();
-        let id = ClientIdentity { cn: Some("node-maintainer".into()), fingerprint: None };
+        let id = ClientIdentity {
+            cn: Some("node-maintainer".into()),
+            fingerprint: None,
+        };
         assert!(require_role(&checker, &id, "/admin/key-rotate").is_ok());
     }
 

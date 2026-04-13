@@ -18,9 +18,9 @@
 //! - **Logged** -- every step appends to `SchemaMeta.migration_log`.
 //! - **Dual-read** -- the node can still read the old format until migration completes.
 
+pub mod background;
 pub mod m0004_protocol_version;
 pub mod m0005_add_tx_index;
-pub mod background;
 
 use crate::storage::SchemaMeta;
 use std::io;
@@ -34,8 +34,16 @@ type MigrateFn = fn(&str, &mut SchemaMeta) -> io::Result<()>;
 ///
 /// When adding new migrations, append to this list and bump CURRENT_SCHEMA_VERSION.
 pub const MIGRATIONS: &[(u32, &str, MigrateFn)] = &[
-    (3, "v3 -> v4: add protocol_version to node_meta", m0004_protocol_version::migrate),
-    (4, "v4 -> v5: add tx_index for fast tx-by-hash lookup", m0005_add_tx_index::migrate),
+    (
+        3,
+        "v3 -> v4: add protocol_version to node_meta",
+        m0004_protocol_version::migrate,
+    ),
+    (
+        4,
+        "v4 -> v5: add tx_index for fast tx-by-hash lookup",
+        m0005_add_tx_index::migrate,
+    ),
 ];
 
 /// Run all pending migrations from `from_version` up to `to_version`.

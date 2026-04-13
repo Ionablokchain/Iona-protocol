@@ -38,12 +38,19 @@ pub struct SimpleBlockProducer {
 }
 
 impl SimpleBlockProducer {
-    pub fn new(cfg: SimpleProducerCfg) -> Self { Self { cfg } }
+    pub fn new(cfg: SimpleProducerCfg) -> Self {
+        Self { cfg }
+    }
 
     /// Attempt to produce and broadcast a proposal for the engine's current height/round.
     ///
     /// Returns `true` if a proposal was produced.
-    pub fn try_produce<V: crate::crypto::Verifier, S: Signer, B: crate::consensus::BlockStore, O: Outbox>(
+    pub fn try_produce<
+        V: crate::crypto::Verifier,
+        S: Signer,
+        B: crate::consensus::BlockStore,
+        O: Outbox,
+    >(
         &self,
         engine: &mut crate::consensus::Engine<V>,
         signer: &S,
@@ -83,7 +90,12 @@ impl SimpleBlockProducer {
         store.put(block.clone());
 
         // Sign proposal.
-        let sign_bytes = proposal_sign_bytes(engine.state.height, engine.state.round, &bid, engine.state.valid_round);
+        let sign_bytes = proposal_sign_bytes(
+            engine.state.height,
+            engine.state.round,
+            &bid,
+            engine.state.valid_round,
+        );
         let sig = signer.sign(&sign_bytes);
 
         let prop = Proposal {
@@ -91,7 +103,11 @@ impl SimpleBlockProducer {
             round: engine.state.round,
             proposer: signer.public_key(),
             block_id: bid.clone(),
-            block: if self.cfg.include_block_in_proposal { Some(block.clone()) } else { None },
+            block: if self.cfg.include_block_in_proposal {
+                Some(block.clone())
+            } else {
+                None
+            },
             pol_round: engine.state.valid_round,
             signature: sig,
         };

@@ -38,8 +38,12 @@ impl PeerStore {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let s = serde_json::to_string_pretty(&self.data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("peer-store encode: {e}")))?;
+        let s = serde_json::to_string_pretty(&self.data).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("peer-store encode: {e}"),
+            )
+        })?;
         fs::write(&self.path, s)
     }
 }

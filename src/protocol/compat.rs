@@ -109,11 +109,16 @@ pub struct CompatReport {
 impl CompatReport {
     pub fn from_results(results: Vec<CompatCheckResult>) -> Self {
         let passed = results.iter().all(|r| r.passed);
-        let overall_level = results.iter()
+        let overall_level = results
+            .iter()
             .map(|r| r.level)
             .max()
             .unwrap_or(CompatLevel::Full);
-        Self { results, overall_level, passed }
+        Self {
+            results,
+            overall_level,
+            passed,
+        }
     }
 
     /// Get results filtered by domain.
@@ -129,13 +134,19 @@ impl CompatReport {
 
 impl std::fmt::Display for CompatReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Compatibility Report: {} ({})",
+        writeln!(
+            f,
+            "Compatibility Report: {} ({})",
             if self.passed { "PASS" } else { "FAIL" },
             self.overall_level
         )?;
         for r in &self.results {
             let mark = if r.passed { "OK" } else { "FAIL" };
-            writeln!(f, "  [{mark}] [{}] {}: {} ({})", r.domain, r.rule_id, r.detail, r.level)?;
+            writeln!(
+                f,
+                "  [{mark}] [{}] {}: {} ({})",
+                r.domain, r.rule_id, r.detail, r.level
+            )?;
         }
         Ok(())
     }
@@ -268,7 +279,8 @@ impl CompatChecker {
     fn check_state_migration_exists(&self) -> CompatCheckResult {
         let sv = crate::storage::CURRENT_SCHEMA_VERSION;
         // Check that MIGRATIONS covers up to current version.
-        let max_migration_from = crate::storage::migrations::MIGRATIONS.iter()
+        let max_migration_from = crate::storage::migrations::MIGRATIONS
+            .iter()
             .map(|(from, _, _)| *from)
             .max()
             .unwrap_or(0);
@@ -282,9 +294,7 @@ impl CompatChecker {
             domain: CompatDomain::State,
             passed: covered,
             level: CompatLevel::Migration,
-            detail: format!(
-                "schema_version={sv}, max migration from_v={max_migration_from}",
-            ),
+            detail: format!("schema_version={sv}, max migration from_v={max_migration_from}",),
         }
     }
 
@@ -331,10 +341,7 @@ impl CompatChecker {
             domain: CompatDomain::Consensus,
             passed: deterministic,
             level: CompatLevel::Full,
-            detail: format!(
-                "PV determinism verified for {} heights",
-                heights.len()
-            ),
+            detail: format!("PV determinism verified for {} heights", heights.len()),
         }
     }
 
@@ -350,20 +357,14 @@ impl CompatChecker {
             if let Some(ppv) = prev_pv {
                 if a.protocol_version <= ppv {
                     valid = false;
-                    detail = format!(
-                        "PV {} <= previous PV {}",
-                        a.protocol_version, ppv
-                    );
+                    detail = format!("PV {} <= previous PV {}", a.protocol_version, ppv);
                     break;
                 }
             }
             if let (Some(ph), Some(ah)) = (prev_height, a.activation_height) {
                 if ah <= ph {
                     valid = false;
-                    detail = format!(
-                        "activation height {} <= previous height {}",
-                        ah, ph
-                    );
+                    detail = format!("activation height {} <= previous height {}", ah, ph);
                     break;
                 }
             }
@@ -387,7 +388,9 @@ impl CompatChecker {
     /// CONS-003: Grace window allows stragglers to catch up.
     fn check_consensus_grace_window(&self) -> CompatCheckResult {
         // Any activation with PV > 1 should have a grace window > 0.
-        let needs_grace: Vec<_> = self.activations.iter()
+        let needs_grace: Vec<_> = self
+            .activations
+            .iter()
             .filter(|a| a.protocol_version > 1 && a.activation_height.is_some())
             .collect();
 

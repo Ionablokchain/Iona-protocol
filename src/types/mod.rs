@@ -7,7 +7,9 @@ pub type Round = u32;
 pub struct Hash32(pub [u8; 32]);
 
 impl Hash32 {
-    pub fn zero() -> Self { Self([0u8; 32]) }
+    pub fn zero() -> Self {
+        Self([0u8; 32])
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,8 +92,12 @@ pub struct BlockHeader {
     pub protocol_version: u32,
 }
 
-fn default_chain_id() -> u64 { 6126151 }
-fn default_protocol_version() -> u32 { 1 }
+fn default_chain_id() -> u64 {
+    6126151
+}
+fn default_protocol_version() -> u32 {
+    1
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Block {
@@ -110,7 +116,8 @@ impl Block {
     /// This is stable across serde versions and JSON whitespace changes.
     pub fn id(&self) -> Hash32 {
         let h = &self.header;
-        let mut buf = Vec::with_capacity(8 + 8 + 4 + 32 + 2 + h.proposer_pk.len() + 32 + 32 + 32 + 8 + 8);
+        let mut buf =
+            Vec::with_capacity(8 + 8 + 4 + 32 + 2 + h.proposer_pk.len() + 32 + 32 + 32 + 8 + 8);
         buf.extend_from_slice(b"IONA_BLK");
         buf.extend_from_slice(&h.height.to_le_bytes());
         buf.extend_from_slice(&h.round.to_le_bytes());
@@ -143,8 +150,10 @@ pub fn hash_bytes(b: &[u8]) -> Hash32 {
 /// not the signature itself (mirrors ETH tx hash semantics).
 pub fn tx_hash(tx: &Tx) -> Hash32 {
     let payload_bytes = tx.payload.as_bytes();
-    let from_bytes    = tx.from.as_bytes();
-    let mut buf = Vec::with_capacity(7 + 2 + tx.pubkey.len() + 2 + from_bytes.len() + 8*5 + 4 + payload_bytes.len());
+    let from_bytes = tx.from.as_bytes();
+    let mut buf = Vec::with_capacity(
+        7 + 2 + tx.pubkey.len() + 2 + from_bytes.len() + 8 * 5 + 4 + payload_bytes.len(),
+    );
     buf.extend_from_slice(b"IONA_TX");
     buf.extend_from_slice(&(tx.pubkey.len() as u16).to_le_bytes());
     buf.extend_from_slice(&tx.pubkey);

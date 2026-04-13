@@ -32,9 +32,7 @@
 
 use crate::execution::KvState;
 use crate::vm::state::VmState;
-use revm::primitives::{
-    Account, AccountInfo, Address, Bytecode, B256, KECCAK_EMPTY, U256,
-};
+use revm::primitives::{Account, AccountInfo, Address, Bytecode, B256, KECCAK_EMPTY, U256};
 use revm::{Database, DatabaseCommit};
 use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
@@ -150,9 +148,9 @@ impl<'a> Database for KvStateDb<'a> {
         for (_addr, bytecode) in &self.state.vm.code {
             let h = B256::from_slice(&Keccak256::digest(bytecode).to_vec());
             if h == code_hash {
-                return Ok(Bytecode::new_raw(
-                    revm::primitives::Bytes::copy_from_slice(bytecode),
-                ));
+                return Ok(Bytecode::new_raw(revm::primitives::Bytes::copy_from_slice(
+                    bytecode,
+                )));
             }
         }
         Err(format!("code not found for hash {code_hash}"))
@@ -209,7 +207,9 @@ impl<'a> DatabaseCommit for KvStateDb<'a> {
             if account.info.nonce == 0 {
                 self.state.nonces.remove(&iona_key);
             } else {
-                self.state.nonces.insert(iona_key.clone(), account.info.nonce);
+                self.state
+                    .nonces
+                    .insert(iona_key.clone(), account.info.nonce);
             }
 
             // ── Bytecode ──────────────────────────────────────────────────────
@@ -290,12 +290,18 @@ pub fn execute_evm_on_state(
                     logs,
                     ..
                 } => (true, *gas_used, output.clone(), logs.clone()),
-                revm::primitives::ExecutionResult::Revert { gas_used, output } => {
-                    (false, *gas_used, revm::primitives::Output::Call(output.clone()), vec![])
-                }
-                revm::primitives::ExecutionResult::Halt { gas_used, .. } => {
-                    (false, *gas_used, revm::primitives::Output::Call(revm::primitives::Bytes::new()), vec![])
-                }
+                revm::primitives::ExecutionResult::Revert { gas_used, output } => (
+                    false,
+                    *gas_used,
+                    revm::primitives::Output::Call(output.clone()),
+                    vec![],
+                ),
+                revm::primitives::ExecutionResult::Halt { gas_used, .. } => (
+                    false,
+                    *gas_used,
+                    revm::primitives::Output::Call(revm::primitives::Bytes::new()),
+                    vec![],
+                ),
             };
 
             let (return_data, created_address) = match output {
@@ -316,7 +322,11 @@ pub fn execute_evm_on_state(
                 return_data,
                 created_address,
                 logs,
-                error: if success { None } else { Some("execution reverted".into()) },
+                error: if success {
+                    None
+                } else {
+                    Some("execution reverted".into())
+                },
             }
         }
         Err(e) => UnifiedEvmResult {
@@ -334,7 +344,14 @@ fn build_tx_env(tx: &EvmTx) -> TxEnv {
     let mut env = TxEnv::default();
     match tx {
         EvmTx::Legacy {
-            from, to, nonce, gas_limit, gas_price, value, data, chain_id,
+            from,
+            to,
+            nonce,
+            gas_limit,
+            gas_price,
+            value,
+            data,
+            chain_id,
         } => {
             env.caller = Address::from_slice(&from[12..]);
             env.gas_limit = *gas_limit;
@@ -349,7 +366,15 @@ fn build_tx_env(tx: &EvmTx) -> TxEnv {
             env.data = revm::primitives::Bytes::copy_from_slice(data);
         }
         EvmTx::Eip2930 {
-            from, to, nonce, gas_limit, gas_price, value, data, access_list, chain_id,
+            from,
+            to,
+            nonce,
+            gas_limit,
+            gas_price,
+            value,
+            data,
+            access_list,
+            chain_id,
         } => {
             env.caller = Address::from_slice(&from[12..]);
             env.gas_limit = *gas_limit;
@@ -376,8 +401,16 @@ fn build_tx_env(tx: &EvmTx) -> TxEnv {
                 .collect();
         }
         EvmTx::Eip1559 {
-            from, to, nonce, gas_limit, max_fee_per_gas, max_priority_fee_per_gas,
-            value, data, access_list, chain_id,
+            from,
+            to,
+            nonce,
+            gas_limit,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+            value,
+            data,
+            access_list,
+            chain_id,
         } => {
             env.caller = Address::from_slice(&from[12..]);
             env.gas_limit = *gas_limit;

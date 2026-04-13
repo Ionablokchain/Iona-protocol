@@ -18,8 +18,8 @@
 //!       └── nondeterminism::NdLogger::log(source, value)
 //! ```
 
-pub mod historical;
-pub mod state_root_verify;
 pub mod divergence;
+pub mod historical;
 pub mod nondeterminism;
 pub mod replay_tool;
+pub mod state_root_verify;

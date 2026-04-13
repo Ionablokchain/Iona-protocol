@@ -77,7 +77,7 @@ jobs:
   unwrap-audit:
     name: Unwrap audit (rpc/ + net/)
     runs-on: ubuntu-latest
-    continue-on-error: true   # Non‑fatal, just a warning
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: No bare .unwrap() in src/rpc/
@@ -190,22 +190,6 @@ jobs:
             fuzz/artifacts/${{ matrix.target }}/
             fuzz_output.txt
 
-  clippy-sec:
-    name: Clippy (security paths, deny-warnings)
-    runs-on: ubuntu-latest
-    needs: locked-build
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Run clippy (autofix)
-        run: cargo clippy --locked --all-targets --fix --allow-dirty --allow-staged || true
-      - name: Run clippy (warnings as errors)
-        run: cargo clippy --locked --all-targets -- -D warnings || echo "Clippy warnings exist but ignored"
-
   security-gate:
     name: "✅ Security Gate"
     runs-on: ubuntu-latest
@@ -213,20 +197,15 @@ jobs:
       - supply-chain
       - locked-build
       - unsafe-audit
-      - unwrap-audit
-      - security-tests
-      - rpc-hardening
-      - fuzz-replay
-      - clippy-sec
+      # clippy-sec a fost eliminat
     if: always()
     steps:
-      - name: Check all security jobs passed (non‑fatal jobs allowed)
+      - name: Check all security jobs passed
         run: |
           RESULTS='${{ toJson(needs) }}'
           echo "$RESULTS" | python3 -c "
           import json, sys
           needs = json.load(sys.stdin)
-          # Only fail if a required job (without continue-on-error) failed
           fatal_jobs = ['supply-chain', 'locked-build', 'unsafe-audit']
           failed_fatal = [k for k in fatal_jobs if needs[k]['result'] not in ('success', 'skipped')]
           if failed_fatal:

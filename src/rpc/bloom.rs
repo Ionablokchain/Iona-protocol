@@ -8,7 +8,7 @@ use sha3::{Digest, Keccak256};
 /// 2-byte windows of the keccak256 hash.
 ///
 /// `Default` is manually derived (not auto-derivable for [u8; 256]).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Bloom(pub [u8; 256]);
 
 impl Default for Bloom {
@@ -19,7 +19,9 @@ impl Default for Bloom {
 
 impl Bloom {
     /// Create an empty bloom filter.
-    pub fn zero() -> Self { Self::default() }
+    pub fn zero() -> Self {
+        Self::default()
+    }
 
     /// Insert an item into the bloom filter.
     pub fn insert(&mut self, data: &[u8]) {
@@ -55,7 +57,9 @@ impl Bloom {
     pub fn from_hex(s: &str) -> Option<Self> {
         let hexs = s.trim_start_matches("0x");
         let bytes = hex::decode(hexs).ok()?;
-        if bytes.len() != 256 { return None; }
+        if bytes.len() != 256 {
+            return None;
+        }
         let mut b = [0u8; 256];
         b.copy_from_slice(&bytes);
         Some(Bloom(b))

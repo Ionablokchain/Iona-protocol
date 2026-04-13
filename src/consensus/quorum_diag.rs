@@ -112,7 +112,8 @@ impl QuorumCalculator {
         votes: &HashMap<PublicKeyBytes, Option<Hash32>>,
         target_block: &Hash32,
     ) -> QuorumDiagnostic {
-        let voters: Vec<PublicKeyBytes> = votes.iter()
+        let voters: Vec<PublicKeyBytes> = votes
+            .iter()
             .filter(|(_, bid)| bid.as_ref() == Some(target_block))
             .map(|(pk, _)| pk.clone())
             .collect();
@@ -125,13 +126,16 @@ impl QuorumCalculator {
         if diag.has_quorum {
             format!(
                 "quorum_ok: {}/{} power ({}/{} validators)",
-                diag.current_power, diag.quorum_threshold,
-                diag.voted.len(), diag.total_validators
+                diag.current_power,
+                diag.quorum_threshold,
+                diag.voted.len(),
+                diag.total_validators
             )
         } else {
             format!(
                 "NO_QUORUM: have={}/{} power, voted=[{}], missing=[{}]",
-                diag.current_power, diag.quorum_threshold,
+                diag.current_power,
+                diag.quorum_threshold,
                 diag.voted.join(","),
                 diag.missing.join(","),
             )
@@ -152,7 +156,10 @@ impl QuorumCalculator {
         }
 
         let voter_set: HashSet<&PublicKeyBytes> = current_voters.iter().collect();
-        let mut remaining: Vec<VotingPower> = self.vset.vals.iter()
+        let mut remaining: Vec<VotingPower> = self
+            .vset
+            .vals
+            .iter()
             .filter(|v| !voter_set.contains(&v.pk))
             .map(|v| v.power)
             .collect();
@@ -218,8 +225,8 @@ pub fn check_validator_connectivity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::Signer;
     use crate::crypto::ed25519::Ed25519Keypair;
+    use crate::crypto::Signer;
 
     fn make_vset(n: usize) -> (ValidatorSet, Vec<PublicKeyBytes>) {
         let mut vals = Vec::new();
@@ -229,7 +236,10 @@ mod tests {
             seed[0] = (i + 1) as u8;
             let kp = Ed25519Keypair::from_seed(seed);
             let pk = kp.public_key();
-            vals.push(Validator { pk: pk.clone(), power: 1 });
+            vals.push(Validator {
+                pk: pk.clone(),
+                power: 1,
+            });
             pks.push(pk);
         }
         (ValidatorSet { vals }, pks)
@@ -292,10 +302,10 @@ mod tests {
     fn test_validators_needed() {
         let (vset, pks) = make_vset(4);
         let qc = QuorumCalculator::new(&vset);
-        assert_eq!(qc.validators_needed(&pks), 0);  // all voted
-        assert_eq!(qc.validators_needed(&pks[..2]), 1);  // need 1 more
-        assert_eq!(qc.validators_needed(&pks[..1]), 2);  // need 2 more
-        assert_eq!(qc.validators_needed(&[]), 3);  // need 3
+        assert_eq!(qc.validators_needed(&pks), 0); // all voted
+        assert_eq!(qc.validators_needed(&pks[..2]), 1); // need 1 more
+        assert_eq!(qc.validators_needed(&pks[..1]), 2); // need 2 more
+        assert_eq!(qc.validators_needed(&[]), 3); // need 3
     }
 
     #[test]
@@ -311,17 +321,29 @@ mod tests {
     #[test]
     fn test_weighted_quorum() {
         // Validator with power 10, 5, 5 → total 20, threshold 14
-        let mut seed1 = [0u8; 32]; seed1[0] = 1;
-        let mut seed2 = [0u8; 32]; seed2[0] = 2;
-        let mut seed3 = [0u8; 32]; seed3[0] = 3;
+        let mut seed1 = [0u8; 32];
+        seed1[0] = 1;
+        let mut seed2 = [0u8; 32];
+        seed2[0] = 2;
+        let mut seed3 = [0u8; 32];
+        seed3[0] = 3;
         let pk1 = Ed25519Keypair::from_seed(seed1).public_key();
         let pk2 = Ed25519Keypair::from_seed(seed2).public_key();
         let pk3 = Ed25519Keypair::from_seed(seed3).public_key();
         let vset = ValidatorSet {
             vals: vec![
-                Validator { pk: pk1.clone(), power: 10 },
-                Validator { pk: pk2.clone(), power: 5 },
-                Validator { pk: pk3.clone(), power: 5 },
+                Validator {
+                    pk: pk1.clone(),
+                    power: 10,
+                },
+                Validator {
+                    pk: pk2.clone(),
+                    power: 5,
+                },
+                Validator {
+                    pk: pk3.clone(),
+                    power: 5,
+                },
             ],
         };
         let qc = QuorumCalculator::new(&vset);

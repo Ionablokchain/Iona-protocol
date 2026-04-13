@@ -1,5 +1,5 @@
-use crate::execution::KvState;
 use crate::crypto::Verifier;
+use crate::execution::KvState;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{fs, io, path::Path};
@@ -32,8 +32,12 @@ pub fn read_snapshot_manifest(data_dir: &str, height: u64) -> io::Result<Snapsho
     Ok(m)
 }
 
-
-pub fn write_snapshot(data_dir: &str, height: u64, state: &KvState, zstd_level: i32) -> io::Result<()> {
+pub fn write_snapshot(
+    data_dir: &str,
+    height: u64,
+    state: &KvState,
+    zstd_level: i32,
+) -> io::Result<()> {
     fs::create_dir_all(snapshots_dir(data_dir))?;
 
     let json = serde_json::to_vec(state)
@@ -73,7 +77,10 @@ pub fn list_snapshot_heights(data_dir: &str) -> io::Result<Vec<u64>> {
         let ent = ent?;
         let name = ent.file_name();
         let name = name.to_string_lossy();
-        if let Some(h) = name.strip_prefix("state_").and_then(|s| s.split('.').next()) {
+        if let Some(h) = name
+            .strip_prefix("state_")
+            .and_then(|s| s.split('.').next())
+        {
             if let Ok(v) = h.parse::<u64>() {
                 out.push(v);
             }
@@ -86,7 +93,6 @@ pub fn list_snapshot_heights(data_dir: &str) -> io::Result<Vec<u64>> {
 pub fn latest_snapshot_height(data_dir: &str) -> io::Result<Option<u64>> {
     Ok(list_snapshot_heights(data_dir)?.pop())
 }
-
 
 pub fn list_delta_edges(data_dir: &str) -> io::Result<Vec<(u64, u64)>> {
     let dir = snapshots_dir(data_dir);
@@ -115,7 +121,6 @@ pub fn list_delta_edges(data_dir: &str) -> io::Result<Vec<(u64, u64)>> {
     Ok(out)
 }
 
-
 pub fn prune_snapshots(data_dir: &str, keep: usize) -> io::Result<()> {
     let hs = list_snapshot_heights(data_dir)?;
     if hs.len() <= keep {
@@ -133,7 +138,9 @@ pub fn restore_latest_if_missing(data_dir: &str, state_full_path: &str) -> io::R
     if Path::new(state_full_path).exists() {
         return Ok(None);
     }
-    let Some(h) = latest_snapshot_height(data_dir)? else { return Ok(None); };
+    let Some(h) = latest_snapshot_height(data_dir)? else {
+        return Ok(None);
+    };
 
     let bytes = fs::read(snapshot_path(data_dir, h))?;
     let json = zstd::decode_all(&bytes[..])
@@ -183,7 +190,10 @@ pub struct AttestationSig {
 
 /// Best-effort: attach an attestation if `attestation.json` exists next to the snapshot.
 fn load_attestation_if_any(data_dir: &str, height: u64) -> Option<SnapshotAttestation> {
-    let p = format!("{}/snapshots/state_{:020}.attestation.json", data_dir, height);
+    let p = format!(
+        "{}/snapshots/state_{:020}.attestation.json",
+        data_dir, height
+    );
     std::fs::read_to_string(p)
         .ok()
         .and_then(|s| serde_json::from_str::<SnapshotAttestation>(&s).ok())
@@ -195,12 +205,19 @@ pub fn verify_attestation(
     manifest: &StateSyncManifest,
     validator_pubkeys_hex: &[String],
 ) -> io::Result<bool> {
-    let Some(att) = &manifest.attestation else { return Ok(false); };
+    let Some(att) = &manifest.attestation else {
+        return Ok(false);
+    };
 
-    let Some(root_hex) = manifest.state_root_hex.clone() else { return Ok(false); };
+    let Some(root_hex) = manifest.state_root_hex.clone() else {
+        return Ok(false);
+    };
     let msg = snapshot_attest_sign_bytes(manifest.height, &root_hex)?;
 
-    let allow: std::collections::HashSet<String> = validator_pubkeys_hex.iter().map(|s| s.to_lowercase()).collect();
+    let allow: std::collections::HashSet<String> = validator_pubkeys_hex
+        .iter()
+        .map(|s| s.to_lowercase())
+        .collect();
 
     let mut ok = 0u32;
     for s in &att.signatures {
@@ -331,11 +348,17 @@ pub struct DeltaSyncManifest {
 }
 
 pub fn delta_path(data_dir: &str, from_h: u64, to_h: u64) -> String {
-    format!("{}/snapshots/delta_{:020}_{:020}.json.zst", data_dir, from_h, to_h)
+    format!(
+        "{}/snapshots/delta_{:020}_{:020}.json.zst",
+        data_dir, from_h, to_h
+    )
 }
 
 pub fn delta_statesync_manifest_path(data_dir: &str, from_h: u64, to_h: u64) -> String {
-    format!("{}/snapshots/delta_{:020}_{:020}.statesync.json", data_dir, from_h, to_h)
+    format!(
+        "{}/snapshots/delta_{:020}_{:020}.statesync.json",
+        data_dir, from_h, to_h
+    )
 }
 
 pub fn read_snapshot_state(data_dir: &str, height: u64) -> io::Result<KvState> {
@@ -426,7 +449,15 @@ pub fn apply_delta(base: &KvState, d: &StateDelta) -> KvState {
 }
 
 /// Write a delta file and a statesync manifest for it.
-pub fn write_delta(data_dir: &str, from_h: u64, to_h: u64, from: &KvState, to: &KvState, zstd_level: i32, chunk_size: u32) -> io::Result<()> {
+pub fn write_delta(
+    data_dir: &str,
+    from_h: u64,
+    to_h: u64,
+    from: &KvState,
+    to: &KvState,
+    zstd_level: i32,
+    chunk_size: u32,
+) -> io::Result<()> {
     fs::create_dir_all(snapshots_dir(data_dir))?;
     let d = compute_delta(from_h, to_h, from, to);
     let json = serde_json::to_vec(&d)
@@ -467,17 +498,23 @@ pub fn write_delta(data_dir: &str, from_h: u64, to_h: u64, from: &KvState, to: &
     Ok(())
 }
 
-
 // --- Snapshot attestation persistence helpers ---
 
 pub fn attestation_path(data_dir: &str, height: u64) -> String {
-    format!("{}/snapshots/state_{:020}.attestation.json", data_dir, height)
+    format!(
+        "{}/snapshots/state_{:020}.attestation.json",
+        data_dir, height
+    )
 }
 
 pub fn write_attestation(data_dir: &str, height: u64, a: &SnapshotAttestation) -> io::Result<()> {
     fs::create_dir_all(snapshots_dir(data_dir))?;
-    let s = serde_json::to_string_pretty(a)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("attestation encode: {e}")))?;
+    let s = serde_json::to_string_pretty(a).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("attestation encode: {e}"),
+        )
+    })?;
     fs::write(attestation_path(data_dir, height), s)?;
     Ok(())
 }
@@ -488,8 +525,9 @@ pub fn read_attestation(data_dir: &str, height: u64) -> io::Result<Option<Snapsh
         return Ok(None);
     }
     let bytes = fs::read(p)?;
-    let a: SnapshotAttestation = serde_json::from_slice(&bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("attestation json: {e}")))?;
+    let a: SnapshotAttestation = serde_json::from_slice(&bytes).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("attestation json: {e}"))
+    })?;
     Ok(Some(a))
 }
 
@@ -511,8 +549,6 @@ pub fn snapshot_attest_sign_bytes(height: u64, state_root_hex: &str) -> io::Resu
     out.extend_from_slice(&root);
     Ok(out)
 }
-
-
 
 /// v2 attestation sign-bytes bind the attestation to:
 /// - chain_id (prevents cross-chain replay)

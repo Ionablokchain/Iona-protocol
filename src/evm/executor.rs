@@ -1,6 +1,6 @@
 use crate::types::tx_evm::EvmTx;
 use revm::primitives::{Address, Bytes, Env, ExecutionResult, TxEnv, U256};
-use revm::{Evm, DatabaseCommit};
+use revm::{DatabaseCommit, Evm};
 
 #[derive(Debug)]
 pub struct EvmExecOutput {
@@ -11,7 +11,7 @@ pub struct EvmExecOutput {
     pub return_data: Vec<u8>,
 }
 
-fn to_addr(a: [u8;20]) -> Address {
+fn to_addr(a: [u8; 20]) -> Address {
     Address::from_slice(&a)
 }
 
@@ -29,8 +29,17 @@ where
     let mut tx_env = TxEnv::default();
 
     match tx {
-        
-        EvmTx::Eip2930 { from, to, nonce, gas_limit, gas_price, value, data, access_list, chain_id } => {
+        EvmTx::Eip2930 {
+            from,
+            to,
+            nonce,
+            gas_limit,
+            gas_price,
+            value,
+            data,
+            access_list,
+            chain_id,
+        } => {
             tx_env.caller = to_addr(from);
             tx_env.gas_limit = gas_limit;
             tx_env.gas_price = U256::from(gas_price);
@@ -44,11 +53,28 @@ where
             tx_env.data = Bytes::from(data);
             tx_env.access_list = access_list
                 .into_iter()
-                .map(|it| (to_addr(it.address), it.storage_keys.into_iter().map(U256::from_be_bytes).collect()))
+                .map(|it| {
+                    (
+                        to_addr(it.address),
+                        it.storage_keys
+                            .into_iter()
+                            .map(U256::from_be_bytes)
+                            .collect(),
+                    )
+                })
                 .collect();
         }
 
-        EvmTx::Legacy { from, to, nonce, gas_limit, gas_price, value, data, chain_id } => {
+        EvmTx::Legacy {
+            from,
+            to,
+            nonce,
+            gas_limit,
+            gas_price,
+            value,
+            data,
+            chain_id,
+        } => {
             tx_env.caller = to_addr(from);
             tx_env.gas_limit = gas_limit;
             tx_env.gas_price = U256::from(gas_price);
@@ -61,16 +87,27 @@ where
             };
             tx_env.data = Bytes::from(data);
         }
-        EvmTx::Eip1559 { from, to, nonce, gas_limit, max_fee_per_gas, max_priority_fee_per_gas, value, data, access_list, chain_id } => {
+        EvmTx::Eip1559 {
+            from,
+            to,
+            nonce,
+            gas_limit,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+            value,
+            data,
+            access_list,
+            chain_id,
+        } => {
             tx_env.caller = to_addr(from);
             tx_env.gas_limit = gas_limit;
-	        // Some REVM versions expose only `gas_price` on TxEnv. Keep compatibility
-	        // by translating EIP-1559 fields into an effective gas price.
-	        //
-	        // We conservatively use `max_fee_per_gas` here; callers that need more
-	        // precise EIP-1559 accounting should implement it at the fee layer.
-	        let _ = max_priority_fee_per_gas; // retained for forward-compat
-	        tx_env.gas_price = U256::from(max_fee_per_gas);
+            // Some REVM versions expose only `gas_price` on TxEnv. Keep compatibility
+            // by translating EIP-1559 fields into an effective gas price.
+            //
+            // We conservatively use `max_fee_per_gas` here; callers that need more
+            // precise EIP-1559 accounting should implement it at the fee layer.
+            let _ = max_priority_fee_per_gas; // retained for forward-compat
+            tx_env.gas_price = U256::from(max_fee_per_gas);
             tx_env.value = U256::from(value);
             tx_env.nonce = Some(nonce);
             tx_env.chain_id = Some(chain_id);
@@ -82,7 +119,15 @@ where
             // Access list mapping (optional for full support)
             tx_env.access_list = access_list
                 .into_iter()
-                .map(|it| (to_addr(it.address), it.storage_keys.into_iter().map(U256::from_be_bytes).collect()))
+                .map(|it| {
+                    (
+                        to_addr(it.address),
+                        it.storage_keys
+                            .into_iter()
+                            .map(U256::from_be_bytes)
+                            .collect(),
+                    )
+                })
                 .collect();
         }
     }
@@ -91,11 +136,19 @@ where
 
     let res = evm.transact_commit().map_err(|e| format!("{:?}", e))?;
     Ok(match res {
-        ExecutionResult::Success { gas_used, logs, output, .. } => EvmExecOutput {
+        ExecutionResult::Success {
+            gas_used,
+            logs,
+            output,
+            ..
+        } => EvmExecOutput {
             gas_used,
             success: true,
             logs: logs.clone(),
-            created_address: match &output { revm::primitives::Output::Create(_, addr) => *addr, _ => None },
+            created_address: match &output {
+                revm::primitives::Output::Create(_, addr) => *addr,
+                _ => None,
+            },
             return_data: match output {
                 revm::primitives::Output::Call(out) => out.to_vec(),
                 revm::primitives::Output::Create(out, _) => out.to_vec(),

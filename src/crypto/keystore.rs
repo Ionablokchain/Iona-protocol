@@ -8,7 +8,10 @@
 //! Derivation: PBKDF2-HMAC-SHA256 (100_000 iterations) -> 32-byte key
 //! Encryption: AES-256-GCM
 
-use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 use base64::Engine;
 use pbkdf2::pbkdf2_hmac;
 use rand::{rngs::OsRng, RngCore};
@@ -76,7 +79,10 @@ pub fn decrypt_seed32_from_file(path: &str, pass: &str) -> io::Result<[u8; 32]> 
     let k: KeystoreFile = serde_json::from_str(&s)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("keystore parse: {e}")))?;
     if k.v != V {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unsupported keystore version {}", k.v)));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported keystore version {}", k.v),
+        ));
     }
 
     let salt = base64::engine::general_purpose::STANDARD
@@ -99,7 +105,12 @@ pub fn decrypt_seed32_from_file(path: &str, pass: &str) -> io::Result<[u8; 32]> 
 
     let pt = cipher
         .decrypt(Nonce::from_slice(&nonce_bytes), ct.as_ref())
-        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "wrong password or corrupted keystore"))?;
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "wrong password or corrupted keystore",
+            )
+        })?;
 
     key.zeroize();
 

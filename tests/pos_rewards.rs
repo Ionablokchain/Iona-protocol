@@ -3,18 +3,23 @@
 //! Run with: cargo test --test pos_rewards
 
 use iona::economics::params::EconomicsParams;
-use iona::economics::rewards::{distribute_epoch_rewards, is_epoch_boundary, epoch_at, EPOCH_BLOCKS, TREASURY_ADDR};
+use iona::economics::rewards::{
+    distribute_epoch_rewards, epoch_at, is_epoch_boundary, EPOCH_BLOCKS, TREASURY_ADDR,
+};
 use iona::economics::staking::{StakingState, Validator as EconValidator};
 use iona::economics::staking_tx::try_apply_staking_tx;
 use iona::execution::KvState;
 
 fn make_validator(addr: &str, stake: u128, commission_bps: u64) -> (String, EconValidator) {
-    (addr.to_string(), EconValidator {
-        operator: addr.to_string(),
-        stake,
-        jailed: false,
-        commission_bps,
-    })
+    (
+        addr.to_string(),
+        EconValidator {
+            operator: addr.to_string(),
+            stake,
+            jailed: false,
+            commission_bps,
+        },
+    )
 }
 
 fn default_staking() -> (KvState, StakingState, EconomicsParams) {
@@ -60,8 +65,7 @@ fn test_reward_distribution_invariant() {
 
     let reward = distribute_epoch_rewards(EPOCH_BLOCKS, &mut kv, &mut staking, &params);
 
-    let distributed: u128 = reward.validator_rewards.values().sum::<u128>()
-        + reward.treasury_share;
+    let distributed: u128 = reward.validator_rewards.values().sum::<u128>() + reward.treasury_share;
 
     // Allow up to 2 units of rounding error (integer division)
     assert!(
@@ -130,8 +134,12 @@ fn test_higher_commission_means_more_operator_reward() {
     staking.validators.insert(b, v);
 
     // Add equal delegations so the difference comes from commission
-    staking.delegations.insert(("d1".into(), "high_commission".into()), 5_000_000_000);
-    staking.delegations.insert(("d2".into(), "low_commission".into()), 5_000_000_000);
+    staking
+        .delegations
+        .insert(("d1".into(), "high_commission".into()), 5_000_000_000);
+    staking
+        .delegations
+        .insert(("d2".into(), "low_commission".into()), 5_000_000_000);
 
     distribute_epoch_rewards(EPOCH_BLOCKS, &mut kv, &mut staking, &params);
 
@@ -154,8 +162,12 @@ fn test_delegator_reward_proportional() {
     staking.validators.insert(a, v);
 
     // carol delegates 2x more than dave
-    staking.delegations.insert(("carol".into(), "alice".into()), 2_000_000_000);
-    staking.delegations.insert(("dave".into(), "alice".into()), 1_000_000_000);
+    staking
+        .delegations
+        .insert(("carol".into(), "alice".into()), 2_000_000_000);
+    staking
+        .delegations
+        .insert(("dave".into(), "alice".into()), 1_000_000_000);
 
     distribute_epoch_rewards(EPOCH_BLOCKS, &mut kv, &mut staking, &params);
 
@@ -184,10 +196,24 @@ fn test_delegate_flow() {
     kv.balances.insert("bob".into(), 500_000);
 
     // Delegate
-    let res = try_apply_staking_tx("stake delegate alice 200000", "bob", &mut kv, &mut staking, &params, 0).unwrap();
+    let res = try_apply_staking_tx(
+        "stake delegate alice 200000",
+        "bob",
+        &mut kv,
+        &mut staking,
+        &params,
+        0,
+    )
+    .unwrap();
     assert!(res.success, "{:?}", res.error);
     assert_eq!(*kv.balances.get("bob").unwrap(), 300_000);
-    assert_eq!(*staking.delegations.get(&("bob".into(), "alice".into())).unwrap(), 200_000);
+    assert_eq!(
+        *staking
+            .delegations
+            .get(&("bob".into(), "alice".into()))
+            .unwrap(),
+        200_000
+    );
     assert_eq!(staking.validators["alice"].stake, 1_200_000);
 }
 
@@ -195,40 +221,90 @@ fn test_delegate_flow() {
 fn test_undelegate_and_withdraw_full_flow() {
     let mut kv = KvState::default();
     let mut staking = StakingState::default();
-    let params = EconomicsParams { unbonding_epochs: 3, ..Default::default() };
+    let params = EconomicsParams {
+        unbonding_epochs: 3,
+        ..Default::default()
+    };
 
     let (a, v) = make_validator("alice", 1_000_000, 0);
     staking.validators.insert(a, v);
     kv.balances.insert("bob".into(), 500_000);
 
     // 1. Delegate
-    try_apply_staking_tx("stake delegate alice 100000", "bob", &mut kv, &mut staking, &params, 0).unwrap();
+    try_apply_staking_tx(
+        "stake delegate alice 100000",
+        "bob",
+        &mut kv,
+        &mut staking,
+        &params,
+        0,
+    )
+    .unwrap();
     assert_eq!(*kv.balances.get("bob").unwrap(), 400_000);
 
     // 2. Undelegate at epoch 1
-    let res = try_apply_staking_tx("stake undelegate alice 100000", "bob", &mut kv, &mut staking, &params, 1).unwrap();
+    let res = try_apply_staking_tx(
+        "stake undelegate alice 100000",
+        "bob",
+        &mut kv,
+        &mut staking,
+        &params,
+        1,
+    )
+    .unwrap();
     assert!(res.success, "{:?}", res.error);
 
     // 3. Cannot withdraw at epoch 3 (need epoch >= 1 + 3 = 4)
-    let res = try_apply_staking_tx("stake withdraw alice", "bob", &mut kv, &mut staking, &params, 3).unwrap();
+    let res = try_apply_staking_tx(
+        "stake withdraw alice",
+        "bob",
+        &mut kv,
+        &mut staking,
+        &params,
+        3,
+    )
+    .unwrap();
     assert!(!res.success, "Should be locked until epoch 4");
 
     // 4. Can withdraw at epoch 4
-    let res = try_apply_staking_tx("stake withdraw alice", "bob", &mut kv, &mut staking, &params, 4).unwrap();
+    let res = try_apply_staking_tx(
+        "stake withdraw alice",
+        "bob",
+        &mut kv,
+        &mut staking,
+        &params,
+        4,
+    )
+    .unwrap();
     assert!(res.success, "{:?}", res.error);
-    assert_eq!(*kv.balances.get("bob").unwrap(), 500_000, "Full balance restored");
+    assert_eq!(
+        *kv.balances.get("bob").unwrap(),
+        500_000,
+        "Full balance restored"
+    );
 }
 
 #[test]
 fn test_register_and_deregister_validator() {
     let mut kv = KvState::default();
     let mut staking = StakingState::default();
-    let params = EconomicsParams { min_stake: 10_000, ..Default::default() };
+    let params = EconomicsParams {
+        min_stake: 10_000,
+        ..Default::default()
+    };
 
     kv.balances.insert("charlie".into(), 1_000_000);
 
     // Register
-    let res = try_apply_staking_tx("stake register 500", "charlie", &mut kv, &mut staking, &params, 0).unwrap();
+    let res = try_apply_staking_tx(
+        "stake register 500",
+        "charlie",
+        &mut kv,
+        &mut staking,
+        &params,
+        0,
+    )
+    .unwrap();
     assert!(res.success, "{:?}", res.error);
     assert!(staking.validators.contains_key("charlie"));
     assert_eq!(staking.validators["charlie"].commission_bps, 500);
@@ -236,7 +312,15 @@ fn test_register_and_deregister_validator() {
     assert_eq!(bal_after_register, 1_000_000 - 10_000);
 
     // Deregister (no external delegators)
-    let res = try_apply_staking_tx("stake deregister", "charlie", &mut kv, &mut staking, &params, 0).unwrap();
+    let res = try_apply_staking_tx(
+        "stake deregister",
+        "charlie",
+        &mut kv,
+        &mut staking,
+        &params,
+        0,
+    )
+    .unwrap();
     assert!(res.success, "{:?}", res.error);
     assert!(!staking.validators.contains_key("charlie"));
     // Stake returned
@@ -247,19 +331,49 @@ fn test_register_and_deregister_validator() {
 fn test_cannot_deregister_with_external_delegators() {
     let mut kv = KvState::default();
     let mut staking = StakingState::default();
-    let params = EconomicsParams { min_stake: 1_000, ..Default::default() };
+    let params = EconomicsParams {
+        min_stake: 1_000,
+        ..Default::default()
+    };
 
     // Register charlie
     kv.balances.insert("charlie".into(), 100_000);
-    try_apply_staking_tx("stake register 0", "charlie", &mut kv, &mut staking, &params, 0).unwrap();
+    try_apply_staking_tx(
+        "stake register 0",
+        "charlie",
+        &mut kv,
+        &mut staking,
+        &params,
+        0,
+    )
+    .unwrap();
 
     // Dave delegates to charlie
     kv.balances.insert("dave".into(), 50_000);
-    try_apply_staking_tx("stake delegate charlie 50000", "dave", &mut kv, &mut staking, &params, 0).unwrap();
+    try_apply_staking_tx(
+        "stake delegate charlie 50000",
+        "dave",
+        &mut kv,
+        &mut staking,
+        &params,
+        0,
+    )
+    .unwrap();
 
     // Charlie cannot deregister
-    let res = try_apply_staking_tx("stake deregister", "charlie", &mut kv, &mut staking, &params, 0).unwrap();
-    assert!(!res.success, "Should not deregister with external delegators");
+    let res = try_apply_staking_tx(
+        "stake deregister",
+        "charlie",
+        &mut kv,
+        &mut staking,
+        &params,
+        0,
+    )
+    .unwrap();
+    assert!(
+        !res.success,
+        "Should not deregister with external delegators"
+    );
 }
 
 #[test]
@@ -273,7 +387,15 @@ fn test_cannot_delegate_to_jailed_validator() {
     staking.validators.insert(a, v);
     kv.balances.insert("bob".into(), 500_000);
 
-    let res = try_apply_staking_tx("stake delegate alice 100000", "bob", &mut kv, &mut staking, &params, 0).unwrap();
+    let res = try_apply_staking_tx(
+        "stake delegate alice 100000",
+        "bob",
+        &mut kv,
+        &mut staking,
+        &params,
+        0,
+    )
+    .unwrap();
     assert!(!res.success, "Should not delegate to jailed validator");
 }
 

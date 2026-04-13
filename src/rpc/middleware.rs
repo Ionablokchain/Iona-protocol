@@ -131,10 +131,7 @@ pub async fn read_limit_middleware(
                     tracing::warn!(%req_id, %ip, "rpc::middleware: read rate limit exceeded");
                     return (
                         StatusCode::TOO_MANY_REQUESTS,
-                        [
-                            ("x-request-id", req_id.as_str()),
-                            ("retry-after", "1"),
-                        ],
+                        [("x-request-id", req_id.as_str()), ("retry-after", "1")],
                         r#"{"error":{"code":"RATE_LIMITED","message":"read rate limit exceeded"}}"#,
                     )
                         .into_response();
@@ -167,10 +164,7 @@ pub async fn concurrency_middleware(
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                [
-                    ("x-request-id", req_id.as_str()),
-                    ("retry-after", "1"),
-                ],
+                [("x-request-id", req_id.as_str()), ("retry-after", "1")],
                 r#"{"error":{"code":"OVERLOADED","message":"server at capacity"}}"#,
             )
                 .into_response();
@@ -235,10 +229,7 @@ pub async fn body_limit_middleware(
 /// Only applied to requests with `Content-Type: application/json` bodies (POST/PUT/PATCH).
 pub async fn json_depth_middleware(req: Request, next: Next) -> Response {
     let is_json_post = {
-        let method_ok = matches!(
-            req.method(),
-            &Method::POST | &Method::PUT | &Method::PATCH
-        );
+        let method_ok = matches!(req.method(), &Method::POST | &Method::PUT | &Method::PATCH);
         let ct_ok = req
             .headers()
             .get(header::CONTENT_TYPE)

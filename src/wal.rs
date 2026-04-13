@@ -6,7 +6,6 @@
 ///   and old segments are pruned (keeping last KEEP_SEGMENTS)
 /// - Corrupt-line tolerance: bad JSON lines are skipped with a warning instead of panic
 /// - Atomic snapshot: snapshot is written to a tmp file then renamed for crash safety
-
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -18,11 +17,23 @@ const KEEP_SEGMENTS: usize = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WalEvent {
-    Inbound  { bytes: Vec<u8> },
-    Outbound { bytes: Vec<u8> },
-    Step     { height: u64, round: u32, step: String },
-    Snapshot { bytes: Vec<u8> },
-    Note     { msg: String },
+    Inbound {
+        bytes: Vec<u8>,
+    },
+    Outbound {
+        bytes: Vec<u8>,
+    },
+    Step {
+        height: u64,
+        round: u32,
+        step: String,
+    },
+    Snapshot {
+        bytes: Vec<u8>,
+    },
+    Note {
+        msg: String,
+    },
 }
 
 pub struct Wal {
@@ -43,7 +54,12 @@ impl Wal {
         let written = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
-        Ok(Self { dir, current_segment, file, written })
+        Ok(Self {
+            dir,
+            current_segment,
+            file,
+            written,
+        })
     }
 
     /// For backward compat: open WAL given a file path (creates dir from parent).
@@ -58,7 +74,8 @@ impl Wal {
     }
 
     fn latest_segment(dir: &Path) -> Option<u32> {
-        fs::read_dir(dir).ok()?
+        fs::read_dir(dir)
+            .ok()?
             .filter_map(|e| e.ok())
             .filter_map(|e| {
                 let name = e.file_name();
@@ -101,7 +118,9 @@ impl Wal {
     }
 
     fn prune_old_segments(&self) {
-        if self.current_segment < KEEP_SEGMENTS as u32 { return; }
+        if self.current_segment < KEEP_SEGMENTS as u32 {
+            return;
+        }
         let cutoff = self.current_segment.saturating_sub(KEEP_SEGMENTS as u32);
         // Keep segments [cutoff, current_segment]
         for seg in 0..cutoff {
@@ -118,7 +137,9 @@ impl Wal {
     /// Skips corrupt lines with a warning (does not panic).
     pub fn replay(dir: impl AsRef<Path>) -> std::io::Result<Vec<WalEvent>> {
         let dir = dir.as_ref();
-        if !dir.exists() { return Ok(vec![]); }
+        if !dir.exists() {
+            return Ok(vec![]);
+        }
 
         let mut segments: Vec<u32> = fs::read_dir(dir)?
             .filter_map(|e| e.ok())
@@ -145,7 +166,11 @@ impl Wal {
                 let line = match line {
                     Ok(l) if l.trim().is_empty() => continue,
                     Ok(l) => l,
-                    Err(e) => { warn!("WAL read error seg={seg} line={lineno}: {e}"); corrupt += 1; continue; }
+                    Err(e) => {
+                        warn!("WAL read error seg={seg} line={lineno}: {e}");
+                        corrupt += 1;
+                        continue;
+                    }
                 };
                 match serde_json::from_str::<WalEvent>(&line) {
                     Ok(ev) => out.push(ev),
@@ -166,12 +191,17 @@ impl Wal {
 
     /// Replay from legacy single-file path (backward compat with v18).
     pub fn replay_path(path: &str) -> std::io::Result<Vec<WalEvent>> {
-        if !Path::new(path).exists() { return Ok(vec![]); }
+        if !Path::new(path).exists() {
+            return Ok(vec![]);
+        }
         let f = File::open(path)?;
         let br = BufReader::new(f);
         let mut out = Vec::new();
         for line in br.lines() {
-            let line = match line { Ok(l) if !l.trim().is_empty() => l, _ => continue };
+            let line = match line {
+                Ok(l) if !l.trim().is_empty() => l,
+                _ => continue,
+            };
             match serde_json::from_str::<WalEvent>(&line) {
                 Ok(ev) => out.push(ev),
                 Err(e) => warn!("legacy WAL corrupt line: {e}"),

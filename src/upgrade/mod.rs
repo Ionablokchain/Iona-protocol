@@ -54,22 +54,22 @@ pub enum MigrationResult {
     /// Migration completed (or would complete) successfully.
     Ok {
         from_version: u32,
-        to_version:   u32,
+        to_version: u32,
         /// Summary of changes (or planned changes in dry-run).
-        changes:      Vec<String>,
+        changes: Vec<String>,
     },
     /// Migration was skipped (data already at target version).
     Skipped { from_version: u32 },
     /// Migration failed.
-    Failed {
-        from_version: u32,
-        reason:       String,
-    },
+    Failed { from_version: u32, reason: String },
 }
 
 impl MigrationResult {
     pub fn is_ok(&self) -> bool {
-        matches!(self, MigrationResult::Ok { .. } | MigrationResult::Skipped { .. })
+        matches!(
+            self,
+            MigrationResult::Ok { .. } | MigrationResult::Skipped { .. }
+        )
     }
 
     pub fn is_failed(&self) -> bool {
@@ -80,15 +80,28 @@ impl MigrationResult {
 impl std::fmt::Display for MigrationResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MigrationResult::Ok { from_version, to_version, changes } => {
-                write!(f, "v{from_version} → v{to_version}: OK ({} change(s))", changes.len())?;
-                for c in changes { write!(f, "\n    • {c}")?; }
+            MigrationResult::Ok {
+                from_version,
+                to_version,
+                changes,
+            } => {
+                write!(
+                    f,
+                    "v{from_version} → v{to_version}: OK ({} change(s))",
+                    changes.len()
+                )?;
+                for c in changes {
+                    write!(f, "\n    • {c}")?;
+                }
                 Ok(())
             }
-            MigrationResult::Skipped { from_version } =>
-                write!(f, "v{from_version}: skipped (already migrated)"),
-            MigrationResult::Failed { from_version, reason } =>
-                write!(f, "v{from_version}: FAILED — {reason}"),
+            MigrationResult::Skipped { from_version } => {
+                write!(f, "v{from_version}: skipped (already migrated)")
+            }
+            MigrationResult::Failed {
+                from_version,
+                reason,
+            } => write!(f, "v{from_version}: FAILED — {reason}"),
         }
     }
 }
@@ -104,7 +117,9 @@ impl MigrationRegistry {
     /// Create a registry with all built-in migrations.
     pub fn new() -> Self {
         use migrations::*;
-        let mut reg = Self { migrations: Vec::new() };
+        let mut reg = Self {
+            migrations: Vec::new(),
+        };
         reg.register(Box::new(M001AddStateVmField));
         reg.register(Box::new(M002AddReceiptsIndex));
         reg.register(Box::new(M003AddEvidenceStore));
@@ -193,10 +208,26 @@ impl std::fmt::Display for CompatReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "=== IONA Compatibility Report ===")?;
         writeln!(f, "  Disk schema version   : {}", self.disk_schema_version)?;
-        writeln!(f, "  Binary schema version : {}", self.binary_schema_version)?;
-        writeln!(f, "  Binary protocol version: {}", self.binary_protocol_version)?;
-        writeln!(f, "  Compatible            : {}", if self.compatible { "YES" } else { "NO" })?;
-        writeln!(f, "  Migrations needed     : {}", if self.migrations_needed { "YES" } else { "no" })?;
+        writeln!(
+            f,
+            "  Binary schema version : {}",
+            self.binary_schema_version
+        )?;
+        writeln!(
+            f,
+            "  Binary protocol version: {}",
+            self.binary_protocol_version
+        )?;
+        writeln!(
+            f,
+            "  Compatible            : {}",
+            if self.compatible { "YES" } else { "NO" }
+        )?;
+        writeln!(
+            f,
+            "  Migrations needed     : {}",
+            if self.migrations_needed { "YES" } else { "no" }
+        )?;
         if self.migrations_needed {
             writeln!(f, "  Pending migrations    : {}", self.pending_migrations)?;
         }
@@ -212,8 +243,8 @@ impl std::fmt::Display for CompatReport {
 
 /// Generate a compatibility report for a given data directory.
 pub fn check_compat(data_dir: &Path) -> std::io::Result<CompatReport> {
-    use crate::storage::{DataDir, CURRENT_SCHEMA_VERSION};
     use crate::protocol::version::CURRENT_PROTOCOL_VERSION;
+    use crate::storage::{DataDir, CURRENT_SCHEMA_VERSION};
 
     let dd = DataDir::new(data_dir.to_str().unwrap_or("."));
     let disk_sv = dd.read_schema_version().unwrap_or(0);
@@ -221,7 +252,8 @@ pub fn check_compat(data_dir: &Path) -> std::io::Result<CompatReport> {
     let binary_pv = CURRENT_PROTOCOL_VERSION;
 
     let registry = MigrationRegistry::new();
-    let pending = registry.all()
+    let pending = registry
+        .all()
         .iter()
         .filter(|m| m.from_version() >= disk_sv)
         .count();
@@ -305,8 +337,11 @@ mod tests {
     #[test]
     fn registry_has_5_migrations() {
         let reg = MigrationRegistry::new();
-        assert_eq!(reg.all().len(), 5,
-            "registry must contain exactly 5 built-in migrations");
+        assert_eq!(
+            reg.all().len(),
+            5,
+            "registry must contain exactly 5 built-in migrations"
+        );
     }
 
     #[test]
@@ -315,8 +350,10 @@ mod tests {
         let versions: Vec<u32> = reg.all().iter().map(|m| m.from_version()).collect();
         let mut sorted = versions.clone();
         sorted.sort();
-        assert_eq!(versions, sorted,
-            "migrations must be registered in ascending from_version order");
+        assert_eq!(
+            versions, sorted,
+            "migrations must be registered in ascending from_version order"
+        );
     }
 
     #[test]
@@ -324,8 +361,10 @@ mod tests {
         let reg = MigrationRegistry::new();
         let versions: Vec<u32> = reg.all().iter().map(|m| m.from_version()).collect();
         for (i, &v) in versions.iter().enumerate() {
-            assert_eq!(v, i as u32,
-                "migration at position {i} must have from_version={i}, got {v}");
+            assert_eq!(
+                v, i as u32,
+                "migration at position {i} must have from_version={i}, got {v}"
+            );
         }
     }
 
@@ -335,8 +374,12 @@ mod tests {
         let reg = MigrationRegistry::new();
         // Simulate all 5 migrations already applied (current version = 5).
         let results = reg.run(dir.path(), 5, true);
-        assert!(results.iter().all(|r| matches!(r, MigrationResult::Skipped { .. })),
-            "all migrations must be skipped when already at target version");
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r, MigrationResult::Skipped { .. })),
+            "all migrations must be skipped when already at target version"
+        );
     }
 
     #[test]
@@ -346,21 +389,23 @@ mod tests {
         let results = reg.run(dir.path(), 0, /* dry_run = */ true);
         assert!(!results.is_empty());
         for result in &results {
-            assert!(result.is_ok(),
-                "dry-run migration must not fail on empty directory: {result}");
+            assert!(
+                result.is_ok(),
+                "dry-run migration must not fail on empty directory: {result}"
+            );
         }
     }
 
     #[test]
     fn compat_report_display_contains_key_fields() {
         let report = CompatReport {
-            disk_schema_version:    3,
-            binary_schema_version:  5,
+            disk_schema_version: 3,
+            binary_schema_version: 5,
             binary_protocol_version: 1,
-            compatible:             true,
-            migrations_needed:      true,
-            pending_migrations:     2,
-            issues:                 vec![],
+            compatible: true,
+            migrations_needed: true,
+            pending_migrations: 2,
+            issues: vec![],
         };
         let s = format!("{report}");
         assert!(s.contains("Disk schema version"));
@@ -371,7 +416,8 @@ mod tests {
     #[test]
     fn migration_result_is_ok_semantics() {
         let ok = MigrationResult::Ok {
-            from_version: 0, to_version: 1,
+            from_version: 0,
+            to_version: 1,
             changes: vec!["added vm field".into()],
         };
         assert!(ok.is_ok());

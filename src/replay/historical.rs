@@ -66,12 +66,8 @@ pub fn replay_block(
         crate::crypto::tx::derive_address(&block.header.proposer_pk)
     };
 
-    let (new_state, gas_used, receipts) = execute_block(
-        state,
-        &block.txs,
-        base_fee_per_gas,
-        &proposer_addr,
-    );
+    let (new_state, gas_used, receipts) =
+        execute_block(state, &block.txs, base_fee_per_gas, &proposer_addr);
 
     let state_root = new_state.root();
     let expected_root = block.header.state_root.clone();
@@ -274,10 +270,7 @@ mod tests {
     fn test_replay_and_verify_with_external_roots() {
         let state = KvState::default();
         let root = state.root();
-        let blocks = vec![
-            empty_block(1, root.clone()),
-            empty_block(2, root.clone()),
-        ];
+        let blocks = vec![empty_block(1, root.clone()), empty_block(2, root.clone())];
 
         let mut expected = std::collections::BTreeMap::new();
         expected.insert(1, root.clone());
@@ -291,9 +284,7 @@ mod tests {
     fn test_replay_and_verify_external_mismatch() {
         let state = KvState::default();
         let root = state.root();
-        let blocks = vec![
-            empty_block(1, root.clone()),
-        ];
+        let blocks = vec![empty_block(1, root.clone())];
 
         let mut expected = std::collections::BTreeMap::new();
         expected.insert(1, Hash32([0xAA; 32])); // wrong external root

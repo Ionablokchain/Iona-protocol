@@ -248,28 +248,56 @@ impl ConsensusTracer {
 
     /// Get events for a specific height.
     pub fn events_at_height(&self, height: Height) -> Vec<&ConsensusEvent> {
-        self.events.iter().filter(|e| event_height(e) == Some(height)).collect()
+        self.events
+            .iter()
+            .filter(|e| event_height(e) == Some(height))
+            .collect()
     }
 
     /// Get the latest commit event.
     pub fn latest_commit(&self) -> Option<&ConsensusEvent> {
-        self.events.iter().rev().find(|e| matches!(e, ConsensusEvent::Commit { .. }))
+        self.events
+            .iter()
+            .rev()
+            .find(|e| matches!(e, ConsensusEvent::Commit { .. }))
     }
 
     /// Get stats for a height range.
     pub fn stats(&self, from: Height, to: Height) -> ConsensusStats {
-        let relevant: Vec<&ConsensusEvent> = self.events.iter()
+        let relevant: Vec<&ConsensusEvent> = self
+            .events
+            .iter()
             .filter(|e| {
-                event_height(e).map(|h| h >= from && h <= to).unwrap_or(false)
+                event_height(e)
+                    .map(|h| h >= from && h <= to)
+                    .unwrap_or(false)
             })
             .collect();
 
-        let proposals = relevant.iter().filter(|e| matches!(e, ConsensusEvent::Proposal { .. })).count();
-        let prevotes = relevant.iter().filter(|e| matches!(e, ConsensusEvent::Prevote { .. })).count();
-        let precommits = relevant.iter().filter(|e| matches!(e, ConsensusEvent::Precommit { .. })).count();
-        let commits = relevant.iter().filter(|e| matches!(e, ConsensusEvent::Commit { .. })).count();
-        let timeouts = relevant.iter().filter(|e| matches!(e, ConsensusEvent::Timeout { .. })).count();
-        let round_skips = relevant.iter().filter(|e| matches!(e, ConsensusEvent::RoundSkip { .. })).count();
+        let proposals = relevant
+            .iter()
+            .filter(|e| matches!(e, ConsensusEvent::Proposal { .. }))
+            .count();
+        let prevotes = relevant
+            .iter()
+            .filter(|e| matches!(e, ConsensusEvent::Prevote { .. }))
+            .count();
+        let precommits = relevant
+            .iter()
+            .filter(|e| matches!(e, ConsensusEvent::Precommit { .. }))
+            .count();
+        let commits = relevant
+            .iter()
+            .filter(|e| matches!(e, ConsensusEvent::Commit { .. }))
+            .count();
+        let timeouts = relevant
+            .iter()
+            .filter(|e| matches!(e, ConsensusEvent::Timeout { .. }))
+            .count();
+        let round_skips = relevant
+            .iter()
+            .filter(|e| matches!(e, ConsensusEvent::RoundSkip { .. }))
+            .count();
 
         ConsensusStats {
             from,
@@ -343,7 +371,12 @@ pub struct StateRootLogEntry {
 
 impl std::fmt::Display for StateRootLogEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "height={} root=0x{}", self.height, hex::encode(self.state_root.0))
+        write!(
+            f,
+            "height={} root=0x{}",
+            self.height,
+            hex::encode(self.state_root.0)
+        )
     }
 }
 
@@ -367,11 +400,14 @@ impl StateRootLog {
         if !self.enabled {
             return;
         }
-        self.entries.insert(height, StateRootLogEntry {
+        self.entries.insert(
             height,
-            state_root,
-            timestamp,
-        });
+            StateRootLogEntry {
+                height,
+                state_root,
+                timestamp,
+            },
+        );
     }
 
     /// Get the state root at a specific height.
@@ -381,7 +417,10 @@ impl StateRootLog {
 
     /// Get all entries as a BTreeMap of height -> Hash32 (for cross-node comparison).
     pub fn roots(&self) -> BTreeMap<Height, Hash32> {
-        self.entries.iter().map(|(&h, e)| (h, e.state_root.clone())).collect()
+        self.entries
+            .iter()
+            .map(|(&h, e)| (h, e.state_root.clone()))
+            .collect()
     }
 
     /// Get the latest logged height.
@@ -518,30 +557,52 @@ mod tests {
     fn test_event_display() {
         let events = vec![
             ConsensusEvent::NewHeight { height: 42 },
-            ConsensusEvent::NewRound { height: 42, round: 1 },
+            ConsensusEvent::NewRound {
+                height: 42,
+                round: 1,
+            },
             ConsensusEvent::Proposal {
-                height: 42, round: 0, proposer: "val2".into(),
-                block_hash: Hash32([0xAB; 32]), tx_count: 5,
+                height: 42,
+                round: 0,
+                proposer: "val2".into(),
+                block_hash: Hash32([0xAB; 32]),
+                tx_count: 5,
             },
             ConsensusEvent::Prevote {
-                height: 42, round: 0, validator: "val2".into(),
+                height: 42,
+                round: 0,
+                validator: "val2".into(),
                 block_hash: Some(Hash32([0xAB; 32])),
             },
             ConsensusEvent::Prevote {
-                height: 42, round: 0, validator: "val3".into(),
+                height: 42,
+                round: 0,
+                validator: "val3".into(),
                 block_hash: None, // NIL vote
             },
             ConsensusEvent::Precommit {
-                height: 42, round: 0, validator: "val2".into(),
+                height: 42,
+                round: 0,
+                validator: "val2".into(),
                 block_hash: Some(Hash32([0xAB; 32])),
             },
             ConsensusEvent::Commit {
-                height: 42, round: 0, block_hash: Hash32([0xAB; 32]),
-                state_root: Hash32([0xCD; 32]), tx_count: 5, gas_used: 21000,
+                height: 42,
+                round: 0,
+                block_hash: Hash32([0xAB; 32]),
+                state_root: Hash32([0xCD; 32]),
+                tx_count: 5,
+                gas_used: 21000,
             },
-            ConsensusEvent::Timeout { height: 42, round: 0, phase: "propose".into() },
+            ConsensusEvent::Timeout {
+                height: 42,
+                round: 0,
+                phase: "propose".into(),
+            },
             ConsensusEvent::RoundSkip {
-                height: 42, from_round: 0, to_round: 2,
+                height: 42,
+                from_round: 0,
+                to_round: 2,
                 reason: "timeout + no proposal".into(),
             },
         ];

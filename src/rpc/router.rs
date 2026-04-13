@@ -1,5 +1,5 @@
-use axum::{routing::post, Router};
 use crate::rpc::eth_rpc::{handle_rpc, EthRpcState};
+use axum::{routing::post, Router};
 
 pub fn build_router(state: EthRpcState) -> Router {
     Router::new()

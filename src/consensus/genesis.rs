@@ -78,10 +78,18 @@ pub struct GenesisValidator {
     pub rpc_addr: Option<String>,
 }
 
-fn default_pv()           -> u32 { 1 }
-fn default_base_fee()     -> u64 { 1_000_000_000 }   // 1 Gwei
-fn default_stake()        -> u64 { 1_000_000 }
-fn default_power()        -> VotingPower { 1 }
+fn default_pv() -> u32 {
+    1
+}
+fn default_base_fee() -> u64 {
+    1_000_000_000
+} // 1 Gwei
+fn default_stake() -> u64 {
+    1_000_000
+}
+fn default_power() -> VotingPower {
+    1
+}
 fn default_genesis_time() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -96,14 +104,20 @@ impl GenesisConfig {
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
         let s = fs::read_to_string(path.as_ref())?;
         serde_json::from_str(&s).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("genesis.json parse: {e}"))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("genesis.json parse: {e}"),
+            )
         })
     }
 
     /// Save genesis to a JSON file (pretty-printed).
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let out = serde_json::to_string_pretty(self).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("genesis.json encode: {e}"))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("genesis.json encode: {e}"),
+            )
         })?;
         if let Some(parent) = path.as_ref().parent() {
             fs::create_dir_all(parent)?;
@@ -187,12 +201,12 @@ impl GenesisConfig {
     pub fn generate_testnet(n_validators: usize, chain_id: u64) -> Self {
         let validators = (1..=n_validators as u64)
             .map(|i| GenesisValidator {
-                seed:        i,
-                power:       1,
-                name:        format!("val{i}"),
-                pubkey_hex:  None,
-                p2p_addr:    Some(format!("/ip4/127.0.0.1/tcp/{}", 7000 + i * 10)),
-                rpc_addr:    Some(format!("http://127.0.0.1:{}", 8540 + i)),
+                seed: i,
+                power: 1,
+                name: format!("val{i}"),
+                pubkey_hex: None,
+                p2p_addr: Some(format!("/ip4/127.0.0.1/tcp/{}", 7000 + i * 10)),
+                rpc_addr: Some(format!("http://127.0.0.1:{}", 8540 + i)),
             })
             .collect();
 
@@ -208,12 +222,12 @@ impl GenesisConfig {
 
         Self {
             chain_id,
-            chain_name:       format!("iona-testnet-{chain_id}"),
+            chain_name: format!("iona-testnet-{chain_id}"),
             validators,
             protocol_version: 1,
             initial_base_fee: 1_000_000_000,
-            stake_each:       1_000_000,
-            genesis_time:     default_genesis_time(),
+            stake_each: 1_000_000,
+            genesis_time: default_genesis_time(),
             alloc,
         }
     }
@@ -269,8 +283,8 @@ pub fn generate_testnet_configs(
         fs::create_dir_all(&node_dir)?;
         fs::create_dir_all(node_dir.join("data"))?;
 
-        let p2p_port   = 7000 + i as u64 * 10;
-        let rpc_port   = 8540 + i as u64;
+        let p2p_port = 7000 + i as u64 * 10;
+        let rpc_port = 8540 + i as u64;
         let admin_port = 9000 + i as u64;
 
         // All peers except self
@@ -286,7 +300,8 @@ pub fn generate_testnet_configs(
             .collect::<Vec<_>>()
             .join(", ");
 
-        let config = format!(r#"# IONA v30.0.0 — Node {i} config (auto-generated)
+        let config = format!(
+            r#"# IONA v30.0.0 — Node {i} config (auto-generated)
 # Genesis hash: {genesis_hash}
 
 [node]

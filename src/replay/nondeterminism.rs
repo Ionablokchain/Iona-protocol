@@ -100,9 +100,11 @@ pub struct NdEvent {
 
 impl std::fmt::Display for NdEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}] {} h={}: {} (observed={}",
-            self.severity, self.source, self.height,
-            self.description, self.observed_value)?;
+        write!(
+            f,
+            "[{}] {} h={}: {} (observed={}",
+            self.severity, self.source, self.height, self.description, self.observed_value
+        )?;
         if let Some(alt) = &self.deterministic_alternative {
             write!(f, ", should_use={alt}")?;
         }
@@ -140,7 +142,14 @@ impl NdLogger {
     }
 
     /// Log a nondeterminism event.
-    pub fn log(&self, source: NdSource, severity: NdSeverity, description: &str, observed: &str, alternative: Option<&str>) {
+    pub fn log(
+        &self,
+        source: NdSource,
+        severity: NdSeverity,
+        description: &str,
+        observed: &str,
+        alternative: Option<&str>,
+    ) {
         if !self.enabled {
             return;
         }
@@ -234,21 +243,25 @@ impl NdLogger {
 
     /// Get events filtered by severity.
     pub fn events_by_severity(&self, min_severity: NdSeverity) -> Vec<NdEvent> {
-        self.events().into_iter()
+        self.events()
+            .into_iter()
             .filter(|e| e.severity >= min_severity)
             .collect()
     }
 
     /// Get events filtered by source.
     pub fn events_by_source(&self, source: &NdSource) -> Vec<NdEvent> {
-        self.events().into_iter()
+        self.events()
+            .into_iter()
             .filter(|e| &e.source == source)
             .collect()
     }
 
     /// Check if any critical nondeterminism was detected.
     pub fn has_critical(&self) -> bool {
-        self.events().iter().any(|e| e.severity == NdSeverity::Critical)
+        self.events()
+            .iter()
+            .any(|e| e.severity == NdSeverity::Critical)
     }
 
     /// Clear all events.
@@ -261,9 +274,18 @@ impl NdLogger {
     /// Generate a summary report.
     pub fn report(&self) -> NdReport {
         let events = self.events();
-        let critical_count = events.iter().filter(|e| e.severity == NdSeverity::Critical).count();
-        let warning_count = events.iter().filter(|e| e.severity == NdSeverity::Warning).count();
-        let info_count = events.iter().filter(|e| e.severity == NdSeverity::Info).count();
+        let critical_count = events
+            .iter()
+            .filter(|e| e.severity == NdSeverity::Critical)
+            .count();
+        let warning_count = events
+            .iter()
+            .filter(|e| e.severity == NdSeverity::Warning)
+            .count();
+        let info_count = events
+            .iter()
+            .filter(|e| e.severity == NdSeverity::Info)
+            .count();
 
         NdReport {
             total_events: events.len(),
@@ -290,11 +312,20 @@ pub struct NdReport {
 
 impl std::fmt::Display for NdReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Nondeterminism Report: {}",
-            if self.clean { "CLEAN" } else { "ISSUES DETECTED" })?;
-        writeln!(f, "  total={}, critical={}, warning={}, info={}",
-            self.total_events, self.critical_count,
-            self.warning_count, self.info_count)?;
+        writeln!(
+            f,
+            "Nondeterminism Report: {}",
+            if self.clean {
+                "CLEAN"
+            } else {
+                "ISSUES DETECTED"
+            }
+        )?;
+        writeln!(
+            f,
+            "  total={}, critical={}, warning={}, info={}",
+            self.total_events, self.critical_count, self.warning_count, self.info_count
+        )?;
         for e in &self.events {
             writeln!(f, "  {e}")?;
         }
@@ -334,7 +365,9 @@ pub fn check_code_snippet(code: &str) -> Vec<(String, NdSeverity)> {
         if code.contains(pattern) {
             let severity = match pattern {
                 "HashMap" | "HashSet" => NdSeverity::Warning,
-                "SystemTime::now" | "Instant::now" | "thread_rng" | "rand::random" => NdSeverity::Critical,
+                "SystemTime::now" | "Instant::now" | "thread_rng" | "rand::random" => {
+                    NdSeverity::Critical
+                }
                 "f32" | "f64" => NdSeverity::Warning,
                 _ => NdSeverity::Info,
             };
@@ -523,7 +556,10 @@ mod tests {
     fn test_nd_source_display() {
         assert_eq!(format!("{}", NdSource::Timestamp), "TIMESTAMP");
         assert_eq!(format!("{}", NdSource::Rng), "RNG");
-        assert_eq!(format!("{}", NdSource::Other("custom".into())), "OTHER(custom)");
+        assert_eq!(
+            format!("{}", NdSource::Other("custom".into())),
+            "OTHER(custom)"
+        );
     }
 
     #[test]

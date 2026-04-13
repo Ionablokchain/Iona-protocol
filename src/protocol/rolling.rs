@@ -25,9 +25,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::version::{ProtocolActivation, version_for_height, SUPPORTED_PROTOCOL_VERSIONS};
-use super::wire::{Hello, check_hello_compat};
 use super::safety;
+use super::version::{version_for_height, ProtocolActivation, SUPPORTED_PROTOCOL_VERSIONS};
+use super::wire::{check_hello_compat, Hello};
 
 // ─── Upgrade plan ────────────────────────────────────────────────────────────
 
@@ -106,7 +106,8 @@ impl RollingUpgradePlan {
         if self.upgrade_order.len() != self.total_nodes {
             errors.push(format!(
                 "upgrade_order length ({}) != total_nodes ({})",
-                self.upgrade_order.len(), self.total_nodes
+                self.upgrade_order.len(),
+                self.total_nodes
             ));
         }
 
@@ -122,7 +123,11 @@ impl RollingUpgradePlan {
             }
         }
 
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     /// Estimate total upgrade duration.
@@ -171,9 +176,17 @@ pub enum SimEvent {
     /// Node taken offline for upgrade.
     NodeOffline { index: usize, height: u64 },
     /// Node brought back online after upgrade.
-    NodeOnline { index: usize, height: u64, new_pv: Vec<u32> },
+    NodeOnline {
+        index: usize,
+        height: u64,
+        new_pv: Vec<u32>,
+    },
     /// Block produced at height.
-    BlockProduced { height: u64, pv: u32, proposer: usize },
+    BlockProduced {
+        height: u64,
+        pv: u32,
+        proposer: usize,
+    },
     /// All nodes upgraded.
     AllUpgraded { height: u64 },
     /// Activation height reached.
@@ -181,7 +194,11 @@ pub enum SimEvent {
     /// Safety check passed.
     SafetyCheckPassed { check: String, height: u64 },
     /// Safety violation detected.
-    SafetyViolation { check: String, height: u64, detail: String },
+    SafetyViolation {
+        check: String,
+        height: u64,
+        detail: String,
+    },
 }
 
 /// Simulate a rolling upgrade according to the plan.
@@ -213,7 +230,8 @@ pub fn simulate_rolling_upgrade(
         blocks_to_simulate / (plan.total_nodes as u64 + 1)
     } else {
         blocks_to_simulate
-    }.max(1);
+    }
+    .max(1);
 
     for block_num in 0..blocks_to_simulate {
         let height = start_height + block_num + 1;
@@ -228,7 +246,10 @@ pub fn simulate_rolling_upgrade(
 
             // Take node offline.
             nodes[node_idx].online = false;
-            events.push(SimEvent::NodeOffline { index: node_idx, height });
+            events.push(SimEvent::NodeOffline {
+                index: node_idx,
+                height,
+            });
 
             // Upgrade node.
             nodes[node_idx].supported_pv = (1..=plan.target_pv).collect();
@@ -254,10 +275,7 @@ pub fn simulate_rolling_upgrade(
         let pv = version_for_height(height, activations);
 
         // Select proposer (round-robin among online nodes).
-        let online_nodes: Vec<usize> = nodes.iter()
-            .filter(|n| n.online)
-            .map(|n| n.index)
-            .collect();
+        let online_nodes: Vec<usize> = nodes.iter().filter(|n| n.online).map(|n| n.index).collect();
 
         if online_nodes.is_empty() {
             violations.push(format!("no online nodes at height {height}"));
@@ -271,12 +289,17 @@ pub fn simulate_rolling_upgrade(
         if online_nodes.len() < required_online {
             violations.push(format!(
                 "liveness violation at height {height}: only {} online, need {}",
-                online_nodes.len(), required_online
+                online_nodes.len(),
+                required_online
             ));
         }
 
         // Produce block.
-        events.push(SimEvent::BlockProduced { height, pv, proposer });
+        events.push(SimEvent::BlockProduced {
+            height,
+            pv,
+            proposer,
+        });
         blocks_produced += 1;
 
         // Update all online nodes.
@@ -293,10 +316,15 @@ pub fn simulate_rolling_upgrade(
         if let Err(e) = safety::check_no_split_finality(height, 1) {
             violations.push(format!("S1 at height {height}: {e}"));
             events.push(SimEvent::SafetyViolation {
-                check: "S1".into(), height, detail: e,
+                check: "S1".into(),
+                height,
+                detail: e,
             });
         } else {
-            events.push(SimEvent::SafetyCheckPassed { check: "S1".into(), height });
+            events.push(SimEvent::SafetyCheckPassed {
+                check: "S1".into(),
+                height,
+            });
         }
 
         // S2: Finality monotonic.
@@ -304,15 +332,19 @@ pub fn simulate_rolling_upgrade(
             if let Err(e) = safety::check_finality_monotonic(height - 1, height) {
                 violations.push(format!("S2 at height {height}: {e}"));
                 events.push(SimEvent::SafetyViolation {
-                    check: "S2".into(), height, detail: e,
+                    check: "S2".into(),
+                    height,
+                    detail: e,
                 });
             }
         }
 
         // Wire compatibility: all online node pairs must be compatible.
         for i in 0..nodes.len() {
-            for j in (i+1)..nodes.len() {
-                if !nodes[i].online || !nodes[j].online { continue; }
+            for j in (i + 1)..nodes.len() {
+                if !nodes[i].online || !nodes[j].online {
+                    continue;
+                }
                 let hello_i = Hello {
                     supported_pv: nodes[i].supported_pv.clone(),
                     supported_sv: vec![0, 1, 2, 3, 4],
@@ -455,8 +487,7 @@ mod tests {
 
     #[test]
     fn test_simulate_with_activation() {
-        let plan = RollingUpgradePlan::new(4, 2)
-            .with_activation(15, 5);
+        let plan = RollingUpgradePlan::new(4, 2).with_activation(15, 5);
         let activations = vec![
             ProtocolActivation {
                 protocol_version: 1,
@@ -472,7 +503,10 @@ mod tests {
         let result = simulate_rolling_upgrade(&plan, &activations, 0, 30);
 
         // Should have ActivationReached event.
-        let has_activation = result.events.iter().any(|e| matches!(e, SimEvent::ActivationReached { .. }));
+        let has_activation = result
+            .events
+            .iter()
+            .any(|e| matches!(e, SimEvent::ActivationReached { .. }));
         assert!(has_activation, "should have ActivationReached event");
     }
 
@@ -491,8 +525,7 @@ mod tests {
 
     #[test]
     fn test_plan_with_custom_order() {
-        let plan = RollingUpgradePlan::new(4, 1)
-            .with_order(vec![3, 2, 1, 0]);
+        let plan = RollingUpgradePlan::new(4, 1).with_order(vec![3, 2, 1, 0]);
         assert_eq!(plan.upgrade_order, vec![3, 2, 1, 0]);
         assert!(plan.validate().is_ok());
     }
@@ -505,9 +538,15 @@ mod tests {
         let result = simulate_rolling_upgrade(&plan, &activations, 0, 30);
 
         // No wire incompatibility violations.
-        let wire_violations: Vec<_> = result.violations.iter()
+        let wire_violations: Vec<_> = result
+            .violations
+            .iter()
             .filter(|v| v.contains("wire incompat"))
             .collect();
-        assert!(wire_violations.is_empty(), "wire violations: {:?}", wire_violations);
+        assert!(
+            wire_violations.is_empty(),
+            "wire violations: {:?}",
+            wire_violations
+        );
     }
 }

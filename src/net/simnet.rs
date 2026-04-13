@@ -69,7 +69,10 @@ impl SimNet {
         Self::with_config(node_id, SimNetConfig::default())
     }
 
-    pub fn with_config(node_id: NodeId, cfg: SimNetConfig) -> (Self, mpsc::UnboundedReceiver<NetMsg>) {
+    pub fn with_config(
+        node_id: NodeId,
+        cfg: SimNetConfig,
+    ) -> (Self, mpsc::UnboundedReceiver<NetMsg>) {
         let inner = Arc::new(Mutex::new(Inner {
             peers: HashMap::new(),
             rng: cfg.seed ^ (node_id.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
@@ -95,7 +98,6 @@ impl SimNet {
         rx
     }
 
-
     /// Enable partitioning (messages across different partitions are dropped).
     pub fn enable_partitioning(&self, enabled: bool) {
         if let Ok(mut g) = self.inner.lock() {
@@ -112,11 +114,17 @@ impl SimNet {
 
     /// Snapshot of bounded consensus history (for tests/diagnostics).
     pub fn consensus_history(&self) -> Vec<ConsensusMsg> {
-        self.inner.lock().map(|g| g.consensus_history.clone()).unwrap_or_default()
+        self.inner
+            .lock()
+            .map(|g| g.consensus_history.clone())
+            .unwrap_or_default()
     }
 
     pub fn handle(&self, node_id: NodeId) -> Self {
-        Self { inner: self.inner.clone(), node_id }
+        Self {
+            inner: self.inner.clone(),
+            node_id,
+        }
     }
 
     /// Replay bounded consensus history to a given node (useful for late joiners).
@@ -127,29 +135,49 @@ impl SimNet {
                 Some(t) => t.clone(),
                 None => return,
             };
-            (tx, inner.consensus_history.clone(), inner.cfg.clone(), inner.cfg.drop_ppm_consensus, self.node_id)
+            (
+                tx,
+                inner.consensus_history.clone(),
+                inner.cfg.clone(),
+                inner.cfg.drop_ppm_consensus,
+                self.node_id,
+            )
         };
         for msg in msgs {
-            Self::send_with_impairments(tx.clone(), delay_cfg.clone(), drop_ppm, NetMsg::Consensus { from, msg });
+            Self::send_with_impairments(
+                tx.clone(),
+                delay_cfg.clone(),
+                drop_ppm,
+                NetMsg::Consensus { from, msg },
+            );
         }
     }
 
     pub fn send_to(&self, to: NodeId, msg: NetMsg) {
         let (tx, cfg, drop_ppm, allow) = {
             let inner = self.inner.lock().unwrap();
-            let tx = match inner.peers.get(&to) { Some(t) => t.clone(), None => return };
+            let tx = match inner.peers.get(&to) {
+                Some(t) => t.clone(),
+                None => return,
+            };
             let drop_ppm = match msg {
                 NetMsg::Consensus { .. } => inner.cfg.drop_ppm_consensus,
-                NetMsg::BlockRequest { .. } | NetMsg::BlockResponse { .. } => inner.cfg.drop_ppm_block,
+                NetMsg::BlockRequest { .. } | NetMsg::BlockResponse { .. } => {
+                    inner.cfg.drop_ppm_block
+                }
             };
             let allow = if inner.partitioning_enabled {
                 let a = *inner.partitions.get(&self.node_id).unwrap_or(&0);
                 let b = *inner.partitions.get(&to).unwrap_or(&0);
                 a == b
-            } else { true };
+            } else {
+                true
+            };
             (tx, inner.cfg.clone(), drop_ppm, allow)
         };
-        if !allow { return; }
+        if !allow {
+            return;
+        }
         Self::send_with_impairments(tx, cfg, drop_ppm, msg);
     }
 
@@ -164,29 +192,68 @@ impl SimNet {
                 inner.consensus_history.drain(0..extra);
             }
 
-            (inner.peers.clone(), inner.cfg.clone(), inner.cfg.drop_ppm_consensus, self.node_id,
-             inner.consensus_history.clone(), inner.partitioning_enabled, inner.partitions.clone(), inner.partitions.get(&self.node_id).copied().unwrap_or(0))
+            (
+                inner.peers.clone(),
+                inner.cfg.clone(),
+                inner.cfg.drop_ppm_consensus,
+                self.node_id,
+                inner.consensus_history.clone(),
+                inner.partitioning_enabled,
+                inner.partitions.clone(),
+                inner.partitions.get(&self.node_id).copied().unwrap_or(0),
+            )
         };
 
         // broadcast to all except self
         for (id, tx) in peers.into_iter() {
-            if id == self.node_id { continue; }
+            if id == self.node_id {
+                continue;
+            }
             // partition filter
-            if cfg_partitioning && partitions.get(&id).copied().unwrap_or(0) != my_part { continue; }
-            Self::send_with_impairments(tx, cfg.clone(), drop_ppm, NetMsg::Consensus { from, msg: msg.clone() });
+            if cfg_partitioning && partitions.get(&id).copied().unwrap_or(0) != my_part {
+                continue;
+            }
+            Self::send_with_impairments(
+                tx,
+                cfg.clone(),
+                drop_ppm,
+                NetMsg::Consensus {
+                    from,
+                    msg: msg.clone(),
+                },
+            );
         }
     }
 
     pub fn request_block(&self, id: Hash32) {
         let (peers, cfg, drop_ppm, from, cfg_partitioning, partitions, my_part) = {
             let inner = self.inner.lock().unwrap();
-            (inner.peers.clone(), inner.cfg.clone(), inner.cfg.drop_ppm_block, self.node_id,
-             inner.partitioning_enabled, inner.partitions.clone(), inner.partitions.get(&self.node_id).copied().unwrap_or(0))
+            (
+                inner.peers.clone(),
+                inner.cfg.clone(),
+                inner.cfg.drop_ppm_block,
+                self.node_id,
+                inner.partitioning_enabled,
+                inner.partitions.clone(),
+                inner.partitions.get(&self.node_id).copied().unwrap_or(0),
+            )
         };
         for (pid, tx) in peers.into_iter() {
-            if pid == self.node_id { continue; }
-            if cfg_partitioning && partitions.get(&pid).copied().unwrap_or(0) != my_part { continue; }
-            Self::send_with_impairments(tx, cfg.clone(), drop_ppm, NetMsg::BlockRequest { from, id: id.clone() });
+            if pid == self.node_id {
+                continue;
+            }
+            if cfg_partitioning && partitions.get(&pid).copied().unwrap_or(0) != my_part {
+                continue;
+            }
+            Self::send_with_impairments(
+                tx,
+                cfg.clone(),
+                drop_ppm,
+                NetMsg::BlockRequest {
+                    from,
+                    id: id.clone(),
+                },
+            );
         }
     }
 
@@ -201,7 +268,9 @@ impl SimNet {
     }
 
     fn should_drop(inner: &mut Inner, drop_ppm: u32) -> bool {
-        if drop_ppm == 0 { return false; }
+        if drop_ppm == 0 {
+            return false;
+        }
         let r = Self::rand_u32(inner) % 1_000_000;
         r < drop_ppm
     }
@@ -209,13 +278,20 @@ impl SimNet {
     fn sample_delay_ms(inner: &mut Inner) -> u64 {
         let min = inner.cfg.min_delay_ms;
         let max = inner.cfg.max_delay_ms;
-        if max <= min { return min; }
+        if max <= min {
+            return min;
+        }
         let span = max - min + 1;
         let r = (Self::rand_u32(inner) as u64) % span;
         min + r
     }
 
-    fn send_with_impairments(tx: mpsc::UnboundedSender<NetMsg>, cfg: SimNetConfig, drop_ppm: u32, msg: NetMsg) {
+    fn send_with_impairments(
+        tx: mpsc::UnboundedSender<NetMsg>,
+        cfg: SimNetConfig,
+        drop_ppm: u32,
+        msg: NetMsg,
+    ) {
         // impairment decisions are centralized under the Inner mutex to keep determinism
         let (drop_it, delay_ms) = {
             // create a temporary inner-like RNG state for this send by hashing (deterministic but not shared)
@@ -229,17 +305,23 @@ impl SimNet {
                 NetMsg::BlockResponse { .. } => 3,
             };
             // xorshift
-            x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
             let r = ((x.wrapping_mul(0x2545F4914F6CDD1D) >> 32) & 0xFFFF_FFFF) as u32;
             let drop_it = drop_ppm != 0 && (r % 1_000_000) < drop_ppm;
-            let delay_ms = if cfg.max_delay_ms <= cfg.min_delay_ms { cfg.min_delay_ms } else {
+            let delay_ms = if cfg.max_delay_ms <= cfg.min_delay_ms {
+                cfg.min_delay_ms
+            } else {
                 let span = cfg.max_delay_ms - cfg.min_delay_ms + 1;
                 cfg.min_delay_ms + (r as u64 % span)
             };
             (drop_it, delay_ms)
         };
 
-        if drop_it { return; }
+        if drop_it {
+            return;
+        }
         if delay_ms == 0 {
             let _ = tx.send(msg);
             return;
@@ -263,5 +345,4 @@ impl SimNet {
             }
         });
     }
-
 }

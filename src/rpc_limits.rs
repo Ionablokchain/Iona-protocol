@@ -96,7 +96,10 @@ pub enum IpStatus {
     /// Normal operation.
     Allowed,
     /// Temporarily blocked; reconnect allowed after `until`.
-    Quarantined { until: Instant, escalation_count: u32 },
+    Quarantined {
+        until: Instant,
+        escalation_count: u32,
+    },
     /// Permanently blocked for this session.
     Banned,
 }
@@ -124,7 +127,10 @@ impl IpEntry {
     fn is_blocked(&mut self) -> bool {
         match &self.status {
             IpStatus::Banned => true,
-            IpStatus::Quarantined { until, escalation_count } => {
+            IpStatus::Quarantined {
+                until,
+                escalation_count,
+            } => {
                 if Instant::now() < *until {
                     true
                 } else {
@@ -162,7 +168,10 @@ impl IpEntry {
                     escalation_count: 1,
                 };
             }
-            IpStatus::Quarantined { until, escalation_count } => {
+            IpStatus::Quarantined {
+                until,
+                escalation_count,
+            } => {
                 let new_count = escalation_count + 1;
                 if new_count >= QUARANTINE_BEFORE_BAN {
                     tracing::warn!(
@@ -194,7 +203,10 @@ pub struct ConcurrencyGuard {
 
 impl ConcurrencyGuard {
     pub fn new(max: usize) -> Self {
-        Self { current: Arc::new(AtomicUsize::new(0)), max }
+        Self {
+            current: Arc::new(AtomicUsize::new(0)),
+            max,
+        }
     }
 
     /// Attempt to acquire a slot. Returns a `ConcurrencyTicket` on success.
@@ -207,10 +219,15 @@ impl ConcurrencyGuard {
                 return None;
             }
             match self.current.compare_exchange_weak(
-                cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed,
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    return Some(ConcurrencyTicket { guard: self.current.clone() });
+                    return Some(ConcurrencyTicket {
+                        guard: self.current.clone(),
+                    });
                 }
                 Err(actual) => cur = actual,
             }
@@ -348,20 +365,19 @@ impl RpcLimiter {
         let mut ips = self.ips.lock();
         let entry = ips.entry(ip).or_insert_with(IpEntry::new);
         // Penalise the submit bucket streak directly.
-        entry.submit.violation_streak =
-            entry.submit.violation_streak.saturating_add(5); // decode errors cost more
+        entry.submit.violation_streak = entry.submit.violation_streak.saturating_add(5); // decode errors cost more
         let streak = entry.submit.violation_streak;
         entry.maybe_escalate(streak);
     }
 
     /// Record a payload-too-large violation.
     pub fn record_payload_too_large(&self, ip: IpAddr, req_id: &str, size: usize) {
-        self.metric_payload_too_large.fetch_add(1, Ordering::Relaxed);
+        self.metric_payload_too_large
+            .fetch_add(1, Ordering::Relaxed);
         tracing::warn!(%ip, %req_id, size, "rpc::limiter: payload too large");
         let mut ips = self.ips.lock();
         let entry = ips.entry(ip).or_insert_with(IpEntry::new);
-        entry.submit.violation_streak =
-            entry.submit.violation_streak.saturating_add(3);
+        entry.submit.violation_streak = entry.submit.violation_streak.saturating_add(3);
         let streak = entry.submit.violation_streak;
         entry.maybe_escalate(streak);
     }
@@ -371,7 +387,8 @@ impl RpcLimiter {
         match self.concurrency.try_acquire() {
             Some(t) => Some(t),
             None => {
-                self.metric_concurrency_rejected.fetch_add(1, Ordering::Relaxed);
+                self.metric_concurrency_rejected
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     %req_id,
                     current = self.concurrency.current(),
@@ -386,10 +403,12 @@ impl RpcLimiter {
     /// Snapshot of current metrics for Prometheus/health endpoint.
     pub fn metrics_snapshot(&self) -> RpcMetrics {
         let ips = self.ips.lock();
-        let quarantined = ips.values()
+        let quarantined = ips
+            .values()
             .filter(|e| matches!(e.status, IpStatus::Quarantined { .. }))
             .count();
-        let banned = ips.values()
+        let banned = ips
+            .values()
             .filter(|e| e.status == IpStatus::Banned)
             .count();
         drop(ips);
@@ -408,7 +427,9 @@ impl RpcLimiter {
     // Cleanup stale entries every 60 s.
     fn cleanup_if_needed(&self) {
         let mut last = self.last_cleanup.lock();
-        if last.elapsed() < Duration::from_secs(60) { return; }
+        if last.elapsed() < Duration::from_secs(60) {
+            return;
+        }
         *last = Instant::now();
         drop(last);
 
@@ -416,7 +437,9 @@ impl RpcLimiter {
         let mut ips = self.ips.lock();
         ips.retain(|_, entry| {
             // Never evict banned IPs — ban is persistent for this session.
-            if entry.status == IpStatus::Banned { return true; }
+            if entry.status == IpStatus::Banned {
+                return true;
+            }
             // Keep if recently active.
             entry.submit.last.elapsed() < cutoff || entry.read.last.elapsed() < cutoff
         });
@@ -424,7 +447,9 @@ impl RpcLimiter {
 }
 
 impl Default for RpcLimiter {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── Result type ───────────────────────────────────────────────────────────
@@ -437,7 +462,9 @@ pub enum RpcLimitResult {
 }
 
 impl RpcLimitResult {
-    pub fn is_allowed(self) -> bool { self == Self::Allowed }
+    pub fn is_allowed(self) -> bool {
+        self == Self::Allowed
+    }
 
     /// HTTP status code to return on rejection.
     pub fn http_status(self) -> u16 {
@@ -466,14 +493,27 @@ pub struct RpcMetrics {
 
 #[derive(Debug, Clone)]
 pub enum ValidationError {
-    PayloadTooLong { len: usize, max: usize },
+    PayloadTooLong {
+        len: usize,
+        max: usize,
+    },
     InvalidUtf8,
     PubkeyTooLong,
     GasLimitZero,
     MaxFeeZero,
-    ChainIdMismatch { got: u64, expected: u64 },
-    NonceGap { sender: String, expected: u64, got: u64 },
-    BatchTooLarge { count: usize, max: usize },
+    ChainIdMismatch {
+        got: u64,
+        expected: u64,
+    },
+    NonceGap {
+        sender: String,
+        expected: u64,
+        got: u64,
+    },
+    BatchTooLarge {
+        count: usize,
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -481,22 +521,23 @@ impl std::fmt::Display for ValidationError {
         // IMPORTANT: error messages must not include internal paths, module names,
         // or any implementation details. Only safe, opaque codes.
         match self {
-            Self::PayloadTooLong { len, max } =>
-                write!(f, "PAYLOAD_TOO_LONG: {len} > {max}"),
-            Self::InvalidUtf8 =>
-                write!(f, "INVALID_ENCODING"),
-            Self::PubkeyTooLong =>
-                write!(f, "PUBKEY_TOO_LONG"),
-            Self::GasLimitZero =>
-                write!(f, "GAS_LIMIT_ZERO"),
-            Self::MaxFeeZero =>
-                write!(f, "MAX_FEE_ZERO"),
-            Self::ChainIdMismatch { got, expected } =>
-                write!(f, "CHAIN_ID_MISMATCH: got={got} expected={expected}"),
-            Self::NonceGap { sender, expected, got } =>
-                write!(f, "NONCE_GAP: sender={sender} expected={expected} got={got}"),
-            Self::BatchTooLarge { count, max } =>
-                write!(f, "BATCH_TOO_LARGE: {count} > {max}"),
+            Self::PayloadTooLong { len, max } => write!(f, "PAYLOAD_TOO_LONG: {len} > {max}"),
+            Self::InvalidUtf8 => write!(f, "INVALID_ENCODING"),
+            Self::PubkeyTooLong => write!(f, "PUBKEY_TOO_LONG"),
+            Self::GasLimitZero => write!(f, "GAS_LIMIT_ZERO"),
+            Self::MaxFeeZero => write!(f, "MAX_FEE_ZERO"),
+            Self::ChainIdMismatch { got, expected } => {
+                write!(f, "CHAIN_ID_MISMATCH: got={got} expected={expected}")
+            }
+            Self::NonceGap {
+                sender,
+                expected,
+                got,
+            } => write!(
+                f,
+                "NONCE_GAP: sender={sender} expected={expected} got={got}"
+            ),
+            Self::BatchTooLarge { count, max } => write!(f, "BATCH_TOO_LARGE: {count} > {max}"),
         }
     }
 }
@@ -546,7 +587,10 @@ pub fn validate_tx(
 /// Call this as the very first check, before any parsing.
 pub fn validate_body_size(body: &[u8], limit: usize) -> Result<(), ValidationError> {
     if body.len() > limit {
-        Err(ValidationError::PayloadTooLong { len: body.len(), max: limit })
+        Err(ValidationError::PayloadTooLong {
+            len: body.len(),
+            max: limit,
+        })
     } else {
         Ok(())
     }
@@ -555,7 +599,10 @@ pub fn validate_body_size(body: &[u8], limit: usize) -> Result<(), ValidationErr
 /// Validate batch item count.
 pub fn validate_batch_size(count: usize) -> Result<(), ValidationError> {
     if count > MAX_BATCH_ITEMS {
-        Err(ValidationError::BatchTooLarge { count, max: MAX_BATCH_ITEMS })
+        Err(ValidationError::BatchTooLarge {
+            count,
+            max: MAX_BATCH_ITEMS,
+        })
     } else {
         Ok(())
     }
@@ -568,7 +615,9 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
-    fn ip(a: u8) -> IpAddr { IpAddr::V4(Ipv4Addr::new(127, 0, 0, a)) }
+    fn ip(a: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, a))
+    }
 
     #[test]
     fn test_submit_rate_limit_allows_up_to_burst() {
@@ -576,10 +625,7 @@ mod tests {
         let peer = ip(1);
         // First SUBMIT_RATE_PER_SEC requests should all be allowed.
         for _ in 0..SUBMIT_RATE_PER_SEC {
-            assert_eq!(
-                limiter.check_submit(peer, "req-0"),
-                RpcLimitResult::Allowed
-            );
+            assert_eq!(limiter.check_submit(peer, "req-0"), RpcLimitResult::Allowed);
         }
     }
 
@@ -594,7 +640,10 @@ mod tests {
         // Next should be rate-limited.
         let result = limiter.check_submit(peer, "req-x");
         assert!(
-            matches!(result, RpcLimitResult::RateLimited | RpcLimitResult::Blocked),
+            matches!(
+                result,
+                RpcLimitResult::RateLimited | RpcLimitResult::Blocked
+            ),
             "expected rate limited, got {result:?}"
         );
     }
@@ -610,7 +659,10 @@ mod tests {
         // Now the IP should be quarantined/blocked.
         let result = limiter.check_submit(peer, "req-x");
         assert!(
-            matches!(result, RpcLimitResult::RateLimited | RpcLimitResult::Blocked),
+            matches!(
+                result,
+                RpcLimitResult::RateLimited | RpcLimitResult::Blocked
+            ),
             "IP should be quarantined after violation streak"
         );
     }
@@ -687,7 +739,10 @@ mod tests {
     #[test]
     fn test_error_messages_are_opaque() {
         // Ensure error messages contain no internal path info.
-        let err = ValidationError::PayloadTooLong { len: 9999, max: 4096 };
+        let err = ValidationError::PayloadTooLong {
+            len: 9999,
+            max: 4096,
+        };
         let msg = err.to_string();
         assert!(!msg.contains("src/"), "error must not leak source paths");
         assert!(!msg.contains("::"), "error must not leak module paths");

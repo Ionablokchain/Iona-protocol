@@ -7,7 +7,7 @@
 //!
 //! This ensures resets are compatible with the internal schema and layout.
 
-use crate::storage::layout::{DataLayout, ResetScope, NodeStatus};
+use crate::storage::layout::{DataLayout, NodeStatus, ResetScope};
 use serde::{Deserialize, Serialize};
 
 /// Admin command result.
@@ -40,7 +40,8 @@ pub enum AdminResult {
 /// Execute an admin command against the given data directory.
 pub fn exec_reset_chain(data_dir: &str) -> Result<AdminResult, String> {
     let layout = DataLayout::new(data_dir);
-    let result = layout.reset(ResetScope::Chain)
+    let result = layout
+        .reset(ResetScope::Chain)
         .map_err(|e| format!("reset-chain failed: {e}"))?;
     Ok(AdminResult::ResetChain {
         dirs_removed: result.dirs_removed,
@@ -50,7 +51,8 @@ pub fn exec_reset_chain(data_dir: &str) -> Result<AdminResult, String> {
 
 pub fn exec_reset_identity(data_dir: &str) -> Result<AdminResult, String> {
     let layout = DataLayout::new(data_dir);
-    let result = layout.reset(ResetScope::Identity)
+    let result = layout
+        .reset(ResetScope::Identity)
         .map_err(|e| format!("reset-identity failed: {e}"))?;
     Ok(AdminResult::ResetIdentity {
         dirs_removed: result.dirs_removed,
@@ -60,7 +62,8 @@ pub fn exec_reset_identity(data_dir: &str) -> Result<AdminResult, String> {
 
 pub fn exec_reset_full(data_dir: &str) -> Result<AdminResult, String> {
     let layout = DataLayout::new(data_dir);
-    let result = layout.reset(ResetScope::Full)
+    let result = layout
+        .reset(ResetScope::Full)
         .map_err(|e| format!("reset-full failed: {e}"))?;
     Ok(AdminResult::ResetFull {
         dirs_removed: result.dirs_removed,
@@ -121,7 +124,10 @@ mod tests {
 
         let result = exec_reset_chain(data_dir).unwrap();
         match result {
-            AdminResult::ResetChain { dirs_removed, dirs_preserved } => {
+            AdminResult::ResetChain {
+                dirs_removed,
+                dirs_preserved,
+            } => {
                 assert!(dirs_removed.contains(&"chain/".to_string()));
                 assert!(dirs_preserved.contains(&"identity/".to_string()));
             }
@@ -146,7 +152,10 @@ mod tests {
 
         let result = exec_reset_identity(data_dir).unwrap();
         match result {
-            AdminResult::ResetIdentity { dirs_removed, dirs_preserved } => {
+            AdminResult::ResetIdentity {
+                dirs_removed,
+                dirs_preserved,
+            } => {
                 assert!(dirs_removed.contains(&"identity/".to_string()));
                 assert!(dirs_preserved.contains(&"chain/".to_string()));
             }
@@ -184,16 +193,18 @@ mod tests {
 
     #[test]
     fn test_result_to_json() {
-        let result = AdminResult::Status { info: NodeStatus {
-            data_dir: "/tmp/test".into(),
-            has_identity: false,
-            has_validator_key: false,
-            has_chain_data: false,
-            schema_version: None,
-            blocks_count: 0,
-            snapshots_count: 0,
-            disk_usage_bytes: 0,
-        }};
+        let result = AdminResult::Status {
+            info: NodeStatus {
+                data_dir: "/tmp/test".into(),
+                has_identity: false,
+                has_validator_key: false,
+                has_chain_data: false,
+                schema_version: None,
+                blocks_count: 0,
+                snapshots_count: 0,
+                disk_usage_bytes: 0,
+            },
+        };
         let json = result_to_json(&result);
         assert!(json.contains("\"command\": \"Status\""));
         assert!(json.contains("\"blocks_count\": 0"));

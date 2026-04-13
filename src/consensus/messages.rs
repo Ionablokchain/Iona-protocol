@@ -9,15 +9,18 @@ use crate::types::{Block, Hash32, Height, Round};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum VoteType { Prevote, Precommit }
+pub enum VoteType {
+    Prevote,
+    Precommit,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Proposal {
-    pub height:    Height,
-    pub round:     Round,
-    pub proposer:  PublicKeyBytes,
-    pub block_id:  Hash32,
-    pub block:     Option<Block>,
+    pub height: Height,
+    pub round: Round,
+    pub proposer: PublicKeyBytes,
+    pub block_id: Hash32,
+    pub block: Option<Block>,
     pub pol_round: Option<Round>,
     pub signature: SignatureBytes,
 }
@@ -25,10 +28,10 @@ pub struct Proposal {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Vote {
     pub vote_type: VoteType,
-    pub height:    Height,
-    pub round:     Round,
-    pub voter:     PublicKeyBytes,
-    pub block_id:  Option<Hash32>,
+    pub height: Height,
+    pub round: Round,
+    pub voter: PublicKeyBytes,
+    pub block_id: Option<Hash32>,
     pub signature: SignatureBytes,
 }
 
@@ -52,15 +55,15 @@ pub enum ConsensusMsg {
 // This format is stable across Rust versions, serde versions, and OS byte order
 // because we explicitly write little-endian regardless of host byte order.
 
-const DOMAIN_PROPOSAL:   [u8; 4] = *b"PROP";
-const DOMAIN_PREVOTE:    [u8; 4] = *b"VTPY";
-const DOMAIN_PRECOMMIT:  [u8; 4] = *b"VTCX";
-const DOMAIN_NIL_VOTE:   [u8; 4] = *b"VNIL";
+const DOMAIN_PROPOSAL: [u8; 4] = *b"PROP";
+const DOMAIN_PREVOTE: [u8; 4] = *b"VTPY";
+const DOMAIN_PRECOMMIT: [u8; 4] = *b"VTCX";
+const DOMAIN_NIL_VOTE: [u8; 4] = *b"VNIL";
 
 pub fn proposal_sign_bytes(
-    height:    Height,
-    round:     Round,
-    block_id:  &Hash32,
+    height: Height,
+    round: Round,
+    block_id: &Hash32,
     pol_round: Option<Round>,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + 8 + 4 + 32 + 5);
@@ -70,30 +73,39 @@ pub fn proposal_sign_bytes(
     out.extend_from_slice(&block_id.0);
     // pol_round: 0x00 = None, 0x01 || u32 = Some(r)
     match pol_round {
-        None    => out.push(0x00),
-        Some(r) => { out.push(0x01); out.extend_from_slice(&r.to_le_bytes()); }
+        None => out.push(0x00),
+        Some(r) => {
+            out.push(0x01);
+            out.extend_from_slice(&r.to_le_bytes());
+        }
     }
     out
 }
 
 pub fn vote_sign_bytes(
-    vt:       VoteType,
-    height:   Height,
-    round:    Round,
+    vt: VoteType,
+    height: Height,
+    round: Round,
     block_id: &Option<Hash32>,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + 8 + 4 + 33);
     let domain = match (vt, block_id) {
-        (VoteType::Prevote,   Some(_)) => DOMAIN_PREVOTE,
+        (VoteType::Prevote, Some(_)) => DOMAIN_PREVOTE,
         (VoteType::Precommit, Some(_)) => DOMAIN_PRECOMMIT,
-        _                              => DOMAIN_NIL_VOTE,
+        _ => DOMAIN_NIL_VOTE,
     };
     out.extend_from_slice(&domain);
     out.extend_from_slice(&height.to_le_bytes());
     out.extend_from_slice(&round.to_le_bytes());
     match block_id {
-        Some(id) => { out.push(0x01); out.extend_from_slice(&id.0); }
-        None     => { out.push(0x00); out.extend_from_slice(&[0u8; 32]); }
+        Some(id) => {
+            out.push(0x01);
+            out.extend_from_slice(&id.0);
+        }
+        None => {
+            out.push(0x00);
+            out.extend_from_slice(&[0u8; 32]);
+        }
     }
     out
 }

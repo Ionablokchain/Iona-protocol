@@ -1,20 +1,19 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 /// Mempool entry (raw signed tx bytes + decoded metadata needed for ordering).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingTx {
     pub hash: String,
-    pub from: String,      // 0x...
+    pub from: String, // 0x...
     pub nonce: u64,
-    pub tx_type: u8,       // 0 legacy, 1, 2
+    pub tx_type: u8, // 0 legacy, 1, 2
     pub gas_limit: u64,
-    pub gas_price: u128,                 // legacy/2930
-    pub max_fee_per_gas: Option<u128>,   // 1559
+    pub gas_price: u128,                        // legacy/2930
+    pub max_fee_per_gas: Option<u128>,          // 1559
     pub max_priority_fee_per_gas: Option<u128>, // 1559
     pub raw: Vec<u8>,
     pub inserted_at: u64, // unix seconds
-
 }
 
 impl PendingTx {
@@ -59,7 +58,11 @@ impl TxPool {
 
     /// Pop the next executable tx for each sender given current nonce.
     /// Returns a list sorted by priority (descending).
-    pub fn drain_next_ready(&mut self, account_nonces: &HashMap<String, u64>, max: usize) -> Vec<PendingTx> {
+    pub fn drain_next_ready(
+        &mut self,
+        account_nonces: &HashMap<String, u64>,
+        max: usize,
+    ) -> Vec<PendingTx> {
         let mut ready: Vec<PendingTx> = vec![];
 
         for (sender, lane) in self.by_sender.iter_mut() {
@@ -76,7 +79,9 @@ impl TxPool {
 
     /// Count contiguous pending txs starting at `expected_nonce` (for "pending" nonce RPC).
     pub fn contiguous_from(&self, sender: &str, expected_nonce: u64) -> u64 {
-        let Some(lane) = self.by_sender.get(sender) else { return 0; };
+        let Some(lane) = self.by_sender.get(sender) else {
+            return 0;
+        };
         let mut n = expected_nonce;
         let mut count = 0u64;
         while lane.contains_key(&n) {
@@ -87,16 +92,24 @@ impl TxPool {
     }
 }
 
-
 impl TxPool {
     /// Prune by age and total size. Evicts oldest first.
     pub fn prune(&mut self, now_secs: u64, max_age_secs: u64, max_total: usize) {
         // remove too-old
         for (_sender, lane) in self.by_sender.iter_mut() {
-            let old: Vec<u64> = lane.iter().filter_map(|(n, tx)| {
-                if now_secs.saturating_sub(tx.inserted_at) > max_age_secs { Some(*n) } else { None }
-            }).collect();
-            for n in old { lane.remove(&n); }
+            let old: Vec<u64> = lane
+                .iter()
+                .filter_map(|(n, tx)| {
+                    if now_secs.saturating_sub(tx.inserted_at) > max_age_secs {
+                        Some(*n)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for n in old {
+                lane.remove(&n);
+            }
         }
         // remove empty lanes
         self.by_sender.retain(|_, lane| !lane.is_empty());

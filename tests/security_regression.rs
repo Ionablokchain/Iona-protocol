@@ -13,18 +13,24 @@
 //!
 //! Tests are named: `regression_<short_description>` or `regression_<ISSUE_ID>_<desc>`.
 
-use iona::rpc_limits::{
-    validate_tx, validate_body_size, validate_batch_size,
-    RpcLimiter, RpcLimitResult, MAX_BODY_BYTES, SUBMIT_RATE_PER_SEC,
-};
-use iona::consensus::double_sign::{DoubleSignGuard, vote_guard_key};
+use iona::consensus::double_sign::{vote_guard_key, DoubleSignGuard};
 use iona::crypto::PublicKeyBytes;
-use iona::net::peer_score::{PeerScore, ViolationReason, BAN_THRESHOLD, PEER_MAX_PENDING_VALIDATIONS};
-use iona::types::{Tx, Hash32};
+use iona::net::peer_score::{
+    PeerScore, ViolationReason, BAN_THRESHOLD, PEER_MAX_PENDING_VALIDATIONS,
+};
+use iona::rpc_limits::{
+    validate_batch_size, validate_body_size, validate_tx, RpcLimitResult, RpcLimiter,
+    MAX_BODY_BYTES, SUBMIT_RATE_PER_SEC,
+};
+use iona::types::{Hash32, Tx};
 use std::net::{IpAddr, Ipv4Addr};
 
-fn ip(a: u8) -> IpAddr { IpAddr::V4(Ipv4Addr::new(192, 168, 1, a)) }
-fn hash(b: u8) -> Hash32 { Hash32([b; 32]) }
+fn ip(a: u8) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(192, 168, 1, a))
+}
+fn hash(b: u8) -> Hash32 {
+    Hash32([b; 32])
+}
 
 fn tx(chain_id: u64, nonce: u64, gas: u64, fee: u64, payload: &str) -> Tx {
     Tx {
@@ -68,7 +74,10 @@ fn regression_zero_max_fee_rejected() {
 #[test]
 fn regression_wrong_chain_id_rejected() {
     let result = validate_tx(&tx(9999, 0, 21000, 1, "ok"), 1, 0);
-    assert!(result.is_err(), "wrong chain_id must be rejected (cross-chain replay)");
+    assert!(
+        result.is_err(),
+        "wrong chain_id must be rejected (cross-chain replay)"
+    );
 }
 
 /// REGRESSION: A tx with a past nonce (below confirmed) could cause a
@@ -78,7 +87,10 @@ fn regression_wrong_chain_id_rejected() {
 fn regression_past_nonce_rejected() {
     // Confirmed nonce is 10, tx nonce is 5 → must reject.
     let result = validate_tx(&tx(1, 5, 21000, 1, "ok"), 1, 10);
-    assert!(result.is_err(), "past nonce must be rejected (replay protection)");
+    assert!(
+        result.is_err(),
+        "past nonce must be rejected (replay protection)"
+    );
 }
 
 /// REGRESSION: An oversized payload could cause unbounded memory allocation
@@ -98,7 +110,10 @@ fn regression_oversized_payload_rejected() {
 /// Fixed: validate_batch_size enforces MAX_BATCH_ITEMS.
 #[test]
 fn regression_oversized_batch_rejected() {
-    assert!(validate_batch_size(1_000_000).is_err(), "huge batch must be rejected");
+    assert!(
+        validate_batch_size(1_000_000).is_err(),
+        "huge batch must be rejected"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,7 +135,10 @@ fn regression_flooder_eventually_quarantined() {
     // Must eventually be rate-limited or blocked.
     let result = limiter.check_submit(peer, "final");
     assert!(
-        matches!(result, RpcLimitResult::RateLimited | RpcLimitResult::Blocked),
+        matches!(
+            result,
+            RpcLimitResult::RateLimited | RpcLimitResult::Blocked
+        ),
         "sustained flooder must be quarantined, got {result:?}"
     );
 }
@@ -187,7 +205,11 @@ fn regression_peer_validation_slot_cap() {
 fn regression_banned_peer_blocked_from_all_traffic() {
     let mut ps = PeerScore::with_defaults();
     // Force ban.
-    ps.penalise_with("peer-evil", ViolationReason::InvalidBlock, BAN_THRESHOLD.unsigned_abs() as i64 + 50);
+    ps.penalise_with(
+        "peer-evil",
+        ViolationReason::InvalidBlock,
+        BAN_THRESHOLD.unsigned_abs() as i64 + 50,
+    );
     assert!(ps.should_ban("peer-evil"), "peer must be banned");
     assert!(
         !ps.check_msg_quota("peer-evil"),
@@ -236,7 +258,10 @@ fn regression_guard_survives_restart() {
     {
         let g = DoubleSignGuard::new(path, &pk).unwrap();
         let result = g.check_proposal(5, 0, &hash(99));
-        assert!(result.is_err(), "guard after restart must still refuse double-proposal");
+        assert!(
+            result.is_err(),
+            "guard after restart must still refuse double-proposal"
+        );
     }
 }
 
@@ -265,5 +290,8 @@ fn regression_rolled_back_guard_detected() {
 
     // Reload must fail.
     let result = DoubleSignGuard::new(path_str, &pk);
-    assert!(result.is_err(), "corrupted/rolled-back guard must be detected at load");
+    assert!(
+        result.is_err(),
+        "corrupted/rolled-back guard must be detected at load"
+    );
 }

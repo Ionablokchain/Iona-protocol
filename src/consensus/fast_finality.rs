@@ -24,8 +24,8 @@
 //!
 //! Even with WAN latencies (~80ms RTT), total is ~300-400ms.
 
-use crate::types::{Hash32, Height};
 use crate::consensus::CommitCertificate;
+use crate::types::{Hash32, Height};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -178,7 +178,11 @@ impl FinalityTracker {
             total_finalized: self.total_finalized,
             average_finality_ms: self.average_finality_ms(),
             p95_finality_ms: self.p95_finality_ms(),
-            best_finality_ms: if self.best_finality_ms == u64::MAX { 0 } else { self.best_finality_ms },
+            best_finality_ms: if self.best_finality_ms == u64::MAX {
+                0
+            } else {
+                self.best_finality_ms
+            },
             worst_finality_ms: self.worst_finality_ms,
             consecutive_fast_commits: self.consecutive_fast_commits,
             is_sub_second: self.is_sub_second(),

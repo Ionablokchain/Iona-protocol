@@ -72,10 +72,14 @@ pub fn required_role(endpoint: &str) -> Role {
         // Read-only — any authenticated identity
         "/admin/status" | "/admin/audit" | "/admin/metrics" => Role::Auditor,
         // Node control — operator and above
-        "/admin/snapshot" | "/admin/peer-kick" | "/admin/config-reload"
+        "/admin/snapshot"
+        | "/admin/peer-kick"
+        | "/admin/config-reload"
         | "/admin/mempool-flush" => Role::Operator,
         // Destructive / privileged — maintainer only
-        "/admin/key-rotate" | "/admin/upgrade-trigger" | "/admin/reset-chain"
+        "/admin/key-rotate"
+        | "/admin/upgrade-trigger"
+        | "/admin/reset-chain"
         | "/admin/schema-migrate" => Role::Maintainer,
         // Default: deny unknown admin endpoints at the highest level
         _ => Role::Maintainer,
@@ -128,7 +132,10 @@ impl RbacPolicy {
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let s = std::fs::read_to_string(path)?;
         toml::from_str(&s).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("rbac.toml parse: {e}"))
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("rbac.toml parse: {e}"),
+            )
         })
     }
 
@@ -142,8 +149,8 @@ impl RbacPolicy {
         for entry in &self.identities {
             let cn_ok = match (&entry.cn, &identity.cn) {
                 (Some(ecn), Some(icn)) => ecn.to_lowercase() == icn.to_lowercase(),
-                (Some(_), None) => false,   // entry requires CN but cert has none
-                (None, _) => true,          // entry doesn't restrict by CN
+                (Some(_), None) => false, // entry requires CN but cert has none
+                (None, _) => true,        // entry doesn't restrict by CN
             };
             let fp_ok = match (&entry.fingerprint, &identity.fingerprint) {
                 (Some(efp), Some(ifp)) => efp == ifp,
@@ -290,7 +297,10 @@ mod tests {
     use super::*;
 
     fn alice() -> ClientIdentity {
-        ClientIdentity { cn: Some("ops-alice".into()), fingerprint: None }
+        ClientIdentity {
+            cn: Some("ops-alice".into()),
+            fingerprint: None,
+        }
     }
 
     fn bot() -> ClientIdentity {
@@ -301,11 +311,15 @@ mod tests {
     }
 
     fn stranger() -> ClientIdentity {
-        ClientIdentity { cn: Some("hacker".into()), fingerprint: None }
+        ClientIdentity {
+            cn: Some("hacker".into()),
+            fingerprint: None,
+        }
     }
 
     fn policy() -> RbacPolicy {
-        toml::from_str(r#"
+        toml::from_str(
+            r#"
 [[identities]]
 cn = "ops-alice"
 roles = ["operator"]
@@ -318,7 +332,9 @@ roles       = ["auditor"]
 [[identities]]
 cn = "node-maintainer"
 roles = ["maintainer"]
-"#).unwrap()
+"#,
+        )
+        .unwrap()
     }
 
     #[test]

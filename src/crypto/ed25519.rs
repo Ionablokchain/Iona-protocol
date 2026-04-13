@@ -1,5 +1,7 @@
 use super::{CryptoError, PublicKeyBytes, SignatureBytes, Signer, Verifier};
-use ed25519_dalek::{Signature, Signer as DalekSigner, SigningKey, Verifier as DalekVerifier, VerifyingKey};
+use ed25519_dalek::{
+    Signature, Signer as DalekSigner, SigningKey, Verifier as DalekVerifier, VerifyingKey,
+};
 use rand::rngs::OsRng;
 
 #[derive(Clone)]
@@ -47,11 +49,13 @@ impl Verifier for Ed25519Verifier {
         .map_err(|e| CryptoError::Key(format!("{e}")))?;
 
         let sig = Signature::from_bytes(
-            sig.0.as_slice()
+            sig.0
+                .as_slice()
                 .try_into()
                 .map_err(|_| CryptoError::Key("bad sig bytes".into()))?,
         );
-        vk.verify(msg, &sig).map_err(|_| CryptoError::InvalidSignature)
+        vk.verify(msg, &sig)
+            .map_err(|_| CryptoError::InvalidSignature)
     }
 }
 

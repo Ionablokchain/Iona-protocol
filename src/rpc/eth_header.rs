@@ -90,14 +90,13 @@ pub fn bloom_from_hex(s: &str) -> [u8; 256] {
     out
 }
 
-
 /// keccak256(RLP([])) - used for ommersHash when there are no ommers.
-pub fn empty_ommers_hash() -> [u8;32] {
+pub fn empty_ommers_hash() -> [u8; 32] {
     // RLP empty list is 0xc0
     let mut h = Keccak256::new();
     h.update(&[0xc0]);
     let r = h.finalize();
-    let mut out=[0u8;32];
+    let mut out = [0u8; 32];
     out.copy_from_slice(&r);
     out
 }

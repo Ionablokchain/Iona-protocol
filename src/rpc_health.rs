@@ -204,13 +204,26 @@ mod tests {
             mempool_size: 50,
             diagnostic: None,
             validator_infos: vec![
-                ValidatorInfo { pubkey_short: "aabb..".into(), power: 1, connected: true },
-                ValidatorInfo { pubkey_short: "ccdd..".into(), power: 1, connected: true },
-                ValidatorInfo { pubkey_short: "eeff..".into(), power: 1, connected: false },
+                ValidatorInfo {
+                    pubkey_short: "aabb..".into(),
+                    power: 1,
+                    connected: true,
+                },
+                ValidatorInfo {
+                    pubkey_short: "ccdd..".into(),
+                    power: 1,
+                    connected: true,
+                },
+                ValidatorInfo {
+                    pubkey_short: "eeff..".into(),
+                    power: 1,
+                    connected: false,
+                },
             ],
             total_power: 3,
             quorum_threshold: 3,
-        }.build();
+        }
+        .build();
 
         assert_eq!(status.node_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(status.height, 42);

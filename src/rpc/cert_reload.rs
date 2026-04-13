@@ -26,12 +26,12 @@
 //!                                        └──────────────────────┘
 //! ```
 
+use parking_lot::RwLock;
 use std::{
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use parking_lot::RwLock;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
@@ -61,12 +61,12 @@ pub struct CertReloadConfig {
 impl Default for CertReloadConfig {
     fn default() -> Self {
         Self {
-            cert_file:           PathBuf::from("/etc/iona/tls/admin-server.crt"),
-            key_file:            PathBuf::from("/etc/iona/tls/admin-server.key"),
-            ca_file:             PathBuf::from("/etc/iona/tls/ca.crt"),
-            overlap_seconds:     60,
-            watch_files:         true,
-            emit_expiry_metric:  true,
+            cert_file: PathBuf::from("/etc/iona/tls/admin-server.crt"),
+            key_file: PathBuf::from("/etc/iona/tls/admin-server.key"),
+            ca_file: PathBuf::from("/etc/iona/tls/ca.crt"),
+            overlap_seconds: 60,
+            watch_files: true,
+            emit_expiry_metric: true,
             min_validity_seconds: 86_400,
         }
     }
@@ -77,36 +77,40 @@ impl Default for CertReloadConfig {
 /// A snapshot of loaded TLS certificate material.
 #[derive(Clone, Debug)]
 pub struct TlsCertState {
-    pub cert_pem:       Vec<u8>,
-    pub key_pem:        Vec<u8>,
-    pub ca_pem:         Vec<u8>,
-    pub loaded_at:      SystemTime,
-    pub subject_cn:     String,
+    pub cert_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+    pub ca_pem: Vec<u8>,
+    pub loaded_at: SystemTime,
+    pub subject_cn: String,
     pub not_after_unix: i64,
-    pub fingerprint:    String,
+    pub fingerprint: String,
 }
 
 impl TlsCertState {
     /// Load all three PEM files from disk, parse metadata.
     pub fn load_from_disk(cfg: &CertReloadConfig) -> std::io::Result<Self> {
-        let cert_pem = std::fs::read(&cfg.cert_file)
-            .map_err(|e| std::io::Error::new(e.kind(),
-                format!("cert_file {:?}: {}", cfg.cert_file, e)))?;
-        let key_pem = std::fs::read(&cfg.key_file)
-            .map_err(|e| std::io::Error::new(e.kind(),
-                format!("key_file {:?}: {}", cfg.key_file, e)))?;
-        let ca_pem = std::fs::read(&cfg.ca_file)
-            .map_err(|e| std::io::Error::new(e.kind(),
-                format!("ca_file {:?}: {}", cfg.ca_file, e)))?;
+        let cert_pem = std::fs::read(&cfg.cert_file).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("cert_file {:?}: {}", cfg.cert_file, e))
+        })?;
+        let key_pem = std::fs::read(&cfg.key_file).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("key_file {:?}: {}", cfg.key_file, e))
+        })?;
+        let ca_pem = std::fs::read(&cfg.ca_file).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("ca_file {:?}: {}", cfg.ca_file, e))
+        })?;
 
-        let subject_cn     = parse_subject_cn(&cert_pem);
+        let subject_cn = parse_subject_cn(&cert_pem);
         let not_after_unix = parse_not_after_unix(&cert_pem);
-        let fingerprint    = compute_sha256_fingerprint(&cert_pem);
+        let fingerprint = compute_sha256_fingerprint(&cert_pem);
 
         Ok(Self {
-            cert_pem, key_pem, ca_pem,
+            cert_pem,
+            key_pem,
+            ca_pem,
             loaded_at: SystemTime::now(),
-            subject_cn, not_after_unix, fingerprint,
+            subject_cn,
+            not_after_unix,
+            fingerprint,
         })
     }
 
@@ -123,12 +127,12 @@ impl TlsCertState {
 // ── Internal reloader state ───────────────────────────────────────────────────
 
 struct Inner {
-    current:          TlsCertState,
+    current: TlsCertState,
     /// Previous cert still accepted during the overlap window.
-    overlap:          Option<(TlsCertState, Instant)>,
+    overlap: Option<(TlsCertState, Instant)>,
     overlap_duration: Duration,
     /// Monotonically increasing rotation counter.
-    rotation_count:   u64,
+    rotation_count: u64,
 }
 
 impl Inner {
@@ -151,13 +155,16 @@ impl Inner {
     }
 
     fn overlap_active(&self) -> bool {
-        self.overlap.as_ref()
+        self.overlap
+            .as_ref()
             .map(|(_, t)| t.elapsed() < self.overlap_duration)
             .unwrap_or(false)
     }
 
     fn expire_overlap_if_due(&mut self) {
-        let expired = self.overlap.as_ref()
+        let expired = self
+            .overlap
+            .as_ref()
             .map(|(_, t)| t.elapsed() >= self.overlap_duration)
             .unwrap_or(false);
         if expired {
@@ -180,8 +187,8 @@ impl Inner {
 /// Create one instance per TLS endpoint (admin RPC, remote signer).
 /// Call `.reload().await` from your SIGHUP handler or CLI command handler.
 pub struct CertReloader {
-    config:    CertReloadConfig,
-    inner:     Arc<RwLock<Inner>>,
+    config: CertReloadConfig,
+    inner: Arc<RwLock<Inner>>,
     change_tx: watch::Sender<u64>,
     change_rx: watch::Receiver<u64>,
 }
@@ -191,8 +198,7 @@ impl CertReloader {
     ///
     /// Fails if the cert files cannot be read.
     pub fn new(config: CertReloadConfig) -> Result<Self, CertReloadError> {
-        let initial = TlsCertState::load_from_disk(&config)
-            .map_err(CertReloadError::Io)?;
+        let initial = TlsCertState::load_from_disk(&config).map_err(CertReloadError::Io)?;
 
         // Validate initial cert is not already expired.
         if initial.seconds_until_expiry() <= 0 {
@@ -210,11 +216,14 @@ impl CertReloader {
             "mTLS cert loaded"
         );
 
-        let inner = Arc::new(RwLock::new(
-            Inner::new(initial, config.overlap_seconds)
-        ));
+        let inner = Arc::new(RwLock::new(Inner::new(initial, config.overlap_seconds)));
         let (change_tx, change_rx) = watch::channel(0u64);
-        Ok(Self { config, inner, change_tx, change_rx })
+        Ok(Self {
+            config,
+            inner,
+            change_tx,
+            change_rx,
+        })
     }
 
     /// **Hot-reload the certificate from disk.**
@@ -228,11 +237,10 @@ impl CertReloader {
     /// On failure: existing cert unchanged; error logged and returned.
     pub async fn reload(&self) -> Result<ReloadResult, CertReloadError> {
         // Load new cert from disk.
-        let new_cert = TlsCertState::load_from_disk(&self.config)
-            .map_err(|e| {
-                error!(event = "cert_reload_io_error", error = %e);
-                CertReloadError::Io(e)
-            })?;
+        let new_cert = TlsCertState::load_from_disk(&self.config).map_err(|e| {
+            error!(event = "cert_reload_io_error", error = %e);
+            CertReloadError::Io(e)
+        })?;
 
         // Validate new cert is not near expiry.
         let ttl = new_cert.seconds_until_expiry();
@@ -245,7 +253,7 @@ impl CertReloader {
             );
             if ttl <= 0 {
                 return Err(CertReloadError::Expired {
-                    subject:    new_cert.subject_cn,
+                    subject: new_cert.subject_cn,
                     expired_at: new_cert.not_after_unix,
                 });
             }
@@ -294,16 +302,16 @@ impl CertReloader {
         // metrics::gauge!("iona_tls_cert_expiry_seconds", ttl as f64,
         //     "endpoint" => "admin_rpc");
         info!(
-            event    = "cert_expiry_metric_updated",
-            metric   = "iona_tls_cert_expiry_seconds",
-            value    = ttl,
+            event = "cert_expiry_metric_updated",
+            metric = "iona_tls_cert_expiry_seconds",
+            value = ttl,
             endpoint = "admin_rpc"
         );
 
         Ok(ReloadResult {
-            new_subject:     new_cert.subject_cn,
+            new_subject: new_cert.subject_cn,
             new_fingerprint: new_cert.fingerprint,
-            expires_in_s:    ttl,
+            expires_in_s: ttl,
             rotation_count,
             overlap_active,
             overlap_seconds: self.config.overlap_seconds,
@@ -389,7 +397,9 @@ impl CertReloader {
 
     /// Spawn periodic expiry-metric emitter (every 60 seconds).
     pub fn spawn_expiry_monitor(self: Arc<Self>) {
-        if !self.config.emit_expiry_metric { return; }
+        if !self.config.emit_expiry_metric {
+            return;
+        }
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
@@ -397,9 +407,9 @@ impl CertReloader {
                 // In production: metrics::gauge!("iona_tls_cert_expiry_seconds", ttl as f64);
                 if ttl < 7 * 86_400 {
                     warn!(
-                        event   = "cert_expiry_critical",
-                        ttl_s   = ttl,
-                        ttl_d   = ttl / 86_400,
+                        event = "cert_expiry_critical",
+                        ttl_s = ttl,
+                        ttl_d = ttl / 86_400,
                         "TLS cert expires in < 7 days — rotate IMMEDIATELY"
                     );
                 } else if ttl < 30 * 86_400 {
@@ -420,11 +430,11 @@ impl CertReloader {
 /// Successful reload result (returned to CLI / admin RPC).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReloadResult {
-    pub new_subject:     String,
+    pub new_subject: String,
     pub new_fingerprint: String,
-    pub expires_in_s:    i64,
-    pub rotation_count:  u64,
-    pub overlap_active:  bool,
+    pub expires_in_s: i64,
+    pub rotation_count: u64,
+    pub overlap_active: bool,
     pub overlap_seconds: u64,
 }
 
@@ -469,12 +479,10 @@ pub async fn handle_cert_reload(
             });
             axum::response::Json(body)
         }
-        Err(e) => {
-            axum::response::Json(serde_json::json!({
-                "ok":    false,
-                "error": e.to_string(),
-            }))
-        }
+        Err(e) => axum::response::Json(serde_json::json!({
+            "ok":    false,
+            "error": e.to_string(),
+        })),
     }
 }
 
@@ -518,11 +526,13 @@ pub fn spawn_sighup_handler(reloader: Arc<CertReloader>) {
     #[cfg(unix)]
     tokio::spawn(async move {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut sighup = signal(SignalKind::hangup())
-            .expect("Failed to register SIGHUP handler");
+        let mut sighup = signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
         loop {
             sighup.recv().await;
-            info!(event = "sighup_received", "SIGHUP: triggering cert hot-reload");
+            info!(
+                event = "sighup_received",
+                "SIGHUP: triggering cert hot-reload"
+            );
             match reloader.reload().await {
                 Ok(r) => info!(
                     event   = "sighup_cert_reload_ok",
@@ -559,7 +569,8 @@ fn parse_not_after_unix(pem: &[u8]) -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as i64 + 365 * 86_400
+        .as_secs() as i64
+        + 365 * 86_400
 }
 
 fn compute_sha256_fingerprint(pem: &[u8]) -> String {

@@ -9,11 +9,15 @@
 
 use clap::Parser;
 use rand::Rng;
-use std::{path::PathBuf, process::{Child, Command, Stdio}, time::Duration};
+use std::{
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    time::Duration,
+};
 use tokio::time::sleep;
 
 #[derive(Parser, Debug)]
-#[command(name="iona-chaos", about="IONA chaos harness (local multi-node)")]
+#[command(name = "iona-chaos", about = "IONA chaos harness (local multi-node)")]
 struct Args {
     /// Number of nodes to spawn
     #[arg(long, default_value_t = 6)]
@@ -48,10 +52,17 @@ fn node_dir(base: &str, idx: usize) -> PathBuf {
     PathBuf::from(base).join(format!("node{}", idx))
 }
 
-fn write_config(dir: &PathBuf, seed: u64, chain_id: u64, p2p_port: u16, rpc_port: u16, peers: Vec<String>) -> anyhow::Result<()> {
+fn write_config(
+    dir: &PathBuf,
+    seed: u64,
+    chain_id: u64,
+    p2p_port: u16,
+    rpc_port: u16,
+    peers: Vec<String>,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let cfg = format!(
-r#"[node]
+        r#"[node]
 data_dir = "{}"
 seed = {}
 chain_id = {}
@@ -77,7 +88,11 @@ enable_faucet = false
         seed,
         chain_id,
         p2p_port,
-        peers.into_iter().map(|p| format!("  \"{}\",", p)).collect::<Vec<_>>().join("\n"),
+        peers
+            .into_iter()
+            .map(|p| format!("  \"{}\",", p))
+            .collect::<Vec<_>>()
+            .join("\n"),
         rpc_port,
     );
     std::fs::write(dir.join("config.toml"), cfg)?;
@@ -86,7 +101,12 @@ enable_faucet = false
 
 fn spawn_node(dir: &PathBuf) -> anyhow::Result<Child> {
     let mut cmd = Command::new("cargo");
-    cmd.arg("run").arg("--bin").arg("iona-node").arg("--").arg("--config").arg(dir.join("config.toml"));
+    cmd.arg("run")
+        .arg("--bin")
+        .arg("iona-node")
+        .arg("--")
+        .arg("--config")
+        .arg(dir.join("config.toml"));
     cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     Ok(cmd.spawn()?)
 }
@@ -102,12 +122,21 @@ async fn main() -> anyhow::Result<()> {
     for i in 0..args.nodes {
         let mut peers = vec![];
         for j in 0..args.nodes {
-            if i == j { continue; }
+            if i == j {
+                continue;
+            }
             let port = args.p2p_port_base + j as u16;
             peers.push(format!("/ip4/127.0.0.1/tcp/{}", port));
         }
-        let dir = node_dir(&args.data_dir, i+1);
-        write_config(&dir, (i+1) as u64, chain_id, args.p2p_port_base + i as u16, args.rpc_port_base + i as u16, peers)?;
+        let dir = node_dir(&args.data_dir, i + 1);
+        write_config(
+            &dir,
+            (i + 1) as u64,
+            chain_id,
+            args.p2p_port_base + i as u16,
+            args.rpc_port_base + i as u16,
+            peers,
+        )?;
         children[i] = Some(spawn_node(&dir)?);
     }
 
@@ -124,17 +153,23 @@ async fn main() -> anyhow::Result<()> {
                 let _ = ch.kill();
                 let _ = ch.wait();
             }
-            let dir = node_dir(&args.data_dir, idx+1);
+            let dir = node_dir(&args.data_dir, idx + 1);
             children[idx] = Some(spawn_node(&dir)?);
-            eprintln!("[chaos] restarted node{}", idx+1);
+            eprintln!("[chaos] restarted node{}", idx + 1);
         } else {
             // partition shuffle: split nodes into two groups and re-write peers then restart all
             let mut group_a = vec![];
             let mut group_b = vec![];
             for i in 0..args.nodes {
-                if rng.gen::<bool>() { group_a.push(i); } else { group_b.push(i); }
+                if rng.gen::<bool>() {
+                    group_a.push(i);
+                } else {
+                    group_b.push(i);
+                }
             }
-            if group_a.is_empty() || group_b.is_empty() { continue; }
+            if group_a.is_empty() || group_b.is_empty() {
+                continue;
+            }
 
             for &i in group_a.iter().chain(group_b.iter()) {
                 if let Some(mut ch) = children[i].take() {
@@ -144,19 +179,45 @@ async fn main() -> anyhow::Result<()> {
             }
 
             for &i in group_a.iter() {
-                let peers = group_a.iter().filter(|&&j| j!=i).map(|&j| format!("/ip4/127.0.0.1/tcp/{}", args.p2p_port_base + j as u16)).collect();
-                let dir = node_dir(&args.data_dir, i+1);
-                write_config(&dir, (i+1) as u64, chain_id, args.p2p_port_base + i as u16, args.rpc_port_base + i as u16, peers)?;
+                let peers = group_a
+                    .iter()
+                    .filter(|&&j| j != i)
+                    .map(|&j| format!("/ip4/127.0.0.1/tcp/{}", args.p2p_port_base + j as u16))
+                    .collect();
+                let dir = node_dir(&args.data_dir, i + 1);
+                write_config(
+                    &dir,
+                    (i + 1) as u64,
+                    chain_id,
+                    args.p2p_port_base + i as u16,
+                    args.rpc_port_base + i as u16,
+                    peers,
+                )?;
                 children[i] = Some(spawn_node(&dir)?);
             }
             for &i in group_b.iter() {
-                let peers = group_b.iter().filter(|&&j| j!=i).map(|&j| format!("/ip4/127.0.0.1/tcp/{}", args.p2p_port_base + j as u16)).collect();
-                let dir = node_dir(&args.data_dir, i+1);
-                write_config(&dir, (i+1) as u64, chain_id, args.p2p_port_base + i as u16, args.rpc_port_base + i as u16, peers)?;
+                let peers = group_b
+                    .iter()
+                    .filter(|&&j| j != i)
+                    .map(|&j| format!("/ip4/127.0.0.1/tcp/{}", args.p2p_port_base + j as u16))
+                    .collect();
+                let dir = node_dir(&args.data_dir, i + 1);
+                write_config(
+                    &dir,
+                    (i + 1) as u64,
+                    chain_id,
+                    args.p2p_port_base + i as u16,
+                    args.rpc_port_base + i as u16,
+                    peers,
+                )?;
                 children[i] = Some(spawn_node(&dir)?);
             }
 
-            eprintln!("[chaos] applied partition shuffle: A={} B={}", group_a.len(), group_b.len());
+            eprintln!(
+                "[chaos] applied partition shuffle: A={} B={}",
+                group_a.len(),
+                group_b.len()
+            );
         }
     }
 

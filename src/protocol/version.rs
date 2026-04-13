@@ -51,7 +51,9 @@ pub struct ProtocolActivation {
     pub grace_blocks: u64,
 }
 
-fn default_grace_blocks() -> u64 { 1000 }
+fn default_grace_blocks() -> u64 {
+    1000
+}
 
 /// Default activation schedule: v1 active from genesis.
 pub fn default_activations() -> Vec<ProtocolActivation> {
@@ -186,13 +188,11 @@ mod tests {
         // Since SUPPORTED_PROTOCOL_VERSIONS is compile-time &[1], we test the
         // grace-window logic using only v1 blocks against a schedule that
         // activates v1 at a specific height (no higher version needed).
-        let activations = vec![
-            ProtocolActivation {
-                protocol_version: 1,
-                activation_height: Some(1000),
-                grace_blocks: 100,
-            },
-        ];
+        let activations = vec![ProtocolActivation {
+            protocol_version: 1,
+            activation_height: Some(1000),
+            grace_blocks: 100,
+        }];
         // Before activation: v1 is fine (version_for_height returns 1)
         assert!(validate_block_version(1, 999, &activations).is_ok());
         // At activation: v1 is the expected version

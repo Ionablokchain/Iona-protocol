@@ -10,9 +10,7 @@
 //!  G6 — Key file permissions > 0600 → startup gate fires (Unix only)
 //!  G7 — Data-dir permissions > 0700 → startup gate fires (Unix only)
 
-use iona::rpc::middleware::{
-    json_nesting_depth, MAX_HEADER_BYTES, MAX_JSON_DEPTH,
-};
+use iona::rpc::middleware::{json_nesting_depth, MAX_HEADER_BYTES, MAX_JSON_DEPTH};
 use iona::rpc_limits::{
     new_request_id, validate_body_size, RpcLimitResult, RpcLimiter, MAX_BODY_BYTES,
 };
@@ -40,9 +38,8 @@ fn g1_body_over_limit_is_rejected() {
 
 #[test]
 fn g1_large_body_rejected_without_allocation_growth() {
-    // The middleware rejects on the Content-Length header before buffering the body,
-    // so the actual oversized allocation never happens.  Here we prove the same
-    // validation logic rejects incrementally larger bodies at the limit boundary.
+    // The middleware rejects on Content-Length before buffering in the real path.
+    // Here we at least prove the same boundary logic rejects bodies above the cap.
     for extra in [1usize, 100, 1_000, 1_000_000] {
         let oversized = vec![0u8; MAX_BODY_BYTES + extra];
         assert!(
@@ -53,7 +50,7 @@ fn g1_large_body_rejected_without_allocation_growth() {
     }
 }
 
-// ── G2: Read rate-limit flood ──────────────────────────────────────────────
+// ── G2: Read / submit rate-limit flood ─────────────────────────────────────
 
 #[test]
 fn g2_read_flood_rate_limits_hot_ip() {
@@ -61,7 +58,6 @@ fn g2_read_flood_rate_limits_hot_ip() {
     let hot_ip: IpAddr = "10.0.0.1".parse().unwrap();
     let other_ip: IpAddr = "10.0.0.2".parse().unwrap();
 
-    // Exhaust the per-IP read bucket.
     let mut limited = false;
     for i in 0..10_000 {
         let id = format!("req-flood-{i}");
@@ -70,14 +66,14 @@ fn g2_read_flood_rate_limits_hot_ip() {
             break;
         }
     }
+
     assert!(limited, "hot IP must be rate-limited after flood");
 
-    // Cold IP must still be allowed (independent bucket).
     let cold_req = new_request_id();
     assert_eq!(
         limiter.check_read(other_ip, &cold_req),
         RpcLimitResult::Allowed,
-        "unaffected IP must still pass"
+        "different IP must still be allowed"
     );
 }
 
@@ -94,6 +90,7 @@ fn g2_submit_flood_rate_limits_hot_ip() {
             break;
         }
     }
+
     assert!(limited, "submit flood must be rate-limited");
 }
 
@@ -103,12 +100,14 @@ fn g2_submit_flood_rate_limits_hot_ip() {
 fn g3_flat_json_accepted() {
     let flat = br#"{"key":"value","n":42}"#;
     let depth = json_nesting_depth(flat);
-    assert!(depth <= MAX_JSON_DEPTH, "flat JSON must be within depth limit, got {depth}");
+    assert!(
+        depth <= MAX_JSON_DEPTH,
+        "flat JSON must be within depth limit, got {depth}"
+    );
 }
 
 #[test]
 fn g3_nested_json_at_limit_accepted() {
-    // Build exactly MAX_JSON_DEPTH levels of nesting.
     let mut s = String::new();
     for _ in 0..MAX_JSON_DEPTH {
         s.push('{');
@@ -117,6 +116,7 @@ fn g3_nested_json_at_limit_accepted() {
     for _ in 0..MAX_JSON_DEPTH {
         s.push('}');
     }
+
     let depth = json_nesting_depth(s.as_bytes());
     assert_eq!(
         depth, MAX_JSON_DEPTH,
@@ -135,6 +135,7 @@ fn g3_deeply_nested_json_exceeds_limit() {
     for _ in 0..levels {
         s.push('}');
     }
+
     let depth = json_nesting_depth(s.as_bytes());
     assert!(
         depth > MAX_JSON_DEPTH,
@@ -144,25 +145,28 @@ fn g3_deeply_nested_json_exceeds_limit() {
 
 #[test]
 fn g3_braces_inside_strings_not_counted() {
-    // Braces inside a string value must not contribute to depth.
     let tricky = br#"{"key": "{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{"}"#;
     let depth = json_nesting_depth(tricky);
-    assert_eq!(depth, 1, "string content must not inflate depth, got {depth}");
+    assert_eq!(
+        depth, 1,
+        "string content must not inflate depth, got {depth}"
+    );
 }
 
 #[test]
 fn g3_escaped_quote_inside_string_handled() {
-    // Escaped quote inside string must not terminate the string early.
     let input = br#"{"key": "val\"ue", "k2": {}}"#;
     let depth = json_nesting_depth(input);
-    assert_eq!(depth, 2, "escaped quote must be handled correctly, got {depth}");
+    assert_eq!(
+        depth, 2,
+        "escaped quote must be handled correctly, got {depth}"
+    );
 }
 
-// ── G4: Header size limit ─────────────────────────────────────────────────
+// ── G4: Header size limit ──────────────────────────────────────────────────
 
 #[test]
 fn g4_header_size_constant_is_sensible() {
-    // MAX_HEADER_BYTES should be at least 1 KiB and at most 64 KiB.
     assert!(
         MAX_HEADER_BYTES >= 1_024,
         "MAX_HEADER_BYTES too small: {MAX_HEADER_BYTES}"
@@ -175,23 +179,18 @@ fn g4_header_size_constant_is_sensible() {
 
 #[test]
 fn g4_header_size_calculation_is_correct() {
-    // Simulate the per-header calculation used in the middleware:
-    //   name.len() + value.len() + 4 (": " + "\r\n")
     let headers = vec![
         ("authorization", "Bearer my-secret-token"),
         ("content-type", "application/json"),
         ("x-request-id", "req-0001-abcd"),
     ];
-    let total: usize = headers
-        .iter()
-        .map(|(k, v)| k.len() + v.len() + 4)
-        .sum();
+
+    let total: usize = headers.iter().map(|(k, v)| k.len() + v.len() + 4).sum();
     assert!(
         total < MAX_HEADER_BYTES,
         "normal request headers must be within limit, got {total}"
     );
 
-    // Build a pathological set of oversized headers.
     let giant_value = "x".repeat(MAX_HEADER_BYTES);
     let big_header_total = "x-custom".len() + giant_value.len() + 4;
     assert!(
@@ -200,12 +199,56 @@ fn g4_header_size_calculation_is_correct() {
     );
 }
 
-// ── G5: Public-bind startup gate ──────────────────────────────────────────
+// ── G5: Public-bind startup gate ───────────────────────────────────────────
 
-/// Mirrors the logic in iona-node.rs main() to keep the check testable without
-/// spinning up a full node.
+/// Mirrors the public-bind gate logic used by the node, but stays small and
+/// deterministic so it is safe for CI and unit testing.
+///
+/// Rules:
+/// - loopback binds are NOT public
+/// - localhost binds are NOT public
+/// - wildcard binds ARE public
+/// - all other addresses are treated as public
 fn is_public_bind(addr: &str) -> bool {
-    !addr.starts_with("127.") && !addr.starts_with("[::1]") && addr != "localhost"
+    let addr = addr.trim();
+
+    if addr.is_empty() {
+        return false;
+    }
+
+    let lower = addr.to_ascii_lowercase();
+
+    if lower == "localhost" || lower.starts_with("localhost:") {
+        return false;
+    }
+
+    if addr.starts_with('[') {
+        // IPv6 form like [::1]:9001 or [::]:9001
+        if let Some(end) = addr.find(']') {
+            let host = &addr[1..end];
+            return match host {
+                "::1" => false,
+                "::" => true,
+                _ => true,
+            };
+        }
+    }
+
+    let host = addr.split(':').next().unwrap_or(addr);
+
+    if host.starts_with("127.") {
+        return false;
+    }
+
+    if host == "::1" {
+        return false;
+    }
+
+    if host == "0.0.0.0" || host == "::" {
+        return true;
+    }
+
+    true
 }
 
 #[test]
@@ -214,12 +257,15 @@ fn g5_loopback_bind_is_not_public() {
     assert!(!is_public_bind("127.0.0.2:9001"));
     assert!(!is_public_bind("[::1]:9001"));
     assert!(!is_public_bind("localhost:9001"));
+    assert!(!is_public_bind("LOCALHOST:9001"));
+    assert!(!is_public_bind("localhost"));
 }
 
 #[test]
 fn g5_wildcard_bind_is_public() {
     assert!(is_public_bind("0.0.0.0:9001"));
     assert!(is_public_bind("0.0.0.0:80"));
+    assert!(is_public_bind("[::]:9001"));
 }
 
 #[test]
@@ -240,20 +286,24 @@ mod unix_perm_tests {
     /// Mirrors check_key_permissions from iona-node.rs.
     fn check_key_permissions(data_dir: &str, keystore_mode: &str) -> anyhow::Result<()> {
         let dir_path = std::path::Path::new(data_dir);
+
         if dir_path.exists() {
             let meta = fs::metadata(dir_path)?;
             let mode = meta.permissions().mode() & 0o777;
             if mode & 0o077 != 0 {
                 anyhow::bail!(
                     "data directory '{}' has permissions {:03o} — expected 0700",
-                    data_dir, mode
+                    data_dir,
+                    mode
                 );
             }
         }
+
         let key_file = match keystore_mode.trim().to_lowercase().as_str() {
             "encrypted" => format!("{data_dir}/keys.enc"),
             _ => format!("{data_dir}/keys.json"),
         };
+
         let key_path = std::path::Path::new(&key_file);
         if key_path.exists() {
             let meta = fs::metadata(key_path)?;
@@ -261,17 +311,18 @@ mod unix_perm_tests {
             if mode & 0o177 != 0 {
                 anyhow::bail!(
                     "key file '{}' has permissions {:03o} — expected 0600",
-                    key_file, mode
+                    key_file,
+                    mode
                 );
             }
         }
+
         Ok(())
     }
 
     #[test]
     fn g6_key_file_0600_is_accepted() {
         let dir = TempDir::new().unwrap();
-        // Set dir to 0700
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
 
         let key_path = dir.path().join("keys.json");
@@ -296,10 +347,11 @@ mod unix_perm_tests {
             result.is_err(),
             "0644 key file (world-readable) must be rejected"
         );
+        let err_text = result.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(
-            result.unwrap_err().to_string().contains("0644") || result.is_err(),
+            err_text.contains("0644"),
             "error must mention the mode"
-        );
+       );
     }
 
     #[test]
@@ -319,7 +371,7 @@ mod unix_perm_tests {
     fn g7_data_dir_0700_is_accepted() {
         let dir = TempDir::new().unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        // No key file present → only dir check.
+
         let result = check_key_permissions(dir.path().to_str().unwrap(), "plain");
         assert!(result.is_ok(), "0700 dir must pass: {result:?}");
     }
@@ -346,7 +398,7 @@ mod unix_perm_tests {
     }
 }
 
-// ── Misc: rate-limit result semantics ─────────────────────────────────────
+// ── Misc: rate-limit result semantics ──────────────────────────────────────
 
 #[test]
 fn rate_limit_result_is_allowed_semantics() {

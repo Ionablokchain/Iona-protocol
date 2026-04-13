@@ -8,16 +8,18 @@
 
 use crate::types::{Block, Hash32, Height};
 use lru::LruCache;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use parking_lot::Mutex;
 use tracing::warn;
 
-fn hex(h: &Hash32) -> String { hex::encode(h.0) }
+fn hex(h: &Hash32) -> String {
+    hex::encode(h.0)
+}
 
 const CACHE_SIZE: usize = 256;
 
@@ -31,8 +33,8 @@ struct IndexFile {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TxLocation {
     pub block_height: Height,
-    pub block_id:     String,   // hex
-    pub tx_index:     usize,
+    pub block_id: String, // hex
+    pub tx_index: usize,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -42,12 +44,12 @@ struct TxIndexFile {
 }
 
 pub struct FsBlockStore {
-    dir:        PathBuf,
-    idx_path:   PathBuf,
+    dir: PathBuf,
+    idx_path: PathBuf,
     tx_idx_path: PathBuf,
-    idx:        Mutex<IndexFile>,
-    tx_idx:     Mutex<TxIndexFile>,
-    cache:      Mutex<LruCache<Hash32, Block>>,
+    idx: Mutex<IndexFile>,
+    tx_idx: Mutex<TxIndexFile>,
+    cache: Mutex<LruCache<Hash32, Block>>,
 }
 
 impl FsBlockStore {
@@ -55,7 +57,7 @@ impl FsBlockStore {
         let dir = root.into();
         fs::create_dir_all(&dir)?;
 
-        let idx_path    = dir.join("index.json");
+        let idx_path = dir.join("index.json");
         let tx_idx_path = dir.join("tx_index.json");
 
         let idx = if idx_path.exists() {
@@ -74,9 +76,12 @@ impl FsBlockStore {
             dir,
             idx_path,
             tx_idx_path,
-            idx:     Mutex::new(idx),
-            tx_idx:  Mutex::new(tx_idx),
-            cache:   Mutex::new({ let cap = NonZeroUsize::new(CACHE_SIZE).unwrap_or(NonZeroUsize::MIN); LruCache::new(cap) }),
+            idx: Mutex::new(idx),
+            tx_idx: Mutex::new(tx_idx),
+            cache: Mutex::new({
+                let cap = NonZeroUsize::new(CACHE_SIZE).unwrap_or(NonZeroUsize::MIN);
+                LruCache::new(cap)
+            }),
         })
     }
 
@@ -112,7 +117,9 @@ impl FsBlockStore {
         let idx = self.idx.lock();
         let hexid = idx.by_height.get(&h)?.clone();
         let bytes = hex::decode(hexid).ok()?;
-        if bytes.len() != 32 { return None; }
+        if bytes.len() != 32 {
+            return None;
+        }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
         Some(Hash32(arr))
@@ -149,7 +156,7 @@ impl crate::consensus::BlockStore for FsBlockStore {
 
     fn put(&self, block: Block) {
         let id = block.id();
-        let p  = self.path_for(&id);
+        let p = self.path_for(&id);
 
         // Write block to disk with fsync
         if let Ok(bytes) = bincode::serialize(&block) {
@@ -161,7 +168,10 @@ impl crate::consensus::BlockStore for FsBlockStore {
                         }
                     }
                 }
-                Err(e) => { warn!("block write failed: {e}"); return; }
+                Err(e) => {
+                    warn!("block write failed: {e}");
+                    return;
+                }
             }
         }
 
@@ -171,11 +181,14 @@ impl crate::consensus::BlockStore for FsBlockStore {
             let mut tx_idx = self.tx_idx.lock();
             for (i, tx) in block.txs.iter().enumerate() {
                 let tx_hash = crate::types::tx_hash(tx);
-                tx_idx.locs.insert(hex::encode(tx_hash.0), TxLocation {
-                    block_height: block.header.height,
-                    block_id: block_id_hex.clone(),
-                    tx_index: i,
-                });
+                tx_idx.locs.insert(
+                    hex::encode(tx_hash.0),
+                    TxLocation {
+                        block_height: block.header.height,
+                        block_id: block_id_hex.clone(),
+                        tx_index: i,
+                    },
+                );
             }
         }
         self.persist_tx_index();

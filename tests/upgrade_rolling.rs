@@ -12,11 +12,10 @@
 //!  U9  — Individual migration idempotency (M001..M005)
 //! U10  — Rolling upgrade simulation: 5 nodes, upgrade one at a time
 
-use iona::upgrade::{
-    check_compat, dry_run_migrations,
-    MigrationRegistry, MigrationResult, CompatReport,
-};
 use iona::storage::CURRENT_SCHEMA_VERSION;
+use iona::upgrade::{
+    check_compat, dry_run_migrations, CompatReport, MigrationRegistry, MigrationResult,
+};
 use std::fs;
 use tempfile::TempDir;
 
@@ -32,7 +31,8 @@ fn data_dir_at_version(version: u32) -> TempDir {
     fs::write(
         dir.path().join("schema.json"),
         serde_json::to_string_pretty(&schema).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
     dir
 }
 
@@ -46,7 +46,10 @@ fn u1_fresh_dir_all_migrations_applied() {
 
     assert!(!results.is_empty(), "should have at least one migration");
     for result in &results {
-        assert!(result.is_ok(), "all migrations must succeed on fresh dir: {result}");
+        assert!(
+            result.is_ok(),
+            "all migrations must succeed on fresh dir: {result}"
+        );
     }
 }
 
@@ -57,10 +60,19 @@ fn u1_fresh_dir_files_created() {
     reg.run(dir.path(), 0, false);
 
     // M002 creates receipts/, M003 creates evidence.json, M004 creates snapshots/, M005 creates audit.log
-    assert!(dir.path().join("receipts").exists(),       "receipts/ must exist");
-    assert!(dir.path().join("evidence.json").exists(),  "evidence.json must exist");
-    assert!(dir.path().join("snapshots").exists(),      "snapshots/ must exist");
-    assert!(dir.path().join("audit.log").exists(),      "audit.log must exist");
+    assert!(dir.path().join("receipts").exists(), "receipts/ must exist");
+    assert!(
+        dir.path().join("evidence.json").exists(),
+        "evidence.json must exist"
+    );
+    assert!(
+        dir.path().join("snapshots").exists(),
+        "snapshots/ must exist"
+    );
+    assert!(
+        dir.path().join("audit.log").exists(),
+        "audit.log must exist"
+    );
 }
 
 // ── U2: Already current ────────────────────────────────────────────────────
@@ -91,14 +103,16 @@ fn u3_partial_migration_resumes() {
     let reg = MigrationRegistry::new();
 
     // Simulate: only M001 and M002 have run (schema at v2).
-    reg.run(dir.path(), 0, false);  // apply all to get files in place...
-    // ...but we pretend only v2 is applied by querying from v2.
+    reg.run(dir.path(), 0, false); // apply all to get files in place...
+                                   // ...but we pretend only v2 is applied by querying from v2.
     let results = reg.run(dir.path(), 2, false);
 
     // M003..M005 should have run (or skipped if files already exist from the first run).
     let applied_or_skipped = results.iter().all(|r| r.is_ok());
-    assert!(applied_or_skipped,
-        "partial migration must complete without error");
+    assert!(
+        applied_or_skipped,
+        "partial migration must complete without error"
+    );
 }
 
 // ── U4: Dry-run ───────────────────────────────────────────────────────────
@@ -115,9 +129,18 @@ fn u4_dry_run_from_v0_no_files_created() {
     }
 
     // No files should have been created.
-    assert!(!dir.path().join("receipts").exists(),      "dry-run must not create receipts/");
-    assert!(!dir.path().join("evidence.json").exists(), "dry-run must not create evidence.json");
-    assert!(!dir.path().join("audit.log").exists(),     "dry-run must not create audit.log");
+    assert!(
+        !dir.path().join("receipts").exists(),
+        "dry-run must not create receipts/"
+    );
+    assert!(
+        !dir.path().join("evidence.json").exists(),
+        "dry-run must not create evidence.json"
+    );
+    assert!(
+        !dir.path().join("audit.log").exists(),
+        "dry-run must not create audit.log"
+    );
 }
 
 #[test]
@@ -125,13 +148,19 @@ fn u4_dry_run_migrations_fn_returns_true_on_success() {
     let dir = empty_data_dir();
     // Write schema.json at v0 so dry_run_migrations can read the version.
     let schema = serde_json::json!({ "version": 0 });
-    fs::write(dir.path().join("schema.json"),
-        serde_json::to_string_pretty(&schema).unwrap()).unwrap();
+    fs::write(
+        dir.path().join("schema.json"),
+        serde_json::to_string_pretty(&schema).unwrap(),
+    )
+    .unwrap();
 
     // dry_run_migrations uses DataDir to read schema version, which in CI
     // may default to 0. Just verify it returns without panic.
     let result = dry_run_migrations(dir.path());
-    assert!(result.is_ok(), "dry_run_migrations must return Ok: {result:?}");
+    assert!(
+        result.is_ok(),
+        "dry_run_migrations must return Ok: {result:?}"
+    );
 }
 
 // ── U5: Compatibility — disk newer ───────────────────────────────────────
@@ -140,17 +169,20 @@ fn u4_dry_run_migrations_fn_returns_true_on_success() {
 fn u5_disk_newer_than_binary_reports_incompatible() {
     // Manually construct a CompatReport as check_compat() would produce.
     let report = CompatReport {
-        disk_schema_version:    CURRENT_SCHEMA_VERSION + 10,
-        binary_schema_version:  CURRENT_SCHEMA_VERSION,
+        disk_schema_version: CURRENT_SCHEMA_VERSION + 10,
+        binary_schema_version: CURRENT_SCHEMA_VERSION,
         binary_protocol_version: 1,
-        compatible:             false,
-        migrations_needed:      false,
-        pending_migrations:     0,
-        issues:                 vec!["on-disk schema is newer than binary".into()],
+        compatible: false,
+        migrations_needed: false,
+        pending_migrations: 0,
+        issues: vec!["on-disk schema is newer than binary".into()],
     };
-    assert!(!report.is_ok(), "disk newer than binary must be incompatible");
+    assert!(
+        !report.is_ok(),
+        "disk newer than binary must be incompatible"
+    );
     let s = format!("{report}");
-    assert!(s.contains("NO"),    "report must say NOT compatible");
+    assert!(s.contains("NO"), "report must say NOT compatible");
 }
 
 // ── U6: Compatibility — migrations needed ────────────────────────────────
@@ -158,18 +190,21 @@ fn u5_disk_newer_than_binary_reports_incompatible() {
 #[test]
 fn u6_old_disk_needs_migrations() {
     let report = CompatReport {
-        disk_schema_version:    2,
-        binary_schema_version:  CURRENT_SCHEMA_VERSION,
+        disk_schema_version: 2,
+        binary_schema_version: CURRENT_SCHEMA_VERSION,
         binary_protocol_version: 1,
-        compatible:             true,
-        migrations_needed:      true,
-        pending_migrations:     (CURRENT_SCHEMA_VERSION - 2) as usize,
-        issues:                 vec![],
+        compatible: true,
+        migrations_needed: true,
+        pending_migrations: (CURRENT_SCHEMA_VERSION - 2) as usize,
+        issues: vec![],
     };
-    assert!(report.compatible,           "binary can open old dir (with migration)");
-    assert!(report.migrations_needed,    "migration is needed");
+    assert!(
+        report.compatible,
+        "binary can open old dir (with migration)"
+    );
+    assert!(report.migrations_needed, "migration is needed");
     let s = format!("{report}");
-    assert!(s.contains("YES"),           "report must say migrations needed");
+    assert!(s.contains("YES"), "report must say migrations needed");
 }
 
 // ── U7: Compatibility — already current ──────────────────────────────────
@@ -177,13 +212,13 @@ fn u6_old_disk_needs_migrations() {
 #[test]
 fn u7_current_dir_no_migration_needed() {
     let report = CompatReport {
-        disk_schema_version:    CURRENT_SCHEMA_VERSION,
-        binary_schema_version:  CURRENT_SCHEMA_VERSION,
+        disk_schema_version: CURRENT_SCHEMA_VERSION,
+        binary_schema_version: CURRENT_SCHEMA_VERSION,
         binary_protocol_version: 1,
-        compatible:             true,
-        migrations_needed:      false,
-        pending_migrations:     0,
-        issues:                 vec![],
+        compatible: true,
+        migrations_needed: false,
+        pending_migrations: 0,
+        issues: vec![],
     };
     assert!(report.is_ok());
     assert!(!report.migrations_needed);
@@ -196,8 +231,10 @@ fn u8_registry_versions_ordered_and_contiguous() {
     let reg = MigrationRegistry::new();
     let versions: Vec<u32> = reg.all().iter().map(|m| m.from_version()).collect();
     for (i, &v) in versions.iter().enumerate() {
-        assert_eq!(v, i as u32,
-            "migration at index {i} must have from_version={i}, got {v}");
+        assert_eq!(
+            v, i as u32,
+            "migration at index {i} must have from_version={i}, got {v}"
+        );
     }
 }
 
@@ -205,8 +242,11 @@ fn u8_registry_versions_ordered_and_contiguous() {
 fn u8_registry_descriptions_are_non_empty() {
     let reg = MigrationRegistry::new();
     for m in reg.all() {
-        assert!(!m.description().is_empty(),
-            "migration v{} must have a non-empty description", m.from_version());
+        assert!(
+            !m.description().is_empty(),
+            "migration v{} must have a non-empty description",
+            m.from_version()
+        );
     }
 }
 
@@ -223,8 +263,10 @@ fn u9_each_migration_is_idempotent() {
     // Second run — every migration must be OK (skipped or re-applied cleanly).
     let results = reg.run(dir.path(), 0, false);
     for result in &results {
-        assert!(result.is_ok(),
-            "second run must not fail (idempotency): {result}");
+        assert!(
+            result.is_ok(),
+            "second run must not fail (idempotency): {result}"
+        );
     }
 }
 
@@ -252,8 +294,7 @@ fn u10_rolling_upgrade_5_nodes() {
     for dir in &dirs {
         let results = reg.run(dir.path(), 0, false);
         for result in &results {
-            assert!(result.is_ok(),
-                "node upgrade must succeed: {result}");
+            assert!(result.is_ok(), "node upgrade must succeed: {result}");
         }
         upgraded += 1;
         // After each node upgrade, the remaining nodes are still at v0.
@@ -268,10 +309,14 @@ fn u10_rolling_upgrade_5_nodes() {
     // Phase 3: all nodes upgraded. Verify all have consistent schema files.
     // (M003..M005 create specific files; check they all have audit.log)
     for dir in &dirs {
-        assert!(dir.path().join("audit.log").exists(),
-            "every upgraded node must have an audit.log");
-        assert!(dir.path().join("evidence.json").exists(),
-            "every upgraded node must have evidence.json");
+        assert!(
+            dir.path().join("audit.log").exists(),
+            "every upgraded node must have an audit.log"
+        );
+        assert!(
+            dir.path().join("evidence.json").exists(),
+            "every upgraded node must have evidence.json"
+        );
     }
 }
 
@@ -280,11 +325,15 @@ fn u10_rolling_upgrade_5_nodes() {
 #[test]
 fn migration_result_ok_display() {
     let r = MigrationResult::Ok {
-        from_version: 0, to_version: 1,
+        from_version: 0,
+        to_version: 1,
         changes: vec!["added vm field".into(), "normalised balances".into()],
     };
     let s = format!("{r}");
-    assert!(s.contains("v0 → v1"), "display must show version transition");
+    assert!(
+        s.contains("v0 → v1"),
+        "display must show version transition"
+    );
     assert!(s.contains("added vm field"), "display must list changes");
 }
 

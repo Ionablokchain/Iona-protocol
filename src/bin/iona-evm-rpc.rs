@@ -1,12 +1,12 @@
 use clap::Parser;
-use iona::rpc::router::build_router;
 use iona::rpc::eth_rpc::EthRpcState;
+use iona::rpc::router::build_router;
 use std::net::SocketAddr;
-use tokio::time::{sleep, Duration};
 use tokio::net::TcpListener;
+use tokio::time::{sleep, Duration};
 
 #[derive(Parser, Debug)]
-#[command(name="iona-evm-rpc")]
+#[command(name = "iona-evm-rpc")]
 struct Args {
     /// Data dir for persistence (state snapshot)
     #[arg(long)]
@@ -21,19 +21,19 @@ struct Args {
     prune_keep_blocks: Option<usize>,
 
     /// Listen address (e.g. 127.0.0.1:8545)
-    #[arg(long, default_value="127.0.0.1:8545")]
+    #[arg(long, default_value = "127.0.0.1:8545")]
     listen: String,
 
     /// Block time in milliseconds. If >0, produces blocks periodically by calling iona_mine internally.
-    #[arg(long, default_value_t=0)]
+    #[arg(long, default_value_t = 0)]
     block_time_ms: u64,
 
     /// Max txs per produced block
-    #[arg(long, default_value_t=256)]
+    #[arg(long, default_value_t = 256)]
     max_txs: u64,
 
     /// Disable automine (do not mine immediately on sendRawTransaction)
-    #[arg(long, default_value_t=false)]
+    #[arg(long, default_value_t = false)]
     no_automine: bool,
 }
 
@@ -65,7 +65,6 @@ async fn main() -> anyhow::Result<()> {
             let _ = iona::rpc::chain_store::prune_and_compact(&cdir, &st, keep);
         }
     }
-
 
     let addr: SocketAddr = args.listen.parse()?;
     let app = build_router(st.clone());

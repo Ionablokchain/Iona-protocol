@@ -11,7 +11,12 @@ pub struct Validator {
 
 impl Validator {
     pub fn new(operator: String, stake: u128, commission_bps: u64) -> Self {
-        Self { operator, stake, jailed: false, commission_bps }
+        Self {
+            operator,
+            stake,
+            jailed: false,
+            commission_bps,
+        }
     }
 }
 
@@ -29,11 +34,20 @@ impl StakingState {
         *self.delegations.entry(k).or_insert(0) += amount;
     }
 
-    pub fn undelegate(&mut self, delegator: String, validator: String, amount: u128, current_epoch: u64, unbonding_epochs: u64) {
+    pub fn undelegate(
+        &mut self,
+        delegator: String,
+        validator: String,
+        amount: u128,
+        current_epoch: u64,
+        unbonding_epochs: u64,
+    ) {
         let k = (delegator.clone(), validator.clone());
         let cur = self.delegations.get(&k).copied().unwrap_or(0);
         let a = amount.min(cur);
-        if a == 0 { return; }
+        if a == 0 {
+            return;
+        }
         self.delegations.insert(k.clone(), cur - a);
         let unlock = current_epoch.saturating_add(unbonding_epochs);
         self.unbonding.insert(k, (a, unlock));

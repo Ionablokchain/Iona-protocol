@@ -91,8 +91,9 @@ pub fn export_snapshot(data_dir: &str, output_path: &str) -> io::Result<Snapshot
     let meta_path = format!("{}/node_meta.json", data_dir);
     let node_meta: Option<serde_json::Value> = if Path::new(&meta_path).exists() {
         let s = std::fs::read_to_string(&meta_path)?;
-        Some(serde_json::from_str(&s)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("node_meta.json: {e}")))?)
+        Some(serde_json::from_str(&s).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("node_meta.json: {e}"))
+        })?)
     } else {
         None
     };
@@ -125,9 +126,11 @@ pub fn export_snapshot(data_dir: &str, output_path: &str) -> io::Result<Snapshot
 
     // Serialize state
     let snapshot_state = SnapshotState {
-        accounts: serde_json::from_value(serde_json::to_value(&state_full)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?)
-            .unwrap_or_default(),
+        accounts: serde_json::from_value(
+            serde_json::to_value(&state_full)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
+        )
+        .unwrap_or_default(),
         stakes: serde_json::to_value(&stakes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
         vm: serde_json::json!({}),
@@ -156,7 +159,8 @@ pub fn export_snapshot(data_dir: &str, output_path: &str) -> io::Result<Snapshot
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let schema_version = schema.get("version")
+    let schema_version = schema
+        .get("version")
         .and_then(|v| v.as_u64())
         .unwrap_or(crate::storage::CURRENT_SCHEMA_VERSION as u64) as u32;
 
@@ -354,18 +358,14 @@ mod tests {
         ).unwrap();
         std::fs::write(
             data_dir.join("stakes.json"),
-            r#"{"validators":{},"processed_evidence":[]}"#
-        ).unwrap();
-        std::fs::write(
-            data_dir.join("schema.json"),
-            r#"{"version":4}"#
-        ).unwrap();
+            r#"{"validators":{},"processed_evidence":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(data_dir.join("schema.json"), r#"{"version":4}"#).unwrap();
 
         let snapshot_path = tmp.join("test_snapshot.json");
-        let header = export_snapshot(
-            data_dir.to_str().unwrap(),
-            snapshot_path.to_str().unwrap(),
-        ).unwrap();
+        let header =
+            export_snapshot(data_dir.to_str().unwrap(), snapshot_path.to_str().unwrap()).unwrap();
 
         assert_eq!(header.version, 1);
         assert_eq!(header.schema_version, 4);
@@ -380,7 +380,8 @@ mod tests {
         let imported = import_snapshot(
             snapshot_path.to_str().unwrap(),
             import_dir.to_str().unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(imported.height, header.height);
         assert_eq!(imported.payload_blake3, header.payload_blake3);
@@ -418,7 +419,10 @@ mod tests {
 
         let result = verify_snapshot(path.to_str().unwrap());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("integrity check failed"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("integrity check failed"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

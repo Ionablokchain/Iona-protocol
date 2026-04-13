@@ -143,8 +143,13 @@ pub fn validate_config(
     // 2. Check for self-bootstrap (node's own address in bootnodes).
     // We can detect this if the bootnode points to the same listen address.
     // (Simple heuristic: check if any bootnode contains the listen port)
-    let listen_port = listen_addr.rsplit(':').next().unwrap_or("")
-        .chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+    let listen_port = listen_addr
+        .rsplit(':')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>();
     for bn in bootnodes {
         if !listen_port.is_empty() && bn.contains("127.0.0.1") && bn.contains(&listen_port) {
             errors.push(ValidationError {
@@ -211,7 +216,7 @@ pub fn validate_config(
 /// Compute a genesis hash for integrity checking.
 /// Uses SHA-256 of the canonical JSON representation.
 pub fn genesis_hash(genesis_json: &str) -> [u8; 32] {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(genesis_json.as_bytes());
     let result = hasher.finalize();
@@ -335,13 +340,16 @@ mod tests {
             None,
             &[],
             1000,
-            true,    // Producer enabled...
-            1,       // ...but seed 1 is NOT a validator.
+            true, // Producer enabled...
+            1,    // ...but seed 1 is NOT a validator.
             &[2, 3, 4],
             "0.0.0.0:9001",
         );
         assert!(!result.is_ok());
-        assert!(result.errors.iter().any(|e| e.field.contains("simple_producer")));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.field.contains("simple_producer")));
     }
 
     #[test]
@@ -360,7 +368,10 @@ mod tests {
             "0.0.0.0:9001",
         );
         assert!(!result.is_ok());
-        assert!(result.errors.iter().any(|e| e.message.contains("duplicate")));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.message.contains("duplicate")));
     }
 
     #[test]
@@ -418,9 +429,10 @@ mod tests {
     #[test]
     fn test_validation_result_display() {
         let result = ValidationResult {
-            errors: vec![
-                ValidationError { field: "test".into(), message: "bad".into() },
-            ],
+            errors: vec![ValidationError {
+                field: "test".into(),
+                message: "bad".into(),
+            }],
         };
         let s = format!("{result}");
         assert!(s.contains("FAIL"));
@@ -440,7 +452,10 @@ mod tests {
         assert!(ok.into_result().is_ok());
 
         let fail = ValidationResult {
-            errors: vec![ValidationError { field: "x".into(), message: "y".into() }],
+            errors: vec![ValidationError {
+                field: "x".into(),
+                message: "y".into(),
+            }],
         };
         assert!(fail.into_result().is_err());
     }

@@ -208,8 +208,12 @@ mod tests {
     }
 
     impl BackgroundMigration for TestMigration {
-        fn name(&self) -> &str { &self.name }
-        fn priority(&self) -> MigrationPriority { self.priority }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn priority(&self) -> MigrationPriority {
+            self.priority
+        }
         fn run(&self, progress: &MigrationProgress) -> Result<(), String> {
             progress.total.store(10, Ordering::Relaxed);
             for _ in 0..10 {

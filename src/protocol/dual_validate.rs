@@ -17,7 +17,7 @@
 //! let stats = shadow.stats();
 //! ```
 
-use crate::protocol::version::{ProtocolActivation, version_for_height, CURRENT_PROTOCOL_VERSION};
+use crate::protocol::version::{version_for_height, ProtocolActivation, CURRENT_PROTOCOL_VERSION};
 use crate::types::{Block, Height};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -68,9 +68,7 @@ impl ShadowValidator {
         // Find the next activation that hasn't happened yet.
         let next_activation = self.activations.iter().find(|a| {
             a.protocol_version > current_pv
-                && a.activation_height
-                    .map(|ah| height < ah)
-                    .unwrap_or(false)
+                && a.activation_height.map(|ah| height < ah).unwrap_or(false)
         });
 
         let Some(_activation) = next_activation else {

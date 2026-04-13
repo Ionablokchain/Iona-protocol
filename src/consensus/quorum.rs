@@ -9,13 +9,21 @@ pub struct VoteTally {
 }
 
 impl VoteTally {
-    pub fn add_vote(&mut self, vset: &ValidatorSet, voter: &PublicKeyBytes, block_id: &Option<Hash32>) {
+    pub fn add_vote(
+        &mut self,
+        vset: &ValidatorSet,
+        voter: &PublicKeyBytes,
+        block_id: &Option<Hash32>,
+    ) {
         let p = vset.power_of(voter);
         *self.per_block.entry(block_id.clone()).or_insert(0) += p;
     }
 
     pub fn best(&self) -> Option<(Option<Hash32>, VotingPower)> {
-        self.per_block.iter().max_by_key(|(_, p)| **p).map(|(k, p)| (k.clone(), *p))
+        self.per_block
+            .iter()
+            .max_by_key(|(_, p)| **p)
+            .map(|(k, p)| (k.clone(), *p))
     }
 }
 

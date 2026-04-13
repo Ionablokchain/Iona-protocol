@@ -69,7 +69,13 @@ impl NodeMeta {
     }
 
     /// Mark a migration as in-progress (for crash-safe resume).
-    pub fn begin_migration(&mut self, from_sv: u32, to_sv: u32, step: &str, data_dir: &str) -> io::Result<()> {
+    pub fn begin_migration(
+        &mut self,
+        from_sv: u32,
+        to_sv: u32,
+        step: &str,
+        data_dir: &str,
+    ) -> io::Result<()> {
         self.migration_state = Some(MigrationState {
             from_sv,
             to_sv,
@@ -97,8 +103,9 @@ impl NodeMeta {
             return Ok(None);
         }
         let s = fs::read_to_string(&path)?;
-        let meta: Self = serde_json::from_str(&s)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("node_meta.json: {e}")))?;
+        let meta: Self = serde_json::from_str(&s).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("node_meta.json: {e}"))
+        })?;
         Ok(Some(meta))
     }
 
@@ -107,8 +114,12 @@ impl NodeMeta {
         self.updated_at = Some(now_iso8601());
         let path = format!("{data_dir}/node_meta.json");
         let tmp = format!("{path}.tmp");
-        let out = serde_json::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("node_meta.json encode: {e}")))?;
+        let out = serde_json::to_string_pretty(self).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("node_meta.json encode: {e}"),
+            )
+        })?;
         fs::write(&tmp, &out)?;
         fs::rename(&tmp, &path)?;
         Ok(())
@@ -155,7 +166,10 @@ mod tests {
     fn test_new_current() {
         let meta = NodeMeta::new_current();
         assert_eq!(meta.schema_version, crate::storage::CURRENT_SCHEMA_VERSION);
-        assert_eq!(meta.protocol_version, crate::protocol::version::CURRENT_PROTOCOL_VERSION);
+        assert_eq!(
+            meta.protocol_version,
+            crate::protocol::version::CURRENT_PROTOCOL_VERSION
+        );
         assert!(!meta.node_version.is_empty());
     }
 
@@ -197,7 +211,8 @@ mod tests {
         let mut meta = NodeMeta::new_current();
         assert!(!meta.has_pending_migration());
 
-        meta.begin_migration(3, 4, "adding node_meta.json", data_dir).unwrap();
+        meta.begin_migration(3, 4, "adding node_meta.json", data_dir)
+            .unwrap();
         assert!(meta.has_pending_migration());
 
         // Reload from disk and verify migration_state is persisted

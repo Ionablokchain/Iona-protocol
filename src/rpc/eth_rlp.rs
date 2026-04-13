@@ -1,5 +1,5 @@
-use rlp::RlpStream;
 use crate::rpc::eth_rpc::{Log, Receipt};
+use rlp::RlpStream;
 
 fn hex_to_bytes(h: &str) -> Vec<u8> {
     hex::decode(h.trim_start_matches("0x")).unwrap_or_default()
@@ -40,7 +40,6 @@ pub fn rlp_encode_receipt(r: &Receipt) -> Vec<u8> {
 
     s.out().to_vec()
 }
-
 
 /// Typed receipt envelope per EIP-2718.
 /// For London+Shanghai baseline:

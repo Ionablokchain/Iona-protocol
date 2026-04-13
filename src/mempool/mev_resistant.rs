@@ -23,7 +23,7 @@
 //! 5. **Anti-Backrunning Delay**: A configurable delay window prevents validators
 //!    from inserting their own transactions immediately after seeing a large trade.
 
-use crate::types::{Hash32, Height, Tx, hash_bytes};
+use crate::types::{hash_bytes, Hash32, Height, Tx};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -129,13 +129,9 @@ pub struct EncryptedEnvelope {
 
 /// Encrypt a transaction for threshold-encrypted mempool.
 /// Uses AES-256-GCM with a key derived from the epoch secret.
-pub fn encrypt_tx_envelope(
-    tx: &Tx,
-    epoch_secret: &[u8; 32],
-    epoch: u64,
-) -> EncryptedEnvelope {
-    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+pub fn encrypt_tx_envelope(tx: &Tx, epoch_secret: &[u8; 32], epoch: u64) -> EncryptedEnvelope {
     use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 
     let plaintext = serde_json::to_vec(tx).unwrap_or_default();
 
@@ -146,7 +142,9 @@ pub fn encrypt_tx_envelope(
 
     let cipher = Aes256Gcm::new_from_slice(epoch_secret).expect("valid key size");
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).unwrap_or_default();
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_ref())
+        .unwrap_or_default();
 
     EncryptedEnvelope {
         ciphertext,
@@ -158,12 +156,9 @@ pub fn encrypt_tx_envelope(
 }
 
 /// Decrypt a transaction from a threshold-encrypted envelope.
-pub fn decrypt_tx_envelope(
-    envelope: &EncryptedEnvelope,
-    epoch_secret: &[u8; 32],
-) -> Option<Tx> {
-    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+pub fn decrypt_tx_envelope(envelope: &EncryptedEnvelope, epoch_secret: &[u8; 32]) -> Option<Tx> {
     use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 
     let cipher = Aes256Gcm::new_from_slice(epoch_secret).ok()?;
     let nonce = Nonce::from_slice(&envelope.nonce);
@@ -208,11 +203,7 @@ fn fair_order_shuffle(
 }
 
 /// Deterministic Fisher-Yates shuffle using block hash as seed.
-fn deterministic_shuffle(
-    items: &mut [(u64, TxCommit)],
-    seed: &Hash32,
-    extra_nonce: u64,
-) {
+fn deterministic_shuffle(items: &mut [(u64, TxCommit)], seed: &Hash32, extra_nonce: u64) {
     let n = items.len();
     if n <= 1 {
         return;
@@ -304,14 +295,17 @@ impl MevMempool {
         }
 
         self.metrics.commits_received += 1;
-        self.pending_commits.insert(commit.commit_hash.clone(), commit);
+        self.pending_commits
+            .insert(commit.commit_hash.clone(), commit);
         Ok(())
     }
 
     /// Submit a reveal (phase 2 of commit-reveal).
     pub fn submit_reveal(&mut self, reveal: TxReveal) -> Result<(), &'static str> {
         // Verify the commit exists
-        let commit = self.pending_commits.get(&reveal.commit_hash)
+        let commit = self
+            .pending_commits
+            .get(&reveal.commit_hash)
             .ok_or("commit not found")?;
 
         // Verify the reveal matches the commit
@@ -328,7 +322,8 @@ impl MevMempool {
         }
 
         // Check TTL
-        if self.current_height.saturating_sub(commit.commit_height) > self.config.commit_ttl_blocks {
+        if self.current_height.saturating_sub(commit.commit_height) > self.config.commit_ttl_blocks
+        {
             self.metrics.commits_expired += 1;
             self.pending_commits.remove(&reveal.commit_hash);
             return Err("commit expired");
@@ -410,18 +405,25 @@ impl MevMempool {
                 .enumerate()
                 .map(|(i, tx)| {
                     let order = self.order_counter.wrapping_add(i as u64);
-                    (order, TxCommit {
-                        commit_hash: crate::types::tx_hash(tx),
-                        sender: tx.from.clone(),
-                        received_order: order,
-                        commit_height: self.current_height,
-                        encrypted_tx: None,
-                    })
+                    (
+                        order,
+                        TxCommit {
+                            commit_hash: crate::types::tx_hash(tx),
+                            sender: tx.from.clone(),
+                            received_order: order,
+                            commit_height: self.current_height,
+                            encrypted_tx: None,
+                        },
+                    )
                 })
                 .collect();
 
             // Apply fair ordering with jitter
-            fair_order_shuffle(&mut ordering, self.config.ordering_jitter_ms, &self.last_block_hash);
+            fair_order_shuffle(
+                &mut ordering,
+                self.config.ordering_jitter_ms,
+                &self.last_block_hash,
+            );
             self.metrics.fair_order_shuffles += 1;
 
             // Map back to transactions (best effort: match by sender+order)
@@ -452,7 +454,8 @@ impl MevMempool {
 
         // Expire old commits
         let ttl = self.config.commit_ttl_blocks;
-        let expired: Vec<Hash32> = self.pending_commits
+        let expired: Vec<Hash32> = self
+            .pending_commits
             .iter()
             .filter(|(_, c)| height.saturating_sub(c.commit_height) > ttl)
             .map(|(h, _)| h.clone())
@@ -511,12 +514,7 @@ impl MevMempool {
 }
 
 /// Compute the commit hash for the commit-reveal scheme.
-pub fn compute_commit_hash(
-    sender: &str,
-    nonce: u64,
-    tx_bytes: &[u8],
-    salt: &[u8],
-) -> Hash32 {
+pub fn compute_commit_hash(sender: &str, nonce: u64, tx_bytes: &[u8], salt: &[u8]) -> Hash32 {
     let mut buf = Vec::with_capacity(sender.len() + 8 + tx_bytes.len() + salt.len() + 16);
     buf.extend_from_slice(b"IONA_COMMIT");
     buf.extend_from_slice(sender.as_bytes());
@@ -684,13 +682,16 @@ mod tests {
         let seed = Hash32([42; 32]);
         let mut commits1: Vec<(u64, TxCommit)> = (0..10)
             .map(|i| {
-                (i * 10, TxCommit {
-                    commit_hash: Hash32([i as u8; 32]),
-                    sender: format!("sender_{i}"),
-                    received_order: i,
-                    commit_height: 0,
-                    encrypted_tx: None,
-                })
+                (
+                    i * 10,
+                    TxCommit {
+                        commit_hash: Hash32([i as u8; 32]),
+                        sender: format!("sender_{i}"),
+                        received_order: i,
+                        commit_height: 0,
+                        encrypted_tx: None,
+                    },
+                )
             })
             .collect();
 

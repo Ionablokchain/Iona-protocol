@@ -27,7 +27,7 @@ pub enum EvmTx {
     },
     Legacy {
         from: Address20,
-        to: Option<Address20>,     // None = contract creation
+        to: Option<Address20>, // None = contract creation
         nonce: u64,
         gas_limit: u64,
         gas_price: u128,

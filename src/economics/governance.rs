@@ -25,7 +25,13 @@ pub struct GovernanceState {
 }
 
 impl GovernanceState {
-    pub fn submit(&mut self, kind: ProposalKind, deposit: u128, start_epoch: u64, voting_epochs: u64) -> u64 {
+    pub fn submit(
+        &mut self,
+        kind: ProposalKind,
+        deposit: u128,
+        start_epoch: u64,
+        voting_epochs: u64,
+    ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let p = Proposal {
@@ -48,8 +54,14 @@ impl GovernanceState {
         let mut yes = 0;
         let mut no = 0;
         for ((pid, _), v) in self.votes.iter() {
-            if *pid != proposal_id { continue; }
-            if *v { yes += 1 } else { no += 1 }
+            if *pid != proposal_id {
+                continue;
+            }
+            if *v {
+                yes += 1
+            } else {
+                no += 1
+            }
         }
         (yes, no)
     }

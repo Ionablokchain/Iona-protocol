@@ -1,6 +1,6 @@
+use crate::rpc::mpt::eth_ordered_trie_root_hex;
 use rlp::RlpStream;
 use serde::{Deserialize, Serialize};
-use crate::rpc::mpt::eth_ordered_trie_root_hex;
 
 /// EIP-4895 withdrawal (Shanghai).
 ///
@@ -23,7 +23,12 @@ pub struct Withdrawal {
 impl Withdrawal {
     /// Construct a new withdrawal.
     pub fn new(index: u64, validator_index: u64, address: [u8; 20], amount_gwei: u64) -> Self {
-        Self { index, validator_index, address, amount_gwei }
+        Self {
+            index,
+            validator_index,
+            address,
+            amount_gwei,
+        }
     }
 
     /// RLP-encode as `[index, validatorIndex, address, amount]`.

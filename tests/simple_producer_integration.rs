@@ -1,11 +1,13 @@
-
-use iona::consensus::{ConsensusMsg, SimpleBlockProducer, SimpleProducerCfg, Validator, ValidatorSet, BlockStore, Outbox, Engine};
+use iona::consensus::DoubleSignGuard;
+use iona::consensus::{
+    BlockStore, ConsensusMsg, Engine, Outbox, SimpleBlockProducer, SimpleProducerCfg, Validator,
+    ValidatorSet,
+};
 use iona::crypto::ed25519::{Ed25519Keypair, Ed25519Verifier};
 use iona::crypto::Signer;
-use iona::types::{Hash32, Height};
-use iona::slashing::StakeLedger;
-use iona::consensus::DoubleSignGuard;
 use iona::execution::KvState;
+use iona::slashing::StakeLedger;
+use iona::types::{Hash32, Height};
 
 use std::collections::HashMap;
 
@@ -28,9 +30,19 @@ struct TestOutbox {
     pub broadcasts: Vec<ConsensusMsg>,
 }
 impl Outbox for TestOutbox {
-    fn broadcast(&mut self, msg: ConsensusMsg) { self.broadcasts.push(msg); }
+    fn broadcast(&mut self, msg: ConsensusMsg) {
+        self.broadcasts.push(msg);
+    }
     fn request_block(&mut self, _block_id: Hash32) {}
-    fn on_commit(&mut self, _cert: &iona::consensus::CommitCertificate, _block: &iona::types::Block, _new_state: &KvState, _new_base_fee: u64, _receipts: &[iona::types::Receipt]) {}
+    fn on_commit(
+        &mut self,
+        _cert: &iona::consensus::CommitCertificate,
+        _block: &iona::types::Block,
+        _new_state: &KvState,
+        _new_base_fee: u64,
+        _receipts: &[iona::types::Receipt],
+    ) {
+    }
 }
 
 fn make_engine(height: Height, vset: ValidatorSet) -> Engine<Ed25519Verifier> {
@@ -56,25 +68,50 @@ fn round_robin_producer_broadcasts_proposal() {
 
     let vset = ValidatorSet {
         vals: vec![
-            Validator { pk: k1.public_key(), power: 1 },
-            Validator { pk: k2.public_key(), power: 1 },
-            Validator { pk: k3.public_key(), power: 1 },
+            Validator {
+                pk: k1.public_key(),
+                power: 1,
+            },
+            Validator {
+                pk: k2.public_key(),
+                power: 1,
+            },
+            Validator {
+                pk: k3.public_key(),
+                power: 1,
+            },
         ],
     };
 
-    let producer = SimpleBlockProducer::new(SimpleProducerCfg { max_txs: 0, include_block_in_proposal: true });
+    let producer = SimpleBlockProducer::new(SimpleProducerCfg {
+        max_txs: 0,
+        include_block_in_proposal: true,
+    });
     let mut store = MemStore::default();
     let mut out = TestOutbox::default();
 
     // Height=1, round=0 => idx = (1+0)%3 = 1 => k2 is proposer
     let mut eng = make_engine(1, vset.clone());
     assert!(producer.try_produce(&mut eng, &k2, &store, &mut out, vec![]));
-    assert!(out.broadcasts.iter().any(|m| matches!(m, ConsensusMsg::Proposal(_))), "expected Proposal broadcast");
+    assert!(
+        out.broadcasts
+            .iter()
+            .any(|m| matches!(m, ConsensusMsg::Proposal(_))),
+        "expected Proposal broadcast"
+    );
 
     // Extract the proposal and ensure the block was persisted in the store.
-    let prop = out.broadcasts.iter().find_map(|m| {
-        if let ConsensusMsg::Proposal(p) = m { Some(p.clone()) } else { None }
-    }).expect("proposal missing");
+    let prop = out
+        .broadcasts
+        .iter()
+        .find_map(|m| {
+            if let ConsensusMsg::Proposal(p) = m {
+                Some(p.clone())
+            } else {
+                None
+            }
+        })
+        .expect("proposal missing");
     let bid = prop.block_id.clone();
     assert!(store.get(&bid).is_some(), "expected block persisted");
 
@@ -100,10 +137,24 @@ fn round_robin_producer_broadcasts_proposal() {
     eng.state.proposal_block = None;
 
     assert!(producer.try_produce(&mut eng, &k3, &store, &mut out, vec![]));
-    assert!(out.broadcasts.iter().any(|m| matches!(m, ConsensusMsg::Proposal(_))));
+    assert!(out
+        .broadcasts
+        .iter()
+        .any(|m| matches!(m, ConsensusMsg::Proposal(_))));
 
-    let prop2 = out.broadcasts.iter().find_map(|m| {
-        if let ConsensusMsg::Proposal(p) = m { Some(p.clone()) } else { None }
-    }).expect("proposal missing");
-    assert!(store.get(&prop2.block_id).is_some(), "expected block persisted (height=2)");
+    let prop2 = out
+        .broadcasts
+        .iter()
+        .find_map(|m| {
+            if let ConsensusMsg::Proposal(p) = m {
+                Some(p.clone())
+            } else {
+                None
+            }
+        })
+        .expect("proposal missing");
+    assert!(
+        store.get(&prop2.block_id).is_some(),
+        "expected block persisted (height=2)"
+    );
 }

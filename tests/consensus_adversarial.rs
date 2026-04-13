@@ -10,18 +10,21 @@
 //!   D. Consensus safety invariants under adversarial input
 //!   E. Evidence handling (DoS-safe)
 
-use iona::consensus::double_sign::{DoubleSignGuard, vote_guard_key};
+use iona::consensus::double_sign::{vote_guard_key, DoubleSignGuard};
 use iona::consensus::messages::VoteType;
 use iona::crypto::PublicKeyBytes;
 use iona::types::Hash32;
 
-fn hash(b: u8) -> Hash32 { Hash32([b; 32]) }
-fn opt_hash(b: u8) -> Option<Hash32> { Some(hash(b)) }
+fn hash(b: u8) -> Hash32 {
+    Hash32([b; 32])
+}
+fn opt_hash(b: u8) -> Option<Hash32> {
+    Some(hash(b))
+}
 
 fn make_guard(dir: &tempfile::TempDir, pk_byte: u8) -> DoubleSignGuard {
     let pk = PublicKeyBytes(vec![pk_byte; 32]);
-    DoubleSignGuard::new(dir.path().to_str().unwrap(), &pk)
-        .expect("guard must load cleanly")
+    DoubleSignGuard::new(dir.path().to_str().unwrap(), &pk).expect("guard must load cleanly")
 }
 
 // ── A. Double-sign guard ──────────────────────────────────────────────────
@@ -31,17 +34,22 @@ fn adversarial_double_prevote_same_height_round() {
     let dir = tempfile::tempdir().unwrap();
     let g = make_guard(&dir, 1);
     // Sign prevote for block A.
-    g.record_vote(VoteType::Prevote, 10, 0, &opt_hash(0xAA)).unwrap();
+    g.record_vote(VoteType::Prevote, 10, 0, &opt_hash(0xAA))
+        .unwrap();
     // Attempt prevote for block B at same position → must fail.
     let result = g.check_vote(VoteType::Prevote, 10, 0, &opt_hash(0xBB));
-    assert!(result.is_err(), "double prevote for different block must be refused");
+    assert!(
+        result.is_err(),
+        "double prevote for different block must be refused"
+    );
 }
 
 #[test]
 fn adversarial_double_precommit_same_height_round() {
     let dir = tempfile::tempdir().unwrap();
     let g = make_guard(&dir, 2);
-    g.record_vote(VoteType::Precommit, 7, 1, &opt_hash(0x11)).unwrap();
+    g.record_vote(VoteType::Precommit, 7, 1, &opt_hash(0x11))
+        .unwrap();
     let result = g.check_vote(VoteType::Precommit, 7, 1, &opt_hash(0x22));
     assert!(result.is_err(), "double precommit must be refused");
 }
@@ -60,10 +68,14 @@ fn adversarial_vote_then_nil_vote_same_position() {
     let dir = tempfile::tempdir().unwrap();
     let g = make_guard(&dir, 4);
     // Record a prevote for a block.
-    g.record_vote(VoteType::Prevote, 3, 0, &opt_hash(0x55)).unwrap();
+    g.record_vote(VoteType::Prevote, 3, 0, &opt_hash(0x55))
+        .unwrap();
     // Now attempt a nil prevote at same position — this is equivocation.
     let result = g.check_vote(VoteType::Prevote, 3, 0, &None);
-    assert!(result.is_err(), "nil vote after block vote at same position is equivocation");
+    assert!(
+        result.is_err(),
+        "nil vote after block vote at same position is equivocation"
+    );
 }
 
 #[test]
@@ -72,7 +84,10 @@ fn adversarial_nil_vote_then_block_vote_same_position() {
     let g = make_guard(&dir, 5);
     g.record_vote(VoteType::Prevote, 3, 0, &None).unwrap();
     let result = g.check_vote(VoteType::Prevote, 3, 0, &opt_hash(0x77));
-    assert!(result.is_err(), "block vote after nil at same position is equivocation");
+    assert!(
+        result.is_err(),
+        "block vote after nil at same position is equivocation"
+    );
 }
 
 // ── B. Replay protection ──────────────────────────────────────────────────
@@ -83,10 +98,14 @@ fn replay_same_vote_allowed_idempotent() {
     // (idempotent replay = safe, allows network retransmission).
     let dir = tempfile::tempdir().unwrap();
     let g = make_guard(&dir, 6);
-    g.record_vote(VoteType::Precommit, 1, 0, &opt_hash(0xAA)).unwrap();
+    g.record_vote(VoteType::Precommit, 1, 0, &opt_hash(0xAA))
+        .unwrap();
     // Exact same vote replayed — must be OK.
     let result = g.check_vote(VoteType::Precommit, 1, 0, &opt_hash(0xAA));
-    assert!(result.is_ok(), "idempotent replay of same vote must be allowed");
+    assert!(
+        result.is_ok(),
+        "idempotent replay of same vote must be allowed"
+    );
 }
 
 #[test]
@@ -124,9 +143,12 @@ fn prevote_and_precommit_are_independent() {
     let dir = tempfile::tempdir().unwrap();
     let g = make_guard(&dir, 10);
     // Prevote for block A.
-    g.record_vote(VoteType::Prevote, 5, 0, &opt_hash(0xAA)).unwrap();
+    g.record_vote(VoteType::Prevote, 5, 0, &opt_hash(0xAA))
+        .unwrap();
     // Precommit for block B at same position is a different vote type — fine.
-    assert!(g.check_vote(VoteType::Precommit, 5, 0, &opt_hash(0xBB)).is_ok());
+    assert!(g
+        .check_vote(VoteType::Precommit, 5, 0, &opt_hash(0xBB))
+        .is_ok());
 }
 
 // ── D. Guard survives restart ─────────────────────────────────────────────
@@ -214,8 +236,10 @@ fn record_count_increments_correctly() {
     let (p1, _) = g.record_count();
     assert_eq!(p1, 1);
 
-    g.record_vote(VoteType::Prevote, 1, 0, &opt_hash(1)).unwrap();
-    g.record_vote(VoteType::Precommit, 1, 0, &opt_hash(1)).unwrap();
+    g.record_vote(VoteType::Prevote, 1, 0, &opt_hash(1))
+        .unwrap();
+    g.record_vote(VoteType::Precommit, 1, 0, &opt_hash(1))
+        .unwrap();
     let (_, v2) = g.record_count();
     assert_eq!(v2, 2);
 }

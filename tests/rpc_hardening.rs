@@ -14,10 +14,9 @@
 //!   H. Request-ID uniqueness
 
 use iona::rpc_limits::{
-    validate_body_size, validate_batch_size, validate_tx, RpcLimiter, RpcLimitResult,
-    ValidationError, MAX_BODY_BYTES, MAX_BATCH_ITEMS, MAX_CONCURRENT_REQUESTS,
+    new_request_id, validate_batch_size, validate_body_size, validate_tx, RpcLimitResult,
+    RpcLimiter, ValidationError, MAX_BATCH_ITEMS, MAX_BODY_BYTES, MAX_CONCURRENT_REQUESTS,
     SUBMIT_RATE_PER_SEC, VIOLATIONS_BEFORE_QUARANTINE,
-    new_request_id,
 };
 use iona::types::Tx;
 use std::net::{IpAddr, Ipv4Addr};
@@ -94,20 +93,32 @@ fn reject_tx_payload_too_long() {
 #[test]
 fn reject_tx_zero_gas_limit() {
     let tx = minimal_tx(1, 0, 0, 1, "ok");
-    assert!(matches!(validate_tx(&tx, 1, 0).unwrap_err(), ValidationError::GasLimitZero));
+    assert!(matches!(
+        validate_tx(&tx, 1, 0).unwrap_err(),
+        ValidationError::GasLimitZero
+    ));
 }
 
 #[test]
 fn reject_tx_zero_max_fee() {
     let tx = minimal_tx(1, 0, 21000, 0, "ok");
-    assert!(matches!(validate_tx(&tx, 1, 0).unwrap_err(), ValidationError::MaxFeeZero));
+    assert!(matches!(
+        validate_tx(&tx, 1, 0).unwrap_err(),
+        ValidationError::MaxFeeZero
+    ));
 }
 
 #[test]
 fn reject_tx_wrong_chain_id() {
     let tx = minimal_tx(9999, 0, 21000, 1, "ok");
     let err = validate_tx(&tx, 1, 0).unwrap_err();
-    assert!(matches!(err, ValidationError::ChainIdMismatch { got: 9999, expected: 1 }));
+    assert!(matches!(
+        err,
+        ValidationError::ChainIdMismatch {
+            got: 9999,
+            expected: 1
+        }
+    ));
 }
 
 #[test]
@@ -127,7 +138,10 @@ fn allow_tx_nonce_equal_to_confirmed() {
 #[test]
 fn allow_tx_nonce_ahead_of_confirmed() {
     let tx = minimal_tx(1, 10, 21000, 1, "ok");
-    assert!(validate_tx(&tx, 1, 5).is_ok(), "future nonce should be queued");
+    assert!(
+        validate_tx(&tx, 1, 5).is_ok(),
+        "future nonce should be queued"
+    );
 }
 
 #[test]
@@ -152,7 +166,10 @@ fn rate_limit_submit_after_burst_exhausted() {
     }
     let result = limiter.check_submit(peer, "req-overflow");
     assert!(
-        matches!(result, RpcLimitResult::RateLimited | RpcLimitResult::Blocked),
+        matches!(
+            result,
+            RpcLimitResult::RateLimited | RpcLimitResult::Blocked
+        ),
         "must be rate-limited after burst, got {result:?}"
     );
 }
@@ -181,10 +198,7 @@ fn independent_ips_do_not_interfere() {
         limiter.check_submit(ip(3), "req");
     }
     // ip(4) must be unaffected.
-    assert_eq!(
-        limiter.check_submit(ip(4), "req"),
-        RpcLimitResult::Allowed
-    );
+    assert_eq!(limiter.check_submit(ip(4), "req"), RpcLimitResult::Allowed);
 }
 
 // ── D. IP quarantine/ban escalation ──────────────────────────────────────
@@ -218,7 +232,10 @@ fn repeated_violations_escalate_to_quarantine() {
     // Should now be quarantined or banned.
     let result = limiter.check_submit(peer, "req-after");
     assert!(
-        matches!(result, RpcLimitResult::RateLimited | RpcLimitResult::Blocked),
+        matches!(
+            result,
+            RpcLimitResult::RateLimited | RpcLimitResult::Blocked
+        ),
         "IP should be quarantined after sustained violations, got {result:?}"
     );
 }
@@ -231,7 +248,9 @@ fn concurrency_cap_enforced() {
     let mut tickets = Vec::new();
     for _ in 0..MAX_CONCURRENT_REQUESTS {
         tickets.push(
-            limiter.try_concurrency_slot("req").expect("slot must be available")
+            limiter
+                .try_concurrency_slot("req")
+                .expect("slot must be available"),
         );
     }
     // At cap — next must fail.
@@ -285,19 +304,32 @@ fn batch_zero_allowed() {
 #[test]
 fn error_messages_contain_no_src_paths() {
     let errors = vec![
-        ValidationError::PayloadTooLong { len: 9999, max: 4096 },
+        ValidationError::PayloadTooLong {
+            len: 9999,
+            max: 4096,
+        },
         ValidationError::InvalidUtf8,
         ValidationError::PubkeyTooLong,
         ValidationError::GasLimitZero,
         ValidationError::MaxFeeZero,
-        ValidationError::ChainIdMismatch { got: 2, expected: 1 },
-        ValidationError::NonceGap { sender: "alice".into(), expected: 5, got: 2 },
+        ValidationError::ChainIdMismatch {
+            got: 2,
+            expected: 1,
+        },
+        ValidationError::NonceGap {
+            sender: "alice".into(),
+            expected: 5,
+            got: 2,
+        },
         ValidationError::BatchTooLarge { count: 11, max: 10 },
     ];
     for err in &errors {
         let msg = err.to_string();
         assert!(!msg.contains("src/"), "error leaks src path: {msg}");
-        assert!(!msg.contains("rpc_limits"), "error leaks module name: {msg}");
+        assert!(
+            !msg.contains("rpc_limits"),
+            "error leaks module name: {msg}"
+        );
         assert!(!msg.contains("unwrap"), "error leaks internal: {msg}");
         assert!(!msg.contains("panic"), "error leaks panic info: {msg}");
     }

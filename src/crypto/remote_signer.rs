@@ -75,7 +75,11 @@ impl RemoteSigner {
         let url = format!("{}/pubkey", base_url.trim_end_matches('/'));
         let r: PubkeyResp = client.get(url).send()?.error_for_status()?.json()?;
         let pk = B64.decode(r.pubkey_base64.as_bytes())?;
-        Ok(Self { base_url, client, pubkey: PublicKeyBytes(pk) })
+        Ok(Self {
+            base_url,
+            client,
+            pubkey: PublicKeyBytes(pk),
+        })
     }
 
     pub fn base_url(&self) -> &str {
@@ -101,7 +105,9 @@ impl Signer for RemoteSigner {
 
     fn sign(&self, msg: &[u8]) -> SignatureBytes {
         let url = format!("{}/sign", self.base_url.trim_end_matches('/'));
-        let req = SignReq { msg_base64: B64.encode(msg) };
+        let req = SignReq {
+            msg_base64: B64.encode(msg),
+        };
         match self
             .client
             .post(url)

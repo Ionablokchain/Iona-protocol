@@ -19,8 +19,9 @@ impl ReceiptsStore {
     }
 
     pub fn put(&self, id: &Hash32, receipts: &[Receipt]) -> io::Result<()> {
-        let s = serde_json::to_string_pretty(receipts)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("receipt encode: {e}")))?;
+        let s = serde_json::to_string_pretty(receipts).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("receipt encode: {e}"))
+        })?;
         fs::write(self.path_for(id), s)
     }
 
@@ -30,8 +31,9 @@ impl ReceiptsStore {
             return Ok(None);
         }
         let s = fs::read_to_string(p)?;
-        let r = serde_json::from_str(&s)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("receipt decode: {e}")))?;
+        let r = serde_json::from_str(&s).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("receipt decode: {e}"))
+        })?;
         Ok(Some(r))
     }
 }

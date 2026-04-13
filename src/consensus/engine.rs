@@ -1,15 +1,15 @@
+use crate::consensus::double_sign::DoubleSignGuard;
 use crate::consensus::messages::*;
 use crate::consensus::quorum::*;
 use crate::consensus::validator_set::*;
-use crate::consensus::double_sign::DoubleSignGuard;
-use crate::crypto::{Signer, Verifier, PublicKeyBytes};
+use crate::crypto::{PublicKeyBytes, Signer, Verifier};
 use crate::evidence::Evidence;
 use crate::execution::{build_block, next_base_fee, verify_block_with_vset, KvState};
 use crate::slashing::StakeLedger;
-use crate::types::{Block, Hash32, Height, Round, Tx, Receipt};
+use crate::types::{Block, Hash32, Height, Receipt, Round, Tx};
+use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 use tracing::{info, warn};
-use std::collections::{HashMap, BTreeMap};
 
 #[derive(Debug, Error)]
 pub enum ConsensusError {
@@ -24,7 +24,12 @@ pub enum ConsensusError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Step { Propose, Prevote, Precommit, Commit }
+pub enum Step {
+    Propose,
+    Prevote,
+    Precommit,
+    Commit,
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CommitCertificate {
@@ -118,7 +123,14 @@ pub trait BlockStore: Send + Sync {
 pub trait Outbox {
     fn broadcast(&mut self, msg: ConsensusMsg);
     fn request_block(&mut self, block_id: Hash32);
-    fn on_commit(&mut self, cert: &CommitCertificate, block: &Block, new_state: &KvState, new_base_fee: u64, receipts: &[Receipt]);
+    fn on_commit(
+        &mut self,
+        cert: &CommitCertificate,
+        block: &Block,
+        new_state: &KvState,
+        new_base_fee: u64,
+        receipts: &[Receipt],
+    );
 }
 
 pub struct Engine<V: Verifier> {
@@ -140,7 +152,15 @@ pub struct Engine<V: Verifier> {
 }
 
 impl<V: Verifier> Engine<V> {
-    pub fn new(cfg: Config, vset: ValidatorSet, height: Height, prev_block_id: Hash32, app_state: KvState, stakes: StakeLedger, ds_guard: Option<DoubleSignGuard>) -> Self {
+    pub fn new(
+        cfg: Config,
+        vset: ValidatorSet,
+        height: Height,
+        prev_block_id: Hash32,
+        app_state: KvState,
+        stakes: StakeLedger,
+        ds_guard: Option<DoubleSignGuard>,
+    ) -> Self {
         Self {
             base_fee_per_gas: cfg.initial_base_fee_per_gas,
             cfg,
@@ -156,15 +176,27 @@ impl<V: Verifier> Engine<V> {
     }
 
     pub fn is_proposer(&self, pk: &PublicKeyBytes) -> bool {
-        self.vset.proposer_for(self.state.height, self.state.round).pk == *pk
+        self.vset
+            .proposer_for(self.state.height, self.state.round)
+            .pk
+            == *pk
     }
 
     fn proposer_addr_string(&self, pk: &PublicKeyBytes) -> String {
         hex::encode(&blake3::hash(&pk.0).as_bytes()[..20])
     }
 
-    pub fn tick<S: Signer, B: BlockStore, O: Outbox>(&mut self, signer: &S, store: &B, out: &mut O, dt_ms: u64, mempool_drain: impl FnOnce(usize)->Vec<Tx>) {
-        if self.state.decided.is_some() { return; }
+    pub fn tick<S: Signer, B: BlockStore, O: Outbox>(
+        &mut self,
+        signer: &S,
+        store: &B,
+        out: &mut O,
+        dt_ms: u64,
+        mempool_drain: impl FnOnce(usize) -> Vec<Tx>,
+    ) {
+        if self.state.decided.is_some() {
+            return;
+        }
         self.step_elapsed_ms = self.step_elapsed_ms.saturating_add(dt_ms);
 
         match self.state.step {
@@ -186,7 +218,11 @@ impl<V: Verifier> Engine<V> {
                     self.state.step = Step::Prevote;
                     self.step_elapsed_ms = 0;
                     let vote_block = self.state.proposal.as_ref().and_then(|p| {
-                        if self.state.proposal_block.is_some() { Some(p.block_id.clone()) } else { None }
+                        if self.state.proposal_block.is_some() {
+                            Some(p.block_id.clone())
+                        } else {
+                            None
+                        }
                     });
                     self.broadcast_vote(signer, out, VoteType::Prevote, vote_block);
                 }
@@ -205,9 +241,18 @@ impl<V: Verifier> Engine<V> {
         }
     }
 
-    fn advance_round<S: Signer, B: BlockStore, O: Outbox>(&mut self, signer: &S, store: &B, out: &mut O) {
+    fn advance_round<S: Signer, B: BlockStore, O: Outbox>(
+        &mut self,
+        signer: &S,
+        store: &B,
+        out: &mut O,
+    ) {
         if self.state.round + 1 >= self.cfg.max_rounds {
-            warn!(height=self.state.height, round=self.state.round, "max rounds reached; staying");
+            warn!(
+                height = self.state.height,
+                round = self.state.round,
+                "max rounds reached; staying"
+            );
             return;
         }
         self.state.round += 1;
@@ -215,17 +260,29 @@ impl<V: Verifier> Engine<V> {
         self.state.proposal_block = None;
         self.state.step = Step::Propose;
         self.step_elapsed_ms = 0;
-        info!(height=self.state.height, round=self.state.round, "advance round");
+        info!(
+            height = self.state.height,
+            round = self.state.round,
+            "advance round"
+        );
         self.maybe_propose(signer, store, out, |_| vec![]);
     }
 
-    fn maybe_propose<S: Signer, B: BlockStore, O: Outbox>(&mut self, signer: &S, store: &B, out: &mut O, mempool_drain: impl FnOnce(usize)->Vec<Tx>) {
+    fn maybe_propose<S: Signer, B: BlockStore, O: Outbox>(
+        &mut self,
+        signer: &S,
+        store: &B,
+        out: &mut O,
+        mempool_drain: impl FnOnce(usize) -> Vec<Tx>,
+    ) {
         // If a proposal is already present (e.g. produced by an external proposer loop),
         // do not create a second proposal for the same height/round.
         if self.state.proposal.is_some() {
             return;
         }
-        if !self.is_proposer(&signer.public_key()) { return; }
+        if !self.is_proposer(&signer.public_key()) {
+            return;
+        }
         let txs = mempool_drain(self.cfg.max_txs_per_block);
         let proposer_addr = self.proposer_addr_string(&signer.public_key());
         let (block, _next_state, _receipts) = build_block(
@@ -248,7 +305,12 @@ impl<V: Verifier> Engine<V> {
             }
         }
 
-        let sign_bytes = proposal_sign_bytes(self.state.height, self.state.round, &bid, self.state.valid_round);
+        let sign_bytes = proposal_sign_bytes(
+            self.state.height,
+            self.state.round,
+            &bid,
+            self.state.valid_round,
+        );
         let sig = signer.sign(&sign_bytes);
         if let Some(g) = &self.ds_guard {
             if let Err(e) = g.record_proposal(self.state.height, self.state.round, &bid) {
@@ -262,7 +324,11 @@ impl<V: Verifier> Engine<V> {
             round: self.state.round,
             proposer: signer.public_key(),
             block_id: bid.clone(),
-            block: if self.cfg.include_block_in_proposal { Some(block.clone()) } else { None },
+            block: if self.cfg.include_block_in_proposal {
+                Some(block.clone())
+            } else {
+                None
+            },
             pol_round: self.state.valid_round,
             signature: sig,
         };
@@ -271,10 +337,20 @@ impl<V: Verifier> Engine<V> {
         self.state.proposal_block = Some(block);
 
         out.broadcast(ConsensusMsg::Proposal(prop));
-        info!(height=self.state.height, round=self.state.round, "broadcast proposal");
+        info!(
+            height = self.state.height,
+            round = self.state.round,
+            "broadcast proposal"
+        );
     }
 
-    pub fn on_message<S: Signer, B: BlockStore, O: Outbox>(&mut self, signer: &S, store: &B, out: &mut O, msg: ConsensusMsg) -> Result<(), ConsensusError> {
+    pub fn on_message<S: Signer, B: BlockStore, O: Outbox>(
+        &mut self,
+        signer: &S,
+        store: &B,
+        out: &mut O,
+        msg: ConsensusMsg,
+    ) -> Result<(), ConsensusError> {
         match msg {
             ConsensusMsg::Proposal(p) => self.on_proposal(signer, store, out, p),
             ConsensusMsg::Vote(v) => self.on_vote(signer, store, out, v),
@@ -287,30 +363,48 @@ impl<V: Verifier> Engine<V> {
     }
 
     fn verify_proposal(&self, p: &Proposal) -> Result<(), ConsensusError> {
-        if !self.vset.contains(&p.proposer) { return Err(ConsensusError::UnknownValidator); }
+        if !self.vset.contains(&p.proposer) {
+            return Err(ConsensusError::UnknownValidator);
+        }
         // Must be the designated proposer for this height+round (round-robin)
         if self.vset.proposer_for(p.height, p.round).pk != p.proposer {
             return Err(ConsensusError::UnknownValidator);
         }
-        if p.height != self.state.height || p.round != self.state.round { return Err(ConsensusError::BadStep); }
+        if p.height != self.state.height || p.round != self.state.round {
+            return Err(ConsensusError::BadStep);
+        }
         let bytes = proposal_sign_bytes(p.height, p.round, &p.block_id, p.pol_round);
         V::verify(&p.proposer, &bytes, &p.signature).map_err(|_| ConsensusError::BadSig)?;
         Ok(())
     }
 
     fn verify_vote(&self, v: &Vote) -> Result<(), ConsensusError> {
-        if !self.vset.contains(&v.voter) { return Err(ConsensusError::UnknownValidator); }
-        if v.height != self.state.height || v.round != self.state.round { return Err(ConsensusError::BadStep); }
+        if !self.vset.contains(&v.voter) {
+            return Err(ConsensusError::UnknownValidator);
+        }
+        if v.height != self.state.height || v.round != self.state.round {
+            return Err(ConsensusError::BadStep);
+        }
         let bytes = vote_sign_bytes(v.vote_type, v.height, v.round, &v.block_id);
         V::verify(&v.voter, &bytes, &v.signature).map_err(|_| ConsensusError::BadSig)?;
         Ok(())
     }
 
-    fn on_proposal<S: Signer, B: BlockStore, O: Outbox>(&mut self, signer: &S, store: &B, out: &mut O, mut p: Proposal) -> Result<(), ConsensusError> {
-        if self.state.decided.is_some() { return Ok(()); }
+    fn on_proposal<S: Signer, B: BlockStore, O: Outbox>(
+        &mut self,
+        signer: &S,
+        store: &B,
+        out: &mut O,
+        mut p: Proposal,
+    ) -> Result<(), ConsensusError> {
+        if self.state.decided.is_some() {
+            return Ok(());
+        }
         self.verify_proposal(&p)?;
 
-        if let Some(b) = p.block.clone() { store.put(b); }
+        if let Some(b) = p.block.clone() {
+            store.put(b);
+        }
 
         let block = store.get(&p.block_id);
         if block.is_none() {
@@ -323,7 +417,9 @@ impl<V: Verifier> Engine<V> {
             return Ok(());
         }
 
-        let Some(block) = block else { return Ok(()); };
+        let Some(block) = block else {
+            return Ok(());
+        };
         let proposer_addr = self.proposer_addr_string(&p.proposer);
         if verify_block_with_vset(&self.app_state, &block, &proposer_addr, &p.proposer).is_none() {
             self.state.step = Step::Prevote;
@@ -345,7 +441,9 @@ impl<V: Verifier> Engine<V> {
 
     fn prevote_choice(&self, proposal_id: &Hash32) -> Option<Hash32> {
         if let Some(locked) = &self.state.locked_value {
-            if locked != proposal_id { return None; }
+            if locked != proposal_id {
+                return None;
+            }
         }
         Some(proposal_id.clone())
     }
@@ -366,13 +464,23 @@ impl<V: Verifier> Engine<V> {
                 });
             }
         } else {
-            self.state.vote_index.insert(key, (v.block_id.clone(), v.clone()));
+            self.state
+                .vote_index
+                .insert(key, (v.block_id.clone(), v.clone()));
         }
         None
     }
 
-    fn on_vote<S: Signer, B: BlockStore, O: Outbox>(&mut self, signer: &S, store: &B, out: &mut O, v: Vote) -> Result<(), ConsensusError> {
-        if self.state.decided.is_some() { return Ok(()); }
+    fn on_vote<S: Signer, B: BlockStore, O: Outbox>(
+        &mut self,
+        signer: &S,
+        store: &B,
+        out: &mut O,
+        v: Vote,
+    ) -> Result<(), ConsensusError> {
+        if self.state.decided.is_some() {
+            return Ok(());
+        }
         self.verify_vote(&v)?;
 
         if let Some(ev) = self.record_vote_and_detect_evidence(&v) {
@@ -416,16 +524,28 @@ impl<V: Verifier> Engine<V> {
                                     out.request_block(bid.clone());
                                     return Ok(());
                                 }
-                                let Some(block) = block else { return Ok(()); };
+                                let Some(block) = block else {
+                                    return Ok(());
+                                };
                                 let proposer_pk = PublicKeyBytes(block.header.proposer_pk.clone());
-                                let expected_proposer = &self.vset.proposer_for(self.state.height, v.round).pk;
+                                let expected_proposer =
+                                    &self.vset.proposer_for(self.state.height, v.round).pk;
                                 let proposer_addr = self.proposer_addr_string(&proposer_pk);
                                 let (new_state, _receipts) = verify_block_with_vset(
-                                    &self.app_state, &block, &proposer_addr, expected_proposer
-                                ).ok_or(ConsensusError::Exec)?;
+                                    &self.app_state,
+                                    &block,
+                                    &proposer_addr,
+                                    expected_proposer,
+                                )
+                                .ok_or(ConsensusError::Exec)?;
 
-                                let precommits = self.collect_votes(v.round, VoteType::Precommit, Some(&bid));
-                                let cert = CommitCertificate { height: self.state.height, block_id: bid.clone(), precommits };
+                                let precommits =
+                                    self.collect_votes(v.round, VoteType::Precommit, Some(&bid));
+                                let cert = CommitCertificate {
+                                    height: self.state.height,
+                                    block_id: bid.clone(),
+                                    precommits,
+                                };
                                 self.state.decided = Some(cert.clone());
                                 self.state.step = Step::Commit;
                                 self.step_elapsed_ms = 0;
@@ -433,11 +553,15 @@ impl<V: Verifier> Engine<V> {
                                 self.app_state = new_state.clone();
                                 self.prev_block_id = bid.clone();
 
-                                let new_base = next_base_fee(self.base_fee_per_gas, block.header.gas_used, self.cfg.gas_target);
+                                let new_base = next_base_fee(
+                                    self.base_fee_per_gas,
+                                    block.header.gas_used,
+                                    self.cfg.gas_target,
+                                );
                                 self.base_fee_per_gas = new_base;
 
                                 out.on_commit(&cert, &block, &new_state, new_base, &_receipts);
-                                info!(height=self.state.height, "committed");
+                                info!(height = self.state.height, "committed");
                             } else {
                                 self.advance_round(signer, store, out);
                             }
@@ -461,20 +585,32 @@ impl<V: Verifier> Engine<V> {
 
     fn collect_votes(&self, round: Round, vt: VoteType, target: Option<&Hash32>) -> Vec<Vote> {
         let mut outv = Vec::new();
-        let Some(rt) = self.state.votes.get(&round) else { return outv; };
-        let Some(votes) = rt.get(&vt) else { return outv; };
+        let Some(rt) = self.state.votes.get(&round) else {
+            return outv;
+        };
+        let Some(votes) = rt.get(&vt) else {
+            return outv;
+        };
         for (_voter, vote) in votes.iter() {
             let matches = match (target, &vote.block_id) {
                 (Some(t), Some(b)) => t == b,
                 (None, None) => true,
                 _ => false,
             };
-            if matches { outv.push(vote.clone()); }
+            if matches {
+                outv.push(vote.clone());
+            }
         }
         outv
     }
 
-    fn broadcast_vote<S: Signer, O: Outbox>(&self, signer: &S, out: &mut O, vt: VoteType, block_id: Option<Hash32>) {
+    fn broadcast_vote<S: Signer, O: Outbox>(
+        &self,
+        signer: &S,
+        out: &mut O,
+        vt: VoteType,
+        block_id: Option<Hash32>,
+    ) {
         if let Some(g) = &self.ds_guard {
             if let Err(e) = g.check_vote(vt, self.state.height, self.state.round, &block_id) {
                 warn!("double-sign guard refused vote signature: {e}");
@@ -503,7 +639,11 @@ impl<V: Verifier> Engine<V> {
 
     /// Handle a block received from sync (range response).
     pub fn on_block_received<S: Signer, B: BlockStore, O: Outbox>(
-        &mut self, signer: &S, store: &B, out: &mut O, block: Block
+        &mut self,
+        signer: &S,
+        store: &B,
+        out: &mut O,
+        block: Block,
     ) -> Result<(), ConsensusError> {
         store.put(block.clone());
         // If we had a pending proposal referencing this block, retry it
@@ -521,7 +661,12 @@ impl<V: Verifier> Engine<V> {
         Ok(())
     }
 
-    pub fn next_height<S: Signer, B: BlockStore, O: Outbox>(&mut self, signer: &S, store: &B, out: &mut O) {
+    pub fn next_height<S: Signer, B: BlockStore, O: Outbox>(
+        &mut self,
+        signer: &S,
+        store: &B,
+        out: &mut O,
+    ) {
         self.state = ConsensusState::new(self.state.height + 1);
         self.step_elapsed_ms = 0;
         self.state.step = Step::Propose;

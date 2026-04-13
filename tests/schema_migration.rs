@@ -70,7 +70,10 @@ fn schema_migration_v1_to_current_normalises_state_full() {
     // state_full.json should now have a `vm` field.
     let raw = fs::read_to_string(format!("{}/state_full.json", data.root)).unwrap();
     let val: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    assert!(val.get("vm").is_some(), "vm field should be injected by migration");
+    assert!(
+        val.get("vm").is_some(),
+        "vm field should be injected by migration"
+    );
     // Original data must be preserved.
     assert_eq!(val["kv"]["hello"], "world");
 
@@ -119,7 +122,10 @@ fn schema_migration_future_version_returns_error() {
         "should error when on-disk version is newer than binary"
     );
     let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("newer than this binary"), "error message should explain the issue: {msg}");
+    assert!(
+        msg.contains("newer than this binary"),
+        "error message should explain the issue: {msg}"
+    );
 }
 
 #[test]

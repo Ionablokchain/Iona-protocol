@@ -9,7 +9,7 @@
 use iona::execution::{apply_tx, build_block, KvState};
 use iona::mempool::Mempool;
 use iona::slashing::StakeLedger;
-use iona::types::{Tx, Hash32};
+use iona::types::{Hash32, Tx};
 
 fn make_tx(from: &str, nonce: u64, max_fee: u64, tip: u64, payload: &str) -> Tx {
     Tx {
@@ -36,7 +36,10 @@ fn invariant_balance_conservation() {
     state.balances.insert("bob".into(), 400_000);
 
     let initial_total: u64 = state.balances.values().sum::<u64>() + state.burned;
-    assert_eq!(initial_total, initial_supply, "Initial invariant: balances sum to supply");
+    assert_eq!(
+        initial_total, initial_supply,
+        "Initial invariant: balances sum to supply"
+    );
 
     // Run a few transfer txs through apply_tx (they will fail sig check, but test invariant)
     // For balance invariant we manually simulate a successful transfer
@@ -66,9 +69,18 @@ fn invariant_mempool_nonce_ordering() {
 
     let drained = pool.drain_best(10);
     // Must be in nonce order
-    let nonces: Vec<u64> = drained.iter().filter(|t| t.from == "alice").map(|t| t.nonce).collect();
+    let nonces: Vec<u64> = drained
+        .iter()
+        .filter(|t| t.from == "alice")
+        .map(|t| t.nonce)
+        .collect();
     for w in nonces.windows(2) {
-        assert!(w[0] < w[1], "INVARIANT VIOLATED: nonces not in order: {} >= {}", w[0], w[1]);
+        assert!(
+            w[0] < w[1],
+            "INVARIANT VIOLATED: nonces not in order: {} >= {}",
+            w[0],
+            w[1]
+        );
     }
 }
 
@@ -79,7 +91,10 @@ fn invariant_mempool_no_duplicate_nonce_without_rbf() {
     pool.push(make_tx("alice", 0, 100, 50, "set x 1")).unwrap();
     // Same nonce, same tip — should be rejected
     let res = pool.push(make_tx("alice", 0, 100, 50, "set x 2"));
-    assert!(res.is_err(), "INVARIANT VIOLATED: duplicate nonce accepted without fee bump");
+    assert!(
+        res.is_err(),
+        "INVARIANT VIOLATED: duplicate nonce accepted without fee bump"
+    );
 }
 
 /// INVARIANT: After confirming nonce N, mempool must not return txs with nonce < N.
@@ -96,7 +111,11 @@ fn invariant_mempool_remove_confirmed() {
     let remaining = pool.drain_best(10);
     for tx in &remaining {
         if tx.from == "alice" {
-            assert!(tx.nonce >= 2, "INVARIANT VIOLATED: confirmed tx still in mempool, nonce={}", tx.nonce);
+            assert!(
+                tx.nonce >= 2,
+                "INVARIANT VIOLATED: confirmed tx still in mempool, nonce={}",
+                tx.nonce
+            );
         }
     }
 }
@@ -134,7 +153,8 @@ fn invariant_kv_state_root_determinism() {
     s2.balances.insert("alice".into(), 100);
 
     assert_eq!(
-        s1.root().0, s2.root().0,
+        s1.root().0,
+        s2.root().0,
         "INVARIANT VIOLATED: same state produces different roots"
     );
 }
@@ -149,7 +169,8 @@ fn invariant_kv_state_root_sensitivity() {
     s2.balances.insert("alice".into(), 101); // one unit different
 
     assert_ne!(
-        s1.root().0, s2.root().0,
+        s1.root().0,
+        s2.root().0,
         "INVARIANT VIOLATED: different states produce the same root"
     );
 }
@@ -164,17 +185,24 @@ fn invariant_stake_ledger_active_power() {
     let pk1 = PublicKeyBytes(vec![1u8; 32]);
     let pk2 = PublicKeyBytes(vec![2u8; 32]);
 
-    ledger.validators.insert(pk1.clone(), ValidatorRecord::new(1000));
-    ledger.validators.insert(pk2.clone(), ValidatorRecord::new(500));
+    ledger
+        .validators
+        .insert(pk1.clone(), ValidatorRecord::new(1000));
+    ledger
+        .validators
+        .insert(pk2.clone(), ValidatorRecord::new(500));
 
     assert_eq!(ledger.total_power(), 1500);
 
     // Jail pk2
-    ledger.validators.get_mut(&pk2).unwrap().status =
-        ValidatorStatus::Jailed { since_height: 100, slash_count: 1 };
+    ledger.validators.get_mut(&pk2).unwrap().status = ValidatorStatus::Jailed {
+        since_height: 100,
+        slash_count: 1,
+    };
 
     assert_eq!(
-        ledger.total_power(), 1000,
+        ledger.total_power(),
+        1000,
         "INVARIANT VIOLATED: jailed validator counted in total_power"
     );
 
@@ -182,7 +210,8 @@ fn invariant_stake_ledger_active_power() {
     ledger.validators.get_mut(&pk1).unwrap().status = ValidatorStatus::Tombstoned;
 
     assert_eq!(
-        ledger.total_power(), 0,
+        ledger.total_power(),
+        0,
         "INVARIANT VIOLATED: tombstoned validator counted in total_power"
     );
 }

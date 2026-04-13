@@ -111,18 +111,20 @@ pub enum SandboxViolation {
 impl std::fmt::Display for SandboxViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SystemTimeAccess { location } =>
-                write!(f, "SANDBOX: system time access at {location}"),
-            Self::NonDeterministicRng { location } =>
-                write!(f, "SANDBOX: non-deterministic RNG at {location}"),
-            Self::UnorderedCollection { location } =>
-                write!(f, "SANDBOX: unordered collection at {location}"),
-            Self::FloatingPoint { location } =>
-                write!(f, "SANDBOX: floating-point op at {location}"),
-            Self::ThreadSpawn { location } =>
-                write!(f, "SANDBOX: thread spawn at {location}"),
-            Self::ExternalIo { location } =>
-                write!(f, "SANDBOX: external I/O at {location}"),
+            Self::SystemTimeAccess { location } => {
+                write!(f, "SANDBOX: system time access at {location}")
+            }
+            Self::NonDeterministicRng { location } => {
+                write!(f, "SANDBOX: non-deterministic RNG at {location}")
+            }
+            Self::UnorderedCollection { location } => {
+                write!(f, "SANDBOX: unordered collection at {location}")
+            }
+            Self::FloatingPoint { location } => {
+                write!(f, "SANDBOX: floating-point op at {location}")
+            }
+            Self::ThreadSpawn { location } => write!(f, "SANDBOX: thread spawn at {location}"),
+            Self::ExternalIo { location } => write!(f, "SANDBOX: external I/O at {location}"),
         }
     }
 }
@@ -211,11 +213,17 @@ pub fn audit_source_for_nondeterminism(source: &str) -> Vec<SourceAuditFinding> 
     let dangerous = [
         ("HashMap", "Use BTreeMap instead"),
         ("HashSet", "Use BTreeSet instead"),
-        ("SystemTime::now", "Use block.timestamp via ExecutionContext"),
+        (
+            "SystemTime::now",
+            "Use block.timestamp via ExecutionContext",
+        ),
         ("Instant::now", "Use block.timestamp via ExecutionContext"),
         ("thread_rng", "Use ExecutionContext::deterministic_random"),
         ("rand::random", "Use ExecutionContext::deterministic_random"),
-        ("std::thread::spawn", "Block execution must be single-threaded"),
+        (
+            "std::thread::spawn",
+            "Block execution must be single-threaded",
+        ),
         ("f32", "Use integer/fixed-point arithmetic"),
         ("f64", "Use integer/fixed-point arithmetic"),
     ];
@@ -250,7 +258,11 @@ pub struct SourceAuditFinding {
 
 impl std::fmt::Display for SourceAuditFinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "line {}: found '{}' — {}", self.line, self.pattern, self.suggestion)
+        write!(
+            f,
+            "line {}: found '{}' — {}",
+            self.line, self.pattern, self.suggestion
+        )
     }
 }
 
@@ -263,10 +275,20 @@ mod tests {
     #[test]
     fn test_execution_context_deterministic() {
         let ctx1 = ExecutionContext::from_block(
-            100, 1000000, Hash32([0xAB; 32]), 6126151, 1, "proposer".into(),
+            100,
+            1000000,
+            Hash32([0xAB; 32]),
+            6126151,
+            1,
+            "proposer".into(),
         );
         let ctx2 = ExecutionContext::from_block(
-            100, 1000000, Hash32([0xAB; 32]), 6126151, 1, "proposer".into(),
+            100,
+            1000000,
+            Hash32([0xAB; 32]),
+            6126151,
+            1,
+            "proposer".into(),
         );
 
         // Same inputs → same outputs.
@@ -278,12 +300,10 @@ mod tests {
 
     #[test]
     fn test_execution_context_different_blocks() {
-        let ctx1 = ExecutionContext::from_block(
-            100, 1000000, Hash32([0xAB; 32]), 6126151, 1, "p".into(),
-        );
-        let ctx2 = ExecutionContext::from_block(
-            101, 1001000, Hash32([0xCD; 32]), 6126151, 1, "p".into(),
-        );
+        let ctx1 =
+            ExecutionContext::from_block(100, 1000000, Hash32([0xAB; 32]), 6126151, 1, "p".into());
+        let ctx2 =
+            ExecutionContext::from_block(101, 1001000, Hash32([0xCD; 32]), 6126151, 1, "p".into());
 
         // Different inputs → different outputs.
         assert_ne!(ctx1.deterministic_seed, ctx2.deterministic_seed);
@@ -292,9 +312,7 @@ mod tests {
 
     #[test]
     fn test_deterministic_random_indexed() {
-        let ctx = ExecutionContext::from_block(
-            1, 1000, Hash32([0x01; 32]), 6126151, 1, "p".into(),
-        );
+        let ctx = ExecutionContext::from_block(1, 1000, Hash32([0x01; 32]), 6126151, 1, "p".into());
 
         // Different indices → different values.
         assert_ne!(ctx.deterministic_random(0), ctx.deterministic_random(1));
@@ -372,7 +390,9 @@ mod tests {
 
     #[test]
     fn test_violation_display() {
-        let v = SandboxViolation::SystemTimeAccess { location: "foo.rs:10".into() };
+        let v = SandboxViolation::SystemTimeAccess {
+            location: "foo.rs:10".into(),
+        };
         let s = format!("{v}");
         assert!(s.contains("system time access"));
         assert!(s.contains("foo.rs:10"));
@@ -425,12 +445,24 @@ mod tests {
     #[test]
     fn test_all_violation_types() {
         let violations = vec![
-            SandboxViolation::SystemTimeAccess { location: "a".into() },
-            SandboxViolation::NonDeterministicRng { location: "b".into() },
-            SandboxViolation::UnorderedCollection { location: "c".into() },
-            SandboxViolation::FloatingPoint { location: "d".into() },
-            SandboxViolation::ThreadSpawn { location: "e".into() },
-            SandboxViolation::ExternalIo { location: "f".into() },
+            SandboxViolation::SystemTimeAccess {
+                location: "a".into(),
+            },
+            SandboxViolation::NonDeterministicRng {
+                location: "b".into(),
+            },
+            SandboxViolation::UnorderedCollection {
+                location: "c".into(),
+            },
+            SandboxViolation::FloatingPoint {
+                location: "d".into(),
+            },
+            SandboxViolation::ThreadSpawn {
+                location: "e".into(),
+            },
+            SandboxViolation::ExternalIo {
+                location: "f".into(),
+            },
         ];
 
         let mut sandbox = ExecutionSandbox::new(SandboxMode::Warn);

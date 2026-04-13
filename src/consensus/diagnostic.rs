@@ -27,9 +27,7 @@ pub enum StallReason {
         timeout_ms: u64,
     },
     /// Proposal received but block not yet available.
-    MissingBlock {
-        block_id: String,
-    },
+    MissingBlock { block_id: String },
     /// Not enough prevotes to proceed.
     InsufficientPrevotes {
         have: u64,
@@ -45,9 +43,7 @@ pub enum StallReason {
         missing: Vec<String>,
     },
     /// No connected validators (P2P issue).
-    NoConnectedValidators {
-        total_validators: usize,
-    },
+    NoConnectedValidators { total_validators: usize },
     /// Too few connected validators for quorum.
     InsufficientConnectedValidators {
         connected: usize,
@@ -55,9 +51,7 @@ pub enum StallReason {
         needed: usize,
     },
     /// Already committed at this height.
-    AlreadyCommitted {
-        height: Height,
-    },
+    AlreadyCommitted { height: Height },
     /// Round is advancing (timeout-driven).
     RoundAdvancing {
         current_round: Round,
@@ -93,14 +87,20 @@ pub fn diagnose(
             height: state.height,
             round: state.round,
             step: format!("{:?}", state.step),
-            stall_reasons: vec![StallReason::AlreadyCommitted { height: state.height }],
+            stall_reasons: vec![StallReason::AlreadyCommitted {
+                height: state.height,
+            }],
             summary: format!("COMMITTED height={}", state.height),
         };
     }
 
     // Check P2P connectivity to validators.
     let connected_set: HashSet<&PublicKeyBytes> = connected_validators.iter().collect();
-    let connected_val_count = vset.vals.iter().filter(|v| connected_set.contains(&v.pk)).count();
+    let connected_val_count = vset
+        .vals
+        .iter()
+        .filter(|v| connected_set.contains(&v.pk))
+        .count();
 
     if connected_val_count == 0 && vset.vals.len() > 1 {
         reasons.push(StallReason::NoConnectedValidators {
@@ -128,7 +128,9 @@ pub fn diagnose(
                     timeout_ms: propose_timeout_ms,
                 });
             } else if state.proposal_block.is_none() {
-                let block_id = state.proposal.as_ref()
+                let block_id = state
+                    .proposal
+                    .as_ref()
                     .map(|p| hex::encode(&p.block_id.0[..8]))
                     .unwrap_or_default();
                 reasons.push(StallReason::MissingBlock { block_id });
@@ -136,7 +138,8 @@ pub fn diagnose(
         }
         Step::Prevote => {
             // Tally prevotes.
-            let voters: Vec<PublicKeyBytes> = state.votes
+            let voters: Vec<PublicKeyBytes> = state
+                .votes
                 .get(&state.round)
                 .and_then(|rv| rv.get(&crate::consensus::messages::VoteType::Prevote))
                 .map(|m| m.keys().cloned().collect())
@@ -152,7 +155,8 @@ pub fn diagnose(
             }
         }
         Step::Precommit => {
-            let voters: Vec<PublicKeyBytes> = state.votes
+            let voters: Vec<PublicKeyBytes> = state
+                .votes
                 .get(&state.round)
                 .and_then(|rv| rv.get(&crate::consensus::messages::VoteType::Precommit))
                 .map(|m| m.keys().cloned().collect())
@@ -174,30 +178,53 @@ pub fn diagnose(
 
     // Build summary.
     let summary = if reasons.is_empty() {
-        format!("OK height={} round={} step={:?}", state.height, state.round, state.step)
+        format!(
+            "OK height={} round={} step={:?}",
+            state.height, state.round, state.step
+        )
     } else {
-        let reason_strs: Vec<String> = reasons.iter().map(|r| match r {
-            StallReason::WaitingForProposal { proposer, elapsed_ms, timeout_ms } =>
-                format!("waiting_proposal(from={}, {}/{}ms)", proposer, elapsed_ms, timeout_ms),
-            StallReason::MissingBlock { block_id } =>
-                format!("missing_block(id={})", block_id),
-            StallReason::InsufficientPrevotes { have, need, .. } =>
-                format!("low_prevotes(have={} need={})", have, need),
-            StallReason::InsufficientPrecommits { have, need, .. } =>
-                format!("low_precommits(have={} need={})", have, need),
-            StallReason::NoConnectedValidators { total_validators } =>
-                format!("no_connected_validators(total={})", total_validators),
-            StallReason::InsufficientConnectedValidators { connected, total, needed } =>
-                format!("low_connectivity(connected={}/{} need={})", connected, total, needed),
-            StallReason::AlreadyCommitted { height } =>
-                format!("committed(height={})", height),
-            StallReason::RoundAdvancing { current_round, max_rounds } =>
-                format!("round_advancing({}/{})", current_round, max_rounds),
-        }).collect();
+        let reason_strs: Vec<String> = reasons
+            .iter()
+            .map(|r| match r {
+                StallReason::WaitingForProposal {
+                    proposer,
+                    elapsed_ms,
+                    timeout_ms,
+                } => format!(
+                    "waiting_proposal(from={}, {}/{}ms)",
+                    proposer, elapsed_ms, timeout_ms
+                ),
+                StallReason::MissingBlock { block_id } => format!("missing_block(id={})", block_id),
+                StallReason::InsufficientPrevotes { have, need, .. } => {
+                    format!("low_prevotes(have={} need={})", have, need)
+                }
+                StallReason::InsufficientPrecommits { have, need, .. } => {
+                    format!("low_precommits(have={} need={})", have, need)
+                }
+                StallReason::NoConnectedValidators { total_validators } => {
+                    format!("no_connected_validators(total={})", total_validators)
+                }
+                StallReason::InsufficientConnectedValidators {
+                    connected,
+                    total,
+                    needed,
+                } => format!(
+                    "low_connectivity(connected={}/{} need={})",
+                    connected, total, needed
+                ),
+                StallReason::AlreadyCommitted { height } => format!("committed(height={})", height),
+                StallReason::RoundAdvancing {
+                    current_round,
+                    max_rounds,
+                } => format!("round_advancing({}/{})", current_round, max_rounds),
+            })
+            .collect();
 
         format!(
             "NO_COMMIT height={} round={} step={:?}: {}",
-            state.height, state.round, state.step,
+            state.height,
+            state.round,
+            state.step,
             reason_strs.join(", ")
         )
     };
@@ -215,8 +242,8 @@ pub fn diagnose(
 mod tests {
     use super::*;
     use crate::consensus::validator_set::{Validator, ValidatorSet};
-    use crate::crypto::Signer;
     use crate::crypto::ed25519::Ed25519Keypair;
+    use crate::crypto::Signer;
 
     fn make_vset_and_pks(n: usize) -> (ValidatorSet, Vec<PublicKeyBytes>) {
         let mut vals = Vec::new();
@@ -226,7 +253,10 @@ mod tests {
             seed[0] = (i + 1) as u8;
             let kp = Ed25519Keypair::from_seed(seed);
             let pk = kp.public_key();
-            vals.push(Validator { pk: pk.clone(), power: 1 });
+            vals.push(Validator {
+                pk: pk.clone(),
+                power: 1,
+            });
             pks.push(pk);
         }
         (ValidatorSet { vals }, pks)
@@ -261,7 +291,10 @@ mod tests {
         let state = ConsensusState::new(1);
 
         let diag = diagnose(&state, &vset, &[], 100, 300);
-        assert!(diag.summary.contains("no_connected_validators") || diag.summary.contains("low_connectivity"));
+        assert!(
+            diag.summary.contains("no_connected_validators")
+                || diag.summary.contains("low_connectivity")
+        );
     }
 
     #[test]

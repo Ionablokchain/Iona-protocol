@@ -14,17 +14,17 @@
 //! 3. **Invariant checks**: No split finality, monotonic finality,
 //!    deterministic PV selection, state compatibility.
 
+use iona::protocol::dual_validate::ShadowValidator;
+use iona::protocol::safety::{
+    check_finality_monotonic, check_no_split_finality, check_root_equivalence,
+    check_value_conservation,
+};
 use iona::protocol::version::{
-    default_activations, version_for_height, validate_block_version, ProtocolActivation,
+    default_activations, validate_block_version, version_for_height, ProtocolActivation,
     CURRENT_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
-use iona::protocol::safety::{
-    check_finality_monotonic, check_no_split_finality, check_value_conservation,
-    check_root_equivalence,
-};
 use iona::protocol::wire::{check_hello_compat, Hello};
-use iona::protocol::dual_validate::ShadowValidator;
-use iona::types::{Block, BlockHeader, Hash32, tx_root, receipts_root};
+use iona::types::{receipts_root, tx_root, Block, BlockHeader, Hash32};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -82,11 +82,21 @@ fn upgrade_sim_rolling_no_activation() {
 
     for height in 1..=num_blocks {
         // At certain heights, upgrade a node (add PV support)
-        if height == 5 { node_pvs[0] = vec![1]; } // Node 0 "upgrades" (still PV=1 only)
-        if height == 8 { node_pvs[1] = vec![1]; }
-        if height == 11 { node_pvs[2] = vec![1]; }
-        if height == 14 { node_pvs[3] = vec![1]; }
-        if height == 17 { node_pvs[4] = vec![1]; }
+        if height == 5 {
+            node_pvs[0] = vec![1];
+        } // Node 0 "upgrades" (still PV=1 only)
+        if height == 8 {
+            node_pvs[1] = vec![1];
+        }
+        if height == 11 {
+            node_pvs[2] = vec![1];
+        }
+        if height == 14 {
+            node_pvs[3] = vec![1];
+        }
+        if height == 17 {
+            node_pvs[4] = vec![1];
+        }
 
         // Determine PV for this height
         let pv = version_for_height(height, &activations);
@@ -139,8 +149,10 @@ fn upgrade_sim_activation_with_grace() {
                 // In grace window: both PV=1 and PV=2 should be accepted
                 // (PV=2 is not in SUPPORTED_PROTOCOL_VERSIONS yet, so we only test PV=1 acceptance)
                 // PV=1 is accepted during grace since height < 10 + 3
-                assert!(validate_block_version(1, height, &activations).is_ok(),
-                    "PV=1 should be accepted in grace window at height {height}");
+                assert!(
+                    validate_block_version(1, height, &activations).is_ok(),
+                    "PV=1 should be accepted in grace window at height {height}"
+                );
             }
         }
     }
@@ -258,11 +270,16 @@ fn upgrade_sim_rolling_handshake() {
     // Initially all compatible
     for i in 0..num_nodes {
         for j in 0..num_nodes {
-            if i == j { continue; }
+            if i == j {
+                continue;
+            }
             let a = make_hello(node_pvs[i].clone());
             let b = make_hello(node_pvs[j].clone());
             let r = check_hello_compat(&a, &b);
-            assert!(r.compatible, "initial: node {i} and {j} should be compatible");
+            assert!(
+                r.compatible,
+                "initial: node {i} and {j} should be compatible"
+            );
         }
     }
 
@@ -273,7 +290,9 @@ fn upgrade_sim_rolling_handshake() {
         // All nodes should still be compatible (intersection includes PV=1)
         for i in 0..num_nodes {
             for j in 0..num_nodes {
-                if i == j { continue; }
+                if i == j {
+                    continue;
+                }
                 let a = make_hello(node_pvs[i].clone());
                 let b = make_hello(node_pvs[j].clone());
                 let r = check_hello_compat(&a, &b);
@@ -325,8 +344,14 @@ fn upgrade_sim_multi_node_determinism() {
     }
 
     // All nodes must agree on PV at every height
-    assert_eq!(results[0], results[1], "node 0 and 1 disagree on PV sequence");
-    assert_eq!(results[1], results[2], "node 1 and 2 disagree on PV sequence");
+    assert_eq!(
+        results[0], results[1],
+        "node 0 and 1 disagree on PV sequence"
+    );
+    assert_eq!(
+        results[1], results[2],
+        "node 1 and 2 disagree on PV sequence"
+    );
 }
 
 // ─── 10.4: Migration conformance ────────────────────────────────────────────
@@ -365,7 +390,8 @@ fn upgrade_sim_migration_crash_safe() {
     meta.save(data_dir).unwrap();
 
     // Begin migration
-    meta.begin_migration(3, 4, "test migration", data_dir).unwrap();
+    meta.begin_migration(3, 4, "test migration", data_dir)
+        .unwrap();
     assert!(meta.has_pending_migration());
 
     // Simulate crash: reload from disk

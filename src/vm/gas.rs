@@ -3,7 +3,7 @@
 #[derive(Debug, Clone, Copy)]
 pub struct GasMeter {
     pub limit: u64,
-    pub used:  u64,
+    pub used: u64,
 }
 
 impl GasMeter {
@@ -29,7 +29,9 @@ impl GasMeter {
 
     /// Fraction of gas used (0.0 – 1.0).
     pub fn fraction_used(&self) -> f64 {
-        if self.limit == 0 { return 1.0; }
+        if self.limit == 0 {
+            return 1.0;
+        }
         self.used as f64 / self.limit as f64
     }
 }

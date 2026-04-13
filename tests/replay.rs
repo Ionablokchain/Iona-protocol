@@ -4,11 +4,11 @@
 //! the same sequence of transactions from the same initial state produces
 //! identical state roots every time.
 
-use iona::execution::{execute_block, KvState};
-use iona::types::{Block, BlockHeader, Hash32, Tx, tx_root, receipts_root};
 use iona::crypto::ed25519::Ed25519Keypair;
-use iona::crypto::Signer;
 use iona::crypto::tx::{derive_address, tx_sign_bytes};
+use iona::crypto::Signer;
+use iona::execution::{execute_block, KvState};
+use iona::types::{receipts_root, tx_root, Block, BlockHeader, Hash32, Tx};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -88,7 +88,8 @@ fn replay_chain_deterministic() {
         let (new_state, _gas, _receipts) = execute_block(&state, txs, 1, &proposer);
         let got_root = new_state.root();
         assert_eq!(
-            got_root, *expected_root,
+            got_root,
+            *expected_root,
             "State root mismatch at height {} on replay",
             i + 1
         );
@@ -115,7 +116,8 @@ fn replay_from_snapshot() {
         let (new_state, _, _) = execute_block(&state, txs, 1, &proposer);
         let got_root = new_state.root();
         assert_eq!(
-            got_root, *expected_root,
+            got_root,
+            *expected_root,
             "State root mismatch at height {} on replay from snapshot",
             i + 11
         );
@@ -141,7 +143,12 @@ fn replay_empty_blocks() {
     let mut s2 = state;
     for (i, expected) in roots.iter().enumerate() {
         let (new_state, _, _) = execute_block(&s2, &[], 1, &proposer);
-        assert_eq!(new_state.root(), *expected, "Empty block root mismatch at {}", i);
+        assert_eq!(
+            new_state.root(),
+            *expected,
+            "Empty block root mismatch at {}",
+            i
+        );
         s2 = new_state;
     }
 }
@@ -172,9 +179,27 @@ fn replay_receipts_deterministic() {
             i + 1
         );
         for (j, (r1, r2)) in all_receipts1[i].iter().zip(receipts.iter()).enumerate() {
-            assert_eq!(r1.tx_hash, r2.tx_hash, "tx_hash mismatch h={} tx={}", i + 1, j);
-            assert_eq!(r1.success, r2.success, "success mismatch h={} tx={}", i + 1, j);
-            assert_eq!(r1.gas_used, r2.gas_used, "gas_used mismatch h={} tx={}", i + 1, j);
+            assert_eq!(
+                r1.tx_hash,
+                r2.tx_hash,
+                "tx_hash mismatch h={} tx={}",
+                i + 1,
+                j
+            );
+            assert_eq!(
+                r1.success,
+                r2.success,
+                "success mismatch h={} tx={}",
+                i + 1,
+                j
+            );
+            assert_eq!(
+                r1.gas_used,
+                r2.gas_used,
+                "gas_used mismatch h={} tx={}",
+                i + 1,
+                j
+            );
         }
         state2 = new_state;
     }

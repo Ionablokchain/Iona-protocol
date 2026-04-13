@@ -85,8 +85,12 @@ impl EclipseParams {
     /// Human-readable description of the profile.
     pub fn description(&self) -> &str {
         match self.profile {
-            EclipseProfile::Prod => "Production: strict diversity (min 3 distinct buckets, low per-bucket caps)",
-            EclipseProfile::Testnet => "Testnet: relaxed diversity (min 1 distinct bucket, higher caps)",
+            EclipseProfile::Prod => {
+                "Production: strict diversity (min 3 distinct buckets, low per-bucket caps)"
+            }
+            EclipseProfile::Testnet => {
+                "Testnet: relaxed diversity (min 1 distinct bucket, higher caps)"
+            }
         }
     }
 }
@@ -117,11 +121,26 @@ mod tests {
     #[test]
     fn test_from_str_loose() {
         assert_eq!(EclipseProfile::from_str_loose("prod"), EclipseProfile::Prod);
-        assert_eq!(EclipseProfile::from_str_loose("production"), EclipseProfile::Prod);
-        assert_eq!(EclipseProfile::from_str_loose("mainnet"), EclipseProfile::Prod);
-        assert_eq!(EclipseProfile::from_str_loose("testnet"), EclipseProfile::Testnet);
-        assert_eq!(EclipseProfile::from_str_loose("dev"), EclipseProfile::Testnet);
-        assert_eq!(EclipseProfile::from_str_loose("anything"), EclipseProfile::Testnet);
+        assert_eq!(
+            EclipseProfile::from_str_loose("production"),
+            EclipseProfile::Prod
+        );
+        assert_eq!(
+            EclipseProfile::from_str_loose("mainnet"),
+            EclipseProfile::Prod
+        );
+        assert_eq!(
+            EclipseProfile::from_str_loose("testnet"),
+            EclipseProfile::Testnet
+        );
+        assert_eq!(
+            EclipseProfile::from_str_loose("dev"),
+            EclipseProfile::Testnet
+        );
+        assert_eq!(
+            EclipseProfile::from_str_loose("anything"),
+            EclipseProfile::Testnet
+        );
     }
 
     #[test]

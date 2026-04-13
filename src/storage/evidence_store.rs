@@ -28,16 +28,25 @@ impl EvidenceStore {
     }
 
     pub fn allow(&mut self, peer: &str, height: u64) -> bool {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let q = self.rl.entry(peer.to_string()).or_default();
         while let Some(front) = q.front().cloned() {
-            if now.saturating_sub(front) > 60 { q.pop_front(); } else { break; }
+            if now.saturating_sub(front) > 60 {
+                q.pop_front();
+            } else {
+                break;
+            }
         }
-        if q.len() >= 30 { // 30 evidence/min/peer
+        if q.len() >= 30 {
+            // 30 evidence/min/peer
             return false;
         }
         let c = self.per_height.entry(height).or_insert(0);
-        if *c >= 200 { // cap global evidence per height
+        if *c >= 200 {
+            // cap global evidence per height
             return false;
         }
         q.push_back(now);
@@ -57,7 +66,10 @@ impl EvidenceStore {
             return Ok(false);
         }
         self.seen.insert(id);
-        let mut f = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         let line = serde_json::to_vec(ev).unwrap_or_default();
         f.write_all(&line)?;
         f.write_all(b"\n")?;

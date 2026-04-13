@@ -17,7 +17,7 @@
 //! | ST-7 | Tx uniqueness           | No duplicate tx_hash within the same block            |
 //! | ST-8 | Gas accounting          | Sum of per-tx gas == block header gas_used             |
 
-use crate::types::{Block, Hash32, Height, Receipt, tx_hash};
+use crate::types::{tx_hash, Block, Hash32, Height, Receipt};
 use std::collections::BTreeMap;
 
 // ─── ST-1: Balance non-negative ─────────────────────────────────────────────
@@ -73,10 +73,10 @@ pub fn check_supply_conservation(
     staked_after: u64,
     delta: &SupplyDelta,
 ) -> Result<(), String> {
-    let sum_before: u128 = balances_before.values().map(|&v| v as u128).sum::<u128>()
-        + staked_before as u128;
-    let sum_after: u128 = balances_after.values().map(|&v| v as u128).sum::<u128>()
-        + staked_after as u128;
+    let sum_before: u128 =
+        balances_before.values().map(|&v| v as u128).sum::<u128>() + staked_before as u128;
+    let sum_after: u128 =
+        balances_after.values().map(|&v| v as u128).sum::<u128>() + staked_after as u128;
 
     let expected = sum_before
         .saturating_add(delta.minted as u128)
@@ -87,7 +87,9 @@ pub fn check_supply_conservation(
         return Err(format!(
             "ST-3 VIOLATION: supply not conserved. before={sum_before} + minted={} \
              - slashed={} - burned={} = expected {expected}, got {sum_after} (diff={})",
-            delta.minted, delta.slashed, delta.burned_delta,
+            delta.minted,
+            delta.slashed,
+            delta.burned_delta,
             (sum_after as i128) - (expected as i128)
         ));
     }
@@ -97,9 +99,7 @@ pub fn check_supply_conservation(
 // ─── ST-4: State root determinism ───────────────────────────────────────────
 
 /// Verify that computing the state root twice yields the same result.
-pub fn check_state_root_determinism(
-    state: &crate::execution::KvState,
-) -> Result<Hash32, String> {
+pub fn check_state_root_determinism(state: &crate::execution::KvState) -> Result<Hash32, String> {
     let r1 = state.root();
     let r2 = state.root();
     if r1 != r2 {
@@ -115,10 +115,7 @@ pub fn check_state_root_determinism(
 // ─── ST-5: Height monotonic ─────────────────────────────────────────────────
 
 /// Verify that the new block height strictly follows the previous height.
-pub fn check_height_monotonic(
-    prev_height: Height,
-    new_height: Height,
-) -> Result<(), String> {
+pub fn check_height_monotonic(prev_height: Height, new_height: Height) -> Result<(), String> {
     if new_height <= prev_height {
         return Err(format!(
             "ST-5 VIOLATION: height did not increase: prev={prev_height}, new={new_height}"
@@ -130,10 +127,7 @@ pub fn check_height_monotonic(
 // ─── ST-6: Timestamp monotonic ──────────────────────────────────────────────
 
 /// Verify that the block timestamp does not decrease.
-pub fn check_timestamp_monotonic(
-    prev_timestamp: u64,
-    new_timestamp: u64,
-) -> Result<(), String> {
+pub fn check_timestamp_monotonic(prev_timestamp: u64, new_timestamp: u64) -> Result<(), String> {
     if new_timestamp < prev_timestamp {
         return Err(format!(
             "ST-6 VIOLATION: timestamp decreased from {prev_timestamp} to {new_timestamp}"
@@ -153,8 +147,7 @@ pub fn check_tx_uniqueness(block: &Block) -> Result<(), String> {
         if !seen.insert(h) {
             return Err(format!(
                 "ST-7 VIOLATION: duplicate tx_hash {} in block at height {}",
-                h_hex,
-                block.header.height,
+                h_hex, block.header.height,
             ));
         }
     }
@@ -164,10 +157,7 @@ pub fn check_tx_uniqueness(block: &Block) -> Result<(), String> {
 // ─── ST-8: Gas accounting ───────────────────────────────────────────────────
 
 /// Verify that the sum of per-tx gas matches the block header's gas_used.
-pub fn check_gas_accounting(
-    header_gas_used: u64,
-    receipts: &[Receipt],
-) -> Result<(), String> {
+pub fn check_gas_accounting(header_gas_used: u64, receipts: &[Receipt]) -> Result<(), String> {
     let sum: u64 = receipts.iter().map(|r| r.gas_used).sum();
     if sum != header_gas_used {
         return Err(format!(
@@ -196,8 +186,15 @@ pub struct InvariantCheck {
 
 impl std::fmt::Display for InvariantReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "State Transition Invariants: {}",
-            if self.all_passed { "ALL PASSED" } else { "VIOLATIONS DETECTED" })?;
+        writeln!(
+            f,
+            "State Transition Invariants: {}",
+            if self.all_passed {
+                "ALL PASSED"
+            } else {
+                "VIOLATIONS DETECTED"
+            }
+        )?;
         for c in &self.checks {
             let mark = if c.passed { "OK" } else { "FAIL" };
             writeln!(f, "  [{mark}] {}: {} — {}", c.id, c.name, c.detail)?;
@@ -221,7 +218,9 @@ pub fn check_block_invariants(
         id: "ST-5".into(),
         name: "Height monotonic".into(),
         passed: h.is_ok(),
-        detail: h.err().unwrap_or_else(|| "height strictly increasing".into()),
+        detail: h
+            .err()
+            .unwrap_or_else(|| "height strictly increasing".into()),
     });
 
     // ST-6: Timestamp monotonic
@@ -239,7 +238,9 @@ pub fn check_block_invariants(
         id: "ST-7".into(),
         name: "Tx uniqueness".into(),
         passed: u.is_ok(),
-        detail: u.err().unwrap_or_else(|| format!("{} unique txs", block.txs.len())),
+        detail: u
+            .err()
+            .unwrap_or_else(|| format!("{} unique txs", block.txs.len())),
     });
 
     // ST-8: Gas accounting
@@ -248,7 +249,9 @@ pub fn check_block_invariants(
         id: "ST-8".into(),
         name: "Gas accounting".into(),
         passed: g.is_ok(),
-        detail: g.err().unwrap_or_else(|| format!("gas_used={}", block.header.gas_used)),
+        detail: g
+            .err()
+            .unwrap_or_else(|| format!("gas_used={}", block.header.gas_used)),
     });
 
     let all_passed = checks.iter().all(|c| c.passed);
@@ -305,7 +308,11 @@ mod tests {
         after.insert("alice".into(), 990u64);
         after.insert("bob".into(), 500u64);
 
-        let delta = SupplyDelta { minted: 0, slashed: 0, burned_delta: 10 };
+        let delta = SupplyDelta {
+            minted: 0,
+            slashed: 0,
+            burned_delta: 10,
+        };
         assert!(check_supply_conservation(&before, &after, 0, 0, &delta).is_ok());
     }
 
@@ -317,7 +324,11 @@ mod tests {
         let mut after = BTreeMap::new();
         after.insert("alice".into(), 1100u64);
 
-        let delta = SupplyDelta { minted: 100, slashed: 0, burned_delta: 0 };
+        let delta = SupplyDelta {
+            minted: 100,
+            slashed: 0,
+            burned_delta: 0,
+        };
         assert!(check_supply_conservation(&before, &after, 0, 0, &delta).is_ok());
     }
 
@@ -329,7 +340,11 @@ mod tests {
         let mut after = BTreeMap::new();
         after.insert("alice".into(), 2000u64); // appeared from nowhere
 
-        let delta = SupplyDelta { minted: 0, slashed: 0, burned_delta: 0 };
+        let delta = SupplyDelta {
+            minted: 0,
+            slashed: 0,
+            burned_delta: 0,
+        };
         assert!(check_supply_conservation(&before, &after, 0, 0, &delta).is_err());
     }
 
@@ -401,22 +416,20 @@ mod tests {
 
     #[test]
     fn test_gas_accounting_violation() {
-        let receipts = vec![
-            Receipt {
-                tx_hash: Hash32::zero(),
-                success: true,
-                gas_used: 21000,
-                intrinsic_gas_used: 21000,
-                exec_gas_used: 0,
-                vm_gas_used: 0,
-                evm_gas_used: 0,
-                effective_gas_price: 100,
-                burned: 0,
-                tip: 0,
-                error: None,
-                data: None,
-            },
-        ];
+        let receipts = vec![Receipt {
+            tx_hash: Hash32::zero(),
+            success: true,
+            gas_used: 21000,
+            intrinsic_gas_used: 21000,
+            exec_gas_used: 0,
+            vm_gas_used: 0,
+            evm_gas_used: 0,
+            effective_gas_price: 100,
+            burned: 0,
+            tip: 0,
+            error: None,
+            data: None,
+        }];
         assert!(check_gas_accounting(99999, &receipts).is_err());
     }
 
@@ -453,14 +466,12 @@ mod tests {
     #[test]
     fn test_invariant_report_display() {
         let report = InvariantReport {
-            checks: vec![
-                InvariantCheck {
-                    id: "ST-1".into(),
-                    name: "Test".into(),
-                    passed: true,
-                    detail: "ok".into(),
-                },
-            ],
+            checks: vec![InvariantCheck {
+                id: "ST-1".into(),
+                name: "Test".into(),
+                passed: true,
+                detail: "ok".into(),
+            }],
             all_passed: true,
         };
         let s = format!("{report}");

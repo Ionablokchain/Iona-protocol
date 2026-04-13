@@ -25,10 +25,7 @@ pub enum KeyBackendConfig {
         password_env: String,
     },
     /// Remote signer HTTP service.
-    Remote {
-        url: String,
-        timeout_s: u64,
-    },
+    Remote { url: String, timeout_s: u64 },
     /// PKCS#11 HSM (e.g., YubiHSM, Thales Luna).
     Pkcs11 {
         /// Path to PKCS#11 shared library.
@@ -142,7 +139,12 @@ pub struct Pkcs11Signer {
 }
 
 impl Pkcs11Signer {
-    pub fn new(library_path: &str, slot: u64, key_label: &str, _pin: &str) -> Result<Self, CryptoError> {
+    pub fn new(
+        library_path: &str,
+        slot: u64,
+        key_label: &str,
+        _pin: &str,
+    ) -> Result<Self, CryptoError> {
         Ok(Self {
             _library_path: library_path.to_string(),
             _slot: slot,
@@ -209,7 +211,11 @@ pub struct AzureKeyVaultSigner {
 }
 
 impl AzureKeyVaultSigner {
-    pub fn new(vault_url: &str, key_name: &str, _key_version: Option<&str>) -> Result<Self, CryptoError> {
+    pub fn new(
+        vault_url: &str,
+        key_name: &str,
+        _key_version: Option<&str>,
+    ) -> Result<Self, CryptoError> {
         Ok(Self {
             _vault_url: vault_url.to_string(),
             _key_name: key_name.to_string(),
@@ -219,11 +225,15 @@ impl AzureKeyVaultSigner {
 
 impl HsmSigner for AzureKeyVaultSigner {
     fn public_key(&self) -> Result<PublicKeyBytes, CryptoError> {
-        Err(CryptoError::Key("Azure Key Vault: not yet implemented".into()))
+        Err(CryptoError::Key(
+            "Azure Key Vault: not yet implemented".into(),
+        ))
     }
 
     fn sign(&self, _msg: &[u8]) -> Result<SignatureBytes, CryptoError> {
-        Err(CryptoError::Key("Azure Key Vault: not yet implemented".into()))
+        Err(CryptoError::Key(
+            "Azure Key Vault: not yet implemented".into(),
+        ))
     }
 
     fn backend_name(&self) -> &str {
@@ -231,7 +241,9 @@ impl HsmSigner for AzureKeyVaultSigner {
     }
 
     fn health_check(&self) -> Result<(), CryptoError> {
-        Err(CryptoError::Key("Azure Key Vault: not yet implemented".into()))
+        Err(CryptoError::Key(
+            "Azure Key Vault: not yet implemented".into(),
+        ))
     }
 }
 
@@ -285,19 +297,32 @@ pub fn create_signer(config: &KeyBackendConfig) -> Result<Box<dyn HsmSigner>, Cr
             let seed = [1u8; 32];
             Ok(Box::new(LocalSigner::from_seed(&seed)))
         }
-        KeyBackendConfig::Remote { .. } => {
-            Err(CryptoError::Key("remote signer: use remote_signer module instead".into()))
-        }
-        KeyBackendConfig::Pkcs11 { library_path, slot, key_label, pin_env } => {
+        KeyBackendConfig::Remote { .. } => Err(CryptoError::Key(
+            "remote signer: use remote_signer module instead".into(),
+        )),
+        KeyBackendConfig::Pkcs11 {
+            library_path,
+            slot,
+            key_label,
+            pin_env,
+        } => {
             let pin = std::env::var(pin_env).unwrap_or_default();
             let signer = Pkcs11Signer::new(library_path, *slot, key_label, &pin)?;
             Ok(Box::new(signer))
         }
-        KeyBackendConfig::AwsKms { key_id, region, endpoint } => {
+        KeyBackendConfig::AwsKms {
+            key_id,
+            region,
+            endpoint,
+        } => {
             let signer = AwsKmsSigner::new(key_id, region, endpoint.as_deref())?;
             Ok(Box::new(signer))
         }
-        KeyBackendConfig::AzureKeyVault { vault_url, key_name, key_version } => {
+        KeyBackendConfig::AzureKeyVault {
+            vault_url,
+            key_name,
+            key_version,
+        } => {
             let signer = AzureKeyVaultSigner::new(vault_url, key_name, key_version.as_deref())?;
             Ok(Box::new(signer))
         }
@@ -352,10 +377,24 @@ mod tests {
     #[test]
     fn test_config_serialization() {
         let configs = vec![
-            KeyBackendConfig::Local { path: "keys.enc".into(), password_env: "PW".into() },
-            KeyBackendConfig::AwsKms { key_id: "arn:aws:kms:us-east-1:123:key/abc".into(), region: "us-east-1".into(), endpoint: None },
-            KeyBackendConfig::AzureKeyVault { vault_url: "https://v.vault.azure.net/".into(), key_name: "k".into(), key_version: None },
-            KeyBackendConfig::GcpKms { resource_name: "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1".into() },
+            KeyBackendConfig::Local {
+                path: "keys.enc".into(),
+                password_env: "PW".into(),
+            },
+            KeyBackendConfig::AwsKms {
+                key_id: "arn:aws:kms:us-east-1:123:key/abc".into(),
+                region: "us-east-1".into(),
+                endpoint: None,
+            },
+            KeyBackendConfig::AzureKeyVault {
+                vault_url: "https://v.vault.azure.net/".into(),
+                key_name: "k".into(),
+                key_version: None,
+            },
+            KeyBackendConfig::GcpKms {
+                resource_name: "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1"
+                    .into(),
+            },
         ];
         for c in &configs {
             let json = serde_json::to_string(c).unwrap();
@@ -388,7 +427,9 @@ mod tests {
 
     #[test]
     fn test_gcp_placeholder() {
-        let s = GcpKmsSigner::new("projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1").unwrap();
+        let s =
+            GcpKmsSigner::new("projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1")
+                .unwrap();
         assert_eq!(s.backend_name(), "gcp_kms");
         assert!(s.health_check().is_err());
     }

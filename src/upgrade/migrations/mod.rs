@@ -13,15 +13,17 @@
 //!  - Is idempotent: running twice leaves the data directory in the same state.
 //!  - Includes inline unit tests.
 
-use std::path::Path;
 use crate::upgrade::{Migration, MigrationResult};
+use std::path::Path;
 
 // ── M001: v0 → v1 — add `vm` field to state_full.json ─────────────────────
 
 pub struct M001AddStateVmField;
 
 impl Migration for M001AddStateVmField {
-    fn from_version(&self) -> u32 { 0 }
+    fn from_version(&self) -> u32 {
+        0
+    }
 
     fn description(&self) -> &'static str {
         "Add `vm` field to state_full.json for EVM contract storage (v0 → v1)"
@@ -34,25 +36,29 @@ impl Migration for M001AddStateVmField {
         if !state_path.exists() {
             return MigrationResult::Ok {
                 from_version: 0,
-                to_version:   1,
-                changes:      vec!["no state_full.json present; skipped".into()],
+                to_version: 1,
+                changes: vec!["no state_full.json present; skipped".into()],
             };
         }
 
         let contents = match std::fs::read_to_string(&state_path) {
-            Ok(c)  => c,
-            Err(e) => return MigrationResult::Failed {
-                from_version: 0,
-                reason: format!("cannot read state_full.json: {e}"),
-            },
+            Ok(c) => c,
+            Err(e) => {
+                return MigrationResult::Failed {
+                    from_version: 0,
+                    reason: format!("cannot read state_full.json: {e}"),
+                }
+            }
         };
 
         let mut state: serde_json::Value = match serde_json::from_str(&contents) {
-            Ok(v)  => v,
-            Err(e) => return MigrationResult::Failed {
-                from_version: 0,
-                reason: format!("cannot parse state_full.json: {e}"),
-            },
+            Ok(v) => v,
+            Err(e) => {
+                return MigrationResult::Failed {
+                    from_version: 0,
+                    reason: format!("cannot parse state_full.json: {e}"),
+                }
+            }
         };
 
         if state.get("vm").is_some() {
@@ -72,7 +78,11 @@ impl Migration for M001AddStateVmField {
             }
         }
 
-        MigrationResult::Ok { from_version: 0, to_version: 1, changes }
+        MigrationResult::Ok {
+            from_version: 0,
+            to_version: 1,
+            changes,
+        }
     }
 }
 
@@ -81,7 +91,9 @@ impl Migration for M001AddStateVmField {
 pub struct M002AddReceiptsIndex;
 
 impl Migration for M002AddReceiptsIndex {
-    fn from_version(&self) -> u32 { 1 }
+    fn from_version(&self) -> u32 {
+        1
+    }
 
     fn description(&self) -> &'static str {
         "Create receipts/ index directory for transaction receipt storage (v1 → v2)"
@@ -105,7 +117,11 @@ impl Migration for M002AddReceiptsIndex {
             }
         }
 
-        MigrationResult::Ok { from_version: 1, to_version: 2, changes }
+        MigrationResult::Ok {
+            from_version: 1,
+            to_version: 2,
+            changes,
+        }
     }
 }
 
@@ -114,7 +130,9 @@ impl Migration for M002AddReceiptsIndex {
 pub struct M003AddEvidenceStore;
 
 impl Migration for M003AddEvidenceStore {
-    fn from_version(&self) -> u32 { 2 }
+    fn from_version(&self) -> u32 {
+        2
+    }
 
     fn description(&self) -> &'static str {
         "Initialise evidence.json for equivocation evidence storage (v2 → v3)"
@@ -140,7 +158,11 @@ impl Migration for M003AddEvidenceStore {
             }
         }
 
-        MigrationResult::Ok { from_version: 2, to_version: 3, changes }
+        MigrationResult::Ok {
+            from_version: 2,
+            to_version: 3,
+            changes,
+        }
     }
 }
 
@@ -149,16 +171,18 @@ impl Migration for M003AddEvidenceStore {
 pub struct M004AddSnapshotMeta;
 
 impl Migration for M004AddSnapshotMeta {
-    fn from_version(&self) -> u32 { 3 }
+    fn from_version(&self) -> u32 {
+        3
+    }
 
     fn description(&self) -> &'static str {
         "Create snapshots/ directory and initialise snapshot-meta.json (v3 → v4)"
     }
 
     fn apply(&self, data_dir: &Path, dry_run: bool) -> MigrationResult {
-        let snapshots_dir  = data_dir.join("snapshots");
-        let meta_path      = data_dir.join("snapshot-meta.json");
-        let mut changes    = Vec::new();
+        let snapshots_dir = data_dir.join("snapshots");
+        let meta_path = data_dir.join("snapshot-meta.json");
+        let mut changes = Vec::new();
 
         if !snapshots_dir.exists() {
             changes.push("created snapshots/ directory".into());
@@ -190,7 +214,11 @@ impl Migration for M004AddSnapshotMeta {
             return MigrationResult::Skipped { from_version: 3 };
         }
 
-        MigrationResult::Ok { from_version: 3, to_version: 4, changes }
+        MigrationResult::Ok {
+            from_version: 3,
+            to_version: 4,
+            changes,
+        }
     }
 }
 
@@ -199,7 +227,9 @@ impl Migration for M004AddSnapshotMeta {
 pub struct M005AddAdminAuditLog;
 
 impl Migration for M005AddAdminAuditLog {
-    fn from_version(&self) -> u32 { 4 }
+    fn from_version(&self) -> u32 {
+        4
+    }
 
     fn description(&self) -> &'static str {
         "Initialise admin audit log with genesis hashchain entry (v4 → v5)"
@@ -229,7 +259,11 @@ impl Migration for M005AddAdminAuditLog {
             }
         }
 
-        MigrationResult::Ok { from_version: 4, to_version: 5, changes }
+        MigrationResult::Ok {
+            from_version: 4,
+            to_version: 5,
+            changes,
+        }
     }
 }
 
@@ -260,7 +294,10 @@ mod tests {
 
         let updated: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
-        assert!(updated.get("vm").is_some(), "vm field must be present after migration");
+        assert!(
+            updated.get("vm").is_some(),
+            "vm field must be present after migration"
+        );
     }
 
     #[test]
@@ -285,8 +322,10 @@ mod tests {
 
         M001AddStateVmField.apply(dir.path(), false);
         let result = M001AddStateVmField.apply(dir.path(), false);
-        assert!(matches!(result, MigrationResult::Skipped { .. }),
-            "second run must be skipped");
+        assert!(
+            matches!(result, MigrationResult::Skipped { .. }),
+            "second run must be skipped"
+        );
     }
 
     // ── M002 ────────────────────────────────────────────────────────────────
@@ -303,8 +342,10 @@ mod tests {
     fn m002_dry_run_does_not_create_dir() {
         let dir = TempDir::new().unwrap();
         M002AddReceiptsIndex.apply(dir.path(), true);
-        assert!(!dir.path().join("receipts").exists(),
-            "dry-run must not create the directory");
+        assert!(
+            !dir.path().join("receipts").exists(),
+            "dry-run must not create the directory"
+        );
     }
 
     #[test]

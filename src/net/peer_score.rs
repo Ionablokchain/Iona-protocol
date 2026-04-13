@@ -60,15 +60,15 @@ impl ViolationReason {
     /// Default penalty magnitude for this violation.
     pub fn default_penalty(self) -> i64 {
         match self {
-            Self::BadSignature      => 20,
-            Self::UnknownTopic      => 5,
-            Self::WrongChainId      => 50,
-            Self::MsgRateExceeded   => 10,
-            Self::ByteRateExceeded  => 10,
+            Self::BadSignature => 20,
+            Self::UnknownTopic => 5,
+            Self::WrongChainId => 50,
+            Self::MsgRateExceeded => 10,
+            Self::ByteRateExceeded => 10,
             Self::IncompletResponse => 5,
-            Self::InvalidBlock      => 100,
+            Self::InvalidBlock => 100,
             Self::DuplicateEvidence => 30,
-            Self::Custom            => 1,
+            Self::Custom => 1,
         }
     }
 }
@@ -79,7 +79,7 @@ impl ViolationReason {
 struct RateBucket {
     tokens: f64,
     max: f64,
-    rate: f64,      // tokens (msgs or bytes) per second
+    rate: f64, // tokens (msgs or bytes) per second
     last: Instant,
 }
 
@@ -170,7 +170,10 @@ impl PeerScore {
     /// Check if the peer is allowed to send another message (msg/s quota).
     /// Returns `true` if allowed, `false` if quota exceeded.
     pub fn check_msg_quota(&mut self, peer: &str) -> bool {
-        let entry = self.peers.entry(peer.to_string()).or_insert_with(PeerEntry::new);
+        let entry = self
+            .peers
+            .entry(peer.to_string())
+            .or_insert_with(PeerEntry::new);
         entry.last_active = Instant::now();
         if entry.score <= self.ban_threshold {
             return false;
@@ -190,7 +193,10 @@ impl PeerScore {
 
     /// Check if the peer is allowed to send `bytes` more bytes (bytes/s quota).
     pub fn check_byte_quota(&mut self, peer: &str, bytes: usize) -> bool {
-        let entry = self.peers.entry(peer.to_string()).or_insert_with(PeerEntry::new);
+        let entry = self
+            .peers
+            .entry(peer.to_string())
+            .or_insert_with(PeerEntry::new);
         entry.last_active = Instant::now();
         if entry.score <= self.ban_threshold {
             return false;
@@ -213,7 +219,10 @@ impl PeerScore {
     /// PEER_MAX_PENDING_VALIDATIONS. The caller must call `release_validation`
     /// when validation completes (success or failure).
     pub fn acquire_validation_slot(&mut self, peer: &str) -> bool {
-        let entry = self.peers.entry(peer.to_string()).or_insert_with(PeerEntry::new);
+        let entry = self
+            .peers
+            .entry(peer.to_string())
+            .or_insert_with(PeerEntry::new);
         if entry.pending_validations >= PEER_MAX_PENDING_VALIDATIONS {
             tracing::warn!(
                 peer = %peer,
@@ -242,7 +251,10 @@ impl PeerScore {
 
     /// Penalise a peer with a custom magnitude.
     pub fn penalise_with(&mut self, peer: &str, reason: ViolationReason, penalty: i64) {
-        let entry = self.peers.entry(peer.to_string()).or_insert_with(PeerEntry::new);
+        let entry = self
+            .peers
+            .entry(peer.to_string())
+            .or_insert_with(PeerEntry::new);
         entry.score -= penalty.abs();
         entry.total_violations += 1;
         tracing::warn!(
@@ -256,7 +268,10 @@ impl PeerScore {
 
     /// Reward a peer for good behavior (valid block, helpful sync, etc.)
     pub fn reward(&mut self, peer: &str, amount: i64) {
-        let entry = self.peers.entry(peer.to_string()).or_insert_with(PeerEntry::new);
+        let entry = self
+            .peers
+            .entry(peer.to_string())
+            .or_insert_with(PeerEntry::new);
         // Cap score at 0 to prevent score farming.
         entry.score = (entry.score + amount.abs()).min(0);
     }
@@ -278,7 +293,10 @@ impl PeerScore {
     }
 
     pub fn should_ban(&self, peer: &str) -> bool {
-        self.peers.get(peer).map(|e| e.score <= self.ban_threshold).unwrap_or(false)
+        self.peers
+            .get(peer)
+            .map(|e| e.score <= self.ban_threshold)
+            .unwrap_or(false)
     }
 
     pub fn should_quarantine(&self, peer: &str) -> bool {
@@ -296,20 +314,32 @@ impl PeerScore {
     }
 
     pub fn pending_validations(&self, peer: &str) -> usize {
-        self.peers.get(peer).map(|e| e.pending_validations).unwrap_or(0)
+        self.peers
+            .get(peer)
+            .map(|e| e.pending_validations)
+            .unwrap_or(0)
     }
 
     // ── Snapshot for metrics ──────────────────────────────────────────────
 
     pub fn snapshot(&self) -> PeerScoreSnapshot {
-        let quarantined = self.peers.values()
+        let quarantined = self
+            .peers
+            .values()
             .filter(|e| e.score <= self.quarantine_threshold && e.score > self.ban_threshold)
             .count();
-        let banned = self.peers.values()
+        let banned = self
+            .peers
+            .values()
             .filter(|e| e.score <= self.ban_threshold)
             .count();
         let total_violations: u64 = self.peers.values().map(|e| e.total_violations).sum();
-        PeerScoreSnapshot { quarantined, banned, total_peers: self.peers.len(), total_violations }
+        PeerScoreSnapshot {
+            quarantined,
+            banned,
+            total_peers: self.peers.len(),
+            total_violations,
+        }
     }
 
     // ── Score decay (call periodically) ─────────────────────────────────
@@ -395,7 +425,11 @@ mod tests {
     fn test_ban_threshold_blocks_all_traffic() {
         let mut ps = PeerScore::with_defaults();
         // Force the peer to BAN_THRESHOLD.
-        ps.penalise_with("peer1", ViolationReason::InvalidBlock, BAN_THRESHOLD.unsigned_abs() as i64 + 10);
+        ps.penalise_with(
+            "peer1",
+            ViolationReason::InvalidBlock,
+            BAN_THRESHOLD.unsigned_abs() as i64 + 10,
+        );
         assert!(ps.should_ban("peer1"));
         // All quota checks must fail for a banned peer.
         assert!(!ps.check_msg_quota("peer1"));
@@ -405,9 +439,16 @@ mod tests {
     #[test]
     fn test_quarantine_threshold() {
         let mut ps = PeerScore::with_defaults();
-        ps.penalise_with("peer1", ViolationReason::BadSignature, QUARANTINE_THRESHOLD.unsigned_abs() as i64 + 5);
-        assert!(ps.should_quarantine("peer1") || ps.should_ban("peer1"),
-            "score {} should trigger quarantine or ban", ps.score("peer1"));
+        ps.penalise_with(
+            "peer1",
+            ViolationReason::BadSignature,
+            QUARANTINE_THRESHOLD.unsigned_abs() as i64 + 5,
+        );
+        assert!(
+            ps.should_quarantine("peer1") || ps.should_ban("peer1"),
+            "score {} should trigger quarantine or ban",
+            ps.score("peer1")
+        );
     }
 
     #[test]
@@ -419,7 +460,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2));
         ps.decay();
         let after = ps.score("peer1");
-        assert!(after > before, "score should improve after decay: before={before} after={after}");
+        assert!(
+            after > before,
+            "score should improve after decay: before={before} after={after}"
+        );
     }
 
     #[test]
@@ -438,7 +482,7 @@ mod tests {
     fn test_snapshot() {
         let mut ps = PeerScore::with_defaults();
         ps.penalise_with("peer1", ViolationReason::InvalidBlock, 300); // ban
-        ps.penalise_with("peer2", ViolationReason::BadSignature, 60);  // quarantine
+        ps.penalise_with("peer2", ViolationReason::BadSignature, 60); // quarantine
         let snap = ps.snapshot();
         assert_eq!(snap.banned, 1);
         assert_eq!(snap.quarantined, 1);

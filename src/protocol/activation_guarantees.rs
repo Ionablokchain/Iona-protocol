@@ -18,8 +18,7 @@
 //! | AG-8 | Rollback window defined    | Clear point before which rollback is safe            |
 
 use crate::protocol::version::{
-    ProtocolActivation, version_for_height, CURRENT_PROTOCOL_VERSION,
-    SUPPORTED_PROTOCOL_VERSIONS,
+    version_for_height, ProtocolActivation, CURRENT_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use crate::types::Height;
 
@@ -188,9 +187,7 @@ pub fn check_activation_immutable(
                     return Err(format!(
                         "AG-7 VIOLATION: PV={} has different activation heights: \
                          {:?} vs {:?}",
-                        a.protocol_version,
-                        a.activation_height,
-                        b.activation_height,
+                        a.protocol_version, a.activation_height, b.activation_height,
                     ));
                 }
             }
@@ -205,10 +202,7 @@ pub fn check_activation_immutable(
 ///
 /// Returns `Some(height)` if rollback is possible (before activation),
 /// or `None` if the activation has already passed.
-pub fn rollback_window(
-    activation: &ProtocolActivation,
-    current_height: Height,
-) -> Option<Height> {
+pub fn rollback_window(activation: &ProtocolActivation, current_height: Height) -> Option<Height> {
     match activation.activation_height {
         Some(ah) if current_height < ah => Some(ah - 1),
         _ => None,
@@ -221,7 +215,8 @@ pub fn check_rollback_safe(
     target_pv: u32,
     current_height: Height,
 ) -> Result<Height, String> {
-    let activation = activations.iter()
+    let activation = activations
+        .iter()
         .find(|a| a.protocol_version == target_pv)
         .ok_or_else(|| format!("AG-8: no activation found for PV={target_pv}"))?;
 
@@ -253,8 +248,15 @@ pub struct ActivationCheck {
 
 impl std::fmt::Display for ActivationReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Activation Guarantees: {}",
-            if self.all_passed { "ALL SATISFIED" } else { "ISSUES DETECTED" })?;
+        writeln!(
+            f,
+            "Activation Guarantees: {}",
+            if self.all_passed {
+                "ALL SATISFIED"
+            } else {
+                "ISSUES DETECTED"
+            }
+        )?;
         for c in &self.checks {
             let mark = if c.passed { "OK" } else { "FAIL" };
             writeln!(f, "  [{mark}] {}: {} — {}", c.id, c.name, c.detail)?;
@@ -280,7 +282,9 @@ pub fn check_all_guarantees(
         id: "AG-1".into(),
         name: "Deterministic activation".into(),
         passed: r.is_ok(),
-        detail: r.err().unwrap_or_else(|| "PV deterministic across height range".into()),
+        detail: r
+            .err()
+            .unwrap_or_else(|| "PV deterministic across height range".into()),
     });
 
     // AG-2: Monotonic.
@@ -290,7 +294,9 @@ pub fn check_all_guarantees(
         id: "AG-2".into(),
         name: "Monotonic PV".into(),
         passed: r.is_ok(),
-        detail: r.err().unwrap_or_else(|| "PV non-decreasing across heights".into()),
+        detail: r
+            .err()
+            .unwrap_or_else(|| "PV non-decreasing across heights".into()),
     });
 
     // AG-3: Exactly-once.
@@ -299,9 +305,9 @@ pub fn check_all_guarantees(
         id: "AG-3".into(),
         name: "Exactly-once activation".into(),
         passed: r.is_ok(),
-        detail: r.err().unwrap_or_else(|| {
-            format!("{} unique PVs in schedule", activations.len())
-        }),
+        detail: r
+            .err()
+            .unwrap_or_else(|| format!("{} unique PVs in schedule", activations.len())),
     });
 
     // AG-5: Grace bounded.
@@ -310,7 +316,9 @@ pub fn check_all_guarantees(
         id: "AG-5".into(),
         name: "Grace window bounded".into(),
         passed: r.is_ok(),
-        detail: r.err().unwrap_or_else(|| "all grace windows within bounds".into()),
+        detail: r
+            .err()
+            .unwrap_or_else(|| "all grace windows within bounds".into()),
     });
 
     let all_passed = checks.iter().all(|c| c.passed);
@@ -367,8 +375,16 @@ mod tests {
     #[test]
     fn test_exactly_once_violation() {
         let a = vec![
-            ProtocolActivation { protocol_version: 1, activation_height: None, grace_blocks: 0 },
-            ProtocolActivation { protocol_version: 1, activation_height: Some(100), grace_blocks: 0 },
+            ProtocolActivation {
+                protocol_version: 1,
+                activation_height: None,
+                grace_blocks: 0,
+            },
+            ProtocolActivation {
+                protocol_version: 1,
+                activation_height: Some(100),
+                grace_blocks: 0,
+            },
         ];
         assert!(check_exactly_once(&a).is_err());
     }
@@ -393,13 +409,11 @@ mod tests {
 
     #[test]
     fn test_signal_distance_too_close() {
-        let a = vec![
-            ProtocolActivation {
-                protocol_version: 2,
-                activation_height: Some(110),
-                grace_blocks: 10,
-            },
-        ];
+        let a = vec![ProtocolActivation {
+            protocol_version: 2,
+            activation_height: Some(110),
+            grace_blocks: 10,
+        }];
         // At height 100, only 10 blocks away but need 50.
         assert!(check_signal_distance(&a, 100, 50).is_err());
     }
@@ -412,13 +426,11 @@ mod tests {
 
     #[test]
     fn test_grace_bounded_violation() {
-        let a = vec![
-            ProtocolActivation {
-                protocol_version: 2,
-                activation_height: Some(1000),
-                grace_blocks: MAX_GRACE_BLOCKS + 1,
-            },
-        ];
+        let a = vec![ProtocolActivation {
+            protocol_version: 2,
+            activation_height: Some(1000),
+            grace_blocks: MAX_GRACE_BLOCKS + 1,
+        }];
         assert!(check_grace_bounded(&a).is_err());
     }
 
@@ -438,12 +450,16 @@ mod tests {
 
     #[test]
     fn test_activation_immutable_violation() {
-        let a = vec![
-            ProtocolActivation { protocol_version: 2, activation_height: Some(1000), grace_blocks: 0 },
-        ];
-        let b = vec![
-            ProtocolActivation { protocol_version: 2, activation_height: Some(2000), grace_blocks: 0 },
-        ];
+        let a = vec![ProtocolActivation {
+            protocol_version: 2,
+            activation_height: Some(1000),
+            grace_blocks: 0,
+        }];
+        let b = vec![ProtocolActivation {
+            protocol_version: 2,
+            activation_height: Some(2000),
+            grace_blocks: 0,
+        }];
         assert!(check_activation_immutable(&a, &b).is_err());
     }
 

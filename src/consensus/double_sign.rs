@@ -72,10 +72,9 @@ fn load_state(path: &str) -> Result<GuardState, String> {
     if !Path::new(path).exists() {
         return Ok(GuardState::default());
     }
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("double-sign guard read error: {e}"))?;
-    let mut st: GuardState = serde_json::from_str(&raw)
-        .map_err(|e| format!("double-sign guard parse error: {e}"))?;
+    let raw = fs::read_to_string(path).map_err(|e| format!("double-sign guard read error: {e}"))?;
+    let mut st: GuardState =
+        serde_json::from_str(&raw).map_err(|e| format!("double-sign guard parse error: {e}"))?;
 
     // Verify chain integrity.
     st.verify_chain()?;
@@ -92,10 +91,8 @@ fn save_state(path: &str, st: &mut GuardState) -> Result<(), String> {
 
     // Atomic write: write to .tmp, then rename.
     let tmp_path = format!("{path}.tmp");
-    fs::write(&tmp_path, &json)
-        .map_err(|e| format!("double-sign guard write tmp error: {e}"))?;
-    fs::rename(&tmp_path, path)
-        .map_err(|e| format!("double-sign guard rename error: {e}"))?;
+    fs::write(&tmp_path, &json).map_err(|e| format!("double-sign guard write tmp error: {e}"))?;
+    fs::rename(&tmp_path, path).map_err(|e| format!("double-sign guard rename error: {e}"))?;
 
     Ok(())
 }
@@ -103,6 +100,7 @@ fn save_state(path: &str, st: &mut GuardState) -> Result<(), String> {
 // ── DoubleSignGuard ───────────────────────────────────────────────────────
 
 #[derive(Clone)]
+#[derive(Debug)]
 pub struct DoubleSignGuard {
     path: String,
     inner: Arc<Mutex<GuardState>>,
@@ -140,7 +138,12 @@ impl DoubleSignGuard {
     // ── Check + record: proposals ─────────────────────────────────────────
 
     /// Check whether signing this proposal would be a double-sign.
-    pub fn check_proposal(&self, height: Height, round: Round, block_id: &Hash32) -> Result<(), String> {
+    pub fn check_proposal(
+        &self,
+        height: Height,
+        round: Round,
+        block_id: &Hash32,
+    ) -> Result<(), String> {
         let key = format!("proposal:{height}:{round}");
         let want = h32_hex(block_id);
         let st = self.inner.lock();
@@ -181,7 +184,10 @@ impl DoubleSignGuard {
         block_id: &Option<Hash32>,
     ) -> Result<(), String> {
         let key = vote_guard_key(vt, height, round);
-        let want = block_id.as_ref().map(h32_hex).unwrap_or_else(|| "nil".to_string());
+        let want = block_id
+            .as_ref()
+            .map(h32_hex)
+            .unwrap_or_else(|| "nil".to_string());
         let st = self.inner.lock();
         if let Some(existing) = st.votes.get(&key) {
             if existing != &want {
@@ -204,7 +210,10 @@ impl DoubleSignGuard {
         block_id: &Option<Hash32>,
     ) -> Result<(), String> {
         let key = vote_guard_key(vt, height, round);
-        let val = block_id.as_ref().map(h32_hex).unwrap_or_else(|| "nil".to_string());
+        let val = block_id
+            .as_ref()
+            .map(h32_hex)
+            .unwrap_or_else(|| "nil".to_string());
         let mut st = self.inner.lock();
         st.votes.insert(key, val);
         save_state(&self.path, &mut st)
@@ -247,12 +256,13 @@ mod tests {
     fn test_guard() -> (DoubleSignGuard, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let pk = PublicKeyBytes(vec![0u8; 32]);
-        let g = DoubleSignGuard::new(dir.path().to_str().unwrap(), &pk)
-            .expect("guard should load");
+        let g = DoubleSignGuard::new(dir.path().to_str().unwrap(), &pk).expect("guard should load");
         (g, dir)
     }
 
-    fn hash(b: u8) -> Hash32 { Hash32([b; 32]) }
+    fn hash(b: u8) -> Hash32 {
+        Hash32([b; 32])
+    }
 
     #[test]
     fn test_fresh_guard_allows_proposal() {
@@ -279,7 +289,8 @@ mod tests {
     #[test]
     fn test_double_vote_refused() {
         let (g, _dir) = test_guard();
-        g.record_vote(VoteType::Prevote, 1, 0, &Some(hash(1))).unwrap();
+        g.record_vote(VoteType::Prevote, 1, 0, &Some(hash(1)))
+            .unwrap();
         let result = g.check_vote(VoteType::Prevote, 1, 0, &Some(hash(2)));
         assert!(result.is_err(), "double-vote must be refused");
         assert!(result.unwrap_err().contains("DOUBLE-VOTE"));
@@ -288,9 +299,13 @@ mod tests {
     #[test]
     fn test_nil_vote_differs_from_block_vote() {
         let (g, _dir) = test_guard();
-        g.record_vote(VoteType::Prevote, 1, 0, &Some(hash(1))).unwrap();
+        g.record_vote(VoteType::Prevote, 1, 0, &Some(hash(1)))
+            .unwrap();
         let result = g.check_vote(VoteType::Prevote, 1, 0, &None);
-        assert!(result.is_err(), "nil vote after block vote is a double-sign");
+        assert!(
+            result.is_err(),
+            "nil vote after block vote is a double-sign"
+        );
     }
 
     #[test]
@@ -340,7 +355,10 @@ mod tests {
 
         // Reload — should fail with chain integrity error.
         let result = DoubleSignGuard::new(path_str, &pk);
-        assert!(result.is_err(), "tampered guard file should fail integrity check");
+        assert!(
+            result.is_err(),
+            "tampered guard file should fail integrity check"
+        );
         assert!(result.unwrap_err().contains("chain integrity FAILED"));
     }
 

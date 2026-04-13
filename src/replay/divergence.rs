@@ -73,23 +73,31 @@ pub enum DivergenceDetail {
         value_b: Option<String>,
     },
     /// Account exists in one snapshot but not the other.
-    AccountMissing {
-        account: String,
-        present_in: String,
-    },
+    AccountMissing { account: String, present_in: String },
 }
 
 impl std::fmt::Display for DivergenceDetail {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BalanceDiff { account, value_a, value_b } =>
-                write!(f, "balance({account}): {value_a} vs {value_b}"),
-            Self::NonceDiff { account, value_a, value_b } =>
-                write!(f, "nonce({account}): {value_a} vs {value_b}"),
-            Self::KvDiff { key, value_a, value_b } =>
-                write!(f, "kv({key}): {:?} vs {:?}", value_a, value_b),
-            Self::AccountMissing { account, present_in } =>
-                write!(f, "account {account} only in {present_in}"),
+            Self::BalanceDiff {
+                account,
+                value_a,
+                value_b,
+            } => write!(f, "balance({account}): {value_a} vs {value_b}"),
+            Self::NonceDiff {
+                account,
+                value_a,
+                value_b,
+            } => write!(f, "nonce({account}): {value_a} vs {value_b}"),
+            Self::KvDiff {
+                key,
+                value_a,
+                value_b,
+            } => write!(f, "kv({key}): {:?} vs {:?}", value_a, value_b),
+            Self::AccountMissing {
+                account,
+                present_in,
+            } => write!(f, "account {account} only in {present_in}"),
         }
     }
 }
@@ -109,14 +117,30 @@ pub struct DivergenceReport {
 
 impl std::fmt::Display for DivergenceReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Divergence Report: {}",
-            if self.all_agree { "NO DIVERGENCE" } else { "DIVERGENCE DETECTED" })?;
-        writeln!(f, "  nodes={}, heights={:?}", self.node_count, self.heights_checked)?;
+        writeln!(
+            f,
+            "Divergence Report: {}",
+            if self.all_agree {
+                "NO DIVERGENCE"
+            } else {
+                "DIVERGENCE DETECTED"
+            }
+        )?;
+        writeln!(
+            f,
+            "  nodes={}, heights={:?}",
+            self.node_count, self.heights_checked
+        )?;
         for d in &self.divergences {
-            writeln!(f, "  height {}: {} ({}) vs {} ({})",
+            writeln!(
+                f,
+                "  height {}: {} ({}) vs {} ({})",
                 d.height,
-                d.node_a, hex::encode(&d.root_a.0[..4]),
-                d.node_b, hex::encode(&d.root_b.0[..4]))?;
+                d.node_a,
+                hex::encode(&d.root_a.0[..4]),
+                d.node_b,
+                hex::encode(&d.root_b.0[..4])
+            )?;
             for detail in &d.details {
                 writeln!(f, "    - {detail}")?;
             }
@@ -292,7 +316,8 @@ pub fn detect_divergence_range(
         heights_checked.push(height);
 
         // Gather snapshots at this height from all nodes.
-        let at_height: Vec<&NodeSnapshot> = node_snapshots.values()
+        let at_height: Vec<&NodeSnapshot> = node_snapshots
+            .values()
             .filter_map(|snaps| snaps.iter().find(|s| s.height == height))
             .collect();
 
@@ -439,14 +464,17 @@ mod tests {
     #[test]
     fn test_range_detection() {
         let mut node_snaps = BTreeMap::new();
-        node_snaps.insert("node-1".into(), vec![
-            snap("node-1", 1, [1u8; 32]),
-            snap("node-1", 2, [2u8; 32]),
-        ]);
-        node_snaps.insert("node-2".into(), vec![
-            snap("node-2", 1, [1u8; 32]),
-            snap("node-2", 2, [9u8; 32]), // divergence at height 2
-        ]);
+        node_snaps.insert(
+            "node-1".into(),
+            vec![snap("node-1", 1, [1u8; 32]), snap("node-1", 2, [2u8; 32])],
+        );
+        node_snaps.insert(
+            "node-2".into(),
+            vec![
+                snap("node-2", 1, [1u8; 32]),
+                snap("node-2", 2, [9u8; 32]), // divergence at height 2
+            ],
+        );
 
         let report = detect_divergence_range(&node_snaps);
         assert!(!report.all_agree);

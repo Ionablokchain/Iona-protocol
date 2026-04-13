@@ -33,12 +33,12 @@ pub struct NodeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSection {
-    pub data_dir:   String,
-    pub seed:       u64,
-    pub chain_id:   u64,
-    pub log_level:  String,
+    pub data_dir: String,
+    pub seed: u64,
+    pub chain_id: u64,
+    pub log_level: String,
     /// Key storage mode: "plain" (keys.json) or "encrypted" (keys.enc)
-    pub keystore:   String,
+    pub keystore: String,
     /// Keystore password (plaintext in config). Used as fallback when env var is not set.
     #[serde(default)]
     pub keystore_password: String,
@@ -50,9 +50,9 @@ pub struct NodeSection {
 impl Default for NodeSection {
     fn default() -> Self {
         Self {
-            data_dir:  "./data/node".into(),
-            seed:      1,
-            chain_id:  1,
+            data_dir: "./data/node".into(),
+            seed: 1,
+            chain_id: 1,
             log_level: "info".into(),
             keystore: "plain".into(),
             keystore_password: String::new(),
@@ -61,25 +61,27 @@ impl Default for NodeSection {
     }
 }
 
-fn default_validator_seeds() -> Vec<u64> { vec![2, 3, 4] }
+fn default_validator_seeds() -> Vec<u64> {
+    vec![2, 3, 4]
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusSection {
-    pub propose_timeout_ms:    u64,
-    pub prevote_timeout_ms:    u64,
-    pub precommit_timeout_ms:  u64,
-    pub max_txs_per_block:     usize,
-    pub gas_target:            u64,
-    pub fast_quorum:           bool,
-    pub initial_base_fee:      u64,
-    pub stake_each:            u64,
+    pub propose_timeout_ms: u64,
+    pub prevote_timeout_ms: u64,
+    pub precommit_timeout_ms: u64,
+    pub max_txs_per_block: usize,
+    pub gas_target: u64,
+    pub fast_quorum: bool,
+    pub initial_base_fee: u64,
+    pub stake_each: u64,
     /// Enable the Simple PoS block producer (round-robin propose + sign + broadcast)
-    pub simple_producer:      bool,
+    pub simple_producer: bool,
     /// Seeds of the validators that participate in consensus.
     /// Must match across all nodes for consensus to work.
     /// Default: [2, 3, 4] (the three producers in the standard topology).
     #[serde(default = "default_validator_seeds")]
-    pub validator_seeds:      Vec<u64>,
+    pub validator_seeds: Vec<u64>,
     /// Protocol upgrade activation schedule.
     /// Each entry specifies a protocol version and the height at which it activates.
     /// Used for coordinated hard-fork upgrades.
@@ -91,40 +93,41 @@ fn default_activations() -> Vec<crate::protocol::version::ProtocolActivation> {
     crate::protocol::version::default_activations()
 }
 
-fn default_eclipse_profile() -> String { "testnet".into() }
+fn default_eclipse_profile() -> String {
+    "testnet".into()
+}
 
 impl Default for ConsensusSection {
     fn default() -> Self {
         Self {
-            propose_timeout_ms:   300,
-            prevote_timeout_ms:   200,
+            propose_timeout_ms: 300,
+            prevote_timeout_ms: 200,
             precommit_timeout_ms: 200,
-            max_txs_per_block:    4096,
-            gas_target:           43_000_000,
-            fast_quorum:          true,
-            initial_base_fee:     1,
-            stake_each:           1000,
-            simple_producer:     true,
-            validator_seeds:     default_validator_seeds(),
+            max_txs_per_block: 4096,
+            gas_target: 43_000_000,
+            fast_quorum: true,
+            initial_base_fee: 1,
+            stake_each: 1000,
+            simple_producer: true,
+            validator_seeds: default_validator_seeds(),
             protocol_activations: default_activations(),
         }
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NetworkSection {
-    pub listen:       String,
+    pub listen: String,
     /// Static peer multiaddresses (e.g. ["/ip4/1.2.3.4/tcp/7001"])
-    pub peers:        Vec<String>,
+    pub peers: Vec<String>,
     /// Optional bootstrap peers (may include /p2p/<peerid> for Kademlia)
-    pub bootnodes:    Vec<String>,
+    pub bootnodes: Vec<String>,
     /// Enable LAN peer discovery via mDNS
-    pub enable_mdns:  bool,
+    pub enable_mdns: bool,
     /// Enable Kademlia DHT (optional)
-    pub enable_kad:   bool,
-    pub reconnect_s:  u64,
+    pub enable_kad: bool,
+    pub reconnect_s: u64,
 
     /// Connection limits (anti-DoS)
     pub max_connections_total: usize,
@@ -241,7 +244,11 @@ pub struct GossipsubSection {
 impl Default for GossipsubSection {
     fn default() -> Self {
         Self {
-            allowed_topics: vec!["iona/tx".into(), "iona/blocks".into(), "iona/evidence".into()],
+            allowed_topics: vec![
+                "iona/tx".into(),
+                "iona/blocks".into(),
+                "iona/evidence".into(),
+            ],
             deny_unknown_topics: true,
             max_publish_msgs_per_sec: 30,
             max_publish_bytes_per_sec: 2_000_000,
@@ -277,11 +284,11 @@ impl Default for StateSyncSecuritySection {
 impl Default for NetworkSection {
     fn default() -> Self {
         Self {
-            listen:      "/ip4/0.0.0.0/tcp/7001".into(),
-            peers:       vec![],
-            bootnodes:   vec![],
+            listen: "/ip4/0.0.0.0/tcp/7001".into(),
+            peers: vec![],
+            bootnodes: vec![],
             enable_mdns: false,
-            enable_kad:  true,
+            enable_kad: true,
             reconnect_s: 30,
 
             max_connections_total: 200,
@@ -331,7 +338,7 @@ impl Default for NetworkSection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MempoolSection {
-    pub capacity:    usize,
+    pub capacity: usize,
 }
 
 impl Default for MempoolSection {
@@ -346,9 +353,9 @@ pub struct RpcSection {
     /// Socket address the RPC server binds to.
     /// Default: 127.0.0.1:9001 (loopback-only, secure).
     /// To expose publicly you MUST also pass --unsafe-rpc-public at startup.
-    pub listen:         String,
+    pub listen: String,
     /// Enable the /faucet endpoint. TESTNET ONLY.
-    pub enable_faucet:  bool,
+    pub enable_faucet: bool,
     /// Allow cross-origin requests (CORS permissive mode).
     /// false = restrictive (default, production-safe).
     /// true  = allow-all (dev/testnet UI only).
@@ -358,7 +365,7 @@ pub struct RpcSection {
 impl Default for RpcSection {
     fn default() -> Self {
         Self {
-            listen:        "127.0.0.1:9001".into(),
+            listen: "127.0.0.1:9001".into(),
             enable_faucet: false,
             cors_allow_all: false,
         }
@@ -390,13 +397,13 @@ pub struct AdminSection {
 impl Default for AdminSection {
     fn default() -> Self {
         Self {
-            listen:          "127.0.0.1:9002".into(),
-            rbac_path:       "./rbac.toml".into(),
-            require_mtls:    true,
-            tls_cert_pem:    "./deploy/tls/admin-server.crt.pem".into(),
-            tls_key_pem:     "./deploy/tls/admin-server.key.pem".into(),
+            listen: "127.0.0.1:9002".into(),
+            rbac_path: "./rbac.toml".into(),
+            require_mtls: true,
+            tls_cert_pem: "./deploy/tls/admin-server.crt.pem".into(),
+            tls_key_pem: "./deploy/tls/admin-server.key.pem".into(),
             tls_ca_cert_pem: "./deploy/tls/ca.crt.pem".into(),
-            audit_log_path:  "./data/audit.log".into(),
+            audit_log_path: "./data/audit.log".into(),
         }
     }
 }
@@ -435,8 +442,6 @@ impl Default for SigningSection {
         }
     }
 }
-
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

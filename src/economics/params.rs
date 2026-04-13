@@ -13,12 +13,12 @@ pub struct EconomicsParams {
 impl Default for EconomicsParams {
     fn default() -> Self {
         Self {
-            base_inflation_bps: 500,          // 5% annual
-            min_stake: 10_000_000_000u128,    // 10 billion base units (~10k tokens at 1M decimals)
-            slash_double_sign_bps: 5000,      // 50%
-            slash_downtime_bps: 100,          // 1%
+            base_inflation_bps: 500,       // 5% annual
+            min_stake: 10_000_000_000u128, // 10 billion base units (~10k tokens at 1M decimals)
+            slash_double_sign_bps: 5000,   // 50%
+            slash_downtime_bps: 100,       // 1%
             unbonding_epochs: 14,
-            treasury_bps: 500,                // 5%
+            treasury_bps: 500, // 5%
         }
     }
 }
