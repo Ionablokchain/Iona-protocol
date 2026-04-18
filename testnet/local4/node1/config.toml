@@ -1,43 +1,310 @@
-# IONA v30.0.0 — Node 1 config
-# Chain: iona-testnet-local4 (chain_id=6126151)
+# IONA v30.0.0 — Node 1 configuration
+# Chain: iona-testnet-local4 (chain_id = 6126151)
+#
+# This is a production‑ready configuration for a validator node in a local testnet.
+# All values are explicitly set for clarity and reproducibility.
 
+# -----------------------------------------------------------------------------
+# Node identity and basic settings
+# -----------------------------------------------------------------------------
 [node]
-data_dir          = "/home/claude/iona_v30/testnet/local4/node1/data"
-seed              = 1
-chain_id          = 6126151
-log_level         = "info"
-genesis_file      = "/home/claude/iona_v30/testnet/local4/genesis.json"
-keystore          = "plain"
+# Base directory for node data (database, snapshots, quarantines, keys)
+data_dir = "/home/claude/iona_v30/testnet/local4/node1/data"
+
+# Deterministic key seed (change per node). WARNING: Keep secret in production.
+seed = 1
+
+# Unique chain identifier (must match genesis)
+chain_id = 6126151
+
+# Log level: trace | debug | info | warn | error
+log_level = "info"
+
+# Path to genesis file (must exist and be valid)
+genesis_file = "/home/claude/iona_v30/testnet/local4/genesis.json"
+
+# Keystore mode: plain (insecure) | encrypted (recommended for production)
+keystore = "plain"
+
+# Password for encrypted keystore (fallback if env var not set)
 keystore_password = ""
 
+# Environment variable name containing the keystore password (default)
+keystore_password_env = "IONA_KEYSTORE_PASSWORD"
+
+# -----------------------------------------------------------------------------
+# P2P networking
+# -----------------------------------------------------------------------------
 [network]
-listen               = "/ip4/0.0.0.0/tcp/7010"
-peers                = ["/ip4/127.0.0.1/tcp/7020", "/ip4/127.0.0.1/tcp/7030", "/ip4/127.0.0.1/tcp/7040"]
-enable_mdns          = false
-max_peers            = 50
+# Listen address for P2P (multiaddr format)
+listen = "/ip4/0.0.0.0/tcp/7010"
+
+# Static peers (multiaddrs) – list of other nodes in the testnet
+peers = [
+    "/ip4/127.0.0.1/tcp/7020",
+    "/ip4/127.0.0.1/tcp/7030",
+    "/ip4/127.0.0.1/tcp/7040",
+]
+
+# Bootnodes for peer discovery (empty for local testnet)
+bootnodes = []
+
+# Enable mDNS for local network discovery (disabled for security)
+enable_mdns = false
+
+# Enable Kademlia DHT for peer discovery (optional)
+enable_kad = true
+
+# Maximum number of connected peers (total inbound + outbound)
+max_peers = 50
+
+# Reconnect interval to static peers (seconds)
 reconnect_interval_s = 30
 
+# Additional connection limits (recommended)
+max_connections_per_ip = 8
+
+# Peer scoring and quarantine (defaults)
+[network.rr_limits]
+max_req_per_sec_block  = 15
+max_req_per_sec_status = 30
+max_req_per_sec_range  = 5
+max_bytes_per_sec_block  = 2_000_000
+max_bytes_per_sec_status = 200_000
+max_bytes_per_sec_range  = 4_000_000
+
+global_in_bytes_per_sec  = 10_000_000
+global_out_bytes_per_sec = 10_000_000
+
+peer_strike_decay_s = 30
+peer_score_decay_s  = 60
+peer_quarantine_s   = 60
+rr_strikes_before_quarantine = 2
+rr_strikes_before_ban        = 3
+rr_quarantines_before_ban    = 2
+persist_quarantine = true
+
+# Eclipse attack protection
+[network.diversity]
+bucket_kind = "ip16"
+max_inbound_per_bucket = 4
+max_outbound_per_bucket = 4
+eclipse_detection_min_buckets = 3
+reseed_cooldown_s = 60
+
+# Gossipsub limits
+[network.gossipsub]
+allowed_topics = ["iona/tx", "iona/blocks", "iona/evidence"]
+deny_unknown_topics = true
+max_publish_msgs_per_sec = 50
+max_publish_bytes_per_sec = 5_242_880
+max_in_msgs_per_sec = 100
+max_in_bytes_per_sec = 10_485_760
+
+# State sync security
+[network.state_sync_security]
+bind_validator_set = true
+bind_epoch = true
+attestation_epoch_s = 60
+require_attestation = false
+use_aggregated_signatures = false
+
+# P2P state sync
+enable_p2p_state_sync = true
+state_sync_chunk_bytes = 1_048_576
+state_sync_timeout_s = 15
+
+# Snapshot attestation
+enable_snapshot_attestation = true
+snapshot_attestation_threshold = 2
+snapshot_attestation_collect_s = 8
+
+# -----------------------------------------------------------------------------
+# RPC server (local only for security)
+# -----------------------------------------------------------------------------
 [rpc]
-# SECURITY: loopback only by default
-listen        = "127.0.0.1:8541"
+# SECURITY: bind to loopback by default. To expose publicly, change to 0.0.0.0
+# and pass --unsafe-rpc-public flag at startup.
+listen = "127.0.0.1:8541"
+
+# Enable faucet endpoint (ONLY for testnets — never mainnet)
 enable_faucet = true
+
+# CORS policy: false = restrictive (no cross‑origin), true = allow‑all (dev only)
 cors_allow_all = false
 
+# List of allowed origins when CORS is restricted
+allowed_origins = []
+
+# Rate limiting for RPC calls (requests per second, per IP)
+rate_limit_per_ip = 100
+rate_limit_burst = 200
+
+# Maximum request size (bytes)
+max_request_size = 10_485_760
+
+# Timeout for RPC calls (seconds)
+timeout_s = 30
+
+# Maximum JSON nesting depth (prevents DoS via deep structures)
+max_json_depth = 32
+
+# -----------------------------------------------------------------------------
+# Admin API (local only, for node management)
+# -----------------------------------------------------------------------------
 [admin]
 listen = "127.0.0.1:9001"
 
+# Optional API key for admin endpoints (empty = disabled)
+api_key = ""
+
+# -----------------------------------------------------------------------------
+# Consensus engine
+# -----------------------------------------------------------------------------
 [consensus]
-stake_each           = 1000000
+# Stake assigned to each demo validator (only used in testnets)
+stake_each = 1_000_000
+
+# Timeouts (milliseconds) for each consensus step
 propose_timeout_ms   = 300
 prevote_timeout_ms   = 200
 precommit_timeout_ms = 200
-max_txs_per_block    = 4096
-fast_quorum          = true
 
+# Maximum number of transactions per block
+max_txs_per_block = 4096
+
+# EIP-1559 target gas per block
+gas_target = 43_000_000
+
+# If true, advance to next round as soon as 2/3+ votes are received
+fast_quorum = true
+
+# Initial base fee for EIP-1559
+initial_base_fee = 1
+
+# Maximum rounds before giving up
+max_rounds = 50
+
+# Minimum number of validators required
+min_validator_count = 4
+
+# Protocol version activation schedule (see UPGRADE_SPEC.md)
+[[consensus.protocol_activations]]
+protocol_version = 1
+activation_height = 0
+grace_blocks = 0
+
+[[consensus.protocol_activations]]
+protocol_version = 2
+activation_height = 2_000_000
+grace_blocks = 1000
+
+# -----------------------------------------------------------------------------
+# Mempool
+# -----------------------------------------------------------------------------
+[mempool]
+capacity = 200_000
+max_tx_size = 65_536
+min_gas_price = 1
+max_gas_price = 1_000_000
+max_priority_fee_per_gas = 100
+
+# MEV protection
+[mev]
+enable_commit_reveal = true
+enable_threshold_encryption = true
+enable_fair_ordering = true
+ordering_jitter_ms = 50
+commit_ttl_blocks = 20
+backrun_delay_blocks = 1
+max_pending_commits = 100_000
+
+# -----------------------------------------------------------------------------
+# Storage and persistence
+# -----------------------------------------------------------------------------
 [storage]
-persist_dir           = "/home/claude/iona_v30/testnet/local4/node1/data"
+# Directory for persistent data (same as node.data_dir)
+persist_dir = "/home/claude/iona_v30/testnet/local4/node1/data"
+
+# Interval between automatic state persistence (seconds)
 persist_interval_secs = 5
 
+# Snapshot settings
+enable_snapshots = true
+snapshot_every_n_blocks = 500
+snapshot_keep = 10
+snapshot_zstd_level = 3
+
+# Database cache size (MB)
+db_cache_size_mb = 512
+
+# WAL (Write-Ahead Log) configuration
+[storage.wal]
+max_segment_bytes = 67_108_864
+keep_segments = 3
+fsync_every_write = true
+
+# -----------------------------------------------------------------------------
+# Metrics (Prometheus)
+# -----------------------------------------------------------------------------
 [metrics]
 enabled = true
-listen  = "127.0.0.1:9091"
+listen = "127.0.0.1:9091"
+
+# -----------------------------------------------------------------------------
+# Observability (OpenTelemetry)
+# -----------------------------------------------------------------------------
+[observability]
+enable_otel = false
+otel_endpoint = "http://127.0.0.1:4317"
+service_name = "iona-node1"
+
+# -----------------------------------------------------------------------------
+# Signing (local keystore)
+# -----------------------------------------------------------------------------
+[signing]
+mode = "local"
+remote_url = "https://127.0.0.1:9100"
+remote_timeout_s = 10
+remote_tls_client_cert_pem = ""
+remote_tls_client_key_pem  = ""
+remote_tls_ca_cert_pem     = ""
+remote_tls_server_name     = ""
+
+# -----------------------------------------------------------------------------
+# Audit logging
+# -----------------------------------------------------------------------------
+[audit]
+log_path = "/home/claude/iona_v30/testnet/local4/node1/data/audit.jsonl"
+max_file_size_bytes = 104_857_600
+rotate_count = 5
+emit_to_tracing = true
+
+# -----------------------------------------------------------------------------
+# Governance (testnet defaults)
+# -----------------------------------------------------------------------------
+[governance]
+min_deposit = 1_000_000
+voting_epochs = 100
+quorum_bps = 3340
+threshold_bps = 5000
+
+# -----------------------------------------------------------------------------
+# Economics (testnet defaults)
+# -----------------------------------------------------------------------------
+[economics]
+base_inflation_bps = 500
+min_stake = 10_000_000_000
+slash_double_sign_bps = 5000
+slash_downtime_bps = 100
+unbonding_epochs = 14
+treasury_bps = 500
+
+# -----------------------------------------------------------------------------
+# Backup (optional)
+# -----------------------------------------------------------------------------
+[backup]
+enabled = false
+schedule_cron = "0 2 * * *"
+target_dir = "/backup/iona"
+keep_days = 30
