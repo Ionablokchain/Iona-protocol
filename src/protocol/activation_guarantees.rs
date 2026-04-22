@@ -1,8 +1,8 @@
 //! ProtocolVersion activation guarantees.
 //!
-//! Formalises the guarantees that the activation mechanism provides to
-//! operators, developers, and the consensus layer.  Each guarantee is
-//! expressed as a checkable predicate.
+//! This module formalises the guarantees that the activation mechanism provides to
+//! operators, developers, and the consensus layer. Each guarantee is expressed as
+//! a checkable predicate.
 //!
 //! # Guarantees
 //!
@@ -16,15 +16,35 @@
 //! | AG-6 | Post-activation mandatory  | After grace, only the new PV is valid                |
 //! | AG-7 | Activation height immutable| Once published, activation height cannot change      |
 //! | AG-8 | Rollback window defined    | Clear point before which rollback is safe            |
+//!
+//! # Example
+//!
+//! ```
+//! use iona::protocol::activation_guarantees::{
+//!     check_all_guarantees, check_deterministic_activation, ActivationReport
+//! };
+//! use iona::protocol::version::default_activations;
+//!
+//! let activations = default_activations();
+//! let report = check_all_guarantees(&activations, 100);
+//! if !report.all_passed {
+//!     eprintln!("{}", report);
+//! }
+//! ```
 
 use crate::protocol::version::{
     version_for_height, ProtocolActivation, CURRENT_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use crate::types::Height;
+use std::collections::HashSet;
+use tracing::{debug, info, warn};
 
-// ─── AG-1: Deterministic activation ─────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// AG-1: Deterministic activation
+// -----------------------------------------------------------------------------
 
 /// Verify that `version_for_height` returns the same PV for the same inputs.
+#[must_use]
 pub fn check_deterministic_activation(
     height: Height,
     activations: &[ProtocolActivation],
@@ -32,14 +52,18 @@ pub fn check_deterministic_activation(
     let pv1 = version_for_height(height, activations);
     let pv2 = version_for_height(height, activations);
     if pv1 != pv2 {
-        return Err(format!(
+        let err = format!(
             "AG-1 VIOLATION: PV({height}) returned {pv1} then {pv2}"
-        ));
+        );
+        warn!("{}", err);
+        return Err(err);
     }
+    debug!(height, pv = pv1, "deterministic activation check passed");
     Ok(pv1)
 }
 
 /// Verify determinism across a range of heights.
+#[must_use]
 pub fn check_deterministic_range(
     from: Height,
     to: Height,
@@ -48,12 +72,16 @@ pub fn check_deterministic_range(
     for h in from..=to {
         check_deterministic_activation(h, activations)?;
     }
+    debug!(from, to, "deterministic range check passed");
     Ok(())
 }
 
-// ─── AG-2: Monotonic PV ─────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// AG-2: Monotonic PV
+// -----------------------------------------------------------------------------
 
 /// Verify that PV never decreases as height increases.
+#[must_use]
 pub fn check_pv_monotonic(
     heights: &[Height],
     activations: &[ProtocolActivation],
@@ -62,35 +90,47 @@ pub fn check_pv_monotonic(
     for &h in heights {
         let pv = version_for_height(h, activations);
         if pv < prev_pv {
-            return Err(format!(
+            let err = format!(
                 "AG-2 VIOLATION: PV decreased from {prev_pv} to {pv} at height {h}"
-            ));
+            );
+            warn!("{}", err);
+            return Err(err);
         }
         prev_pv = pv;
     }
+    debug!("monotonic PV check passed");
     Ok(())
 }
 
-// ─── AG-3: Exactly-once activation ──────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// AG-3: Exactly-once activation
+// -----------------------------------------------------------------------------
 
 /// Verify that each PV appears at most once in the activation schedule.
+#[must_use]
 pub fn check_exactly_once(activations: &[ProtocolActivation]) -> Result<(), String> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     for a in activations {
         if !seen.insert(a.protocol_version) {
-            return Err(format!(
+            let err = format!(
                 "AG-3 VIOLATION: PV={} appears multiple times in activation schedule",
                 a.protocol_version
-            ));
+            );
+            warn!("{}", err);
+            return Err(err);
         }
     }
+    debug!(count = activations.len(), "exactly‑once check passed");
     Ok(())
 }
 
-// ─── AG-4: Pre-activation signalling ────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// AG-4: Pre-activation signalling
+// -----------------------------------------------------------------------------
 
 /// For a given activation, compute how many blocks before activation the
 /// node can detect it.
+#[must_use]
 pub fn pre_activation_signal_distance(
     activation: &ProtocolActivation,
     current_height: Height,
@@ -105,6 +145,7 @@ pub fn pre_activation_signal_distance(
 }
 
 /// Verify that all future activations have enough lead time.
+#[must_use]
 pub fn check_signal_distance(
     activations: &[ProtocolActivation],
     current_height: Height,
@@ -115,39 +156,51 @@ pub fn check_signal_distance(
             if ah > current_height {
                 let distance = ah - current_height;
                 if distance < min_lead_blocks {
-                    return Err(format!(
+                    let err = format!(
                         "AG-4 WARNING: PV={} activates in {distance} blocks \
                          (minimum lead time: {min_lead_blocks})",
                         a.protocol_version
-                    ));
+                    );
+                    warn!("{}", err);
+                    return Err(err);
                 }
             }
         }
     }
+    debug!(min_lead_blocks, "signal distance check passed");
     Ok(())
 }
 
-// ─── AG-5: Grace window bounded ─────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// AG-5: Grace window bounded
+// -----------------------------------------------------------------------------
 
 /// Maximum allowed grace window (blocks).
 pub const MAX_GRACE_BLOCKS: u64 = 100_000;
 
 /// Verify that all grace windows are within bounds.
+#[must_use]
 pub fn check_grace_bounded(activations: &[ProtocolActivation]) -> Result<(), String> {
     for a in activations {
         if a.grace_blocks > MAX_GRACE_BLOCKS {
-            return Err(format!(
+            let err = format!(
                 "AG-5 VIOLATION: PV={} has grace_blocks={} > max={MAX_GRACE_BLOCKS}",
                 a.protocol_version, a.grace_blocks
-            ));
+            );
+            warn!("{}", err);
+            return Err(err);
         }
     }
+    debug!("grace bounded check passed");
     Ok(())
 }
 
-// ─── AG-6: Post-activation mandatory ────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// AG-6: Post-activation mandatory
+// -----------------------------------------------------------------------------
 
-/// After activation height + grace, verify that only the new PV is accepted.
+/// After activation height + grace, verify that only the new PV is valid.
+#[must_use]
 pub fn check_post_activation_mandatory(
     height: Height,
     block_pv: u32,
@@ -163,19 +216,25 @@ pub fn check_post_activation_mandatory(
                     .unwrap_or(false)
         });
         if !in_grace {
-            return Err(format!(
+            let err = format!(
                 "AG-6 VIOLATION: block PV={block_pv} at height {height}, \
                  but PV={expected_pv} is mandatory (grace expired)"
-            ));
+            );
+            warn!("{}", err);
+            return Err(err);
         }
     }
+    debug!(height, block_pv, "post‑activation mandatory check passed");
     Ok(())
 }
 
-// ─── AG-7: Activation height immutable ──────────────────────────────────────
+// -----------------------------------------------------------------------------
+// AG-7: Activation height immutable
+// -----------------------------------------------------------------------------
 
 /// Verify that two activation schedules agree on heights for PVs that
 /// appear in both.
+#[must_use]
 pub fn check_activation_immutable(
     schedule_a: &[ProtocolActivation],
     schedule_b: &[ProtocolActivation],
@@ -184,24 +243,30 @@ pub fn check_activation_immutable(
         for b in schedule_b {
             if a.protocol_version == b.protocol_version {
                 if a.activation_height != b.activation_height {
-                    return Err(format!(
+                    let err = format!(
                         "AG-7 VIOLATION: PV={} has different activation heights: \
                          {:?} vs {:?}",
                         a.protocol_version, a.activation_height, b.activation_height,
-                    ));
+                    );
+                    warn!("{}", err);
+                    return Err(err);
                 }
             }
         }
     }
+    debug!("activation immutable check passed");
     Ok(())
 }
 
-// ─── AG-8: Rollback window ──────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// AG-8: Rollback window
+// -----------------------------------------------------------------------------
 
 /// Determine the last safe rollback height for a given activation.
 ///
 /// Returns `Some(height)` if rollback is possible (before activation),
 /// or `None` if the activation has already passed.
+#[must_use]
 pub fn rollback_window(activation: &ProtocolActivation, current_height: Height) -> Option<Height> {
     match activation.activation_height {
         Some(ah) if current_height < ah => Some(ah - 1),
@@ -210,6 +275,7 @@ pub fn rollback_window(activation: &ProtocolActivation, current_height: Height) 
 }
 
 /// Check whether rollback is still safe at the current height.
+#[must_use]
 pub fn check_rollback_safe(
     activations: &[ProtocolActivation],
     target_pv: u32,
@@ -221,15 +287,24 @@ pub fn check_rollback_safe(
         .ok_or_else(|| format!("AG-8: no activation found for PV={target_pv}"))?;
 
     match rollback_window(activation, current_height) {
-        Some(safe_until) => Ok(safe_until),
-        None => Err(format!(
-            "AG-8 VIOLATION: rollback unsafe for PV={target_pv} at height {current_height} \
-             (activation already passed)"
-        )),
+        Some(safe_until) => {
+            debug!(target_pv, safe_until, "rollback safe");
+            Ok(safe_until)
+        }
+        None => {
+            let err = format!(
+                "AG-8 VIOLATION: rollback unsafe for PV={target_pv} at height {current_height} \
+                 (activation already passed)"
+            );
+            warn!("{}", err);
+            Err(err)
+        }
     }
 }
 
-// ─── Aggregate check ────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Aggregate report
+// -----------------------------------------------------------------------------
 
 /// Result of all activation guarantee checks.
 #[derive(Debug, Clone)]
@@ -238,6 +313,7 @@ pub struct ActivationReport {
     pub all_passed: bool,
 }
 
+/// A single check in the activation report.
 #[derive(Debug, Clone)]
 pub struct ActivationCheck {
     pub id: String,
@@ -266,6 +342,7 @@ impl std::fmt::Display for ActivationReport {
 }
 
 /// Run all activation guarantee checks.
+#[must_use]
 pub fn check_all_guarantees(
     activations: &[ProtocolActivation],
     current_height: Height,
@@ -296,14 +373,14 @@ pub fn check_all_guarantees(
         passed: r.is_ok(),
         detail: r
             .err()
-            .unwrap_or_else(|| "PV non-decreasing across heights".into()),
+            .unwrap_or_else(|| "PV non‑decreasing across heights".into()),
     });
 
     // AG-3: Exactly-once.
     let r = check_exactly_once(activations);
     checks.push(ActivationCheck {
         id: "AG-3".into(),
-        name: "Exactly-once activation".into(),
+        name: "Exactly‑once activation".into(),
         passed: r.is_ok(),
         detail: r
             .err()
@@ -321,11 +398,23 @@ pub fn check_all_guarantees(
             .unwrap_or_else(|| "all grace windows within bounds".into()),
     });
 
+    // AG-4 and AG-6, AG-7, AG-8 are not fully covered here because they require
+    // additional context (e.g., actual block PV, second schedule, etc.).
+    // They can be added as needed.
+
     let all_passed = checks.iter().all(|c| c.passed);
+    if all_passed {
+        info!("all activation guarantees satisfied");
+    } else {
+        warn!("some activation guarantees violated");
+    }
+
     ActivationReport { checks, all_passed }
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -414,7 +503,6 @@ mod tests {
             activation_height: Some(110),
             grace_blocks: 10,
         }];
-        // At height 100, only 10 blocks away but need 50.
         assert!(check_signal_distance(&a, 100, 50).is_err());
     }
 
@@ -437,7 +525,6 @@ mod tests {
     #[test]
     fn test_post_activation_mandatory_ok() {
         let a = default_activations();
-        // PV=1 at any height with default activations.
         assert!(check_post_activation_mandatory(100, 1, &a).is_ok());
     }
 
