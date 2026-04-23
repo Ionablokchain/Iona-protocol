@@ -1,0 +1,124 @@
+# Makefile CI for IONA
+#
+# This workflow runs the Makefile-based build and test suite on every push to `main`
+# and on pull requests. It uses caching for build artifacts to speed up subsequent runs.
+#
+# Environment variables:
+#   - MAKE_JOBS: number of parallel jobs for make (default: number of CPU cores)
+#
+# Secrets:
+#   - (none required)
+
+name: Makefile CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  # Allow manual trigger from Actions tab
+  workflow_dispatch:
+
+env:
+  # Use all available cores for parallel builds
+  MAKE_JOBS: $(nproc)
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Build and test the project using Make
+  # -------------------------------------------------------------------------
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Install system dependencies (if any)
+      # Example: uncomment if you need extra packages
+      # - name: Install system dependencies
+      #   run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      # Cache build artifacts (e.g., object files, binaries)
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            .obj
+            **/*.o
+            **/*.a
+            **/*.so
+          key: ${{ runner.os }}-build-${{ hashFiles('Makefile', 'configure', '**/*.c', '**/*.h') }}
+          restore-keys: |
+            ${{ runner.os }}-build-
+
+      # Run configure script (if present)
+      - name: Configure
+        run: ./configure
+
+      # Build the project (parallel)
+      - name: Build
+        run: make -j ${{ env.MAKE_JOBS }}
+
+      # Run tests (if `make check` is defined)
+      - name: Run tests
+        run: make check
+
+      # Run distribution check (if `make distcheck` is defined)
+      - name: Run distribution check
+        run: make distcheck
+
+      # Optional: install the project (if needed for integration tests)
+      # - name: Install
+      #   run: make install DESTDIR=/tmp/install
+
+      # Optional: run additional smoke tests
+      # - name: Smoke test
+      #   run: ./path/to/binary --version
+
+  # -------------------------------------------------------------------------
+  # Clean build (no cache) – runs only on `main` push to verify fresh build
+  # -------------------------------------------------------------------------
+  clean-build:
+    name: Clean Build (No Cache)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-and-test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: ./configure
+
+      - name: Clean build
+        run: make clean && make -j ${{ env.MAKE_JOBS }}
+
+      - name: Run tests
+        run: make check
+
+  # -------------------------------------------------------------------------
+  # Static analysis (optional)
+  # -------------------------------------------------------------------------
+  static-analysis:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install clang-tidy
+        run: sudo apt-get install -y clang-tidy
+
+      - name: Configure
+        run: ./configure
+
+      - name: Run static analysis
+        run: make analyze || echo "No static analysis target found"
