@@ -17,23 +17,25 @@
 //!                                                        (only with snapshot)
 //! ```
 //!
-//! # Usage
+//! # Example
 //!
-//! ```ignore
+//! ```rust,ignore
 //! let mut mgr = TransitionManager::new(activations, current_height);
-//! // Each block:
 //! mgr.on_block(height);
 //! let state = mgr.state();
 //! ```
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use tracing::{debug, info, warn};
 
 use super::version::{
     version_for_height, ProtocolActivation, CURRENT_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
 
-// ─── Transition state ────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// TransitionState
+// -----------------------------------------------------------------------------
 
 /// State of a protocol version transition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,7 +60,7 @@ pub enum TransitionState {
         to_pv: u32,
         activation_height: u64,
     },
-    /// New PV is active; grace window still open for old-PV blocks.
+    /// New PV is active; grace window still open for old‑PV blocks.
     Active { pv: u32, grace_remaining: u64 },
     /// Transition fully finalized; grace window expired.
     Finalized { pv: u32 },
@@ -108,7 +110,9 @@ impl std::fmt::Display for TransitionState {
     }
 }
 
-// ─── Transition event ────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// TransitionEvent
+// -----------------------------------------------------------------------------
 
 /// Events emitted during transition lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,7 +145,9 @@ pub enum TransitionEvent {
     TransitionRolledBack { from_pv: u32, to_pv: u32 },
 }
 
-// ─── Readiness check ─────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// ReadinessReport
+// -----------------------------------------------------------------------------
 
 /// Result of a pre-activation readiness check.
 #[derive(Debug, Clone)]
@@ -162,6 +168,7 @@ pub struct ReadinessCheck {
 
 impl ReadinessReport {
     /// Create a report from a list of checks.
+    #[must_use]
     pub fn from_checks(checks: Vec<ReadinessCheck>) -> Self {
         let ready = checks.iter().all(|c| c.passed);
         Self { ready, checks }
@@ -183,34 +190,36 @@ impl std::fmt::Display for ReadinessReport {
     }
 }
 
-// ─── Transition manager ──────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Pre‑activation window constant
+// -----------------------------------------------------------------------------
 
-/// Pre-activation window size (blocks before activation to enter PreActivation state).
+/// Pre‑activation window size (blocks before activation to enter PreActivation state).
 const PRE_ACTIVATION_WINDOW: u64 = 1000;
 
+// -----------------------------------------------------------------------------
+// TransitionManager
+// -----------------------------------------------------------------------------
+
 /// Manages protocol version transitions.
+#[derive(Debug)]
 pub struct TransitionManager {
-    /// Activation schedule.
     activations: Vec<ProtocolActivation>,
-    /// Current transition state.
     state: TransitionState,
-    /// History of state transitions.
     history: Vec<(u64, TransitionState)>,
-    /// Events emitted (drained by caller).
     events: Vec<TransitionEvent>,
-    /// Current chain height.
     current_height: u64,
-    /// Current active PV.
     current_pv: u32,
-    /// Snapshot heights available for rollback.
     snapshot_heights: Vec<u64>,
 }
 
 impl TransitionManager {
     /// Create a new transition manager.
+    #[must_use]
     pub fn new(activations: Vec<ProtocolActivation>, current_height: u64) -> Self {
         let current_pv = version_for_height(current_height, &activations);
         let state = Self::compute_initial_state(&activations, current_height, current_pv);
+        info!(current_height, current_pv, state = %state, "transition manager created");
         Self {
             activations,
             state,
@@ -228,7 +237,6 @@ impl TransitionManager {
         height: u64,
         current_pv: u32,
     ) -> TransitionState {
-        // Find next scheduled activation that hasn't completed.
         let next = activations.iter().find(|a| {
             a.protocol_version > current_pv
                 || a.activation_height
@@ -269,29 +277,36 @@ impl TransitionManager {
     }
 
     /// Get the current transition state.
+    #[must_use]
     pub fn state(&self) -> &TransitionState {
         &self.state
     }
 
     /// Get the current protocol version.
+    #[must_use]
     pub fn current_pv(&self) -> u32 {
         self.current_pv
     }
 
     /// Get the transition history.
+    #[must_use]
     pub fn history(&self) -> &[(u64, TransitionState)] {
         &self.history
     }
 
     /// Drain pending events.
+    #[must_use]
     pub fn drain_events(&mut self) -> Vec<TransitionEvent> {
-        std::mem::take(&mut self.events)
+        let events = std::mem::take(&mut self.events);
+        debug!(count = events.len(), "drained transition events");
+        events
     }
 
     /// Register a snapshot height for potential rollback.
     pub fn register_snapshot(&mut self, height: u64) {
         self.snapshot_heights.push(height);
         self.snapshot_heights.sort_unstable();
+        debug!(height, "snapshot registered for transition manager");
     }
 
     /// Process a new block at the given height.
@@ -301,14 +316,15 @@ impl TransitionManager {
         let new_pv = version_for_height(height, &self.activations);
         let old_pv = self.current_pv;
 
-        // Detect PV change.
         if new_pv != old_pv {
+            debug!(old_pv, new_pv, height, "protocol version changed");
             self.current_pv = new_pv;
         }
 
         let new_state = self.compute_next_state(height, old_pv, new_pv);
 
         if new_state != self.state {
+            debug!(old = %self.state, new = %new_state, height, "transition state changed");
             self.emit_transition_events(&self.state.clone(), &new_state, height, old_pv, new_pv);
             self.history.push((height, self.state.clone()));
             self.state = new_state;
@@ -317,21 +333,17 @@ impl TransitionManager {
 
     /// Compute the next state based on current height and PV.
     fn compute_next_state(&self, height: u64, old_pv: u32, new_pv: u32) -> TransitionState {
-        // Find next activation after current_pv.
         let next_activation = self
             .activations
             .iter()
             .find(|a| a.protocol_version > self.current_pv && a.activation_height.is_some());
 
-        // Check if we're in a grace window for the current PV.
         let current_activation = self
             .activations
             .iter()
             .find(|a| a.protocol_version == new_pv && a.activation_height.is_some());
 
-        // State machine transitions.
         match (&self.state, next_activation, current_activation) {
-            // Idle with upcoming activation.
             (TransitionState::Idle, Some(next), _) => {
                 let ah = next.activation_height.unwrap();
                 if height >= ah + next.grace_blocks {
@@ -355,7 +367,6 @@ impl TransitionManager {
                 }
             }
 
-            // Scheduled: check if entering pre-activation or activation.
             (
                 TransitionState::Scheduled {
                     target_pv,
@@ -390,7 +401,6 @@ impl TransitionManager {
                 }
             }
 
-            // PreActivation: check if activation reached.
             (
                 TransitionState::PreActivation {
                     target_pv,
@@ -403,13 +413,6 @@ impl TransitionManager {
                 let ah = *activation_height;
                 let tpv = *target_pv;
                 if height >= ah {
-                    // Find grace blocks for this activation.
-                    let grace = self
-                        .activations
-                        .iter()
-                        .find(|a| a.protocol_version == tpv)
-                        .map(|a| a.grace_blocks)
-                        .unwrap_or(0);
                     TransitionState::Activating {
                         from_pv: old_pv,
                         to_pv: new_pv,
@@ -424,7 +427,6 @@ impl TransitionManager {
                 }
             }
 
-            // Activating: move to Active.
             (
                 TransitionState::Activating {
                     to_pv,
@@ -451,7 +453,6 @@ impl TransitionManager {
                 }
             }
 
-            // Active: check if grace expired.
             (
                 TransitionState::Active {
                     pv,
@@ -470,7 +471,6 @@ impl TransitionManager {
                 }
             }
 
-            // Finalized: check if there's a new activation coming.
             (TransitionState::Finalized { .. }, Some(next), _) => {
                 let ah = next.activation_height.unwrap();
                 if height < ah {
@@ -491,7 +491,6 @@ impl TransitionManager {
                 }
             }
 
-            // Terminal/no-change states.
             _ => self.state.clone(),
         }
     }
@@ -571,6 +570,7 @@ impl TransitionManager {
             TransitionState::Scheduled { target_pv, .. }
             | TransitionState::PreActivation { target_pv, .. } => {
                 let tpv = *target_pv;
+                info!(target_pv = tpv, reason, "cancelling scheduled transition");
                 self.history.push((self.current_height, self.state.clone()));
                 self.state = TransitionState::Cancelled {
                     target_pv: tpv,
@@ -582,13 +582,16 @@ impl TransitionManager {
                 });
                 Ok(())
             }
-            _ => Err(format!("cannot cancel transition in state: {}", self.state)),
+            _ => {
+                let err = format!("cannot cancel transition in state: {}", self.state);
+                warn!("{}", err);
+                Err(err)
+            }
         }
     }
 
     /// Attempt rollback to a previous PV (requires snapshot before activation).
     pub fn rollback(&mut self, reason: &str) -> Result<u64, String> {
-        // Find the latest snapshot before the activation height.
         let activation_height = match &self.state {
             TransitionState::Active { .. } | TransitionState::Activating { .. } => self
                 .activations
@@ -596,8 +599,16 @@ impl TransitionManager {
                 .filter(|a| a.protocol_version == self.current_pv)
                 .filter_map(|a| a.activation_height)
                 .max()
-                .ok_or("no activation height found")?,
-            _ => return Err(format!("cannot rollback in state: {}", self.state)),
+                .ok_or_else(|| {
+                    let err = "no activation height found".to_string();
+                    warn!("{}", err);
+                    err
+                })?,
+            _ => {
+                let err = format!("cannot rollback in state: {}", self.state);
+                warn!("{}", err);
+                return Err(err);
+            }
         };
 
         let snapshot = self
@@ -606,11 +617,22 @@ impl TransitionManager {
             .rev()
             .find(|&&h| h < activation_height)
             .copied()
-            .ok_or("no snapshot available before activation height")?;
+            .ok_or_else(|| {
+                let err = "no snapshot available before activation height".to_string();
+                warn!("{}", err);
+                err
+            })?;
 
         let from_pv = self.current_pv;
         let to_pv = version_for_height(snapshot, &self.activations);
 
+        info!(
+            from_pv,
+            to_pv,
+            snapshot,
+            reason,
+            "rolling back transition"
+        );
         self.history.push((self.current_height, self.state.clone()));
         self.state = TransitionState::RolledBack {
             from_pv,
@@ -624,11 +646,12 @@ impl TransitionManager {
         Ok(snapshot)
     }
 
-    /// Run pre-activation readiness checks.
+    /// Run pre‑activation readiness checks.
+    #[must_use]
     pub fn check_readiness(&self) -> ReadinessReport {
+        debug!("running readiness checks");
         let mut checks = Vec::new();
 
-        // Check 1: Binary supports target PV.
         let target_pv = match &self.state {
             TransitionState::Scheduled { target_pv, .. }
             | TransitionState::PreActivation { target_pv, .. } => Some(*target_pv),
@@ -643,21 +666,18 @@ impl TransitionManager {
             });
         }
 
-        // Check 2: Current PV is supported.
         checks.push(ReadinessCheck {
             name: "current_pv_supported".into(),
             passed: SUPPORTED_PROTOCOL_VERSIONS.contains(&self.current_pv),
             detail: format!("current PV={}", self.current_pv),
         });
 
-        // Check 3: Snapshot available for rollback.
         checks.push(ReadinessCheck {
             name: "snapshot_available".into(),
             passed: !self.snapshot_heights.is_empty(),
             detail: format!("{} snapshots registered", self.snapshot_heights.len()),
         });
 
-        // Check 4: Activation schedule is valid.
         let schedule_valid = self.activations.windows(2).all(|w| {
             let a = &w[0];
             let b = &w[1];
@@ -669,7 +689,6 @@ impl TransitionManager {
             detail: format!("{} activations defined", self.activations.len()),
         });
 
-        // Check 5: No pending migration.
         checks.push(ReadinessCheck {
             name: "no_pending_state".into(),
             passed: !matches!(
@@ -679,7 +698,13 @@ impl TransitionManager {
             detail: format!("current state: {}", self.state),
         });
 
-        ReadinessReport::from_checks(checks)
+        let report = ReadinessReport::from_checks(checks);
+        if report.ready {
+            info!("readiness check passed");
+        } else {
+            warn!("readiness check failed");
+        }
+        report
     }
 
     /// Validate that a block's PV is correct for the given height.
@@ -688,6 +713,7 @@ impl TransitionManager {
     }
 
     /// Get a summary of the transition manager's state.
+    #[must_use]
     pub fn summary(&self) -> TransitionSummary {
         TransitionSummary {
             current_height: self.current_height,
@@ -700,6 +726,10 @@ impl TransitionManager {
     }
 }
 
+// -----------------------------------------------------------------------------
+// TransitionSummary
+// -----------------------------------------------------------------------------
+
 /// Summary of the transition manager state (for RPC / metrics).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionSummary {
@@ -711,7 +741,9 @@ pub struct TransitionSummary {
     pub pending_events: usize,
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -750,8 +782,7 @@ mod tests {
     #[test]
     fn test_initial_state_scheduled() {
         let mgr = TransitionManager::new(upgrade_activations(), 1);
-        // Height 1 with activation at 100: should be Scheduled (>1000 blocks away? No, 99 blocks)
-        // 99 < PRE_ACTIVATION_WINDOW(1000), so PreActivation
+        // Height 1 with activation at 100: blocks_remaining = 99 < PRE_ACTIVATION_WINDOW (1000) → PreActivation
         assert!(matches!(mgr.state(), TransitionState::PreActivation { .. }));
     }
 
@@ -770,10 +801,8 @@ mod tests {
             },
         ];
         let mut mgr = TransitionManager::new(activations, 1);
-        // At height 1, activation at 2000: Scheduled (1999 > 1000)
         assert!(matches!(mgr.state(), TransitionState::Scheduled { .. }));
 
-        // Advance to pre-activation window
         mgr.on_block(1001);
         assert!(matches!(mgr.state(), TransitionState::PreActivation { .. }));
     }
@@ -807,8 +836,7 @@ mod tests {
 
     #[test]
     fn test_cancel_invalid_state() {
-        let mgr_activations = basic_activations();
-        let mut mgr = TransitionManager::new(mgr_activations, 50);
+        let mut mgr = TransitionManager::new(basic_activations(), 50);
         assert!(mgr.cancel("test").is_err());
     }
 
@@ -818,12 +846,10 @@ mod tests {
         mgr.register_snapshot(40);
 
         let report = mgr.check_readiness();
-        // current_pv_supported should pass
         assert!(report
             .checks
             .iter()
             .any(|c| c.name == "current_pv_supported" && c.passed));
-        // snapshot_available should pass
         assert!(report
             .checks
             .iter()
@@ -864,7 +890,6 @@ mod tests {
         let mut mgr = TransitionManager::new(activations, 1);
         assert!(mgr.history().is_empty());
 
-        // Advance to pre-activation
         mgr.on_block(1001);
         assert!(!mgr.history().is_empty());
     }
