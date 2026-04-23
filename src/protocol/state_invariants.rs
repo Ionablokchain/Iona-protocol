@@ -16,30 +16,51 @@
 //! | ST-6 | Timestamp monotonic     | Block timestamp never decreases                       |
 //! | ST-7 | Tx uniqueness           | No duplicate tx_hash within the same block            |
 //! | ST-8 | Gas accounting          | Sum of per-tx gas == block header gas_used             |
+//!
+//! # Example
+//!
+//! ```
+//! use iona::protocol::state_invariants::{check_block_invariants, InvariantReport};
+//! use iona::types::Block;
+//!
+//! let block = Block { /* ... */ };
+//! let report = check_block_invariants(&block, 1, 1000, &[]);
+//! assert!(report.all_passed);
+//! ```
 
 use crate::types::{tx_hash, Block, Hash32, Height, Receipt};
 use std::collections::BTreeMap;
+use tracing::{debug, info, warn};
 
-// ─── ST-1: Balance non-negative ─────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// ST-1: Balance non-negative
+// -----------------------------------------------------------------------------
 
 /// Verify no account has a negative balance (impossible with u64, but guards
 /// against saturating_sub masking logic bugs).
+#[must_use]
 pub fn check_balances_non_negative(balances: &BTreeMap<String, u64>) -> Result<(), String> {
     // With u64 this is structurally guaranteed; this check exists as a
     // documentation anchor and for potential future i128 migration.
     for (addr, &bal) in balances {
         if bal == u64::MAX {
-            return Err(format!(
+            let err = format!(
                 "ST-1 WARNING: account {addr} has MAX balance ({bal}), likely overflow"
-            ));
+            );
+            warn!("{}", err);
+            return Err(err);
         }
     }
+    debug!(count = balances.len(), "ST-1 passed (all balances normal)");
     Ok(())
 }
 
-// ─── ST-2: Nonce monotonic ──────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// ST-2: Nonce monotonic
+// -----------------------------------------------------------------------------
 
 /// Verify that nonces only increase between two snapshots.
+#[must_use]
 pub fn check_nonces_monotonic(
     before: &BTreeMap<String, u64>,
     after: &BTreeMap<String, u64>,
@@ -47,15 +68,24 @@ pub fn check_nonces_monotonic(
     for (addr, &new_nonce) in after {
         let old_nonce = before.get(addr).copied().unwrap_or(0);
         if new_nonce < old_nonce {
-            return Err(format!(
+            let err = format!(
                 "ST-2 VIOLATION: nonce for {addr} decreased from {old_nonce} to {new_nonce}"
-            ));
+            );
+            warn!("{}", err);
+            return Err(err);
         }
     }
+    debug!(
+        before_len = before.len(),
+        after_len = after.len(),
+        "ST-2 passed (nonces monotonic)"
+    );
     Ok(())
 }
 
-// ─── ST-3: Supply conservation ──────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// ST-3: Supply conservation
+// -----------------------------------------------------------------------------
 
 /// Parameters for supply conservation check.
 #[derive(Debug, Clone)]
@@ -66,6 +96,7 @@ pub struct SupplyDelta {
 }
 
 /// Check that total token supply is conserved across a state transition.
+#[must_use]
 pub fn check_supply_conservation(
     balances_before: &BTreeMap<String, u64>,
     balances_after: &BTreeMap<String, u64>,
@@ -84,104 +115,163 @@ pub fn check_supply_conservation(
         .saturating_sub(delta.burned_delta as u128);
 
     if sum_after != expected {
-        return Err(format!(
+        let diff = (sum_after as i128) - (expected as i128);
+        let err = format!(
             "ST-3 VIOLATION: supply not conserved. before={sum_before} + minted={} \
-             - slashed={} - burned={} = expected {expected}, got {sum_after} (diff={})",
-            delta.minted,
-            delta.slashed,
-            delta.burned_delta,
-            (sum_after as i128) - (expected as i128)
-        ));
+             - slashed={} - burned={} = expected {expected}, got {sum_after} (diff={diff})",
+            delta.minted, delta.slashed, delta.burned_delta
+        );
+        warn!("{}", err);
+        return Err(err);
     }
+
+    debug!(
+        sum_before,
+        sum_after,
+        minted = delta.minted,
+        slashed = delta.slashed,
+        burned = delta.burned_delta,
+        "ST-3 passed (supply conserved)"
+    );
     Ok(())
 }
 
-// ─── ST-4: State root determinism ───────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// ST-4: State root determinism
+// -----------------------------------------------------------------------------
 
 /// Verify that computing the state root twice yields the same result.
+#[must_use]
 pub fn check_state_root_determinism(state: &crate::execution::KvState) -> Result<Hash32, String> {
     let r1 = state.root();
     let r2 = state.root();
     if r1 != r2 {
-        return Err(format!(
+        let err = format!(
             "ST-4 VIOLATION: state root not deterministic: {} vs {}",
             hex::encode(r1.0),
             hex::encode(r2.0),
-        ));
+        );
+        warn!("{}", err);
+        return Err(err);
     }
+    debug!("ST-4 passed (state root deterministic)");
     Ok(r1)
 }
 
-// ─── ST-5: Height monotonic ─────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// ST-5: Height monotonic
+// -----------------------------------------------------------------------------
 
 /// Verify that the new block height strictly follows the previous height.
+#[must_use]
 pub fn check_height_monotonic(prev_height: Height, new_height: Height) -> Result<(), String> {
     if new_height <= prev_height {
-        return Err(format!(
+        let err = format!(
             "ST-5 VIOLATION: height did not increase: prev={prev_height}, new={new_height}"
-        ));
+        );
+        warn!("{}", err);
+        return Err(err);
     }
+    debug!(
+        prev = prev_height,
+        new = new_height,
+        "ST-5 passed (height increased)"
+    );
     Ok(())
 }
 
-// ─── ST-6: Timestamp monotonic ──────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// ST-6: Timestamp monotonic
+// -----------------------------------------------------------------------------
 
 /// Verify that the block timestamp does not decrease.
+#[must_use]
 pub fn check_timestamp_monotonic(prev_timestamp: u64, new_timestamp: u64) -> Result<(), String> {
     if new_timestamp < prev_timestamp {
-        return Err(format!(
+        let err = format!(
             "ST-6 VIOLATION: timestamp decreased from {prev_timestamp} to {new_timestamp}"
-        ));
+        );
+        warn!("{}", err);
+        return Err(err);
     }
+    debug!(
+        prev = prev_timestamp,
+        new = new_timestamp,
+        "ST-6 passed (timestamp monotonic)"
+    );
     Ok(())
 }
 
-// ─── ST-7: Tx uniqueness ────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// ST-7: Tx uniqueness
+// -----------------------------------------------------------------------------
 
 /// Verify that no two transactions in the block share the same hash.
+#[must_use]
 pub fn check_tx_uniqueness(block: &Block) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
     for tx in &block.txs {
         let h = tx_hash(tx);
         let h_hex = hex::encode(h.0);
         if !seen.insert(h) {
-            return Err(format!(
+            let err = format!(
                 "ST-7 VIOLATION: duplicate tx_hash {} in block at height {}",
                 h_hex, block.header.height,
-            ));
+            );
+            warn!("{}", err);
+            return Err(err);
         }
     }
+    debug!(
+        height = block.header.height,
+        txs = block.txs.len(),
+        "ST-7 passed (all tx hashes unique)"
+    );
     Ok(())
 }
 
-// ─── ST-8: Gas accounting ───────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// ST-8: Gas accounting
+// -----------------------------------------------------------------------------
 
 /// Verify that the sum of per-tx gas matches the block header's gas_used.
+#[must_use]
 pub fn check_gas_accounting(header_gas_used: u64, receipts: &[Receipt]) -> Result<(), String> {
     let sum: u64 = receipts.iter().map(|r| r.gas_used).sum();
     if sum != header_gas_used {
-        return Err(format!(
+        let err = format!(
             "ST-8 VIOLATION: header gas_used={header_gas_used} but sum(receipt.gas_used)={sum}"
-        ));
+        );
+        warn!("{}", err);
+        return Err(err);
     }
+    debug!(
+        header_gas_used,
+        sum,
+        receipts_len = receipts.len(),
+        "ST-8 passed (gas accounting correct)"
+    );
     Ok(())
 }
 
-// ─── Aggregate check ────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Aggregate reports
+// -----------------------------------------------------------------------------
 
-/// Result of running all state transition invariant checks.
-#[derive(Debug, Clone)]
-pub struct InvariantReport {
-    pub checks: Vec<InvariantCheck>,
-    pub all_passed: bool,
-}
-
+/// Result of a single invariant check.
 #[derive(Debug, Clone)]
 pub struct InvariantCheck {
     pub id: String,
     pub name: String,
     pub passed: bool,
     pub detail: String,
+}
+
+/// Result of running all state transition invariant checks.
+#[derive(Debug, Clone)]
+pub struct InvariantReport {
+    pub checks: Vec<InvariantCheck>,
+    pub all_passed: bool,
 }
 
 impl std::fmt::Display for InvariantReport {
@@ -203,7 +293,8 @@ impl std::fmt::Display for InvariantReport {
     }
 }
 
-/// Run a subset of invariants that can be checked with minimal context.
+/// Run a subset of invariants that can be checked with minimal context (block‑level checks).
+#[must_use]
 pub fn check_block_invariants(
     block: &Block,
     prev_height: Height,
@@ -212,57 +303,136 @@ pub fn check_block_invariants(
 ) -> InvariantReport {
     let mut checks = Vec::new();
 
-    // ST-5: Height monotonic
-    let h = check_height_monotonic(prev_height, block.header.height);
+    // ST-5
+    let r = check_height_monotonic(prev_height, block.header.height);
     checks.push(InvariantCheck {
         id: "ST-5".into(),
         name: "Height monotonic".into(),
-        passed: h.is_ok(),
-        detail: h
-            .err()
-            .unwrap_or_else(|| "height strictly increasing".into()),
+        passed: r.is_ok(),
+        detail: r.err().unwrap_or_else(|| "height strictly increasing".into()),
     });
 
-    // ST-6: Timestamp monotonic
-    let t = check_timestamp_monotonic(prev_timestamp, block.header.timestamp);
+    // ST-6
+    let r = check_timestamp_monotonic(prev_timestamp, block.header.timestamp);
     checks.push(InvariantCheck {
         id: "ST-6".into(),
         name: "Timestamp monotonic".into(),
-        passed: t.is_ok(),
-        detail: t.err().unwrap_or_else(|| "timestamp non-decreasing".into()),
+        passed: r.is_ok(),
+        detail: r.err().unwrap_or_else(|| "timestamp non-decreasing".into()),
     });
 
-    // ST-7: Tx uniqueness
-    let u = check_tx_uniqueness(block);
+    // ST-7
+    let r = check_tx_uniqueness(block);
     checks.push(InvariantCheck {
         id: "ST-7".into(),
         name: "Tx uniqueness".into(),
-        passed: u.is_ok(),
-        detail: u
-            .err()
-            .unwrap_or_else(|| format!("{} unique txs", block.txs.len())),
+        passed: r.is_ok(),
+        detail: r.err().unwrap_or_else(|| format!("{} unique txs", block.txs.len())),
     });
 
-    // ST-8: Gas accounting
-    let g = check_gas_accounting(block.header.gas_used, receipts);
+    // ST-8
+    let r = check_gas_accounting(block.header.gas_used, receipts);
     checks.push(InvariantCheck {
         id: "ST-8".into(),
         name: "Gas accounting".into(),
-        passed: g.is_ok(),
-        detail: g
-            .err()
-            .unwrap_or_else(|| format!("gas_used={}", block.header.gas_used)),
+        passed: r.is_ok(),
+        detail: r.err().unwrap_or_else(|| format!("gas_used={}", block.header.gas_used)),
     });
 
     let all_passed = checks.iter().all(|c| c.passed);
+    if all_passed {
+        info!("All block invariants passed at height {}", block.header.height);
+    } else {
+        warn!("Block invariants failed at height {}", block.header.height);
+    }
+
     InvariantReport { checks, all_passed }
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+/// Run all state transition invariants (requires full state snapshots).
+#[must_use]
+pub fn check_all_state_invariants(
+    balances_before: &BTreeMap<String, u64>,
+    balances_after: &BTreeMap<String, u64>,
+    nonces_before: &BTreeMap<String, u64>,
+    nonces_after: &BTreeMap<String, u64>,
+    staked_before: u64,
+    staked_after: u64,
+    delta: &SupplyDelta,
+    state: &crate::execution::KvState,
+    block: &Block,
+    prev_height: Height,
+    prev_timestamp: u64,
+    receipts: &[Receipt],
+) -> InvariantReport {
+    let mut checks = Vec::new();
+
+    // ST-1
+    let r = check_balances_non_negative(balances_after);
+    checks.push(InvariantCheck {
+        id: "ST-1".into(),
+        name: "Balance non‑negative".into(),
+        passed: r.is_ok(),
+        detail: r.err().unwrap_or_else(|| "all balances in normal range".into()),
+    });
+
+    // ST-2
+    let r = check_nonces_monotonic(nonces_before, nonces_after);
+    checks.push(InvariantCheck {
+        id: "ST-2".into(),
+        name: "Nonce monotonic".into(),
+        passed: r.is_ok(),
+        detail: r.err().unwrap_or_else(|| "nonces increased or stayed".into()),
+    });
+
+    // ST-3
+    let r = check_supply_conservation(
+        balances_before, balances_after,
+        staked_before, staked_after, delta,
+    );
+    checks.push(InvariantCheck {
+        id: "ST-3".into(),
+        name: "Supply conservation".into(),
+        passed: r.is_ok(),
+        detail: r.err().unwrap_or_else(|| "total supply conserved".into()),
+    });
+
+    // ST-4
+    let r = check_state_root_determinism(state);
+    checks.push(InvariantCheck {
+        id: "ST-4".into(),
+        name: "State root determinism".into(),
+        passed: r.is_ok(),
+        detail: if r.is_ok() {
+            format!("root = {}", hex::encode(r.unwrap().0))
+        } else {
+            r.err().unwrap()
+        },
+    });
+
+    // ST-5...ST-8 (block invariants)
+    let block_report = check_block_invariants(block, prev_height, prev_timestamp, receipts);
+    checks.extend(block_report.checks);
+
+    let all_passed = checks.iter().all(|c| c.passed);
+    if all_passed {
+        info!("All state invariants passed");
+    } else {
+        warn!("Some state invariants failed");
+    }
+
+    InvariantReport { checks, all_passed }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::KvState;
+    use crate::types::{Block, BlockHeader, Hash32, Receipt};
 
     #[test]
     fn test_balances_non_negative_ok() {
@@ -338,7 +508,7 @@ mod tests {
         before.insert("alice".into(), 1000u64);
 
         let mut after = BTreeMap::new();
-        after.insert("alice".into(), 2000u64); // appeared from nowhere
+        after.insert("alice".into(), 2000u64);
 
         let delta = SupplyDelta {
             minted: 0,
@@ -350,7 +520,7 @@ mod tests {
 
     #[test]
     fn test_state_root_determinism() {
-        let mut state = crate::execution::KvState::default();
+        let mut state = KvState::default();
         state.balances.insert("alice".into(), 1000);
         state.kv.insert("k".into(), "v".into());
         assert!(check_state_root_determinism(&state).is_ok());
@@ -435,8 +605,6 @@ mod tests {
 
     #[test]
     fn test_block_invariants_report() {
-        use crate::types::{Block, BlockHeader};
-
         let block = Block {
             header: BlockHeader {
                 height: 2,
@@ -476,5 +644,52 @@ mod tests {
         };
         let s = format!("{report}");
         assert!(s.contains("ALL PASSED"));
+    }
+
+    #[test]
+    fn test_check_all_state_invariants() {
+        let mut balances_before = BTreeMap::new();
+        balances_before.insert("alice".into(), 1000);
+        let mut balances_after = BTreeMap::new();
+        balances_after.insert("alice".into(), 1010);
+        let nonces_before = BTreeMap::new();
+        let nonces_after = BTreeMap::new();
+        let delta = SupplyDelta {
+            minted: 10,
+            slashed: 0,
+            burned_delta: 0,
+        };
+        let state = KvState::default();
+        let block = Block {
+            header: BlockHeader {
+                height: 2,
+                round: 0,
+                prev: Hash32::zero(),
+                proposer_pk: vec![0u8; 32],
+                tx_root: Hash32::zero(),
+                receipts_root: Hash32::zero(),
+                state_root: Hash32::zero(),
+                base_fee_per_gas: 1,
+                gas_used: 0,
+                intrinsic_gas_used: 0,
+                exec_gas_used: 0,
+                vm_gas_used: 0,
+                evm_gas_used: 0,
+                chain_id: 6126151,
+                timestamp: 2000,
+                protocol_version: 1,
+            },
+            txs: vec![],
+        };
+        let report = check_all_state_invariants(
+            &balances_before, &balances_after,
+            &nonces_before, &nonces_after,
+            0, 0, &delta,
+            &state,
+            &block,
+            1, 1000,
+            &[],
+        );
+        assert!(report.all_passed, "report: {report}");
     }
 }
