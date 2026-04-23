@@ -16,11 +16,28 @@
 //! | UC-6  | Migration path exists    | SV migration path must be contiguous              |
 //! | UC-7  | No concurrent upgrades   | Only one PV upgrade active at a time              |
 //! | UC-8  | Quorum before activation | Sufficient nodes must be upgraded before activation|
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use iona::protocol::upgrade_constraints::{ConstraintChecker, can_upgrade};
+//!
+//! let checker = ConstraintChecker::new(activations, current_height, current_sv);
+//! let report = checker.check_upgrade(2, 5, Some(1000), 100);
+//! if !report.can_upgrade {
+//!     eprintln!("{}", report);
+//! }
+//! ```
 
 use crate::protocol::version::{
     ProtocolActivation, CURRENT_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use crate::storage::CURRENT_SCHEMA_VERSION;
+use tracing::{debug, info, warn};
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
 
 /// Minimum grace window for any activation (blocks).
 pub const MIN_GRACE_BLOCKS: u64 = 100;
@@ -28,7 +45,9 @@ pub const MIN_GRACE_BLOCKS: u64 = 100;
 /// Maximum PV gap allowed in a single upgrade step.
 pub const MAX_PV_GAP: u32 = 1;
 
-// ─── Constraint check result ────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Constraint result structures
+// -----------------------------------------------------------------------------
 
 /// Result of a single upgrade constraint check.
 #[derive(Debug, Clone)]
@@ -49,6 +68,8 @@ pub struct ConstraintReport {
 }
 
 impl ConstraintReport {
+    /// Create a report from a list of results.
+    #[must_use]
     pub fn from_results(results: Vec<ConstraintResult>) -> Self {
         let can_upgrade = results.iter().filter(|r| r.hard).all(|r| r.passed);
         Self {
@@ -58,6 +79,7 @@ impl ConstraintReport {
     }
 
     /// Get only failed hard constraints.
+    #[must_use]
     pub fn blockers(&self) -> Vec<&ConstraintResult> {
         self.results
             .iter()
@@ -66,6 +88,7 @@ impl ConstraintReport {
     }
 
     /// Get soft warnings.
+    #[must_use]
     pub fn warnings(&self) -> Vec<&ConstraintResult> {
         self.results
             .iter()
@@ -99,20 +122,28 @@ impl std::fmt::Display for ConstraintReport {
     }
 }
 
-// ─── Constraint checker ─────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// ConstraintChecker
+// -----------------------------------------------------------------------------
 
 /// Upgrade compatibility constraint checker.
+#[derive(Debug)]
 pub struct ConstraintChecker {
-    /// Current activation schedule.
     activations: Vec<ProtocolActivation>,
-    /// Current chain height.
     current_height: u64,
-    /// Current schema version on disk.
     current_sv: u32,
 }
 
 impl ConstraintChecker {
+    /// Create a new constraint checker.
+    #[must_use]
     pub fn new(activations: Vec<ProtocolActivation>, current_height: u64, current_sv: u32) -> Self {
+        debug!(
+            current_height,
+            current_sv,
+            activations_len = activations.len(),
+            "constraint checker created"
+        );
         Self {
             activations,
             current_height,
@@ -121,6 +152,7 @@ impl ConstraintChecker {
     }
 
     /// Check all constraints for a proposed upgrade.
+    #[must_use]
     pub fn check_upgrade(
         &self,
         target_pv: u32,
@@ -139,53 +171,97 @@ impl ConstraintChecker {
         results.push(self.check_no_concurrent(target_pv));
         results.push(self.check_quorum_readiness());
 
-        ConstraintReport::from_results(results)
+        let report = ConstraintReport::from_results(results);
+        if report.can_upgrade {
+            info!(
+                target_pv,
+                target_sv,
+                activation_height = ?activation_height,
+                "upgrade constraints satisfied"
+            );
+        } else {
+            warn!(
+                target_pv,
+                target_sv,
+                activation_height = ?activation_height,
+                "upgrade constraints failed"
+            );
+        }
+        report
     }
 
-    // ── UC-1: PV gap limit ──────────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // UC-1: PV gap limit
+    // -------------------------------------------------------------------------
 
     fn check_pv_gap(&self, target_pv: u32) -> ConstraintResult {
         let current = CURRENT_PROTOCOL_VERSION;
         let gap = target_pv.saturating_sub(current);
 
+        let passed = gap <= MAX_PV_GAP;
+        let detail = format!(
+            "current PV={current}, target PV={target_pv}, gap={gap} (max={MAX_PV_GAP})"
+        );
+        if !passed {
+            warn!("UC-1 failed: {}", detail);
+        } else {
+            debug!("UC-1: {}", detail);
+        }
+
         ConstraintResult {
             id: "UC-1".into(),
             name: "PV gap limit".into(),
-            passed: gap <= MAX_PV_GAP,
-            detail: format!(
-                "current PV={current}, target PV={target_pv}, gap={gap} (max={MAX_PV_GAP})"
-            ),
+            passed,
+            detail,
             hard: true,
         }
     }
 
-    // ── UC-2: SV forward-only ───────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // UC-2: SV forward-only
+    // -------------------------------------------------------------------------
 
     fn check_sv_forward(&self, target_sv: u32) -> ConstraintResult {
+        let passed = target_sv >= self.current_sv;
+        let detail = format!("current SV={}, target SV={target_sv}", self.current_sv);
+        if !passed {
+            warn!("UC-2 failed: {}", detail);
+        } else {
+            debug!("UC-2: {}", detail);
+        }
+
         ConstraintResult {
             id: "UC-2".into(),
             name: "SV forward-only".into(),
-            passed: target_sv >= self.current_sv,
-            detail: format!("current SV={}, target SV={target_sv}", self.current_sv),
+            passed,
+            detail,
             hard: true,
         }
     }
 
-    // ── UC-3: Activation height future ──────────────────────────────────
+    // -------------------------------------------------------------------------
+    // UC-3: Activation height future
+    // -------------------------------------------------------------------------
 
     fn check_activation_future(&self, activation_height: Option<u64>) -> ConstraintResult {
         match activation_height {
             Some(ah) => {
                 let in_future = ah > self.current_height;
+                let detail = format!(
+                    "activation_height={ah}, current_height={} ({})",
+                    self.current_height,
+                    if in_future { "in future" } else { "in past!" }
+                );
+                if !in_future {
+                    warn!("UC-3 failed: {}", detail);
+                } else {
+                    debug!("UC-3: {}", detail);
+                }
                 ConstraintResult {
                     id: "UC-3".into(),
                     name: "Activation height future".into(),
                     passed: in_future,
-                    detail: format!(
-                        "activation_height={ah}, current_height={} ({})",
-                        self.current_height,
-                        if in_future { "in future" } else { "in past!" }
-                    ),
+                    detail,
                     hard: true,
                 }
             }
@@ -199,7 +275,9 @@ impl ConstraintChecker {
         }
     }
 
-    // ── UC-4: Grace window minimum ──────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // UC-4: Grace window minimum
+    // -------------------------------------------------------------------------
 
     fn check_grace_minimum(&self, grace_blocks: u64, target_pv: u32) -> ConstraintResult {
         // Only enforce minimum grace for PV upgrades (not rolling/minor).
@@ -213,63 +291,87 @@ impl ConstraintChecker {
             };
         }
 
+        let passed = grace_blocks >= MIN_GRACE_BLOCKS;
+        let detail = format!("grace_blocks={grace_blocks} (min={MIN_GRACE_BLOCKS})");
+        if !passed {
+            warn!("UC-4: {}", detail);
+        } else {
+            debug!("UC-4: {}", detail);
+        }
+
         ConstraintResult {
             id: "UC-4".into(),
             name: "Grace window minimum".into(),
-            passed: grace_blocks >= MIN_GRACE_BLOCKS,
-            detail: format!("grace_blocks={grace_blocks} (min={MIN_GRACE_BLOCKS})"),
+            passed,
+            detail,
             hard: false, // Advisory; some testnets may use zero grace.
         }
     }
 
-    // ── UC-5: Binary supports target PV ─────────────────────────────────
+    // -------------------------------------------------------------------------
+    // UC-5: Binary supports target PV
+    // -------------------------------------------------------------------------
 
     fn check_binary_supports(&self, target_pv: u32) -> ConstraintResult {
         let supported = SUPPORTED_PROTOCOL_VERSIONS.contains(&target_pv);
+        let detail = format!(
+            "target PV={target_pv}, supported={:?}",
+            SUPPORTED_PROTOCOL_VERSIONS
+        );
+        if !supported {
+            warn!("UC-5 failed: {}", detail);
+        } else {
+            debug!("UC-5: {}", detail);
+        }
+
         ConstraintResult {
             id: "UC-5".into(),
             name: "Binary supports target PV".into(),
             passed: supported,
-            detail: format!(
-                "target PV={target_pv}, supported={:?}",
-                SUPPORTED_PROTOCOL_VERSIONS
-            ),
+            detail,
             hard: true,
         }
     }
 
-    // ── UC-6: Migration path exists ─────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // UC-6: Migration path exists
+    // -------------------------------------------------------------------------
 
     fn check_migration_path(&self, target_sv: u32) -> ConstraintResult {
-        // Check that we have migrations for every step from current to target.
         let migrations = &crate::storage::migrations::MIGRATIONS;
         let mut covered = self.current_sv;
 
-        for &(from_v, _, _) in migrations.iter() {
-            if from_v == covered {
+        for e in migrations.iter() {
+            if e.from_version == covered {
                 covered += 1;
             }
         }
 
-        // Legacy migrations cover v0..v3, new registry covers v3+.
         let fully_covered = covered >= target_sv || target_sv <= self.current_sv;
+        let detail = format!(
+            "current SV={}, target SV={target_sv}, migrations cover up to SV={covered}",
+            self.current_sv
+        );
+        if !fully_covered {
+            warn!("UC-6 failed: {}", detail);
+        } else {
+            debug!("UC-6: {}", detail);
+        }
 
         ConstraintResult {
             id: "UC-6".into(),
             name: "Migration path exists".into(),
             passed: fully_covered,
-            detail: format!(
-                "current SV={}, target SV={target_sv}, migrations cover up to SV={covered}",
-                self.current_sv
-            ),
+            detail,
             hard: true,
         }
     }
 
-    // ── UC-7: No concurrent upgrades ────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // UC-7: No concurrent upgrades
+    // -------------------------------------------------------------------------
 
     fn check_no_concurrent(&self, target_pv: u32) -> ConstraintResult {
-        // Check that no other activation is currently in progress.
         let in_progress = self.activations.iter().any(|a| {
             a.activation_height
                 .map(|ah| {
@@ -281,20 +383,29 @@ impl ConstraintChecker {
                 .unwrap_or(false)
         });
 
+        let detail = if in_progress {
+            "another upgrade is currently in grace window".into()
+        } else {
+            "no concurrent upgrades detected".into()
+        };
+        if in_progress {
+            warn!("UC-7 failed: {}", detail);
+        } else {
+            debug!("UC-7: {}", detail);
+        }
+
         ConstraintResult {
             id: "UC-7".into(),
             name: "No concurrent upgrades".into(),
             passed: !in_progress,
-            detail: if in_progress {
-                "another upgrade is currently in grace window".into()
-            } else {
-                "no concurrent upgrades detected".into()
-            },
+            detail,
             hard: true,
         }
     }
 
-    // ── UC-8: Quorum readiness ──────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // UC-8: Quorum readiness
+    // -------------------------------------------------------------------------
 
     fn check_quorum_readiness(&self) -> ConstraintResult {
         // This is a runtime check that requires peer information.
@@ -302,7 +413,7 @@ impl ConstraintChecker {
         ConstraintResult {
             id: "UC-8".into(),
             name: "Quorum readiness".into(),
-            passed: true, // Local readiness confirmed; runtime check needed for network.
+            passed: true,
             detail: format!(
                 "local binary: PV={CURRENT_PROTOCOL_VERSION}, SV={CURRENT_SCHEMA_VERSION} (ready)"
             ),
@@ -311,9 +422,12 @@ impl ConstraintChecker {
     }
 }
 
-// ─── Convenience ────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Convenience function
+// -----------------------------------------------------------------------------
 
 /// Quick check: can we upgrade to the given PV/SV from current state?
+#[must_use]
 pub fn can_upgrade(
     target_pv: u32,
     target_sv: u32,
@@ -322,14 +436,15 @@ pub fn can_upgrade(
     current_height: u64,
     activations: &[ProtocolActivation],
 ) -> bool {
-    let checker =
-        ConstraintChecker::new(activations.to_vec(), current_height, CURRENT_SCHEMA_VERSION);
+    let checker = ConstraintChecker::new(activations.to_vec(), current_height, CURRENT_SCHEMA_VERSION);
     checker
         .check_upgrade(target_pv, target_sv, activation_height, grace_blocks)
         .can_upgrade
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -350,7 +465,6 @@ mod tests {
     #[test]
     fn test_pv_gap_too_large() {
         let c = checker(100);
-        // PV 1 -> 5: gap of 4, max is 1
         let report = c.check_upgrade(5, CURRENT_SCHEMA_VERSION, Some(200), 1000);
         assert!(!report.can_upgrade);
         let blockers: Vec<_> = report.blockers();
@@ -360,7 +474,6 @@ mod tests {
     #[test]
     fn test_sv_backward_rejected() {
         let c = checker(100);
-        // Target SV < current SV
         let report = c.check_upgrade(1, 1, None, 0);
         assert!(!report.can_upgrade);
         let blockers: Vec<_> = report.blockers();
@@ -379,7 +492,6 @@ mod tests {
     #[test]
     fn test_unsupported_pv_rejected() {
         let c = checker(100);
-        // PV 99 is not in SUPPORTED_PROTOCOL_VERSIONS
         let report = c.check_upgrade(99, CURRENT_SCHEMA_VERSION, Some(200), 1000);
         assert!(!report.can_upgrade);
         let blockers: Vec<_> = report.blockers();
@@ -390,10 +502,8 @@ mod tests {
     fn test_grace_warning() {
         let c = checker(100);
         // PV upgrade with grace < MIN_GRACE_BLOCKS
-        // Note: PV must be > current AND supported for this to trigger.
-        // PV=1 is current, so grace check says "not a PV upgrade".
+        // Note: PV=1 is current, so grace check says "not a PV upgrade".
         let report = c.check_upgrade(1, CURRENT_SCHEMA_VERSION, Some(200), 10);
-        // Grace is soft, should still allow upgrade.
         assert!(report.can_upgrade);
     }
 
@@ -435,9 +545,7 @@ mod tests {
             grace_blocks: 100,
         }];
         let c = ConstraintChecker::new(activations, 80, CURRENT_SCHEMA_VERSION);
-        // Try to start another upgrade while first is in grace.
         let report = c.check_upgrade(1, CURRENT_SCHEMA_VERSION, Some(200), 100);
-        // UC-7 checks for *different* PV in progress; same PV is ok.
         assert!(report.can_upgrade);
     }
 }
