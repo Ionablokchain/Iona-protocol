@@ -327,6 +327,381 @@ pub fn dry_run_migrations(data_dir: &Path) -> std::io::Result<bool> {
     Ok(all_ok)
 }
 
+// ── Migrations submodule ───────────────────────────────────────────────────
+
+pub mod migrations {
+    use super::*;
+    use std::fs::{self, File};
+    use std::io::{self, Write};
+    use std::path::PathBuf;
+
+    // Helper to read current schema version from a file.
+    fn read_schema_version(data_dir: &Path) -> io::Result<u32> {
+        let path = data_dir.join("schema_version");
+        if !path.exists() {
+            return Ok(0);
+        }
+        let content = fs::read_to_string(&path)?;
+        let v = content.trim().parse().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid schema version: {e}"),
+            )
+        })?;
+        Ok(v)
+    }
+
+    fn write_schema_version(data_dir: &Path, version: u32) -> io::Result<()> {
+        let path = data_dir.join("schema_version");
+        fs::write(&path, version.to_string())
+    }
+
+    // ------------------------------------------------------------------------
+    // M001: Add state VM field
+    // ------------------------------------------------------------------------
+    pub struct M001AddStateVmField;
+
+    impl Migration for M001AddStateVmField {
+        fn from_version(&self) -> u32 {
+            0
+        }
+
+        fn description(&self) -> &'static str {
+            "Add state VM field: creates state/vm_version with initial '1'"
+        }
+
+        fn apply(&self, data_dir: &Path, dry_run: bool) -> MigrationResult {
+            let current = match read_schema_version(data_dir) {
+                Ok(v) => v,
+                Err(e) => {
+                    return MigrationResult::Failed {
+                        from_version: self.from_version(),
+                        reason: format!("cannot read schema version: {e}"),
+                    }
+                }
+            };
+            if current != self.from_version() {
+                return MigrationResult::Skipped {
+                    from_version: self.from_version(),
+                };
+            }
+
+            let vm_version_path = data_dir.join("state").join("vm_version");
+            let changes = vec![format!("Create file: {}", vm_version_path.display())];
+
+            if dry_run {
+                return MigrationResult::Ok {
+                    from_version: self.from_version(),
+                    to_version: self.from_version() + 1,
+                    changes,
+                };
+            }
+
+            // Real apply
+            if let Some(parent) = vm_version_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| MigrationResult::Failed {
+                        from_version: self.from_version(),
+                        reason: format!("cannot create state directory: {e}"),
+                    })?;
+            }
+            fs::write(&vm_version_path, "1").map_err(|e| MigrationResult::Failed {
+                from_version: self.from_version(),
+                reason: format!("cannot write vm_version: {e}"),
+            })?;
+
+            write_schema_version(data_dir, self.from_version() + 1).map_err(|e| {
+                MigrationResult::Failed {
+                    from_version: self.from_version(),
+                    reason: format!("cannot update schema version: {e}"),
+                }
+            })?;
+
+            MigrationResult::Ok {
+                from_version: self.from_version(),
+                to_version: self.from_version() + 1,
+                changes,
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // M002: Add receipts index
+    // ------------------------------------------------------------------------
+    pub struct M002AddReceiptsIndex;
+
+    impl Migration for M002AddReceiptsIndex {
+        fn from_version(&self) -> u32 {
+            1
+        }
+
+        fn description(&self) -> &'static str {
+            "Add receipts index: creates receipts/index.json"
+        }
+
+        fn apply(&self, data_dir: &Path, dry_run: bool) -> MigrationResult {
+            let current = match read_schema_version(data_dir) {
+                Ok(v) => v,
+                Err(e) => {
+                    return MigrationResult::Failed {
+                        from_version: self.from_version(),
+                        reason: format!("cannot read schema version: {e}"),
+                    }
+                }
+            };
+            if current != self.from_version() {
+                return MigrationResult::Skipped {
+                    from_version: self.from_version(),
+                };
+            }
+
+            let index_path = data_dir.join("receipts").join("index.json");
+            let changes = vec![format!("Create file: {}", index_path.display())];
+
+            if dry_run {
+                return MigrationResult::Ok {
+                    from_version: self.from_version(),
+                    to_version: self.from_version() + 1,
+                    changes,
+                };
+            }
+
+            if let Some(parent) = index_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| MigrationResult::Failed {
+                        from_version: self.from_version(),
+                        reason: format!("cannot create receipts directory: {e}"),
+                    })?;
+            }
+            let initial_content = r#"{"version":1,"receipts":{}}"#;
+            fs::write(&index_path, initial_content).map_err(|e| MigrationResult::Failed {
+                from_version: self.from_version(),
+                reason: format!("cannot write index.json: {e}"),
+            })?;
+
+            write_schema_version(data_dir, self.from_version() + 1).map_err(|e| {
+                MigrationResult::Failed {
+                    from_version: self.from_version(),
+                    reason: format!("cannot update schema version: {e}"),
+                }
+            })?;
+
+            MigrationResult::Ok {
+                from_version: self.from_version(),
+                to_version: self.from_version() + 1,
+                changes,
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // M003: Add evidence store
+    // ------------------------------------------------------------------------
+    pub struct M003AddEvidenceStore;
+
+    impl Migration for M003AddEvidenceStore {
+        fn from_version(&self) -> u32 {
+            2
+        }
+
+        fn description(&self) -> &'static str {
+            "Add evidence store: creates evidence/manifest.json"
+        }
+
+        fn apply(&self, data_dir: &Path, dry_run: bool) -> MigrationResult {
+            let current = match read_schema_version(data_dir) {
+                Ok(v) => v,
+                Err(e) => {
+                    return MigrationResult::Failed {
+                        from_version: self.from_version(),
+                        reason: format!("cannot read schema version: {e}"),
+                    }
+                }
+            };
+            if current != self.from_version() {
+                return MigrationResult::Skipped {
+                    from_version: self.from_version(),
+                };
+            }
+
+            let manifest_path = data_dir.join("evidence").join("manifest.json");
+            let changes = vec![format!("Create file: {}", manifest_path.display())];
+
+            if dry_run {
+                return MigrationResult::Ok {
+                    from_version: self.from_version(),
+                    to_version: self.from_version() + 1,
+                    changes,
+                };
+            }
+
+            if let Some(parent) = manifest_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| MigrationResult::Failed {
+                        from_version: self.from_version(),
+                        reason: format!("cannot create evidence directory: {e}"),
+                    })?;
+            }
+            let content = r#"{"version":1,"evidence":[]}"#;
+            fs::write(&manifest_path, content).map_err(|e| MigrationResult::Failed {
+                from_version: self.from_version(),
+                reason: format!("cannot write manifest.json: {e}"),
+            })?;
+
+            write_schema_version(data_dir, self.from_version() + 1).map_err(|e| {
+                MigrationResult::Failed {
+                    from_version: self.from_version(),
+                    reason: format!("cannot update schema version: {e}"),
+                }
+            })?;
+
+            MigrationResult::Ok {
+                from_version: self.from_version(),
+                to_version: self.from_version() + 1,
+                changes,
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // M004: Add snapshot metadata
+    // ------------------------------------------------------------------------
+    pub struct M004AddSnapshotMeta;
+
+    impl Migration for M004AddSnapshotMeta {
+        fn from_version(&self) -> u32 {
+            3
+        }
+
+        fn description(&self) -> &'static str {
+            "Add snapshot metadata: creates snapshots/manifest.json"
+        }
+
+        fn apply(&self, data_dir: &Path, dry_run: bool) -> MigrationResult {
+            let current = match read_schema_version(data_dir) {
+                Ok(v) => v,
+                Err(e) => {
+                    return MigrationResult::Failed {
+                        from_version: self.from_version(),
+                        reason: format!("cannot read schema version: {e}"),
+                    }
+                }
+            };
+            if current != self.from_version() {
+                return MigrationResult::Skipped {
+                    from_version: self.from_version(),
+                };
+            }
+
+            let manifest_path = data_dir.join("snapshots").join("manifest.json");
+            let changes = vec![format!("Create file: {}", manifest_path.display())];
+
+            if dry_run {
+                return MigrationResult::Ok {
+                    from_version: self.from_version(),
+                    to_version: self.from_version() + 1,
+                    changes,
+                };
+            }
+
+            if let Some(parent) = manifest_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| MigrationResult::Failed {
+                        from_version: self.from_version(),
+                        reason: format!("cannot create snapshots directory: {e}"),
+                    })?;
+            }
+            let content = r#"{"version":1,"snapshots":[]}"#;
+            fs::write(&manifest_path, content).map_err(|e| MigrationResult::Failed {
+                from_version: self.from_version(),
+                reason: format!("cannot write manifest.json: {e}"),
+            })?;
+
+            write_schema_version(data_dir, self.from_version() + 1).map_err(|e| {
+                MigrationResult::Failed {
+                    from_version: self.from_version(),
+                    reason: format!("cannot update schema version: {e}"),
+                }
+            })?;
+
+            MigrationResult::Ok {
+                from_version: self.from_version(),
+                to_version: self.from_version() + 1,
+                changes,
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // M005: Add admin audit log
+    // ------------------------------------------------------------------------
+    pub struct M005AddAdminAuditLog;
+
+    impl Migration for M005AddAdminAuditLog {
+        fn from_version(&self) -> u32 {
+            4
+        }
+
+        fn description(&self) -> &'static str {
+            "Add admin audit log: creates admin_audit.log with header"
+        }
+
+        fn apply(&self, data_dir: &Path, dry_run: bool) -> MigrationResult {
+            let current = match read_schema_version(data_dir) {
+                Ok(v) => v,
+                Err(e) => {
+                    return MigrationResult::Failed {
+                        from_version: self.from_version(),
+                        reason: format!("cannot read schema version: {e}"),
+                    }
+                }
+            };
+            if current != self.from_version() {
+                return MigrationResult::Skipped {
+                    from_version: self.from_version(),
+                };
+            }
+
+            let log_path = data_dir.join("admin_audit.log");
+            let changes = vec![format!("Create file: {}", log_path.display())];
+
+            if dry_run {
+                return MigrationResult::Ok {
+                    from_version: self.from_version(),
+                    to_version: self.from_version() + 1,
+                    changes,
+                };
+            }
+
+            let mut file = File::create(&log_path).map_err(|e| MigrationResult::Failed {
+                from_version: self.from_version(),
+                reason: format!("cannot create audit log: {e}"),
+            })?;
+            writeln!(
+                file,
+                "# IONA Admin Audit Log\n# Format: timestamp|user|action|details"
+            )
+            .map_err(|e| MigrationResult::Failed {
+                from_version: self.from_version(),
+                reason: format!("cannot write audit log header: {e}"),
+            })?;
+
+            write_schema_version(data_dir, self.from_version() + 1).map_err(|e| {
+                MigrationResult::Failed {
+                    from_version: self.from_version(),
+                    reason: format!("cannot update schema version: {e}"),
+                }
+            })?;
+
+            MigrationResult::Ok {
+                from_version: self.from_version(),
+                to_version: self.from_version() + 1,
+                changes,
+            }
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -372,7 +747,9 @@ mod tests {
     fn dry_run_skips_already_applied() {
         let dir = TempDir::new().unwrap();
         let reg = MigrationRegistry::new();
-        // Simulate all 5 migrations already applied (current version = 5).
+        // Simulate all 5 migrations already applied by writing version file.
+        let version_path = dir.path().join("schema_version");
+        fs::write(version_path, "5").unwrap();
         let results = reg.run(dir.path(), 5, true);
         assert!(
             results
@@ -386,6 +763,7 @@ mod tests {
     fn dry_run_from_version_0_produces_ok_results() {
         let dir = TempDir::new().unwrap();
         let reg = MigrationRegistry::new();
+        // No schema_version file → version 0.
         let results = reg.run(dir.path(), 0, /* dry_run = */ true);
         assert!(!results.is_empty());
         for result in &results {
@@ -394,6 +772,36 @@ mod tests {
                 "dry-run migration must not fail on empty directory: {result}"
             );
         }
+        // Check that dry-run did not create any files.
+        assert!(!dir.path().join("state").exists());
+        assert!(!dir.path().join("receipts").exists());
+        assert!(!dir.path().join("evidence").exists());
+        assert!(!dir.path().join("snapshots").exists());
+        assert!(!dir.path().join("admin_audit.log").exists());
+        assert!(!dir.path().join("schema_version").exists());
+    }
+
+    #[test]
+    fn real_migration_updates_schema_version() {
+        let dir = TempDir::new().unwrap();
+        // Start from version 0.
+        let reg = MigrationRegistry::new();
+        let results = reg.run(dir.path(), 0, false);
+        assert_eq!(results.len(), 5);
+        for r in &results {
+            assert!(r.is_ok());
+        }
+        // Check schema version file was written to 5.
+        let version_path = dir.path().join("schema_version");
+        assert!(version_path.exists());
+        let content = fs::read_to_string(version_path).unwrap();
+        assert_eq!(content.trim(), "5");
+        // Check all directories and files exist.
+        assert!(dir.path().join("state/vm_version").exists());
+        assert!(dir.path().join("receipts/index.json").exists());
+        assert!(dir.path().join("evidence/manifest.json").exists());
+        assert!(dir.path().join("snapshots/manifest.json").exists());
+        assert!(dir.path().join("admin_audit.log").exists());
     }
 
     #[test]
