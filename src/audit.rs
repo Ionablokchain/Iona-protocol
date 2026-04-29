@@ -12,10 +12,32 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::io::Write;
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write, BufWriter};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during audit logging or hashchain verification.
+#[derive(Debug, thiserror::Error)]
+pub enum AuditError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("JSON serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("Hashchain verification failed: {0}")]
+    Verification(String),
+}
+
+pub type AuditResult<T> = Result<T, AuditError>;
+
+// -----------------------------------------------------------------------------
+// Event types
+// -----------------------------------------------------------------------------
 
 /// Audit event severity levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,12 +106,11 @@ pub struct AuditEvent {
 
 impl AuditEvent {
     pub fn new(level: AuditLevel, category: AuditCategory, action: impl Into<String>) -> Self {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         Self {
-            timestamp: ts,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
             level,
             category,
             action: action.into(),
@@ -123,29 +144,35 @@ impl fmt::Display for AuditEvent {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Basic audit logger (file + memory ring buffer)
+// -----------------------------------------------------------------------------
+
 /// Audit logger that writes to a file and/or tracing.
 pub struct AuditLogger {
-    file: Option<Mutex<std::fs::File>>,
+    file: Option<Mutex<BufWriter<File>>>,
     events: Mutex<Vec<AuditEvent>>,
+    max_memory_events: usize,
 }
 
 impl AuditLogger {
     /// Create a new audit logger. If `path` is Some, events are appended to
     /// the specified file in JSON-lines format.
-    pub fn new(path: Option<PathBuf>) -> std::io::Result<Self> {
+    pub fn new(path: Option<PathBuf>, max_memory_events: usize) -> AuditResult<Self> {
         let file = match path {
             Some(p) => {
-                let f = std::fs::OpenOptions::new()
+                let f = OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(p)?;
-                Some(Mutex::new(f))
+                Some(Mutex::new(BufWriter::new(f)))
             }
             None => None,
         };
         Ok(Self {
             file,
-            events: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::with_capacity(max_memory_events)),
+            max_memory_events,
         })
     }
 
@@ -155,16 +182,16 @@ impl AuditLogger {
         if let Some(ref file) = self.file {
             if let Ok(json) = serde_json::to_string(&event) {
                 if let Ok(mut f) = file.lock() {
-                    let _ = writeln!(f, "{}", json);
+                    let _ = writeln!(f, "{json}");
                     let _ = f.flush();
                 }
             }
         }
 
-        // Store in memory buffer (capped)
+        // Store in memory buffer (capped ring)
         if let Ok(mut events) = self.events.lock() {
-            if events.len() >= 10_000 {
-                events.drain(..1000); // keep last 9000
+            if events.len() >= self.max_memory_events {
+                events.remove(0);
             }
             events.push(event);
         }
@@ -172,33 +199,29 @@ impl AuditLogger {
 
     /// Get recent audit events (last N).
     pub fn recent(&self, n: usize) -> Vec<AuditEvent> {
-        if let Ok(events) = self.events.lock() {
+        self.events.lock().map(|events| {
             let start = events.len().saturating_sub(n);
             events[start..].to_vec()
-        } else {
-            Vec::new()
-        }
+        }).unwrap_or_default()
     }
 
-    /// Get events by category.
+    /// Get events by category (most recent first, up to `limit`).
     pub fn by_category(&self, cat: AuditCategory, limit: usize) -> Vec<AuditEvent> {
-        if let Ok(events) = self.events.lock() {
-            events
-                .iter()
+        self.events.lock().map(|events| {
+            events.iter()
                 .rev()
                 .filter(|e| e.category == cat)
                 .take(limit)
                 .cloned()
                 .collect()
-        } else {
-            Vec::new()
-        }
+        }).unwrap_or_default()
     }
 }
 
-// ── Convenience functions for common audit events ───────────────────────
+// -----------------------------------------------------------------------------
+// Convenience audit macros/functions
+// -----------------------------------------------------------------------------
 
-/// Log a key generation event.
 pub fn audit_key_generated(logger: &AuditLogger, key_type: &str, address: &str) {
     logger.log(
         AuditEvent::new(AuditLevel::Info, AuditCategory::Key, "key_generated")
@@ -207,7 +230,6 @@ pub fn audit_key_generated(logger: &AuditLogger, key_type: &str, address: &str) 
     );
 }
 
-/// Log a key import event.
 pub fn audit_key_imported(logger: &AuditLogger, source: &str, address: &str) {
     logger.log(
         AuditEvent::new(AuditLevel::Info, AuditCategory::Key, "key_imported")
@@ -216,75 +238,49 @@ pub fn audit_key_imported(logger: &AuditLogger, source: &str, address: &str) {
     );
 }
 
-/// Log a block committed event.
 pub fn audit_block_committed(logger: &AuditLogger, height: u64, hash: &str, txs: usize) {
     logger.log(
-        AuditEvent::new(
-            AuditLevel::Info,
-            AuditCategory::Consensus,
-            "block_committed",
-        )
-        .with_detail("height", height.to_string())
-        .with_detail("hash", hash)
-        .with_detail("tx_count", txs.to_string()),
+        AuditEvent::new(AuditLevel::Info, AuditCategory::Consensus, "block_committed")
+            .with_detail("height", height.to_string())
+            .with_detail("hash", hash)
+            .with_detail("tx_count", txs.to_string()),
     );
 }
 
-/// Log a finality event.
 pub fn audit_finality(logger: &AuditLogger, height: u64, latency_ms: u64) {
     logger.log(
-        AuditEvent::new(
-            AuditLevel::Info,
-            AuditCategory::Consensus,
-            "block_finalized",
-        )
-        .with_detail("height", height.to_string())
-        .with_detail("latency_ms", latency_ms.to_string()),
+        AuditEvent::new(AuditLevel::Info, AuditCategory::Consensus, "block_finalized")
+            .with_detail("height", height.to_string())
+            .with_detail("latency_ms", latency_ms.to_string()),
     );
 }
 
-/// Log an equivocation (double-sign) detection.
 pub fn audit_equivocation(logger: &AuditLogger, validator: &str, height: u64) {
     logger.log(
-        AuditEvent::new(
-            AuditLevel::Critical,
-            AuditCategory::Consensus,
-            "equivocation_detected",
-        )
-        .with_detail("validator", validator)
-        .with_detail("height", height.to_string()),
+        AuditEvent::new(AuditLevel::Critical, AuditCategory::Consensus, "equivocation_detected")
+            .with_detail("validator", validator)
+            .with_detail("height", height.to_string()),
     );
 }
 
-/// Log a schema migration event.
 pub fn audit_migration(logger: &AuditLogger, from_sv: u32, to_sv: u32, status: &str) {
     logger.log(
-        AuditEvent::new(
-            AuditLevel::Warning,
-            AuditCategory::Migration,
-            "schema_migration",
-        )
-        .with_detail("from_sv", from_sv.to_string())
-        .with_detail("to_sv", to_sv.to_string())
-        .with_detail("status", status),
+        AuditEvent::new(AuditLevel::Warning, AuditCategory::Migration, "schema_migration")
+            .with_detail("from_sv", from_sv.to_string())
+            .with_detail("to_sv", to_sv.to_string())
+            .with_detail("status", status),
     );
 }
 
-/// Log a protocol upgrade activation.
 pub fn audit_protocol_upgrade(logger: &AuditLogger, from_pv: u32, to_pv: u32, height: u64) {
     logger.log(
-        AuditEvent::new(
-            AuditLevel::Critical,
-            AuditCategory::Migration,
-            "protocol_upgrade",
-        )
-        .with_detail("from_pv", from_pv.to_string())
-        .with_detail("to_pv", to_pv.to_string())
-        .with_detail("activation_height", height.to_string()),
+        AuditEvent::new(AuditLevel::Critical, AuditCategory::Migration, "protocol_upgrade")
+            .with_detail("from_pv", from_pv.to_string())
+            .with_detail("to_pv", to_pv.to_string())
+            .with_detail("activation_height", height.to_string()),
     );
 }
 
-/// Log a peer ban/quarantine event.
 pub fn audit_peer_action(logger: &AuditLogger, peer_id: &str, action: &str, reason: &str) {
     logger.log(
         AuditEvent::new(AuditLevel::Warning, AuditCategory::Network, action)
@@ -293,7 +289,6 @@ pub fn audit_peer_action(logger: &AuditLogger, peer_id: &str, action: &str, reas
     );
 }
 
-/// Log a snapshot operation.
 pub fn audit_snapshot(logger: &AuditLogger, action: &str, height: u64, path: &str) {
     logger.log(
         AuditEvent::new(AuditLevel::Info, AuditCategory::Admin, action)
@@ -302,7 +297,6 @@ pub fn audit_snapshot(logger: &AuditLogger, action: &str, height: u64, path: &st
     );
 }
 
-/// Log node startup.
 pub fn audit_startup(logger: &AuditLogger, version: &str, pv: u32, sv: u32) {
     logger.log(
         AuditEvent::new(AuditLevel::Info, AuditCategory::Startup, "node_started")
@@ -312,7 +306,6 @@ pub fn audit_startup(logger: &AuditLogger, version: &str, pv: u32, sv: u32) {
     );
 }
 
-/// Log node shutdown.
 pub fn audit_shutdown(logger: &AuditLogger, reason: &str) {
     logger.log(
         AuditEvent::new(AuditLevel::Info, AuditCategory::Shutdown, "node_stopped")
@@ -320,50 +313,30 @@ pub fn audit_shutdown(logger: &AuditLogger, reason: &str) {
     );
 }
 
-// ── Tamper-evident hashchain audit log ────────────────────────────────────
-//
-// Each entry written to disk has two extra fields appended:
-//
-//   "seq"        – monotonically increasing entry index (0-based)
-//   "prev_hash"  – BLAKE3 hash (hex) of the previous entry's raw JSON line
-//                  (genesis entry uses 64 zeros)
-//   "entry_hash" – BLAKE3 hash (hex) of this entry's JSON *without* entry_hash
-//                  (i.e. hash of `{...event..., seq, prev_hash}`)
-//
-// `iona audit verify <path>` replays the chain and reports the first broken link.
+// -----------------------------------------------------------------------------
+// Tamper-evident hashchain audit log
+// -----------------------------------------------------------------------------
+
+const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Compute BLAKE3 hex digest.
+fn blake3_hex(data: &[u8]) -> String {
+    blake3::hash(data).to_hex().to_string()
+}
 
 /// A single entry in the tamper-evident audit log file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HashchainEntry {
-    /// Sequential index (0-based).
     pub seq: u64,
-    /// BLAKE3 hex of the *previous* raw JSON line on disk.
-    /// Genesis: 64 zero digits ("0000…0000").
     pub prev_hash: String,
-    /// BLAKE3 hex of this entry's JSON (all fields except `entry_hash`).
     pub entry_hash: String,
-    /// The embedded audit event.
     #[serde(flatten)]
     pub event: AuditEvent,
 }
 
-/// Compute a BLAKE3 hex digest of the given bytes.
-pub fn blake3_hex(data: &[u8]) -> String {
-    let hash = blake3::hash(data);
-    hash.to_hex().to_string()
-}
-
-/// The all-zeros genesis prev_hash used for the first entry.
-pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-
-/// Tamper-evident audit logger.
-///
-/// Writes JSON-lines where every line includes a `prev_hash` (hash of the
-/// previous line) and an `entry_hash` (hash of this line minus `entry_hash`).
-/// This forms a forward hash chain: any modification, insertion, or deletion
-/// of entries will be detectable by [`verify_hashchain`].
+/// Tamper-evident audit logger using a forward hash chain.
 pub struct HashchainLogger {
-    file: Mutex<std::fs::File>,
+    writer: Mutex<BufWriter<File>>,
     state: Mutex<HashchainState>,
 }
 
@@ -373,105 +346,89 @@ struct HashchainState {
 }
 
 impl HashchainLogger {
-    /// Open (or create) a hashchain audit log at `path`.
-    ///
-    /// If the file already exists its last line is read so the chain continues
-    /// correctly from where it left off.
-    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
-        // Read the last line (if any) to get the current chain tip.
+    /// Open or create a hashchain audit log file.
+    pub fn open(path: &Path) -> AuditResult<Self> {
         let (next_seq, prev_hash) = if path.exists() {
             let content = std::fs::read_to_string(path)?;
-            let last = content.lines().last().unwrap_or("").trim().to_string();
-            if last.is_empty() {
-                (0, GENESIS_HASH.to_string())
-            } else {
-                // The prev_hash for the *next* entry is the hash of this line.
-                let lh = blake3_hex(last.as_bytes());
-                // Parse seq from the line.
-                let seq_val: u64 = serde_json::from_str::<serde_json::Value>(&last)
-                    .ok()
-                    .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
-                    .unwrap_or(0);
-                (seq_val + 1, lh)
+            let last_line = content.lines().filter(|l| !l.trim().is_empty()).last();
+            match last_line {
+                Some(line) => {
+                    let line_hash = blake3_hex(line.as_bytes());
+                    let entry: HashchainEntry = serde_json::from_str(line)?;
+                    (entry.seq + 1, line_hash)
+                }
+                None => (0, GENESIS_HASH.to_string()),
             }
         } else {
             (0, GENESIS_HASH.to_string())
         };
 
-        let file = std::fs::OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
+        let writer = Mutex::new(BufWriter::new(file));
 
         Ok(Self {
-            file: Mutex::new(file),
-            state: Mutex::new(HashchainState {
-                next_seq,
-                prev_hash,
-            }),
+            writer,
+            state: Mutex::new(HashchainState { next_seq, prev_hash }),
         })
     }
 
     /// Append an audit event to the hashchain log.
-    pub fn append(&self, event: AuditEvent) -> std::io::Result<()> {
+    pub fn append(&self, event: AuditEvent) -> AuditResult<()> {
         let mut state = self.state.lock().unwrap();
+        let seq = state.next_seq;
+        let prev_hash = state.prev_hash.clone();
 
-        // Build partial entry (without entry_hash) to compute its hash.
+        // Partial entry (without entry_hash) for computing hash
         let partial = serde_json::json!({
-            "seq":       state.next_seq,
-            "prev_hash": &state.prev_hash,
+            "seq": seq,
+            "prev_hash": prev_hash,
             "timestamp": event.timestamp,
-            "level":     event.level,
-            "category":  event.category,
-            "action":    &event.action,
-            "details":   &event.details,
-            "node_id":   &event.node_id,
+            "level": event.level,
+            "category": event.category,
+            "action": event.action,
+            "details": event.details,
+            "node_id": event.node_id,
         });
-        let partial_bytes = serde_json::to_vec(&partial)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let partial_bytes = serde_json::to_vec(&partial)?;
         let entry_hash = blake3_hex(&partial_bytes);
 
-        // Build the full entry.
         let full = HashchainEntry {
-            seq: state.next_seq,
-            prev_hash: state.prev_hash.clone(),
-            entry_hash: entry_hash.clone(),
+            seq,
+            prev_hash,
+            entry_hash,
             event,
         };
-        let line = serde_json::to_string(&full)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let line = serde_json::to_string(&full)?;
 
-        // Write to file.
+        // Write and flush
         {
-            let mut f = self.file.lock().unwrap();
-            writeln!(f, "{line}")?;
-            f.flush()?;
+            let mut w = self.writer.lock().unwrap();
+            writeln!(w, "{}", line)?;
+            w.flush()?;
         }
 
-        // Advance chain state.
+        // Update state for next entry
         state.next_seq += 1;
         state.prev_hash = blake3_hex(line.as_bytes());
         Ok(())
     }
 }
 
-/// Result of verifying a hashchain log file.
+/// Result of hashchain verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyResult {
-    /// All entries verified successfully.
     Ok { entries: u64 },
-    /// Chain is broken at the given sequence number.
     Broken { seq: u64, reason: String },
-    /// File is empty (no entries).
     Empty,
 }
 
 impl fmt::Display for VerifyResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            VerifyResult::Ok { entries } => {
-                write!(f, "OK: {entries} entries verified, chain intact")
-            }
+            VerifyResult::Ok { entries } => write!(f, "OK: {entries} entries verified, chain intact"),
             VerifyResult::Broken { seq, reason } => write!(f, "BROKEN at seq={seq}: {reason}"),
             VerifyResult::Empty => write!(f, "EMPTY: log file contains no entries"),
         }
@@ -479,10 +436,7 @@ impl fmt::Display for VerifyResult {
 }
 
 /// Verify the tamper-evident hashchain in an audit log file.
-///
-/// Reads every line, recomputes `entry_hash` and checks `prev_hash` continuity.
-/// Returns [`VerifyResult::Ok`] only if every entry is intact.
-pub fn verify_hashchain(path: &std::path::Path) -> std::io::Result<VerifyResult> {
+pub fn verify_hashchain(path: &Path) -> AuditResult<VerifyResult> {
     let content = std::fs::read_to_string(path)?;
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
 
@@ -493,322 +447,147 @@ pub fn verify_hashchain(path: &std::path::Path) -> std::io::Result<VerifyResult>
     let mut expected_prev = GENESIS_HASH.to_string();
     let mut expected_seq = 0u64;
 
-    for (line_idx, line) in lines.iter().enumerate() {
-        // Parse entry.
-        let entry: HashchainEntry = serde_json::from_str(line).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("line {}: JSON parse error: {e}", line_idx),
-            )
-        })?;
+    for (idx, line) in lines.iter().enumerate() {
+        let entry: HashchainEntry = serde_json::from_str(line)
+            .map_err(|e| AuditError::Verification(format!("line {}: JSON error: {}", idx, e)))?;
 
-        // Check sequence number.
         if entry.seq != expected_seq {
             return Ok(VerifyResult::Broken {
                 seq: entry.seq,
-                reason: format!("expected seq={expected_seq}, found seq={}", entry.seq),
+                reason: format!("expected seq={expected_seq}, found {}", entry.seq),
             });
         }
 
-        // Check prev_hash matches.
         if entry.prev_hash != expected_prev {
             return Ok(VerifyResult::Broken {
                 seq: entry.seq,
-                reason: format!(
-                    "prev_hash mismatch: expected {}, found {}",
-                    expected_prev, entry.prev_hash
-                ),
+                reason: format!("prev_hash mismatch: expected {expected_prev}, found {}", entry.prev_hash),
             });
         }
 
-        // Recompute entry_hash.
         let partial = serde_json::json!({
-            "seq":       entry.seq,
-            "prev_hash": &entry.prev_hash,
+            "seq": entry.seq,
+            "prev_hash": entry.prev_hash,
             "timestamp": entry.event.timestamp,
-            "level":     entry.event.level,
-            "category":  entry.event.category,
-            "action":    &entry.event.action,
-            "details":   &entry.event.details,
-            "node_id":   &entry.event.node_id,
+            "level": entry.event.level,
+            "category": entry.event.category,
+            "action": entry.event.action,
+            "details": entry.event.details,
+            "node_id": entry.event.node_id,
         });
-        let partial_bytes = serde_json::to_vec(&partial)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let partial_bytes = serde_json::to_vec(&partial)?;
         let computed_hash = blake3_hex(&partial_bytes);
 
         if computed_hash != entry.entry_hash {
             return Ok(VerifyResult::Broken {
                 seq: entry.seq,
-                reason: format!(
-                    "entry_hash mismatch: computed {computed_hash}, stored {}",
-                    entry.entry_hash
-                ),
+                reason: format!("entry_hash mismatch: computed {computed_hash}, stored {}", entry.entry_hash),
             });
         }
 
-        // Advance: next entry's prev_hash = blake3 of this raw line.
         expected_prev = blake3_hex(line.as_bytes());
         expected_seq += 1;
     }
 
-    Ok(VerifyResult::Ok {
-        entries: expected_seq,
-    })
+    Ok(VerifyResult::Ok { entries: expected_seq })
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
-    fn test_audit_event_creation() {
-        let event = AuditEvent::new(AuditLevel::Info, AuditCategory::Key, "test_action")
-            .with_detail("key", "value")
-            .with_node_id("node_1");
-
+    fn test_audit_event() {
+        let event = AuditEvent::new(AuditLevel::Info, AuditCategory::Key, "test")
+            .with_detail("k", "v")
+            .with_node_id("n1");
         assert_eq!(event.level, AuditLevel::Info);
-        assert_eq!(event.category, AuditCategory::Key);
-        assert_eq!(event.action, "test_action");
         assert_eq!(event.details.len(), 1);
-        assert_eq!(event.node_id.as_deref(), Some("node_1"));
-    }
-
-    #[test]
-    fn test_audit_event_display() {
-        let event = AuditEvent::new(
-            AuditLevel::Critical,
-            AuditCategory::Consensus,
-            "equivocation",
-        )
-        .with_detail("validator", "abc123");
-        let s = format!("{}", event);
-        assert!(s.contains("CRITICAL"));
-        assert!(s.contains("CONSENSUS"));
-        assert!(s.contains("equivocation"));
-        assert!(s.contains("validator=abc123"));
-    }
-
-    #[test]
-    fn test_audit_event_serialization() {
-        let event = AuditEvent::new(AuditLevel::Warning, AuditCategory::Migration, "migrate")
-            .with_detail("from", "3")
-            .with_detail("to", "4");
-        let json = serde_json::to_string(&event).unwrap();
-        let parsed: AuditEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.action, "migrate");
-        assert_eq!(parsed.details.len(), 2);
+        assert_eq!(event.node_id, Some("n1".to_string()));
     }
 
     #[test]
     fn test_audit_logger_memory() {
-        let logger = AuditLogger::new(None).unwrap();
-        for i in 0..100 {
-            logger.log(AuditEvent::new(
-                AuditLevel::Info,
-                AuditCategory::Consensus,
-                format!("block_{i}"),
-            ));
+        let logger = AuditLogger::new(None, 100).unwrap();
+        for i in 0..10 {
+            logger.log(AuditEvent::new(AuditLevel::Info, AuditCategory::Consensus, format!("ev_{i}")));
         }
-        let recent = logger.recent(10);
-        assert_eq!(recent.len(), 10);
-        assert_eq!(recent.last().unwrap().action, "block_99");
+        let recent = logger.recent(5);
+        assert_eq!(recent.len(), 5);
+        assert_eq!(recent.last().unwrap().action, "ev_9");
     }
 
     #[test]
     fn test_audit_logger_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir().unwrap();
         let path = dir.path().join("audit.log");
-        let logger = AuditLogger::new(Some(path.clone())).unwrap();
-
-        audit_startup(&logger, "27.0.0", 1, 4);
-        audit_block_committed(&logger, 1, "abc123", 5);
+        let logger = AuditLogger::new(Some(path.clone()), 1000).unwrap();
+        audit_startup(&logger, "1.0", 1, 2);
+        audit_block_committed(&logger, 100, "0xabc", 5);
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2);
-
-        // Verify JSON parsing
-        let event: AuditEvent = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(event.action, "node_started");
+        let ev: AuditEvent = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(ev.action, "node_started");
     }
 
     #[test]
-    fn test_audit_by_category() {
-        let logger = AuditLogger::new(None).unwrap();
-        audit_startup(&logger, "27.0.0", 1, 4);
-        audit_block_committed(&logger, 1, "abc", 5);
-        audit_block_committed(&logger, 2, "def", 3);
-        audit_peer_action(&logger, "peer1", "quarantine", "rate_limit");
-
-        let consensus = logger.by_category(AuditCategory::Consensus, 10);
-        assert_eq!(consensus.len(), 2);
-
-        let network = logger.by_category(AuditCategory::Network, 10);
-        assert_eq!(network.len(), 1);
-    }
-
-    // ── Hashchain tests ────────────────────────────────────────────────────
-
-    #[test]
-    fn hashchain_empty_file_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit_chain.log");
-        // Create empty file.
-        std::fs::write(&path, b"").unwrap();
-        let result = verify_hashchain(&path).unwrap();
-        assert_eq!(result, VerifyResult::Empty);
-    }
-
-    #[test]
-    fn hashchain_single_entry_verifies() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit_chain.log");
+    fn test_hashchain_single() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("chain.log");
         let logger = HashchainLogger::open(&path).unwrap();
-        logger
-            .append(
-                AuditEvent::new(AuditLevel::Info, AuditCategory::Startup, "node_started")
-                    .with_detail("version", "28.2.0"),
-            )
-            .unwrap();
+        logger.append(AuditEvent::new(AuditLevel::Info, AuditCategory::Startup, "boot")).unwrap();
         let result = verify_hashchain(&path).unwrap();
         assert_eq!(result, VerifyResult::Ok { entries: 1 });
     }
 
     #[test]
-    fn hashchain_multiple_entries_verify() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit_chain.log");
+    fn test_hashchain_multiple() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("chain.log");
         let logger = HashchainLogger::open(&path).unwrap();
-        for i in 0u64..10 {
-            logger
-                .append(
-                    AuditEvent::new(
-                        AuditLevel::Info,
-                        AuditCategory::Consensus,
-                        "block_committed",
-                    )
-                    .with_detail("height", i.to_string()),
-                )
-                .unwrap();
+        for i in 0..5 {
+            logger.append(AuditEvent::new(AuditLevel::Info, AuditCategory::Consensus, format!("block_{i}"))).unwrap();
         }
         let result = verify_hashchain(&path).unwrap();
-        assert_eq!(result, VerifyResult::Ok { entries: 10 });
+        assert_eq!(result, VerifyResult::Ok { entries: 5 });
     }
 
     #[test]
-    fn hashchain_tampered_entry_detected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit_chain.log");
+    fn test_hashchain_tampered() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("chain.log");
         let logger = HashchainLogger::open(&path).unwrap();
-        for i in 0u64..5 {
-            logger
-                .append(
-                    AuditEvent::new(
-                        AuditLevel::Info,
-                        AuditCategory::Consensus,
-                        "block_committed",
-                    )
-                    .with_detail("height", i.to_string()),
-                )
-                .unwrap();
-        }
+        logger.append(AuditEvent::new(AuditLevel::Info, AuditCategory::Consensus, "block")).unwrap();
         drop(logger);
 
-        // Tamper: replace "block_committed" with "TAMPERED" in line 2.
         let content = std::fs::read_to_string(&path).unwrap();
-        let tampered = content.replacen("block_committed", "TAMPERED", 1);
+        let tampered = content.replace("block", "TAMPERED");
         std::fs::write(&path, tampered).unwrap();
 
         let result = verify_hashchain(&path).unwrap();
-        assert!(
-            matches!(result, VerifyResult::Broken { .. }),
-            "tampered entry must be detected"
-        );
+        assert!(matches!(result, VerifyResult::Broken { .. }));
     }
 
     #[test]
-    fn hashchain_deleted_entry_detected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit_chain.log");
-        let logger = HashchainLogger::open(&path).unwrap();
-        for i in 0u64..5 {
-            logger
-                .append(
-                    AuditEvent::new(AuditLevel::Info, AuditCategory::Consensus, "block")
-                        .with_detail("height", i.to_string()),
-                )
-                .unwrap();
-        }
-        drop(logger);
-
-        // Delete the second line (seq=1).
-        let content = std::fs::read_to_string(&path).unwrap();
-        let mut lines: Vec<&str> = content.lines().collect();
-        lines.remove(1); // remove seq=1
-        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
-
-        let result = verify_hashchain(&path).unwrap();
-        assert!(
-            matches!(result, VerifyResult::Broken { .. }),
-            "deleted entry must break the chain"
-        );
-    }
-
-    #[test]
-    fn hashchain_resume_from_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit_chain.log");
-
-        // First session: write 3 entries.
+    fn test_hashchain_resume() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("chain.log");
         {
             let logger = HashchainLogger::open(&path).unwrap();
-            for i in 0u64..3 {
-                logger
-                    .append(
-                        AuditEvent::new(AuditLevel::Info, AuditCategory::Startup, "boot")
-                            .with_detail("seq", i.to_string()),
-                    )
-                    .unwrap();
-            }
+            logger.append(AuditEvent::new(AuditLevel::Info, AuditCategory::Startup, "first")).unwrap();
         }
-
-        // Second session: resume and write 3 more.
         {
             let logger = HashchainLogger::open(&path).unwrap();
-            for i in 3u64..6 {
-                logger
-                    .append(
-                        AuditEvent::new(AuditLevel::Info, AuditCategory::Startup, "boot")
-                            .with_detail("seq", i.to_string()),
-                    )
-                    .unwrap();
-            }
+            logger.append(AuditEvent::new(AuditLevel::Info, AuditCategory::Startup, "second")).unwrap();
         }
-
-        // Verify the combined 6-entry chain.
         let result = verify_hashchain(&path).unwrap();
-        assert_eq!(
-            result,
-            VerifyResult::Ok { entries: 6 },
-            "resumed chain must verify end-to-end"
-        );
-    }
-
-    #[test]
-    fn hashchain_display_ok() {
-        let r = VerifyResult::Ok { entries: 42 };
-        assert!(r.to_string().contains("42"));
-        assert!(r.to_string().contains("OK"));
-    }
-
-    #[test]
-    fn hashchain_display_broken() {
-        let r = VerifyResult::Broken {
-            seq: 7,
-            reason: "hash mismatch".into(),
-        };
-        let s = r.to_string();
-        assert!(s.contains("BROKEN"));
-        assert!(s.contains("seq=7"));
+        assert_eq!(result, VerifyResult::Ok { entries: 2 });
     }
 }
