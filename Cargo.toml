@@ -1,3 +1,8 @@
+[workspace]
+# Virtual workspace – allows adding multiple crates later without changing structure
+members = ["."]
+resolver = "2"
+
 [package]
 name = "iona"
 version = "30.0.0"
@@ -15,52 +20,77 @@ otel = [
 
 # Optional binaries (disabled by default). This prevents unfinished tooling in
 # src/bin from breaking `cargo build` / CI / release builds.
-bin-cli = []
-bin-chaos = []
-bin-remote-signer = []
-bin-evm-rpc = []
-bin-chaindb-tool = []
-bin-block-store = []
+bin-cli            = []
+bin-chaos          = []
+bin-remote-signer  = []
+bin-evm-rpc        = []
+bin-chaindb-tool   = []
+bin-block-store    = []
+
+# -----------------------------------------------------------------------------
+# Dependencies – grouped by domain
+# -----------------------------------------------------------------------------
 
 [dependencies]
-memory-db = { version = "0.32", optional = true }
-trie-db = { version = "0.28", optional = true }
-hash-db = { version = "0.15", optional = true }
-keccak-hasher = "0.15"
-triehash = "0.8"
-k256 = { version = "0.13", features = ["ecdsa"] }
-sha3 = "0.10"
-rlp = "0.5"
-
-revm = { version = "9", default-features = false, features = ["std"] }
+# Async runtime & networking
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+futures = "0.3"
+async-trait = "0.1"
+bytes = "1"
+
+# Serialization / data
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
-rand = "0.8"
-blake3 = "1"
+bincode = "1"
+toml = "0.8"
+serde_with = "3"
+hex = "0.4"
+base64 = "0.22"
+
+# Error handling & logging
+anyhow = "1"
+thiserror = "2"          # upgrade from 1.x to 2.x
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+# CLI & config
 clap = { version = "4", features = ["derive"] }
+
+# Web/RPC servers
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
-
-# TLS server (remote signer)
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 
-# Crypto
+# HTTP clients (remote signer, health checks)
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"] }
+ureq = { version = "2", features = ["json"] }
+
+# Cryptography & hashing
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+k256 = { version = "0.13", features = ["ecdsa"] }
 aes-gcm = "0.10"
 pbkdf2 = "0.12"
 sha2 = "0.10"
+sha3 = "0.10"
+blake3 = "1"
 zeroize = "1"
+rand = "0.8"
 
-# Compression (snapshots)
-zstd = "0.13"
+# Blockchain primitives
+rlp = "0.5"
+triehash = "0.8"
+keccak-hasher = "0.15"
+hash-db = "0.16"            # upgrade from 0.15 to 0.16
+memory-db = "0.32"
+trie-db = "0.28"
+lru = "0.12"
 
-# libp2p
+# EVM (revm)
+revm = { version = "9", default-features = false, features = ["std"] }
+
+# P2P (libp2p)
 libp2p = { version = "0.54", features = [
   "tokio",
   "tcp",
@@ -75,64 +105,40 @@ libp2p = { version = "0.54", features = [
   "macros"
 ] }
 
-bytes = "1"
-bincode = "1"
-
-anyhow = "1"
-futures = "0.3"
-
-hex = "0.4"
-
-async-trait = "0.1"
-
-base64 = "0.22"
-
-# Remote signer (HTTP)
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"] }
-
-serde_with = "3"
-
+# Concurrency & parallelism
 parking_lot = "0.12"
+rayon = "1.8"
 
-# Production observability
-prometheus = { version = "0.13", features = ["process"] }
-
-# LRU block cache
-lru = "0.12"
-
-# Rate limiting
+# Rate limiting / DoS protection
 governor = "0.6"
 nonzero_ext = "0.3"
 
-# Config file support
-toml = "0.8"
+# Compression (snapshots)
+zstd = "0.13"
 
-# CLI HTTP client
-ureq = { version = "2", features = ["json"] }
+# Observability (metrics)
+prometheus = { version = "0.13", features = ["process"] }
 
-# Parallelism
-rayon = "1.8"
-
-# System call bindings for disk space checks (iona doctor)
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-# Optional OpenTelemetry
+# Optional OpenTelemetry (behind `otel` feature)
 opentelemetry = { version = "0.24", optional = true }
 opentelemetry-otlp = { version = "0.17", optional = true, features = ["tonic"] }
 tracing-opentelemetry = { version = "0.25", optional = true }
 
+# System bindings (Unix only)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# -----------------------------------------------------------------------------
+# Development dependencies
+# -----------------------------------------------------------------------------
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
-ureq = { version = "2", features = ["json"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 
-# Temporarily disabled because the benchmark code is outdated
-# [[bench]]
-# name = "core_benchmarks"
-# harness = false
-
+# -----------------------------------------------------------------------------
+# Binaries
+# -----------------------------------------------------------------------------
 [[bin]]
 name = "iona-node"
 path = "src/bin/iona-node.rs"
@@ -167,17 +173,14 @@ name = "block_store"
 path = "src/bin/block_store.rs"
 required-features = ["bin-block-store"]
 
-
-# ── Release profile hardening ──────────────────────────────────────────────
-# panic="abort" eliminates unwinding code (smaller binary, no catch_unwind for
-# adversaries to exploit). lto="thin" catches dead code across crates.
-# overflow-checks=true keeps integer overflow detection in release builds.
+# -----------------------------------------------------------------------------
+# Release profile hardening
+# -----------------------------------------------------------------------------
 [profile.release]
 panic           = "abort"
 lto             = "thin"
 codegen-units   = 1
 overflow-checks = true
 
-# ── Test profile: keep overflow checks, fast build ────────────────────────
 [profile.test]
 overflow-checks = true
