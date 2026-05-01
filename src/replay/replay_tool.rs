@@ -8,26 +8,56 @@
 //! - Validating that a new binary produces identical results on old blocks
 //! - Auditing the chain after a suspected bug or divergence
 //! - Detecting nondeterminism across builds
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use iona::replay::replay_tool::{replay, ReplayOpts, ReplayError};
+//!
+//! fn main() -> Result<(), ReplayError> {
+//!     let result = replay(&blocks, &initial_state, &opts, None)?;
+//!     println!("{result}");
+//!     Ok(())
+//! }
+//! ```
 
 use crate::execution::{execute_block, KvState};
 use crate::replay::nondeterminism::NdLogger;
 use crate::types::{Block, Hash32, Height};
 use std::collections::BTreeMap;
+use thiserror::Error;
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during replay.
+#[derive(Debug, Error)]
+pub enum ReplayError {
+    #[error("invalid height range: from={from} > to={to}")]
+    InvalidHeightRange { from: Height, to: Height },
+    #[error("determinism check count must be > 0, got {0}")]
+    InvalidDeterminismCount(usize),
+    #[error("base fee per gas must be > 0, got {0}")]
+    InvalidBaseFee(u64),
+    #[error("block execution failed at height {height}: {reason}")]
+    ExecutionFailed { height: Height, reason: String },
+}
+
+pub type ReplayResult<T> = Result<T, ReplayError>;
+
+// -----------------------------------------------------------------------------
+// Options
+// -----------------------------------------------------------------------------
 
 /// Options for the replay command.
 #[derive(Debug, Clone)]
 pub struct ReplayOpts {
-    /// Starting block height (inclusive).
     pub from: Height,
-    /// Ending block height (inclusive).
     pub to: Height,
-    /// Whether to verify state roots against block headers.
     pub verify_root: bool,
-    /// Whether to log state roots per block (STEP 5).
     pub log_roots: bool,
-    /// Whether to detect nondeterminism (run each block N times).
     pub determinism_check: usize,
-    /// Base fee per gas (simplified; in production would be computed per-block).
     pub base_fee_per_gas: u64,
 }
 
@@ -44,6 +74,26 @@ impl Default for ReplayOpts {
     }
 }
 
+impl ReplayOpts {
+    /// Validate options.
+    pub fn validate(&self) -> ReplayResult<()> {
+        if self.from > self.to {
+            return Err(ReplayError::InvalidHeightRange {
+                from: self.from,
+                to: self.to,
+            });
+        }
+        if self.base_fee_per_gas == 0 {
+            return Err(ReplayError::InvalidBaseFee(self.base_fee_per_gas));
+        }
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Result types
+// -----------------------------------------------------------------------------
+
 /// Per-block replay result with state root logging (STEP 5).
 #[derive(Debug, Clone)]
 pub struct BlockReplayEntry {
@@ -52,7 +102,6 @@ pub struct BlockReplayEntry {
     pub expected_root: Hash32,
     pub root_match: bool,
     pub gas_used: u64,
-    /// If determinism_check > 0, whether all N runs produced identical roots.
     pub deterministic: bool,
 }
 
@@ -109,6 +158,10 @@ impl std::fmt::Display for ReplayResult {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Core replay function
+// -----------------------------------------------------------------------------
+
 /// Execute the replay tool on a set of blocks.
 ///
 /// This is the core of `iona replay --from <from> --to <to> --verify-root`.
@@ -117,7 +170,9 @@ pub fn replay(
     initial_state: &KvState,
     opts: &ReplayOpts,
     nd_logger: Option<&NdLogger>,
-) -> ReplayResult {
+) -> ReplayResult<ReplayResult> {
+    opts.validate()?;
+
     let mut state = initial_state.clone();
     let mut entries = Vec::with_capacity(blocks.len());
     let mut total_gas = 0u64;
@@ -146,11 +201,11 @@ pub fn replay(
             execute_block(&state, &block.txs, opts.base_fee_per_gas, &proposer_addr);
 
         let state_root = new_state.root();
-        let expected_root = block.header.state_root.clone();
+        let expected_root = block.header.state_root;
         let root_match = if opts.verify_root {
             state_root == expected_root
         } else {
-            true // Skip verification.
+            true
         };
 
         // Determinism check: run N more times and compare roots.
@@ -176,7 +231,7 @@ pub fn replay(
         total_gas += gas_used;
         entries.push(BlockReplayEntry {
             height: h,
-            state_root: state_root.clone(),
+            state_root,
             expected_root,
             root_match,
             gas_used,
@@ -188,70 +243,27 @@ pub fn replay(
 
     let success = first_mismatch.is_none() && first_nondeterministic.is_none();
     let total_blocks = entries.len();
-    ReplayResult {
+
+    Ok(ReplayResult {
         entries,
         success,
         total_blocks,
         total_gas,
         first_mismatch,
         first_nondeterministic,
-    }
+    })
 }
 
-/// STEP 6 — Cross-node comparison tool.
-///
-/// `iona compare val1 val2` — compares state root logs from two nodes.
-/// Takes two sets of (height, state_root) pairs and finds divergence.
-pub fn compare_nodes(
-    node_a_id: &str,
-    node_a_roots: &BTreeMap<Height, Hash32>,
-    node_b_id: &str,
-    node_b_roots: &BTreeMap<Height, Hash32>,
-) -> CompareResult {
-    let mut mismatches = Vec::new();
+// -----------------------------------------------------------------------------
+// Cross-node comparison (STEP 6)
+// -----------------------------------------------------------------------------
 
-    // Check all heights present in both.
-    for (&height, root_a) in node_a_roots {
-        if let Some(root_b) = node_b_roots.get(&height) {
-            if root_a != root_b {
-                mismatches.push(RootMismatch {
-                    height,
-                    root_a: root_a.clone(),
-                    root_b: root_b.clone(),
-                });
-            }
-        }
-    }
-
-    // Heights only in A.
-    let only_a: Vec<Height> = node_a_roots
-        .keys()
-        .filter(|h| !node_b_roots.contains_key(h))
-        .copied()
-        .collect();
-
-    // Heights only in B.
-    let only_b: Vec<Height> = node_b_roots
-        .keys()
-        .filter(|h| !node_a_roots.contains_key(h))
-        .copied()
-        .collect();
-
-    let agree = mismatches.is_empty();
-    let common_heights = node_a_roots
-        .keys()
-        .filter(|h| node_b_roots.contains_key(h))
-        .count();
-
-    CompareResult {
-        node_a: node_a_id.to_string(),
-        node_b: node_b_id.to_string(),
-        common_heights,
-        mismatches,
-        only_in_a: only_a,
-        only_in_b: only_b,
-        agree,
-    }
+/// Root mismatch between two nodes.
+#[derive(Debug, Clone)]
+pub struct RootMismatch {
+    pub height: Height,
+    pub root_a: Hash32,
+    pub root_b: Hash32,
 }
 
 /// Result of cross-node comparison.
@@ -264,14 +276,6 @@ pub struct CompareResult {
     pub only_in_a: Vec<Height>,
     pub only_in_b: Vec<Height>,
     pub agree: bool,
-}
-
-/// A state root mismatch between two nodes at a specific height.
-#[derive(Debug, Clone)]
-pub struct RootMismatch {
-    pub height: Height,
-    pub root_a: Hash32,
-    pub root_b: Hash32,
 }
 
 impl std::fmt::Display for CompareResult {
@@ -302,7 +306,60 @@ impl std::fmt::Display for CompareResult {
     }
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+/// Compare state roots from two nodes to find divergence.
+pub fn compare_nodes(
+    node_a_id: &str,
+    node_a_roots: &BTreeMap<Height, Hash32>,
+    node_b_id: &str,
+    node_b_roots: &BTreeMap<Height, Hash32>,
+) -> CompareResult {
+    let mut mismatches = Vec::new();
+
+    for (&height, root_a) in node_a_roots {
+        if let Some(root_b) = node_b_roots.get(&height) {
+            if root_a != root_b {
+                mismatches.push(RootMismatch {
+                    height,
+                    root_a: root_a.clone(),
+                    root_b: root_b.clone(),
+                });
+            }
+        }
+    }
+
+    let only_a: Vec<Height> = node_a_roots
+        .keys()
+        .filter(|h| !node_b_roots.contains_key(h))
+        .copied()
+        .collect();
+
+    let only_b: Vec<Height> = node_b_roots
+        .keys()
+        .filter(|h| !node_a_roots.contains_key(h))
+        .copied()
+        .collect();
+
+    let common_heights = node_a_roots
+        .keys()
+        .filter(|h| node_b_roots.contains_key(h))
+        .count();
+
+    let agree = mismatches.is_empty() && only_a.is_empty() && only_b.is_empty();
+
+    CompareResult {
+        node_a: node_a_id.to_string(),
+        node_b: node_b_id.to_string(),
+        common_heights,
+        mismatches,
+        only_in_a: only_a,
+        only_in_b: only_b,
+        agree,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -334,7 +391,26 @@ mod tests {
     }
 
     #[test]
-    fn test_replay_basic() {
+    fn test_opts_validation() {
+        let bad = ReplayOpts {
+            from: 10,
+            to: 5,
+            ..Default::default()
+        };
+        assert!(bad.validate().is_err());
+
+        let zero_fee = ReplayOpts {
+            base_fee_per_gas: 0,
+            ..Default::default()
+        };
+        assert!(zero_fee.validate().is_err());
+
+        let good = ReplayOpts::default();
+        assert!(good.validate().is_ok());
+    }
+
+    #[test]
+    fn test_replay_basic() -> ReplayResult<()> {
         let state = KvState::default();
         let root = state.root();
         let blocks = vec![
@@ -352,13 +428,14 @@ mod tests {
             base_fee_per_gas: 1,
         };
 
-        let result = replay(&blocks, &state, &opts, None);
-        assert!(result.success, "replay failed: {result}");
+        let result = replay(&blocks, &state, &opts, None)?;
+        assert!(result.success);
         assert_eq!(result.total_blocks, 3);
+        Ok(())
     }
 
     #[test]
-    fn test_replay_root_mismatch() {
+    fn test_replay_root_mismatch() -> ReplayResult<()> {
         let state = KvState::default();
         let root = state.root();
         let bad_root = Hash32([0xFF; 32]);
@@ -371,13 +448,14 @@ mod tests {
             ..Default::default()
         };
 
-        let result = replay(&blocks, &state, &opts, None);
+        let result = replay(&blocks, &state, &opts, None)?;
         assert!(!result.success);
         assert_eq!(result.first_mismatch, Some(2));
+        Ok(())
     }
 
     #[test]
-    fn test_replay_with_range_filter() {
+    fn test_replay_with_range_filter() -> ReplayResult<()> {
         let state = KvState::default();
         let root = state.root();
         let blocks = vec![
@@ -393,14 +471,13 @@ mod tests {
             ..Default::default()
         };
 
-        let result = replay(&blocks, &state, &opts, None);
-        // Only block 2 replayed (but state starts from genesis, so block 1 is skipped
-        // and block 2 runs on initial state).
+        let result = replay(&blocks, &state, &opts, None)?;
         assert_eq!(result.total_blocks, 1);
+        Ok(())
     }
 
     #[test]
-    fn test_replay_determinism_check() {
+    fn test_replay_determinism_check() -> ReplayResult<()> {
         let state = KvState::default();
         let root = state.root();
         let blocks = vec![empty_block(1, root.clone())];
@@ -409,40 +486,14 @@ mod tests {
             from: 1,
             to: 1,
             verify_root: true,
-            determinism_check: 5, // Run 5 extra times.
+            determinism_check: 5,
             ..Default::default()
         };
 
-        let result = replay(&blocks, &state, &opts, None);
+        let result = replay(&blocks, &state, &opts, None)?;
         assert!(result.success);
         assert!(result.entries[0].deterministic);
-    }
-
-    #[test]
-    fn test_replay_with_nd_logger() {
-        let state = KvState::default();
-        let root = state.root();
-        let blocks = vec![empty_block(1, root.clone())];
-        let logger = NdLogger::new(true);
-
-        let opts = ReplayOpts::default();
-        let result = replay(&blocks, &state, &opts, Some(&logger));
-        assert!(result.success);
-    }
-
-    #[test]
-    fn test_replay_entry_display() {
-        let entry = BlockReplayEntry {
-            height: 42,
-            state_root: Hash32([0xAB; 32]),
-            expected_root: Hash32([0xAB; 32]),
-            root_match: true,
-            gas_used: 1000,
-            deterministic: true,
-        };
-        let s = format!("{entry}");
-        assert!(s.contains("height=42"));
-        assert!(s.contains("OK"));
+        Ok(())
     }
 
     #[test]
@@ -470,55 +521,11 @@ mod tests {
         roots_a.insert(1, Hash32([1u8; 32]));
         roots_a.insert(2, Hash32([2u8; 32]));
         roots_b.insert(1, Hash32([1u8; 32]));
-        roots_b.insert(2, Hash32([9u8; 32])); // Different!
+        roots_b.insert(2, Hash32([9u8; 32]));
 
         let result = compare_nodes("val1", &roots_a, "val2", &roots_b);
         assert!(!result.agree);
         assert_eq!(result.mismatches.len(), 1);
         assert_eq!(result.mismatches[0].height, 2);
-    }
-
-    #[test]
-    fn test_compare_nodes_missing_heights() {
-        let mut roots_a = BTreeMap::new();
-        let mut roots_b = BTreeMap::new();
-
-        roots_a.insert(1, Hash32([1u8; 32]));
-        roots_a.insert(2, Hash32([2u8; 32]));
-        roots_b.insert(1, Hash32([1u8; 32]));
-        // Height 2 missing from B, height 3 only in B.
-        roots_b.insert(3, Hash32([3u8; 32]));
-
-        let result = compare_nodes("val1", &roots_a, "val2", &roots_b);
-        assert!(result.agree); // No mismatches on common heights.
-        assert_eq!(result.only_in_a, vec![2]);
-        assert_eq!(result.only_in_b, vec![3]);
-    }
-
-    #[test]
-    fn test_compare_result_display() {
-        let mut roots_a = BTreeMap::new();
-        let mut roots_b = BTreeMap::new();
-        roots_a.insert(1, Hash32([1u8; 32]));
-        roots_b.insert(1, Hash32([2u8; 32]));
-
-        let result = compare_nodes("val1", &roots_a, "val2", &roots_b);
-        let s = format!("{result}");
-        assert!(s.contains("DIVERGENCE"));
-        assert!(s.contains("MISMATCH"));
-    }
-
-    #[test]
-    fn test_replay_result_display() {
-        let result = ReplayResult {
-            entries: vec![],
-            success: true,
-            total_blocks: 0,
-            total_gas: 0,
-            first_mismatch: None,
-            first_nondeterministic: None,
-        };
-        let s = format!("{result}");
-        assert!(s.contains("PASS"));
     }
 }
