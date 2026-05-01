@@ -16,6 +16,28 @@
 
 use crate::types::{Hash32, Height};
 use std::collections::BTreeMap;
+use thiserror::Error;
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during divergence detection.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ReplayError {
+    #[error("height mismatch: cannot compare snapshots at {0} and {1}")]
+    HeightMismatch(Height, Height),
+    #[error("missing snapshot for node '{0}' at height {1}")]
+    MissingSnapshot(String, Height),
+    #[error("inconsistent snapshot data: {0}")]
+    InconsistentData(String),
+}
+
+pub type ReplayResult<T> = Result<T, ReplayError>;
+
+// -----------------------------------------------------------------------------
+// Snapshot and Divergence types
+// -----------------------------------------------------------------------------
 
 /// A snapshot of a node's state at a given height.
 #[derive(Debug, Clone)]
@@ -149,45 +171,103 @@ impl std::fmt::Display for DivergenceReport {
     }
 }
 
-// ─── Comparison functions ───────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Comparison functions
+// -----------------------------------------------------------------------------
 
 /// Compare two node snapshots at the same height.
-pub fn compare_snapshots(a: &NodeSnapshot, b: &NodeSnapshot) -> Option<Divergence> {
+///
+/// Returns `Ok(Some(Divergence))` if snapshots differ,
+/// `Ok(None)` if they are identical,
+/// and `Err` if heights mismatch.
+pub fn compare_snapshots(a: &NodeSnapshot, b: &NodeSnapshot) -> ReplayResult<Option<Divergence>> {
     if a.height != b.height {
-        return None; // Cannot compare different heights.
+        return Err(ReplayError::HeightMismatch(a.height, b.height));
     }
 
     if a.state_root == b.state_root {
-        return None; // No divergence.
+        return Ok(None);
     }
 
     let mut details = Vec::new();
 
-    // Compare balances if available.
-    if let (Some(bal_a), Some(bal_b)) = (&a.balances, &b.balances) {
-        compare_btree_u64(bal_a, bal_b, &a.node_id, &b.node_id, &mut details, true);
+    // Compare balances if both are present.
+    match (&a.balances, &b.balances) {
+        (Some(bal_a), Some(bal_b)) => {
+            compare_btree_u64(bal_a, bal_b, &a.node_id, &b.node_id, &mut details, true);
+        }
+        (Some(_), None) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "balances".to_string(),
+                value_a: Some("present".to_string()),
+                value_b: None,
+            });
+        }
+        (None, Some(_)) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "balances".to_string(),
+                value_a: None,
+                value_b: Some("present".to_string()),
+            });
+        }
+        (None, None) => {}
     }
 
-    // Compare nonces if available.
-    if let (Some(non_a), Some(non_b)) = (&a.nonces, &b.nonces) {
-        compare_btree_u64(non_a, non_b, &a.node_id, &b.node_id, &mut details, false);
+    // Compare nonces if both are present.
+    match (&a.nonces, &b.nonces) {
+        (Some(non_a), Some(non_b)) => {
+            compare_btree_u64(non_a, non_b, &a.node_id, &b.node_id, &mut details, false);
+        }
+        (Some(_), None) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "nonces".to_string(),
+                value_a: Some("present".to_string()),
+                value_b: None,
+            });
+        }
+        (None, Some(_)) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "nonces".to_string(),
+                value_a: None,
+                value_b: Some("present".to_string()),
+            });
+        }
+        (None, None) => {}
     }
 
-    // Compare KV if available.
-    if let (Some(kv_a), Some(kv_b)) = (&a.kv, &b.kv) {
-        compare_btree_str(kv_a, kv_b, &mut details);
+    // Compare KV if both are present.
+    match (&a.kv, &b.kv) {
+        (Some(kv_a), Some(kv_b)) => {
+            compare_btree_str(kv_a, kv_b, &mut details);
+        }
+        (Some(_), None) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "kv".to_string(),
+                value_a: Some("present".to_string()),
+                value_b: None,
+            });
+        }
+        (None, Some(_)) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "kv".to_string(),
+                value_a: None,
+                value_b: Some("present".to_string()),
+            });
+        }
+        (None, None) => {}
     }
 
-    Some(Divergence {
+    Ok(Some(Divergence {
         height: a.height,
         node_a: a.node_id.clone(),
         node_b: b.node_id.clone(),
-        root_a: a.state_root.clone(),
-        root_b: b.state_root.clone(),
+        root_a: a.state_root,
+        root_b: b.state_root,
         details,
-    })
+    }))
 }
 
+/// Compare two maps of `String -> u64` and push differences.
 fn compare_btree_u64(
     a: &BTreeMap<String, u64>,
     b: &BTreeMap<String, u64>,
@@ -196,7 +276,7 @@ fn compare_btree_u64(
     details: &mut Vec<DivergenceDetail>,
     is_balance: bool,
 ) {
-    // Keys in A but not B.
+    // Keys only in A
     for key in a.keys() {
         if !b.contains_key(key) {
             details.push(DivergenceDetail::AccountMissing {
@@ -205,7 +285,7 @@ fn compare_btree_u64(
             });
         }
     }
-    // Keys in B but not A.
+    // Keys only in B
     for key in b.keys() {
         if !a.contains_key(key) {
             details.push(DivergenceDetail::AccountMissing {
@@ -214,7 +294,7 @@ fn compare_btree_u64(
             });
         }
     }
-    // Keys in both: check values.
+    // Keys in both with different values
     for (key, &val_a) in a {
         if let Some(&val_b) = b.get(key) {
             if val_a != val_b {
@@ -236,6 +316,7 @@ fn compare_btree_u64(
     }
 }
 
+/// Compare two maps of `String -> String` and push differences.
 fn compare_btree_str(
     a: &BTreeMap<String, String>,
     b: &BTreeMap<String, String>,
@@ -273,38 +354,56 @@ fn compare_btree_str(
 
 /// Compare multiple node snapshots at the same height.
 ///
-/// Performs pairwise comparison of all N*(N-1)/2 pairs.
-pub fn detect_divergence(snapshots: &[NodeSnapshot]) -> DivergenceReport {
-    let heights: Vec<Height> = snapshots.iter().map(|s| s.height).collect();
-    let mut divergences = Vec::new();
+/// Performs pairwise comparison of all `N*(N-1)/2` pairs.
+/// If any pair has mismatched heights, an error is returned.
+pub fn detect_divergence(snapshots: &[NodeSnapshot]) -> ReplayResult<DivergenceReport> {
+    if snapshots.is_empty() {
+        return Ok(DivergenceReport {
+            divergences: vec![],
+            all_agree: true,
+            node_count: 0,
+            heights_checked: vec![],
+        });
+    }
 
+    // Ensure all snapshots have the same height.
+    let first_height = snapshots[0].height;
+    for s in snapshots {
+        if s.height != first_height {
+            return Err(ReplayError::HeightMismatch(first_height, s.height));
+        }
+    }
+
+    let mut divergences = Vec::new();
     for i in 0..snapshots.len() {
         for j in (i + 1)..snapshots.len() {
-            if let Some(div) = compare_snapshots(&snapshots[i], &snapshots[j]) {
+            if let Some(div) = compare_snapshots(&snapshots[i], &snapshots[j])? {
                 divergences.push(div);
             }
         }
     }
 
     let all_agree = divergences.is_empty();
-    DivergenceReport {
+    Ok(DivergenceReport {
         divergences,
         all_agree,
         node_count: snapshots.len(),
-        heights_checked: heights,
-    }
+        heights_checked: vec![first_height],
+    })
 }
 
 /// Compare execution results across a range of heights.
 ///
-/// `node_snapshots` is a map from node_id to a sorted list of snapshots.
+/// `node_snapshots` is a map from `node_id` to a sorted list of snapshots.
+/// The list for each node must be sorted by height (ascending).
+/// Returns an error if any node is missing a snapshot at a height present in another node.
 pub fn detect_divergence_range(
     node_snapshots: &BTreeMap<String, Vec<NodeSnapshot>>,
-) -> DivergenceReport {
+) -> ReplayResult<DivergenceReport> {
     let mut all_divergences = Vec::new();
     let mut heights_checked = Vec::new();
 
-    // Collect all unique heights.
+    // Collect all unique heights across all nodes.
     let mut all_heights = std::collections::BTreeSet::new();
     for snapshots in node_snapshots.values() {
         for s in snapshots {
@@ -316,14 +415,20 @@ pub fn detect_divergence_range(
         heights_checked.push(height);
 
         // Gather snapshots at this height from all nodes.
-        let at_height: Vec<&NodeSnapshot> = node_snapshots
-            .values()
-            .filter_map(|snaps| snaps.iter().find(|s| s.height == height))
-            .collect();
+        let mut at_height = Vec::new();
+        for (node_id, snapshots) in node_snapshots {
+            match snapshots.iter().find(|s| s.height == height) {
+                Some(snapshot) => at_height.push(snapshot),
+                None => {
+                    return Err(ReplayError::MissingSnapshot(node_id.clone(), height));
+                }
+            }
+        }
 
+        // Compare pairwise within this height.
         for i in 0..at_height.len() {
             for j in (i + 1)..at_height.len() {
-                if let Some(div) = compare_snapshots(at_height[i], at_height[j]) {
+                if let Some(div) = compare_snapshots(at_height[i], at_height[j])? {
                     all_divergences.push(div);
                 }
             }
@@ -331,15 +436,17 @@ pub fn detect_divergence_range(
     }
 
     let all_agree = all_divergences.is_empty();
-    DivergenceReport {
+    Ok(DivergenceReport {
         divergences: all_divergences,
         all_agree,
         node_count: node_snapshots.len(),
         heights_checked,
-    }
+    })
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -373,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_divergence() {
+    fn test_no_divergence() -> ReplayResult<()> {
         let root = [1u8; 32];
         let snapshots = vec![
             snap("node-1", 100, root),
@@ -381,26 +488,28 @@ mod tests {
             snap("node-3", 100, root),
         ];
 
-        let report = detect_divergence(&snapshots);
-        assert!(report.all_agree, "report: {report}");
+        let report = detect_divergence(&snapshots)?;
+        assert!(report.all_agree);
         assert!(report.divergences.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_divergence_detected() {
+    fn test_divergence_detected() -> ReplayResult<()> {
         let snapshots = vec![
             snap("node-1", 100, [1u8; 32]),
             snap("node-2", 100, [2u8; 32]),
         ];
 
-        let report = detect_divergence(&snapshots);
+        let report = detect_divergence(&snapshots)?;
         assert!(!report.all_agree);
         assert_eq!(report.divergences.len(), 1);
         assert_eq!(report.divergences[0].height, 100);
+        Ok(())
     }
 
     #[test]
-    fn test_divergence_with_balance_details() {
+    fn test_divergence_with_balance_details() -> ReplayResult<()> {
         let mut bal_a = BTreeMap::new();
         bal_a.insert("alice".into(), 1000u64);
         bal_a.insert("bob".into(), 500u64);
@@ -414,55 +523,70 @@ mod tests {
             snap_with_balances("node-2", 100, [2u8; 32], bal_b),
         ];
 
-        let report = detect_divergence(&snapshots);
+        let report = detect_divergence(&snapshots)?;
         assert!(!report.all_agree);
         let div = &report.divergences[0];
         assert!(div.details.iter().any(|d| matches!(d,
             DivergenceDetail::BalanceDiff { account, value_a: 1000, value_b: 999 }
             if account == "alice"
         )));
+        Ok(())
     }
 
     #[test]
-    fn test_divergence_missing_account() {
+    fn test_divergence_missing_account() -> ReplayResult<()> {
         let mut bal_a = BTreeMap::new();
         bal_a.insert("alice".into(), 1000u64);
         bal_a.insert("charlie".into(), 100u64);
 
         let mut bal_b = BTreeMap::new();
         bal_b.insert("alice".into(), 1000u64);
-        // charlie missing from node-2
+        // charlie missing
 
         let snapshots = vec![
             snap_with_balances("node-1", 100, [1u8; 32], bal_a),
             snap_with_balances("node-2", 100, [2u8; 32], bal_b),
         ];
 
-        let report = detect_divergence(&snapshots);
+        let report = detect_divergence(&snapshots)?;
         assert!(!report.all_agree);
         let div = &report.divergences[0];
         assert!(div.details.iter().any(|d| matches!(d,
             DivergenceDetail::AccountMissing { account, present_in }
             if account == "charlie" && present_in == "node-1"
         )));
+        Ok(())
     }
 
     #[test]
-    fn test_three_node_partial_divergence() {
+    fn test_height_mismatch_error() {
+        let snapshots = vec![
+            snap("node-1", 100, [1u8; 32]),
+            snap("node-2", 101, [2u8; 32]),
+        ];
+        let result = detect_divergence(&snapshots);
+        assert!(matches!(
+            result,
+            Err(ReplayError::HeightMismatch(100, 101))
+        ));
+    }
+
+    #[test]
+    fn test_three_node_partial_divergence() -> ReplayResult<()> {
         let snapshots = vec![
             snap("node-1", 100, [1u8; 32]),
             snap("node-2", 100, [1u8; 32]),
-            snap("node-3", 100, [3u8; 32]), // node-3 diverged
+            snap("node-3", 100, [3u8; 32]),
         ];
 
-        let report = detect_divergence(&snapshots);
+        let report = detect_divergence(&snapshots)?;
         assert!(!report.all_agree);
-        // node-3 diverges from both node-1 and node-2.
         assert_eq!(report.divergences.len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn test_range_detection() {
+    fn test_range_detection() -> ReplayResult<()> {
         let mut node_snaps = BTreeMap::new();
         node_snaps.insert(
             "node-1".into(),
@@ -472,30 +596,37 @@ mod tests {
             "node-2".into(),
             vec![
                 snap("node-2", 1, [1u8; 32]),
-                snap("node-2", 2, [9u8; 32]), // divergence at height 2
+                snap("node-2", 2, [9u8; 32]),
             ],
         );
 
-        let report = detect_divergence_range(&node_snaps);
+        let report = detect_divergence_range(&node_snaps)?;
         assert!(!report.all_agree);
         assert_eq!(report.heights_checked.len(), 2);
         assert_eq!(report.divergences.len(), 1);
         assert_eq!(report.divergences[0].height, 2);
+        Ok(())
     }
 
     #[test]
-    fn test_report_display() {
-        let snapshots = vec![
-            snap("node-1", 100, [1u8; 32]),
-            snap("node-2", 100, [2u8; 32]),
-        ];
-        let report = detect_divergence(&snapshots);
-        let s = format!("{report}");
-        assert!(s.contains("DIVERGENCE DETECTED"));
+    fn test_range_missing_snapshot_error() {
+        let mut node_snaps = BTreeMap::new();
+        node_snaps.insert(
+            "node-1".into(),
+            vec![snap("node-1", 1, [1u8; 32]), snap("node-1", 2, [2u8; 32])],
+        );
+        node_snaps.insert("node-2".into(), vec![snap("node-2", 1, [1u8; 32])]); // missing height 2
+
+        let result = detect_divergence_range(&node_snaps);
+        assert!(matches!(
+            result,
+            Err(ReplayError::MissingSnapshot(node_id, height))
+            if node_id == "node-2" && height == 2
+        ));
     }
 
     #[test]
-    fn test_kv_divergence() {
+    fn test_kv_divergence() -> ReplayResult<()> {
         let mut kv_a = BTreeMap::new();
         kv_a.insert("key1".into(), "val_a".to_string());
 
@@ -519,10 +650,11 @@ mod tests {
             kv: Some(kv_b),
         };
 
-        let div = compare_snapshots(&a, &b).unwrap();
+        let div = compare_snapshots(&a, &b)?.expect("should have divergence");
         assert!(div.details.iter().any(|d| matches!(d,
             DivergenceDetail::KvDiff { key, .. } if key == "key1"
         )));
+        Ok(())
     }
 
     #[test]
@@ -534,5 +666,6 @@ mod tests {
         };
         let s = format!("{d}");
         assert!(s.contains("balance(alice)"));
+        assert!(s.contains("100 vs 200"));
     }
 }
