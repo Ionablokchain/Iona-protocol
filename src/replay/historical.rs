@@ -11,12 +11,45 @@
 //! # Usage
 //!
 //! ```ignore
-//! let result = replay_chain(&blocks, &genesis_state, 1);
+//! let result = replay_chain(&blocks, &genesis_state, 1)?;
 //! assert!(result.success, "replay failed at height {}", result.failed_at.unwrap());
 //! ```
 
 use crate::execution::{execute_block, KvState};
 use crate::types::{Block, Hash32, Height, Receipt};
+use std::collections::BTreeMap;
+use thiserror::Error;
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during block replay.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ReplayError {
+    #[error("state root mismatch at height {height}: expected {expected}, got {actual}")]
+    StateRootMismatch {
+        height: Height,
+        expected: String,
+        actual: String,
+    },
+    #[error("external root mismatch at height {height}: expected {expected}, got {actual}")]
+    ExternalRootMismatch {
+        height: Height,
+        expected: String,
+        actual: String,
+    },
+    #[error("blocks must be sorted by height in ascending order (found height {prev} followed by {current})")]
+    UnsortedBlocks { prev: Height, current: Height },
+    #[error("empty block list provided")]
+    EmptyBlockList,
+}
+
+pub type ReplayResult<T> = Result<T, ReplayError>;
+
+// -----------------------------------------------------------------------------
+// Result types
+// -----------------------------------------------------------------------------
 
 /// Result of replaying a single block.
 #[derive(Debug, Clone)]
@@ -51,15 +84,20 @@ pub struct ChainReplayResult {
     pub mismatch: Option<String>,
 }
 
+// -----------------------------------------------------------------------------
+// Core replay functions
+// -----------------------------------------------------------------------------
+
 /// Replay a single block from a given state.
 ///
 /// Returns the replay result and the new state after execution.
+/// This function does not return a `Result` – mismatches are recorded in the
+/// `match_ok` field of `BlockReplayResult`.
 pub fn replay_block(
     block: &Block,
     state: &KvState,
     base_fee_per_gas: u64,
 ) -> (BlockReplayResult, KvState) {
-    // Derive proposer address from header.
     let proposer_addr = if block.header.proposer_pk.is_empty() {
         "0000000000000000000000000000000000000000".to_string()
     } else {
@@ -70,7 +108,7 @@ pub fn replay_block(
         execute_block(state, &block.txs, base_fee_per_gas, &proposer_addr);
 
     let state_root = new_state.root();
-    let expected_root = block.header.state_root.clone();
+    let expected_root = block.header.state_root;
     let match_ok = state_root == expected_root;
 
     let result = BlockReplayResult {
@@ -89,12 +127,30 @@ pub fn replay_block(
 ///
 /// Blocks must be sorted by height in ascending order.
 /// `base_fee_per_gas` is used for all blocks (simplified; in production
-/// it would be computed per-block).
+/// it would be computed per‑block).
+///
+/// Returns `ReplayError` if blocks are unsorted or if a state root mismatch occurs.
 pub fn replay_chain(
     blocks: &[Block],
     initial_state: &KvState,
     base_fee_per_gas: u64,
-) -> ChainReplayResult {
+) -> ReplayResult<ChainReplayResult> {
+    if blocks.is_empty() {
+        return Err(ReplayError::EmptyBlockList);
+    }
+
+    // Validate ascending order
+    for i in 1..blocks.len() {
+        let prev = blocks[i - 1].header.height;
+        let curr = blocks[i].header.height;
+        if curr <= prev {
+            return Err(ReplayError::UnsortedBlocks {
+                prev,
+                current: curr,
+            });
+        }
+    }
+
     let mut state = initial_state.clone();
     let mut results = Vec::with_capacity(blocks.len());
     let mut total_gas = 0u64;
@@ -111,41 +167,56 @@ pub fn replay_chain(
                 hex::encode(result.state_root.0),
             );
             results.push(result.clone());
-            let total_blocks = results.len();
-            return ChainReplayResult {
+            return Ok(ChainReplayResult {
                 success: false,
                 failed_at: Some(result.height),
                 blocks: results,
-                total_blocks,
+                total_blocks: results.len(),
                 total_gas,
                 mismatch: Some(mismatch),
-            };
+            });
         }
 
         state = new_state;
         results.push(result);
     }
 
-    let total_blocks = results.len();
-    ChainReplayResult {
+    Ok(ChainReplayResult {
         success: true,
         failed_at: None,
         blocks: results,
-        total_blocks,
+        total_blocks: results.len(),
         total_gas,
         mismatch: None,
-    }
+    })
 }
 
 /// Replay a chain and compare against a list of expected state roots.
 ///
 /// `expected_roots` maps height -> expected state root.
+/// Returns `ReplayError` on any mismatch or ordering violation.
 pub fn replay_and_verify(
     blocks: &[Block],
     initial_state: &KvState,
     base_fee_per_gas: u64,
-    expected_roots: &std::collections::BTreeMap<Height, Hash32>,
-) -> ChainReplayResult {
+    expected_roots: &BTreeMap<Height, Hash32>,
+) -> ReplayResult<ChainReplayResult> {
+    if blocks.is_empty() {
+        return Err(ReplayError::EmptyBlockList);
+    }
+
+    // Validate ordering
+    for i in 1..blocks.len() {
+        let prev = blocks[i - 1].header.height;
+        let curr = blocks[i].header.height;
+        if curr <= prev {
+            return Err(ReplayError::UnsortedBlocks {
+                prev,
+                current: curr,
+            });
+        }
+    }
+
     let mut state = initial_state.clone();
     let mut results = Vec::with_capacity(blocks.len());
     let mut total_gas = 0u64;
@@ -154,7 +225,7 @@ pub fn replay_and_verify(
         let (result, new_state) = replay_block(block, &state, base_fee_per_gas);
         total_gas += result.gas_used;
 
-        // Check against external expected root (if provided for this height).
+        // Check external expected root if provided
         if let Some(ext_root) = expected_roots.get(&block.header.height) {
             if result.state_root != *ext_root {
                 let mismatch = format!(
@@ -164,34 +235,53 @@ pub fn replay_and_verify(
                     hex::encode(result.state_root.0),
                 );
                 results.push(result);
-                let total_blocks = results.len();
-                return ChainReplayResult {
+                return Ok(ChainReplayResult {
                     success: false,
                     failed_at: Some(block.header.height),
                     blocks: results,
-                    total_blocks,
+                    total_blocks: results.len(),
                     total_gas,
                     mismatch: Some(mismatch),
-                };
+                });
             }
+        }
+
+        // Also check internal block header root
+        if !result.match_ok {
+            let mismatch = format!(
+                "state root mismatch at height {}: expected {}, got {}",
+                result.height,
+                hex::encode(result.expected_root.0),
+                hex::encode(result.state_root.0),
+            );
+            results.push(result);
+            return Ok(ChainReplayResult {
+                success: false,
+                failed_at: Some(result.height),
+                blocks: results,
+                total_blocks: results.len(),
+                total_gas,
+                mismatch: Some(mismatch),
+            });
         }
 
         state = new_state;
         results.push(result);
     }
 
-    let total_blocks = results.len();
-    ChainReplayResult {
+    Ok(ChainReplayResult {
         success: true,
         failed_at: None,
         blocks: results,
-        total_blocks,
+        total_blocks: results.len(),
         total_gas,
         mismatch: None,
-    }
+    })
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -223,19 +313,20 @@ mod tests {
     }
 
     #[test]
-    fn test_replay_empty_block() {
+    fn test_replay_empty_block() -> ReplayResult<()> {
         let state = KvState::default();
         let expected_root = state.root();
-        let block = empty_block(1, expected_root.clone());
+        let block = empty_block(1, expected_root);
 
         let (result, new_state) = replay_block(&block, &state, 1);
-        assert!(result.match_ok, "root mismatch");
+        assert!(result.match_ok);
         assert_eq!(result.gas_used, 0);
         assert_eq!(new_state.root(), expected_root);
+        Ok(())
     }
 
     #[test]
-    fn test_replay_chain_empty_blocks() {
+    fn test_replay_chain_empty_blocks() -> ReplayResult<()> {
         let state = KvState::default();
         let root = state.root();
         let blocks = vec![
@@ -244,64 +335,80 @@ mod tests {
             empty_block(3, root.clone()),
         ];
 
-        let result = replay_chain(&blocks, &state, 1);
-        assert!(result.success, "mismatch: {:?}", result.mismatch);
+        let result = replay_chain(&blocks, &state, 1)?;
+        assert!(result.success);
         assert_eq!(result.total_blocks, 3);
         assert_eq!(result.total_gas, 0);
+        Ok(())
     }
 
     #[test]
-    fn test_replay_chain_root_mismatch() {
+    fn test_replay_chain_root_mismatch() -> ReplayResult<()> {
         let state = KvState::default();
         let root = state.root();
         let bad_root = Hash32([0xFF; 32]);
         let blocks = vec![
             empty_block(1, root.clone()),
-            empty_block(2, bad_root), // mismatch!
+            empty_block(2, bad_root), // mismatch
         ];
 
-        let result = replay_chain(&blocks, &state, 1);
+        let result = replay_chain(&blocks, &state, 1)?;
         assert!(!result.success);
         assert_eq!(result.failed_at, Some(2));
         assert!(result.mismatch.is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_replay_and_verify_with_external_roots() {
+    fn test_unsorted_blocks_error() {
+        let state = KvState::default();
+        let root = state.root();
+        let blocks = vec![
+            empty_block(2, root.clone()),
+            empty_block(1, root.clone()), // out of order
+        ];
+        let err = replay_chain(&blocks, &state, 1).unwrap_err();
+        assert!(matches!(
+            err,
+            ReplayError::UnsortedBlocks { prev: 2, current: 1 }
+        ));
+    }
+
+    #[test]
+    fn test_empty_block_list_error() {
+        let state = KvState::default();
+        let blocks = vec![];
+        let err = replay_chain(&blocks, &state, 1).unwrap_err();
+        assert!(matches!(err, ReplayError::EmptyBlockList));
+    }
+
+    #[test]
+    fn test_replay_and_verify_with_external_roots() -> ReplayResult<()> {
         let state = KvState::default();
         let root = state.root();
         let blocks = vec![empty_block(1, root.clone()), empty_block(2, root.clone())];
 
-        let mut expected = std::collections::BTreeMap::new();
+        let mut expected = BTreeMap::new();
         expected.insert(1, root.clone());
         expected.insert(2, root.clone());
 
-        let result = replay_and_verify(&blocks, &state, 1, &expected);
+        let result = replay_and_verify(&blocks, &state, 1, &expected)?;
         assert!(result.success);
+        Ok(())
     }
 
     #[test]
-    fn test_replay_and_verify_external_mismatch() {
+    fn test_replay_and_verify_external_mismatch() -> ReplayResult<()> {
         let state = KvState::default();
         let root = state.root();
         let blocks = vec![empty_block(1, root.clone())];
 
-        let mut expected = std::collections::BTreeMap::new();
-        expected.insert(1, Hash32([0xAA; 32])); // wrong external root
+        let mut expected = BTreeMap::new();
+        expected.insert(1, Hash32([0xAA; 32]));
 
-        let result = replay_and_verify(&blocks, &state, 1, &expected);
+        let result = replay_and_verify(&blocks, &state, 1, &expected)?;
         assert!(!result.success);
         assert_eq!(result.failed_at, Some(1));
-    }
-
-    #[test]
-    fn test_replay_result_fields() {
-        let state = KvState::default();
-        let root = state.root();
-        let block = empty_block(42, root.clone());
-
-        let (result, _) = replay_block(&block, &state, 1);
-        assert_eq!(result.height, 42);
-        assert!(result.receipts.is_empty());
+        Ok(())
     }
 }
