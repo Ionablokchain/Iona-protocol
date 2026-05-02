@@ -5,6 +5,17 @@
 
 use thiserror::Error;
 
+// -----------------------------------------------------------------------------
+// Result alias
+// -----------------------------------------------------------------------------
+
+/// Result type alias for VM operations.
+pub type VmResult<T> = Result<T, VmError>;
+
+// -----------------------------------------------------------------------------
+// Error definition
+// -----------------------------------------------------------------------------
+
 /// VM execution error.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum VmError {
@@ -64,11 +75,7 @@ pub enum VmError {
     CalldataOob(usize),
     /// Return data access out of bounds (RETURNDATACOPY).
     #[error("return data access out of bounds: offset {offset} size {size} (len {len})")]
-    ReturnDataOob {
-        offset: usize,
-        size: usize,
-        len: usize,
-    },
+    ReturnDataOob { offset: usize, size: usize, len: usize },
 
     // ── Storage ────────────────────────────────────────────────────────────
     /// Storage access error (e.g., I/O failure).
@@ -121,20 +128,49 @@ impl VmError {
         )
     }
 
-    /// Returns the gas cost penalty (if any) for this error.
-    /// For most errors, all gas is consumed; some errors (like REVERT) refund unused gas.
-    pub fn gas_penalty(&self) -> Option<u64> {
+    /// Returns `true` if the error is recoverable (e.g., can be caught by caller).
+    pub fn is_recoverable(&self) -> bool {
+        matches!(
+            self,
+            VmError::ArithmeticOverflow
+                | VmError::DivisionByZero
+                | VmError::InvalidJump(_)
+                | VmError::ReturnDataOob { .. }
+                | VmError::CalldataOob(_)
+                | VmError::WriteProtection
+                | VmError::ContractExists
+                | VmError::State(_)
+                | VmError::Storage(_)
+        )
+    }
+
+    /// Returns an error code suitable for RPC error responses.
+    pub fn code(&self) -> i32 {
         match self {
-            // REVERT consumes only the gas used up to that point
-            VmError::Halt => None,
-            // Other errors consume all gas
-            _ => Some(0), // Placeholder; actual logic would compute remaining gas
+            VmError::OutOfGas => -32015,
+            VmError::InvalidOpcode(_) => -32016,
+            VmError::StackUnderflow => -32017,
+            VmError::StackOverflow => -32018,
+            VmError::DivisionByZero => -32019,
+            VmError::ArithmeticOverflow => -32020,
+            VmError::MemoryLimit => -32021,
+            VmError::InvalidJump(_) => -32022,
+            VmError::CallDepth => -32023,
+            VmError::WriteProtection => -32024,
+            VmError::ContractExists => -32025,
+            VmError::CodeTooLarge => -32026,
+            VmError::CalldataOob(_) => -32027,
+            VmError::ReturnDataOob { .. } => -32028,
+            VmError::Storage(_) => -32029,
+            VmError::State(_) => -32030,
+            VmError::Halt => -32031,
+            VmError::Internal(_) => -32603,
         }
     }
 }
 
 // -----------------------------------------------------------------------------
-// Conversion from standard error types
+// Conversion from standard library and other error types
 // -----------------------------------------------------------------------------
 
 impl From<std::num::TryFromIntError> for VmError {
@@ -152,6 +188,14 @@ impl From<std::array::TryFromSliceError> for VmError {
 impl From<std::io::Error> for VmError {
     fn from(e: std::io::Error) -> Self {
         VmError::Storage(e.to_string())
+    }
+}
+
+impl From<crate::vm::opcodes::OpcodeError> for VmError {
+    fn from(err: crate::vm::opcodes::OpcodeError) -> Self {
+        match err {
+            crate::vm::opcodes::OpcodeError::InvalidOpcode { opcode } => VmError::InvalidOpcode(opcode),
+        }
     }
 }
 
@@ -186,12 +230,28 @@ mod tests {
     }
 
     #[test]
+    fn test_is_recoverable() {
+        assert!(VmError::State("".into()).is_recoverable());
+        assert!(!VmError::OutOfGas.is_recoverable());
+    }
+
+    #[test]
+    fn test_error_codes() {
+        assert_eq!(VmError::OutOfGas.code(), -32015);
+        assert_eq!(VmError::Internal("".into()).code(), -32603);
+    }
+
+    #[test]
     fn test_conversion() {
         let err: VmError = std::num::TryFromIntError::from(());
         assert!(matches!(err, VmError::Internal(_)));
 
         let err: VmError = std::io::Error::new(std::io::ErrorKind::Other, "disk full").into();
         assert!(matches!(err, VmError::Storage(_)));
+
+        let op_err = crate::vm::opcodes::OpcodeError::InvalidOpcode { opcode: 0x42 };
+        let err: VmError = op_err.into();
+        assert!(matches!(err, VmError::InvalidOpcode(0x42)));
     }
 
     #[test]
