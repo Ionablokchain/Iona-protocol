@@ -2,6 +2,19 @@
 //!
 //! Tracks gas consumption during execution, supports refunds,
 //! and provides helpers for memory expansion costs.
+//!
+//! # Example
+//!
+//! ```
+//! use iona::vm::gas::{GasMeter, GasError};
+//!
+//! let mut meter = GasMeter::new(1000);
+//! meter.charge(500)?;
+//! meter.add_refund(100)?;
+//! let net_used = meter.apply_refund();
+//! assert_eq!(net_used, 400);
+//! # Ok::<(), GasError>(())
+//! ```
 
 use thiserror::Error;
 
@@ -37,6 +50,7 @@ pub struct GasMeter {
 
 impl GasMeter {
     /// Create a new gas meter with the given limit.
+    #[inline]
     pub fn new(limit: u64) -> Self {
         Self {
             limit,
@@ -46,6 +60,7 @@ impl GasMeter {
     }
 
     /// Charge `amount` gas. Returns `Err` if limit would be exceeded.
+    #[inline]
     pub fn charge(&mut self, amount: u64) -> Result<(), GasError> {
         let new_used = self.used.saturating_add(amount);
         if new_used > self.limit {
@@ -60,6 +75,7 @@ impl GasMeter {
 
     /// Add a refund amount (e.g., for clearing storage).
     /// The refund is capped at half of the gas used (EIP-3529).
+    #[inline]
     pub fn add_refund(&mut self, amount: u64) -> Result<(), GasError> {
         let new_refund = self.refund.saturating_add(amount);
         let max_refund = self.used / 2;
@@ -75,6 +91,7 @@ impl GasMeter {
 
     /// Apply the refund, reducing gas used.
     /// Returns the net gas used after refund.
+    #[inline]
     pub fn apply_refund(&mut self) -> u64 {
         let refund = std::cmp::min(self.refund, self.used);
         self.used -= refund;
@@ -83,11 +100,31 @@ impl GasMeter {
     }
 
     /// Gas remaining.
+    #[inline]
     pub fn remaining(&self) -> u64 {
         self.limit.saturating_sub(self.used)
     }
 
+    /// Maximum refund allowed under current usage (half of used).
+    #[inline]
+    pub fn max_refund_allowed(&self) -> u64 {
+        self.used / 2
+    }
+
+    /// Current refundable gas (before applying).
+    #[inline]
+    pub fn refundable(&self) -> u64 {
+        self.refund
+    }
+
+    /// Net gas used after applying refund (without mutating).
+    #[inline]
+    pub fn net_used(&self) -> u64 {
+        self.used.saturating_sub(std::cmp::min(self.refund, self.used))
+    }
+
     /// Fraction of gas used (0.0 – 1.0).
+    #[inline]
     pub fn fraction_used(&self) -> f64 {
         if self.limit == 0 {
             return 1.0;
@@ -96,6 +133,7 @@ impl GasMeter {
     }
 
     /// Check if there is enough gas for an operation without charging.
+    #[inline]
     pub fn can_charge(&self, amount: u64) -> bool {
         self.used.saturating_add(amount) <= self.limit
     }
@@ -105,6 +143,7 @@ impl GasMeter {
     /// `current_words` – current memory size in 32‑byte words.
     /// `new_words` – new memory size in 32‑byte words.
     /// Returns the additional gas cost (3 gas per word).
+    #[inline]
     pub fn charge_memory_expansion(&mut self, current_words: usize, new_words: usize) -> Result<u64, GasError> {
         if new_words <= current_words {
             return Ok(0);
@@ -138,7 +177,7 @@ mod tests {
         assert!(g.charge(50).is_ok());
         let err = g.charge(60).unwrap_err();
         assert!(matches!(err, GasError::OutOfGas { needed: 60, remaining: 50 }));
-        assert_eq!(g.used, 100); // used becomes limit
+        assert_eq!(g.used, 100);
         assert_eq!(g.remaining(), 0);
     }
 
@@ -167,7 +206,7 @@ mod tests {
     fn test_refund_capped_at_half_used() {
         let mut g = GasMeter::new(1000);
         g.charge(200).unwrap();
-        // Max refund = 100
+        assert_eq!(g.max_refund_allowed(), 100);
         assert!(g.add_refund(80).is_ok());
         let err = g.add_refund(30).unwrap_err();
         assert!(matches!(err, GasError::RefundOverflow { amount: 30, current: 80 }));
@@ -178,10 +217,8 @@ mod tests {
     fn test_memory_expansion() {
         let mut g = GasMeter::new(1000);
         let cost = g.charge_memory_expansion(0, 10).unwrap();
-        assert_eq!(cost, 30); // 10 words * 3
+        assert_eq!(cost, 30);
         assert_eq!(g.used, 30);
-
-        // No expansion
         let cost = g.charge_memory_expansion(10, 10).unwrap();
         assert_eq!(cost, 0);
         assert_eq!(g.used, 30);
@@ -210,5 +247,22 @@ mod tests {
         assert!((g.fraction_used() - 0.25).abs() < f64::EPSILON);
         g.charge(150).unwrap();
         assert!((g.fraction_used() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_net_used() {
+        let mut g = GasMeter::new(1000);
+        g.charge(500).unwrap();
+        g.add_refund(100).unwrap();
+        assert_eq!(g.net_used(), 400);
+        assert_eq!(g.used, 500);
+        assert_eq!(g.refund, 100);
+    }
+
+    #[test]
+    fn test_max_refund_allowed() {
+        let mut g = GasMeter::new(1000);
+        g.charge(500).unwrap();
+        assert_eq!(g.max_refund_allowed(), 250);
     }
 }
