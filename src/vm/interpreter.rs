@@ -16,6 +16,10 @@ use std::collections::HashSet;
 const STACK_LIMIT: usize = 1024;
 const MAX_CALL_DEPTH: usize = 1024;
 
+// -----------------------------------------------------------------------------
+// Result
+// -----------------------------------------------------------------------------
+
 /// Result of executing a contract.
 #[derive(Debug)]
 pub struct VmResult {
@@ -25,7 +29,9 @@ pub struct VmResult {
     pub logs_count: usize,
 }
 
-// ── 256-bit word helpers ──────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// 256‑bit word helpers
+// -----------------------------------------------------------------------------
 
 type Word = [u8; 32];
 
@@ -34,9 +40,7 @@ fn word_to_u64(w: &Word) -> u64 {
 }
 
 fn word_to_usize(w: &Word) -> usize {
-    // Safe: take low 8 bytes, cap at usize::MAX
-    let lo = word_to_u64(w);
-    lo as usize
+    word_to_u64(w) as usize
 }
 
 fn u64_to_word(v: u64) -> Word {
@@ -61,7 +65,6 @@ fn word_bool(v: bool) -> Word {
     w
 }
 
-// 256-bit add/sub/mul/div using u128 pairs (hi, lo)
 fn word_add(a: &Word, b: &Word) -> Word {
     let mut r = [0u8; 32];
     let mut carry: u16 = 0;
@@ -85,8 +88,7 @@ fn word_sub(a: &Word, b: &Word) -> Word {
 }
 
 fn word_mul(a: &Word, b: &Word) -> Word {
-    // Schoolbook 256-bit multiply, keep low 256 bits
-    let mut result = [0u64; 8]; // 8 × 32-bit limbs
+    let mut result = [0u64; 8];
     let a_limbs: Vec<u32> = (0..8)
         .map(|i| u32::from_be_bytes(a[i * 4..(i + 1) * 4].try_into().unwrap()))
         .rev()
@@ -95,7 +97,6 @@ fn word_mul(a: &Word, b: &Word) -> Word {
         .map(|i| u32::from_be_bytes(b[i * 4..(i + 1) * 4].try_into().unwrap()))
         .rev()
         .collect();
-
     for (i, &ai) in a_limbs.iter().enumerate() {
         for (j, &bj) in b_limbs.iter().enumerate() {
             if i + j < 8 {
@@ -103,13 +104,11 @@ fn word_mul(a: &Word, b: &Word) -> Word {
             }
         }
     }
-    // Propagate carries
     for i in 0..7 {
         result[i + 1] += result[i] >> 32;
         result[i] &= 0xFFFF_FFFF;
     }
     result[7] &= 0xFFFF_FFFF;
-
     let limbs_be: Vec<u32> = result.iter().rev().map(|&v| v as u32).collect();
     let mut r = [0u8; 32];
     for (i, l) in limbs_be.iter().enumerate() {
@@ -122,11 +121,8 @@ fn word_div(a: &Word, b: &Word) -> Word {
     if word_is_zero(b) {
         return [0u8; 32];
     }
-    // For simplicity, use u128 if both fit; otherwise approximate with u64 ratio
-    // Full 256-bit division is complex; this covers all practical cases for the VM scaffold
     let b_lo = word_to_u64(b);
     let a_lo = word_to_u64(a);
-    // Fast path: both fit in u64
     let a_hi = &a[..24];
     let b_hi = &b[..24];
     if a_hi.iter().all(|&x| x == 0) && b_hi.iter().all(|&x| x == 0) {
@@ -135,7 +131,6 @@ fn word_div(a: &Word, b: &Word) -> Word {
         }
         return u64_to_word(a_lo / b_lo);
     }
-    // Use u128 for 128-bit values
     let au = u128::from_be_bytes(a[16..32].try_into().unwrap());
     let bu = u128::from_be_bytes(b[16..32].try_into().unwrap());
     if a[..16].iter().all(|&x| x == 0) && b[..16].iter().all(|&x| x == 0) {
@@ -147,7 +142,6 @@ fn word_div(a: &Word, b: &Word) -> Word {
         w[16..32].copy_from_slice(&r.to_be_bytes());
         return w;
     }
-    // Fallback: approximate (acceptable for VM scaffold)
     [0u8; 32]
 }
 
@@ -175,13 +169,11 @@ fn word_rem(a: &Word, b: &Word) -> Word {
 }
 
 fn word_exp(base: &Word, exp: &Word) -> Word {
-    // exp as u64 (capped — huge exponents burn all gas first)
     let e = word_to_u64(exp);
     if e == 0 {
         return u64_to_word(1);
     }
     let b = word_to_u64(base);
-    // fast path u64 overflow wrapping
     let mut result: u64 = 1;
     let mut base_p = b;
     let mut exp_p = e;
@@ -235,34 +227,15 @@ fn word_shr(shift: &Word, val: &Word) -> Word {
     r
 }
 
-fn word_lt(a: &Word, b: &Word) -> bool {
-    a < b
-}
-fn word_gt(a: &Word, b: &Word) -> bool {
-    a > b
-}
-
 fn keccak256_bytes(data: &[u8]) -> Word {
     let mut h = Keccak256::new();
     h.update(data);
     h.finalize().into()
 }
 
-// ── Stack helpers ─────────────────────────────────────────────────────────
-
-fn pop(stack: &mut Vec<Word>) -> Result<Word, VmError> {
-    stack.pop().ok_or(VmError::StackUnderflow)
-}
-
-fn push(stack: &mut Vec<Word>, v: Word) -> Result<(), VmError> {
-    if stack.len() >= STACK_LIMIT {
-        return Err(VmError::StackOverflow);
-    }
-    stack.push(v);
-    Ok(())
-}
-
-// ── JUMPDEST analysis ─────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// JUMPDEST analysis
+// -----------------------------------------------------------------------------
 
 fn build_jumpdest_set(code: &[u8]) -> HashSet<usize> {
     let mut valid = HashSet::new();
@@ -277,7 +250,485 @@ fn build_jumpdest_set(code: &[u8]) -> HashSet<usize> {
     valid
 }
 
-// ── Main execution ────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Interpreter
+// -----------------------------------------------------------------------------
+
+struct Interpreter<'a, S: VmState> {
+    state: &'a mut S,
+    contract: Word,
+    code: &'a [u8],
+    calldata: &'a [u8],
+    caller: Word,
+    gas: GasMeter,
+    pc: usize,
+    stack: Vec<Word>,
+    mem: Memory,
+    jumpdests: HashSet<usize>,
+    logs_count: usize,
+}
+
+impl<'a, S: VmState> Interpreter<'a, S> {
+    fn new(
+        state: &'a mut S,
+        contract: Word,
+        code: &'a [u8],
+        calldata: &'a [u8],
+        caller: Word,
+        gas_limit: u64,
+    ) -> Self {
+        Self {
+            state,
+            contract,
+            code,
+            calldata,
+            caller,
+            gas: GasMeter::new(gas_limit),
+            pc: 0,
+            stack: Vec::with_capacity(64),
+            mem: Memory::new(),
+            jumpdests: build_jumpdest_set(code),
+            logs_count: 0,
+        }
+    }
+
+    fn run(mut self) -> Result<VmResult, VmError> {
+        while self.pc < self.code.len() {
+            let opcode = self.code[self.pc];
+            self.pc += 1;
+            self.execute_opcode(opcode)?;
+        }
+        Ok(VmResult {
+            return_data: vec![],
+            gas_used: self.gas.used,
+            reverted: false,
+            logs_count: self.logs_count,
+        })
+    }
+
+    fn execute_opcode(&mut self, opcode: u8) -> Result<(), VmError> {
+        match opcode {
+            op::STOP => return self.stop(),
+            op::ADD => self.add()?,
+            op::SUB => self.sub()?,
+            op::MUL => self.mul()?,
+            op::DIV => self.div()?,
+            op::MOD => self.rem()?,
+            op::EXP => self.exp()?,
+            op::LT => self.lt()?,
+            op::GT => self.gt()?,
+            op::EQ => self.eq()?,
+            op::ISZERO => self.iszero()?,
+            op::AND => self.and()?,
+            op::OR => self.or()?,
+            op::XOR => self.xor()?,
+            op::NOT => self.not()?,
+            op::SHL => self.shl()?,
+            op::SHR => self.shr()?,
+            op::SHA3 => self.sha3()?,
+            op::CALLER => self.caller()?,
+            op::CALLVALUE => self.callvalue()?,
+            op::CALLDATALOAD => self.calldataload()?,
+            op::CALLDATASIZE => self.calldatasize()?,
+            op::GAS => self.gas_op()?,
+            op::PC => self.pc_op()?,
+            op::MLOAD => self.mload()?,
+            op::MSTORE => self.mstore()?,
+            op::MSTORE8 => self.mstore8()?,
+            op::MSIZE => self.msize()?,
+            op::SLOAD => self.sload()?,
+            op::SSTORE => self.sstore()?,
+            op::POP => self.pop()?,
+            op::JUMP => self.jump()?,
+            op::JUMPI => self.jumpi()?,
+            op::JUMPDEST => self.jumpdest()?,
+            op::RETURN => return self.return_op(),
+            op::REVERT => return self.revert(),
+            op::INVALID => return Err(VmError::InvalidOpcode(op::INVALID)),
+            0x60..=0x7F => self.push(opcode)?,
+            0x80..=0x8F => self.dup(opcode)?,
+            0x90..=0x9F => self.swap(opcode)?,
+            0xA0..=0xA4 => self.log(opcode)?,
+            _ => return Err(VmError::InvalidOpcode(opcode)),
+        }
+        Ok(())
+    }
+
+    // ----- Basic helpers -----
+    fn pop(&mut self) -> Result<Word, VmError> {
+        self.stack.pop().ok_or(VmError::StackUnderflow)
+    }
+
+    fn push(&mut self, v: Word) -> Result<(), VmError> {
+        if self.stack.len() >= STACK_LIMIT {
+            return Err(VmError::StackOverflow);
+        }
+        self.stack.push(v);
+        Ok(())
+    }
+
+    fn charge(&mut self, amount: u64) -> Result<(), VmError> {
+        self.gas.charge(amount).map_err(|_| VmError::OutOfGas)
+    }
+
+    // ----- Arithmetic -----
+    fn add(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let b = self.pop()?;
+        let a = self.pop()?;
+        self.push(word_add(&a, &b))
+    }
+
+    fn sub(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let b = self.pop()?;
+        let a = self.pop()?;
+        self.push(word_sub(&a, &b))
+    }
+
+    fn mul(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_LOW)?;
+        let b = self.pop()?;
+        let a = self.pop()?;
+        self.push(word_mul(&a, &b))
+    }
+
+    fn div(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_LOW)?;
+        let b = self.pop()?;
+        let a = self.pop()?;
+        self.push(word_div(&a, &b))
+    }
+
+    fn rem(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_LOW)?;
+        let b = self.pop()?;
+        let a = self.pop()?;
+        self.push(word_rem(&a, &b))
+    }
+
+    fn exp(&mut self) -> Result<(), VmError> {
+        let exp_raw = self.pop()?;
+        let base = self.pop()?;
+        let exp_bytes = exp_raw.iter().rev().skip_while(|&&x| x == 0).count().max(1);
+        self.charge(op::GAS_EXP_BASE + op::GAS_EXP_BYTE * exp_bytes as u64)?;
+        self.push(word_exp(&base, &exp_raw))
+    }
+
+    // ----- Comparison / bitwise -----
+    fn lt(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let b = self.pop()?;
+        let a = self.pop()?;
+        self.push(word_bool(a < b))
+    }
+
+    fn gt(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let b = self.pop()?;
+        let a = self.pop()?;
+        self.push(word_bool(a > b))
+    }
+
+    fn eq(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let b = self.pop()?;
+        let a = self.pop()?;
+        self.push(word_bool(a == b))
+    }
+
+    fn iszero(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let a = self.pop()?;
+        self.push(word_bool(word_is_zero(&a)))
+    }
+
+    fn and(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let b = self.pop()?;
+        let a = self.pop()?;
+        let mut r = [0u8; 32];
+        for i in 0..32 {
+            r[i] = a[i] & b[i];
+        }
+        self.push(r)
+    }
+
+    fn or(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let b = self.pop()?;
+        let a = self.pop()?;
+        let mut r = [0u8; 32];
+        for i in 0..32 {
+            r[i] = a[i] | b[i];
+        }
+        self.push(r)
+    }
+
+    fn xor(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let b = self.pop()?;
+        let a = self.pop()?;
+        let mut r = [0u8; 32];
+        for i in 0..32 {
+            r[i] = a[i] ^ b[i];
+        }
+        self.push(r)
+    }
+
+    fn not(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let a = self.pop()?;
+        let mut r = [0u8; 32];
+        for i in 0..32 {
+            r[i] = !a[i];
+        }
+        self.push(r)
+    }
+
+    fn shl(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let shift = self.pop()?;
+        let val = self.pop()?;
+        self.push(word_shl(&shift, &val))
+    }
+
+    fn shr(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let shift = self.pop()?;
+        let val = self.pop()?;
+        self.push(word_shr(&shift, &val))
+    }
+
+    // ----- SHA3 -----
+    fn sha3(&mut self) -> Result<(), VmError> {
+        let offset = word_to_usize(&self.pop()?);
+        let size = word_to_usize(&self.pop()?);
+        let words = (size + 31) / 32;
+        self.charge(op::GAS_SHA3 + op::GAS_COPY_WORD * words as u64)?;
+        let data = self.mem.read_range(offset, size)?;
+        self.push(keccak256_bytes(&data))
+    }
+
+    // ----- Environment -----
+    fn caller(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        self.push(self.caller)
+    }
+
+    fn callvalue(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        self.push([0u8; 32])
+    }
+
+    fn calldataload(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let offset = word_to_usize(&self.pop()?);
+        let mut word = [0u8; 32];
+        for i in 0..32 {
+            let idx = offset.wrapping_add(i);
+            if idx < self.calldata.len() {
+                word[i] = self.calldata[idx];
+            }
+        }
+        self.push(word)
+    }
+
+    fn calldatasize(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        self.push(usize_to_word(self.calldata.len()))
+    }
+
+    fn gas_op(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        self.push(u64_to_word(self.gas.remaining()))
+    }
+
+    fn pc_op(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        self.push(usize_to_word(self.pc - 1))
+    }
+
+    // ----- Memory -----
+    fn mload(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let offset = word_to_usize(&self.pop()?);
+        let mem_gas = self.mem.ensure(offset, 32)?;
+        self.charge(mem_gas)?;
+        self.push(self.mem.load32(offset)?)
+    }
+
+    fn mstore(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let offset = word_to_usize(&self.pop()?);
+        let value = self.pop()?;
+        let mem_gas = self.mem.store32(offset, &value)?;
+        self.charge(mem_gas)
+    }
+
+    fn mstore8(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let offset = word_to_usize(&self.pop()?);
+        let value = self.pop()?;
+        let mem_gas = self.mem.store8(offset, value[31])?;
+        self.charge(mem_gas)
+    }
+
+    fn msize(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        self.push(usize_to_word(self.mem.size()))
+    }
+
+    // ----- Storage -----
+    fn sload(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_SLOAD)?;
+        let key = self.pop()?;
+        let val = self.state.sload(&self.contract, &key)?;
+        self.push(val)
+    }
+
+    fn sstore(&mut self) -> Result<(), VmError> {
+        let key = self.pop()?;
+        let val = self.pop()?;
+        let old = self.state.sload(&self.contract, &key)?;
+        let gas_cost = if word_is_zero(&old) && !word_is_zero(&val) {
+            op::GAS_SSTORE_SET
+        } else if !word_is_zero(&old) && word_is_zero(&val) {
+            op::GAS_SSTORE_CLEAR
+        } else {
+            op::GAS_SSTORE_RESET
+        };
+        self.charge(gas_cost)?;
+        self.state.sstore(&self.contract, &key, val)
+    }
+
+    // ----- Stack ops -----
+    fn pop_op(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let _ = self.pop()?;
+        Ok(())
+    }
+
+    fn push(&mut self, opcode: u8) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let n = (opcode - 0x60 + 1) as usize;
+        let mut word = [0u8; 32];
+        let start = 32 - n;
+        for i in 0..n {
+            if self.pc + i < self.code.len() {
+                word[start + i] = self.code[self.pc + i];
+            }
+        }
+        self.pc += n;
+        self.push(word)
+    }
+
+    fn dup(&mut self, opcode: u8) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let n = (opcode - 0x80 + 1) as usize;
+        if self.stack.len() < n {
+            return Err(VmError::StackUnderflow);
+        }
+        let v = self.stack[self.stack.len() - n];
+        self.push(v)
+    }
+
+    fn swap(&mut self, opcode: u8) -> Result<(), VmError> {
+        self.charge(op::GAS_VERYLOW)?;
+        let n = (opcode - 0x90 + 1) as usize;
+        let len = self.stack.len();
+        if len < n + 1 {
+            return Err(VmError::StackUnderflow);
+        }
+        self.stack.swap(len - 1, len - 1 - n);
+        Ok(())
+    }
+
+    // ----- Control flow -----
+    fn jump(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_JUMP)?;
+        let dest = word_to_usize(&self.pop()?);
+        if !self.jumpdests.contains(&dest) {
+            return Err(VmError::InvalidJump(dest));
+        }
+        self.pc = dest + 1;
+        Ok(())
+    }
+
+    fn jumpi(&mut self) -> Result<(), VmError> {
+        self.charge(op::GAS_JUMPI)?;
+        let dest = word_to_usize(&self.pop()?);
+        let cond = self.pop()?;
+        if !word_is_zero(&cond) {
+            if !self.jumpdests.contains(&dest) {
+                return Err(VmError::InvalidJump(dest));
+            }
+            self.pc = dest + 1;
+        }
+        Ok(())
+    }
+
+    fn jumpdest(&mut self) -> Result<(), VmError> {
+        self.charge(1)
+    }
+
+    // ----- Logging -----
+    fn log(&mut self, opcode: u8) -> Result<(), VmError> {
+        let n_topics = (opcode - 0xA0) as usize;
+        let offset = word_to_usize(&self.pop()?);
+        let size = word_to_usize(&self.pop()?);
+        let mut topics = Vec::with_capacity(n_topics);
+        for _ in 0..n_topics {
+            topics.push(self.pop()?);
+        }
+        let log_gas = op::GAS_LOG_BASE
+            + op::GAS_LOG_TOPIC * n_topics as u64
+            + op::GAS_LOG_BYTE * size as u64;
+        self.charge(log_gas)?;
+        let data = self.mem.read_range(offset, size)?;
+        self.state.emit_log(&self.contract, topics, data);
+        self.logs_count += 1;
+        Ok(())
+    }
+
+    // ----- Return / Revert -----
+    fn stop(&mut self) -> Result<VmResult, VmError> {
+        Ok(VmResult {
+            return_data: vec![],
+            gas_used: self.gas.used,
+            reverted: false,
+            logs_count: self.logs_count,
+        })
+    }
+
+    fn return_op(&mut self) -> Result<VmResult, VmError> {
+        let offset = word_to_usize(&self.pop()?);
+        let size = word_to_usize(&self.pop()?);
+        let data = self.mem.read_range(offset, size)?;
+        Ok(VmResult {
+            return_data: data,
+            gas_used: self.gas.used,
+            reverted: false,
+            logs_count: self.logs_count,
+        })
+    }
+
+    fn revert(&mut self) -> Result<VmResult, VmError> {
+        let offset = word_to_usize(&self.pop()?);
+        let size = word_to_usize(&self.pop()?);
+        let data = self.mem.read_range(offset, size)?;
+        Ok(VmResult {
+            return_data: data,
+            gas_used: self.gas.used,
+            reverted: true,
+            logs_count: 0,
+        })
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Public entry point
+// -----------------------------------------------------------------------------
 
 pub fn exec<S: VmState>(
     state: &mut S,
@@ -288,358 +739,79 @@ pub fn exec<S: VmState>(
     gas_limit: u64,
     _call_depth: usize,
 ) -> Result<VmResult, VmError> {
-    let jumpdests = build_jumpdest_set(code);
-    let mut gas = GasMeter::new(gas_limit);
-    let mut pc = 0usize;
-    let mut stack: Vec<Word> = Vec::with_capacity(64);
-    let mut mem = Memory::new();
-    let mut logs_count = 0usize;
+    let interpreter = Interpreter::new(state, contract, code, calldata, *caller, gas_limit);
+    interpreter.run()
+}
 
-    while pc < code.len() {
-        let opcode = code[pc];
-        pc += 1;
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
-        match opcode {
-            op::STOP => {
-                return Ok(VmResult {
-                    return_data: vec![],
-                    gas_used: gas.used,
-                    reverted: false,
-                    logs_count,
-                });
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::state::MockVmState;
 
-            // ── Arithmetic ───────────────────────────────────────────────
-            op::ADD => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                push(&mut stack, word_add(&a, &b))?;
-            }
-            op::SUB => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                push(&mut stack, word_sub(&a, &b))?;
-            }
-            op::MUL => {
-                gas.charge(op::GAS_LOW).map_err(|_| VmError::OutOfGas)?;
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                push(&mut stack, word_mul(&a, &b))?;
-            }
-            op::DIV => {
-                gas.charge(op::GAS_LOW).map_err(|_| VmError::OutOfGas)?;
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                push(&mut stack, word_div(&a, &b))?;
-            }
-            op::MOD => {
-                gas.charge(op::GAS_LOW).map_err(|_| VmError::OutOfGas)?;
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                push(&mut stack, word_rem(&a, &b))?;
-            }
-            op::EXP => {
-                let exp_raw = pop(&mut stack)?;
-                let base = pop(&mut stack)?;
-                // Gas: 10 + 50 * byte_len(exp)
-                let exp_bytes = exp_raw.iter().rev().skip_while(|&&x| x == 0).count().max(1);
-                gas.charge(op::GAS_EXP_BASE + op::GAS_EXP_BYTE * exp_bytes as u64)
-                    .map_err(|_| VmError::OutOfGas)?;
-                push(&mut stack, word_exp(&base, &exp_raw))?;
-            }
-
-            // ── Comparison / bitwise ──────────────────────────────────────
-            op::LT => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                push(&mut stack, word_bool(word_lt(&a, &b)))?;
-            }
-            op::GT => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                push(&mut stack, word_bool(word_gt(&a, &b)))?;
-            }
-            op::EQ => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                push(&mut stack, word_bool(a == b))?;
-            }
-            op::ISZERO => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let a = pop(&mut stack)?;
-                push(&mut stack, word_bool(word_is_zero(&a)))?;
-            }
-            op::AND => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                let mut r = [0u8; 32];
-                for i in 0..32 {
-                    r[i] = a[i] & b[i];
-                }
-                push(&mut stack, r)?;
-            }
-            op::OR => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                let mut r = [0u8; 32];
-                for i in 0..32 {
-                    r[i] = a[i] | b[i];
-                }
-                push(&mut stack, r)?;
-            }
-            op::XOR => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let b = pop(&mut stack)?;
-                let a = pop(&mut stack)?;
-                let mut r = [0u8; 32];
-                for i in 0..32 {
-                    r[i] = a[i] ^ b[i];
-                }
-                push(&mut stack, r)?;
-            }
-            op::NOT => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let a = pop(&mut stack)?;
-                let mut r = [0u8; 32];
-                for i in 0..32 {
-                    r[i] = !a[i];
-                }
-                push(&mut stack, r)?;
-            }
-            op::SHL => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let shift = pop(&mut stack)?;
-                let val = pop(&mut stack)?;
-                push(&mut stack, word_shl(&shift, &val))?;
-            }
-            op::SHR => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let shift = pop(&mut stack)?;
-                let val = pop(&mut stack)?;
-                push(&mut stack, word_shr(&shift, &val))?;
-            }
-
-            // ── SHA3 ─────────────────────────────────────────────────────
-            op::SHA3 => {
-                let offset = word_to_usize(&pop(&mut stack)?);
-                let size = word_to_usize(&pop(&mut stack)?);
-                let words = (size + 31) / 32;
-                gas.charge(op::GAS_SHA3 + op::GAS_COPY_WORD * words as u64)
-                    .map_err(|_| VmError::OutOfGas)?;
-                let data = mem.read_range(offset, size)?;
-                push(&mut stack, keccak256_bytes(&data))?;
-            }
-
-            // ── Environment ───────────────────────────────────────────────
-            op::CALLER => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                push(&mut stack, *caller)?;
-            }
-            op::CALLVALUE => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                push(&mut stack, [0u8; 32])?;
-            }
-            op::CALLDATALOAD => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let offset = word_to_usize(&pop(&mut stack)?);
-                let mut word = [0u8; 32];
-                for i in 0..32 {
-                    let idx = offset.wrapping_add(i);
-                    if idx < calldata.len() {
-                        word[i] = calldata[idx];
-                    }
-                }
-                push(&mut stack, word)?;
-            }
-            op::CALLDATASIZE => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                push(&mut stack, usize_to_word(calldata.len()))?;
-            }
-            op::GAS => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                push(&mut stack, u64_to_word(gas.remaining()))?;
-            }
-            op::PC => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                push(&mut stack, usize_to_word(pc - 1))?;
-            }
-
-            // ── Memory ────────────────────────────────────────────────────
-            op::MLOAD => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let offset = word_to_usize(&pop(&mut stack)?);
-                let mem_gas = mem.ensure(offset, 32)?;
-                gas.charge(mem_gas).map_err(|_| VmError::OutOfGas)?;
-                push(&mut stack, mem.load32(offset)?)?;
-            }
-            op::MSTORE => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let offset = word_to_usize(&pop(&mut stack)?);
-                let value = pop(&mut stack)?;
-                let mem_gas = mem.store32(offset, &value)?;
-                gas.charge(mem_gas).map_err(|_| VmError::OutOfGas)?;
-            }
-            op::MSTORE8 => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let offset = word_to_usize(&pop(&mut stack)?);
-                let value = pop(&mut stack)?;
-                let mem_gas = mem.store8(offset, value[31])?;
-                gas.charge(mem_gas).map_err(|_| VmError::OutOfGas)?;
-            }
-            op::MSIZE => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                push(&mut stack, usize_to_word(mem.size()))?;
-            }
-
-            // ── Storage ───────────────────────────────────────────────────
-            op::SLOAD => {
-                gas.charge(op::GAS_SLOAD).map_err(|_| VmError::OutOfGas)?;
-                let key = pop(&mut stack)?;
-                let val = state.sload(&contract, &key)?;
-                push(&mut stack, val)?;
-            }
-            op::SSTORE => {
-                let key = pop(&mut stack)?;
-                let val = pop(&mut stack)?;
-                let old = state.sload(&contract, &key)?;
-                let gas_cost = if word_is_zero(&old) && !word_is_zero(&val) {
-                    op::GAS_SSTORE_SET
-                } else if !word_is_zero(&old) && word_is_zero(&val) {
-                    op::GAS_SSTORE_CLEAR
-                } else {
-                    op::GAS_SSTORE_RESET
-                };
-                gas.charge(gas_cost).map_err(|_| VmError::OutOfGas)?;
-                state.sstore(&contract, &key, val)?;
-            }
-
-            // ── Stack ops ─────────────────────────────────────────────────
-            op::POP => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let _ = pop(&mut stack)?;
-            }
-
-            // PUSH1 .. PUSH32
-            0x60..=0x7F => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let n = (opcode - 0x60 + 1) as usize;
-                let mut word = [0u8; 32];
-                let start = 32 - n;
-                for i in 0..n {
-                    if pc + i < code.len() {
-                        word[start + i] = code[pc + i];
-                    }
-                }
-                pc += n;
-                push(&mut stack, word)?;
-            }
-
-            // DUP1 .. DUP16
-            0x80..=0x8F => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let n = (opcode - 0x80 + 1) as usize;
-                if stack.len() < n {
-                    return Err(VmError::StackUnderflow);
-                }
-                let v = stack[stack.len() - n];
-                push(&mut stack, v)?;
-            }
-
-            // SWAP1 .. SWAP16
-            0x90..=0x9F => {
-                gas.charge(op::GAS_VERYLOW).map_err(|_| VmError::OutOfGas)?;
-                let n = (opcode - 0x90 + 1) as usize;
-                let len = stack.len();
-                if len < n + 1 {
-                    return Err(VmError::StackUnderflow);
-                }
-                stack.swap(len - 1, len - 1 - n);
-            }
-
-            // ── Control flow ──────────────────────────────────────────────
-            op::JUMP => {
-                gas.charge(op::GAS_JUMP).map_err(|_| VmError::OutOfGas)?;
-                let dest = word_to_usize(&pop(&mut stack)?);
-                if !jumpdests.contains(&dest) {
-                    return Err(VmError::InvalidJump(dest));
-                }
-                pc = dest + 1;
-            }
-            op::JUMPI => {
-                gas.charge(op::GAS_JUMPI).map_err(|_| VmError::OutOfGas)?;
-                let dest = word_to_usize(&pop(&mut stack)?);
-                let cond = pop(&mut stack)?;
-                if !word_is_zero(&cond) {
-                    if !jumpdests.contains(&dest) {
-                        return Err(VmError::InvalidJump(dest));
-                    }
-                    pc = dest + 1;
-                }
-            }
-            op::JUMPDEST => {
-                gas.charge(1).map_err(|_| VmError::OutOfGas)?;
-            }
-
-            // ── Logging ───────────────────────────────────────────────────
-            0xA0..=0xA4 => {
-                let n_topics = (opcode - 0xA0) as usize;
-                let offset = word_to_usize(&pop(&mut stack)?);
-                let size = word_to_usize(&pop(&mut stack)?);
-                let mut topics = Vec::with_capacity(n_topics);
-                for _ in 0..n_topics {
-                    topics.push(pop(&mut stack)?);
-                }
-                let log_gas = op::GAS_LOG_BASE
-                    + op::GAS_LOG_TOPIC * n_topics as u64
-                    + op::GAS_LOG_BYTE * size as u64;
-                gas.charge(log_gas).map_err(|_| VmError::OutOfGas)?;
-                let data = mem.read_range(offset, size)?;
-                state.emit_log(&contract, topics, data);
-                logs_count += 1;
-            }
-
-            // ── Return / Revert ───────────────────────────────────────────
-            op::RETURN => {
-                let offset = word_to_usize(&pop(&mut stack)?);
-                let size = word_to_usize(&pop(&mut stack)?);
-                let data = mem.read_range(offset, size)?;
-                return Ok(VmResult {
-                    return_data: data,
-                    gas_used: gas.used,
-                    reverted: false,
-                    logs_count,
-                });
-            }
-            op::REVERT => {
-                let offset = word_to_usize(&pop(&mut stack)?);
-                let size = word_to_usize(&pop(&mut stack)?);
-                let data = mem.read_range(offset, size)?;
-                return Ok(VmResult {
-                    return_data: data,
-                    gas_used: gas.used,
-                    reverted: true,
-                    logs_count: 0,
-                });
-            }
-            op::INVALID => {
-                return Err(VmError::InvalidOpcode(op::INVALID));
-            }
-
-            x => return Err(VmError::InvalidOpcode(x)),
-        }
+    #[test]
+    fn test_simple_addition() -> Result<(), VmError> {
+        let code = vec![
+            op::PUSH1, 0x02,
+            op::PUSH1, 0x03,
+            op::ADD,
+            op::PUSH1, 0x00,
+            op::MSTORE,
+            op::PUSH1, 0x20,
+            op::PUSH1, 0x00,
+            op::RETURN,
+        ];
+        let mut state = MockVmState::new();
+        let caller = [0u8; 32];
+        let result = exec(&mut state, [0u8; 32], &code, &[], &caller, 1_000_000, 0)?;
+        assert!(!result.reverted);
+        assert_eq!(result.return_data.len(), 32);
+        let mut expected = [0u8; 32];
+        expected[31] = 5;
+        assert_eq!(&result.return_data[..], &expected[..]);
+        Ok(())
     }
 
-    Ok(VmResult {
-        return_data: vec![],
-        gas_used: gas.used,
-        reverted: false,
-        logs_count,
-    })
+    #[test]
+    fn test_revert() -> Result<(), VmError> {
+        let code = vec![
+            op::PUSH1, 0x10,
+            op::PUSH1, 0x00,
+            op::REVERT,
+        ];
+        let mut state = MockVmState::new();
+        let caller = [0u8; 32];
+        let result = exec(&mut state, [0u8; 32], &code, &[], &caller, 1_000_000, 0)?;
+        assert!(result.reverted);
+        assert_eq!(result.return_data, vec![0; 16]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_storage() -> Result<(), VmError> {
+        let code = vec![
+            op::PUSH1, 0x2A,
+            op::PUSH1, 0x00,
+            op::SSTORE,
+            op::PUSH1, 0x00,
+            op::SLOAD,
+            op::PUSH1, 0x00,
+            op::MSTORE,
+            op::PUSH1, 0x20,
+            op::PUSH1, 0x00,
+            op::RETURN,
+        ];
+        let mut state = MockVmState::new();
+        let caller = [0u8; 32];
+        let result = exec(&mut state, [0u8; 32], &code, &[], &caller, 1_000_000, 0)?;
+        assert!(!result.reverted);
+        assert_eq!(result.return_data.len(), 32);
+        let mut expected = [0u8; 32];
+        expected[31] = 0x2A;
+        assert_eq!(&result.return_data[..], &expected[..]);
+        Ok(())
+    }
 }
