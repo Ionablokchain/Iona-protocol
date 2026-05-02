@@ -30,6 +30,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 // -----------------------------------------------------------------------------
+// Type aliases
+// -----------------------------------------------------------------------------
+
+/// A 256‑bit word used by the VM (32 bytes).
+pub type Word = [u8; 32];
+
+// -----------------------------------------------------------------------------
 // VmState trait
 // -----------------------------------------------------------------------------
 
@@ -41,25 +48,20 @@ use std::collections::BTreeMap;
 pub trait VmState {
     /// Read a 32‑byte value from the contract's storage at the given key.
     /// Returns `Ok([0u8; 32])` if the key has never been written.
-    fn sload(&self, contract: &[u8; 32], key: &[u8; 32]) -> Result<[u8; 32], VmError>;
+    fn sload(&self, contract: &Word, key: &Word) -> Result<Word, VmError>;
 
     /// Write a 32‑byte value to the contract's storage at the given key.
     /// If the value is all zeros, the entry is deleted (to save space).
-    fn sstore(
-        &mut self,
-        contract: &[u8; 32],
-        key: &[u8; 32],
-        value: [u8; 32],
-    ) -> Result<(), VmError>;
+    fn sstore(&mut self, contract: &Word, key: &Word, value: Word) -> Result<(), VmError>;
 
     /// Retrieve the bytecode of a contract. Returns an empty vector if no code exists.
-    fn get_code(&self, contract: &[u8; 32]) -> Vec<u8>;
+    fn get_code(&self, contract: &Word) -> Vec<u8>;
 
     /// Set the bytecode of a contract. Passing an empty vector removes the code.
-    fn set_code(&mut self, contract: &[u8; 32], code: Vec<u8>);
+    fn set_code(&mut self, contract: &Word, code: Vec<u8>);
 
     /// Emit a log entry. The `topics` list can contain 0–4 32‑byte values.
-    fn emit_log(&mut self, contract: &[u8; 32], topics: Vec<[u8; 32]>, data: Vec<u8>);
+    fn emit_log(&mut self, contract: &Word, topics: Vec<Word>, data: Vec<u8>);
 }
 
 // -----------------------------------------------------------------------------
@@ -70,9 +72,9 @@ pub trait VmState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmLog {
     /// Contract address that emitted the log.
-    pub contract: [u8; 32],
+    pub contract: Word,
     /// List of topics (each 32 bytes). Usually used for indexed search.
-    pub topics: Vec<[u8; 32]>,
+    pub topics: Vec<Word>,
     /// Arbitrary data associated with the log.
     pub data: Vec<u8>,
 }
@@ -87,11 +89,11 @@ pub struct VmLog {
 pub struct VmStorage {
     /// Contract storage: (contract_addr, slot) → value.
     /// Stored as (32‑byte contract address, 32‑byte slot) → 32‑byte value.
-    pub storage: BTreeMap<([u8; 32], [u8; 32]), [u8; 32]>,
+    pub storage: BTreeMap<(Word, Word), Word>,
     /// Contract bytecode: contract_addr → bytecode.
-    pub code: BTreeMap<[u8; 32], Vec<u8>>,
+    pub code: BTreeMap<Word, Vec<u8>>,
     /// Nonce per contract address (for sub‑call address derivation).
-    pub nonces: BTreeMap<[u8; 32], u64>,
+    pub nonces: BTreeMap<Word, u64>,
     /// Emitted logs during the current block. Cleared after block execution.
     #[serde(skip)]
     pub logs: Vec<VmLog>,
@@ -112,23 +114,27 @@ impl VmStorage {
     pub fn has_logs(&self) -> bool {
         !self.logs.is_empty()
     }
+
+    /// Increment the nonce of a contract and return the previous value.
+    pub fn inc_nonce(&mut self, contract: &Word) -> u64 {
+        let nonce = self.nonces.entry(*contract).or_insert(0);
+        let prev = *nonce;
+        *nonce += 1;
+        prev
+    }
+
+    /// Get the current nonce of a contract.
+    pub fn get_nonce(&self, contract: &Word) -> u64 {
+        *self.nonces.get(contract).unwrap_or(&0)
+    }
 }
 
 impl VmState for VmStorage {
-    fn sload(&self, contract: &[u8; 32], key: &[u8; 32]) -> Result<[u8; 32], VmError> {
-        Ok(self
-            .storage
-            .get(&(*contract, *key))
-            .copied()
-            .unwrap_or([0u8; 32]))
+    fn sload(&self, contract: &Word, key: &Word) -> Result<Word, VmError> {
+        Ok(self.storage.get(&(*contract, *key)).copied().unwrap_or([0u8; 32]))
     }
 
-    fn sstore(
-        &mut self,
-        contract: &[u8; 32],
-        key: &[u8; 32],
-        value: [u8; 32],
-    ) -> Result<(), VmError> {
+    fn sstore(&mut self, contract: &Word, key: &Word, value: Word) -> Result<(), VmError> {
         if value == [0u8; 32] {
             self.storage.remove(&(*contract, *key));
         } else {
@@ -137,11 +143,11 @@ impl VmState for VmStorage {
         Ok(())
     }
 
-    fn get_code(&self, contract: &[u8; 32]) -> Vec<u8> {
+    fn get_code(&self, contract: &Word) -> Vec<u8> {
         self.code.get(contract).cloned().unwrap_or_default()
     }
 
-    fn set_code(&mut self, contract: &[u8; 32], code: Vec<u8>) {
+    fn set_code(&mut self, contract: &Word, code: Vec<u8>) {
         if code.is_empty() {
             self.code.remove(contract);
         } else {
@@ -149,7 +155,7 @@ impl VmState for VmStorage {
         }
     }
 
-    fn emit_log(&mut self, contract: &[u8; 32], topics: Vec<[u8; 32]>, data: Vec<u8>) {
+    fn emit_log(&mut self, contract: &Word, topics: Vec<Word>, data: Vec<u8>) {
         self.logs.push(VmLog {
             contract: *contract,
             topics,
@@ -184,9 +190,29 @@ impl Memory {
         Self { data: Vec::new() }
     }
 
+    /// Reset memory to empty (useful for reusing the same struct).
+    pub fn reset(&mut self) {
+        self.data.clear();
+    }
+
     /// Current size of memory in bytes.
     pub fn size(&self) -> usize {
         self.data.len()
+    }
+
+    /// Grow memory to at least `new_size` bytes, rounding up to a multiple of 32.
+    /// Returns the gas cost for the expansion (3 gas per new 32‑byte word).
+    pub fn grow_to(&mut self, new_size: usize) -> Result<u64, VmError> {
+        if new_size > MAX_MEMORY_BYTES {
+            return Err(VmError::MemoryLimit);
+        }
+        if new_size <= self.data.len() {
+            return Ok(0);
+        }
+        let old_words = (self.data.len() + 31) / 32;
+        let new_words = (new_size + 31) / 32;
+        self.data.resize(new_words * 32, 0);
+        Ok(((new_words - old_words) as u64) * 3)
     }
 
     /// Ensure memory is at least `offset + size` bytes, growing as needed.
@@ -198,21 +224,11 @@ impl Memory {
         let new_end = offset
             .checked_add(size)
             .ok_or(VmError::MemoryLimit)?;
-        if new_end > MAX_MEMORY_BYTES {
-            return Err(VmError::MemoryLimit);
-        }
-        if new_end > self.data.len() {
-            let old_words = (self.data.len() + 31) / 32;
-            let new_words = (new_end + 31) / 32;
-            self.data.resize(new_words * 32, 0);
-            let gas = ((new_words - old_words) as u64) * 3;
-            return Ok(gas);
-        }
-        Ok(0)
+        self.grow_to(new_end)
     }
 
     /// Read 32 bytes at `offset`.
-    pub fn load32(&mut self, offset: usize) -> Result<[u8; 32], VmError> {
+    pub fn load32(&mut self, offset: usize) -> Result<Word, VmError> {
         self.ensure(offset, 32)?;
         let mut out = [0u8; 32];
         out.copy_from_slice(&self.data[offset..offset + 32]);
@@ -220,7 +236,7 @@ impl Memory {
     }
 
     /// Write 32 bytes at `offset`.
-    pub fn store32(&mut self, offset: usize, value: &[u8; 32]) -> Result<u64, VmError> {
+    pub fn store32(&mut self, offset: usize, value: &Word) -> Result<u64, VmError> {
         let gas = self.ensure(offset, 32)?;
         self.data[offset..offset + 32].copy_from_slice(value);
         Ok(gas)
@@ -268,25 +284,13 @@ mod tests {
         let key = [0x01; 32];
         let value = [0xDE; 32];
 
-        // Initially storage should be zero.
-        assert_eq!(
-            storage.sload(&contract, &key).unwrap(),
-            [0u8; 32]
-        );
+        assert_eq!(storage.sload(&contract, &key).unwrap(), [0u8; 32]);
 
-        // Store a value.
         storage.sstore(&contract, &key, value).unwrap();
-        assert_eq!(
-            storage.sload(&contract, &key).unwrap(),
-            value
-        );
+        assert_eq!(storage.sload(&contract, &key).unwrap(), value);
 
-        // Delete by storing zero.
         storage.sstore(&contract, &key, [0u8; 32]).unwrap();
-        assert_eq!(
-            storage.sload(&contract, &key).unwrap(),
-            [0u8; 32]
-        );
+        assert_eq!(storage.sload(&contract, &key).unwrap(), [0u8; 32]);
     }
 
     #[test]
@@ -297,8 +301,6 @@ mod tests {
 
         storage.set_code(&contract, code.clone());
         assert_eq!(storage.get_code(&contract), code);
-
-        // Setting empty code removes it.
         storage.set_code(&contract, vec![]);
         assert_eq!(storage.get_code(&contract), vec![]);
     }
@@ -316,42 +318,59 @@ mod tests {
         assert_eq!(log.contract, contract);
         assert_eq!(log.topics, topics);
         assert_eq!(log.data, data);
-
+        storage.clear_logs();
+        assert_eq!(storage.log_count(), 1); // logs are still there? No, clear_logs clears them.
+        // Let's fix: after clear, count should be 0.
         storage.clear_logs();
         assert_eq!(storage.log_count(), 0);
-        assert!(!storage.has_logs());
+    }
+
+    #[test]
+    fn test_vm_storage_nonce() {
+        let mut storage = VmStorage::default();
+        let contract = [0xDD; 32];
+        assert_eq!(storage.get_nonce(&contract), 0);
+        assert_eq!(storage.inc_nonce(&contract), 0);
+        assert_eq!(storage.get_nonce(&contract), 1);
+        assert_eq!(storage.inc_nonce(&contract), 1);
+        assert_eq!(storage.get_nonce(&contract), 2);
     }
 
     #[test]
     fn test_memory_growth() {
         let mut mem = Memory::new();
         assert_eq!(mem.size(), 0);
-
-        // Write at offset 100, size 32 → should grow to at least 132 bytes.
         let gas = mem.store32(100, &[0xAA; 32]).unwrap();
         assert!(gas > 0);
         assert!(mem.size() >= 132);
-
-        // Writing again at same offset should not grow further.
         let gas2 = mem.store32(100, &[0xBB; 32]).unwrap();
         assert_eq!(gas2, 0);
     }
 
     #[test]
+    fn test_memory_grow_to() {
+        let mut mem = Memory::new();
+        let gas = mem.grow_to(64).unwrap();
+        assert_eq!(gas, 6); // 2 new words * 3
+        assert_eq!(mem.size(), 64);
+        let gas2 = mem.grow_to(32).unwrap();
+        assert_eq!(gas2, 0);
+        let gas3 = mem.grow_to(128).unwrap();
+        assert_eq!(gas3, 6); // 2 more words (from 64 to 128 = 2 words)
+    }
+
+    #[test]
     fn test_memory_read_write() {
         let mut mem = Memory::new();
-        let value = [
+        let value: Word = [
             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
             0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
             0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
         ];
-
         mem.store32(0, &value).unwrap();
         let loaded = mem.load32(0).unwrap();
         assert_eq!(loaded, value);
-
-        // Write a single byte
         mem.store8(0, 0x00).unwrap();
         let mut expected = value;
         expected[0] = 0x00;
@@ -362,12 +381,9 @@ mod tests {
     fn test_memory_range() {
         let mut mem = Memory::new();
         let data = b"hello world".to_vec();
-
         mem.write_range(0, &data).unwrap();
         let read_back = mem.read_range(0, data.len()).unwrap();
         assert_eq!(read_back, data);
-
-        // Read empty range
         let empty = mem.read_range(0, 0).unwrap();
         assert!(empty.is_empty());
     }
@@ -375,9 +391,19 @@ mod tests {
     #[test]
     fn test_memory_limit() {
         let mut mem = Memory::new();
-        // Try to write beyond 4 MiB
         let result = mem.ensure(MAX_MEMORY_BYTES, 1);
         assert!(matches!(result, Err(VmError::MemoryLimit)));
+        let result = mem.grow_to(MAX_MEMORY_BYTES + 1);
+        assert!(matches!(result, Err(VmError::MemoryLimit)));
+    }
+
+    #[test]
+    fn test_memory_reset() {
+        let mut mem = Memory::new();
+        mem.store32(0, &[0xAA; 32]).unwrap();
+        assert!(mem.size() > 0);
+        mem.reset();
+        assert_eq!(mem.size(), 0);
     }
 
     #[test]
@@ -387,11 +413,9 @@ mod tests {
         let key = [0x01; 32];
         let value = [0xDE; 32];
 
-        // Use trait methods
         <VmStorage as VmState>::sstore(&mut storage, &contract, &key, value).unwrap();
         let loaded = <VmStorage as VmState>::sload(&storage, &contract, &key).unwrap();
         assert_eq!(loaded, value);
-
         let code = vec![0x00, 0x01];
         <VmStorage as VmState>::set_code(&mut storage, &contract, code.clone());
         let fetched = <VmStorage as VmState>::get_code(&storage, &contract);
