@@ -21,6 +21,7 @@ use crate::economics::staking::StakingState;
 use crate::execution::KvState;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use thiserror::Error;
 use tracing::info;
 
 /// Number of blocks per epoch. Rewards are distributed at epoch boundaries.
@@ -34,6 +35,25 @@ pub const EPOCHS_PER_YEAR: u64 = 52_560;
 /// Reserved treasury address in KvState balances.
 pub const TREASURY_ADDR: &str = "treasury";
 
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during reward distribution.
+#[derive(Debug, Error)]
+pub enum RewardsError {
+    #[error("total staked is zero, cannot compute inflation")]
+    ZeroTotalStaked,
+    #[error("commission basis points must be between 0 and 10_000, got {0}")]
+    CommissionOutOfRange(u64),
+    #[error("arithmetic overflow during reward calculation")]
+    Overflow,
+    #[error("invalid parameter: {0}")]
+    InvalidParam(String),
+}
+
+pub type RewardsResult<T> = Result<T, RewardsError>;
+
 /// Epoch reward summary emitted on each epoch boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpochReward {
@@ -44,6 +64,10 @@ pub struct EpochReward {
     pub treasury_share: u128,
     pub validator_rewards: BTreeMap<String, u128>, // validator_addr -> reward
 }
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
 
 /// Check whether `height` is an epoch boundary.
 #[inline]
@@ -57,11 +81,40 @@ pub fn epoch_at(height: u64) -> u64 {
     height / EPOCH_BLOCKS
 }
 
+/// Validate a commission rate (in basis points).
+fn validate_commission(commission_bps: u64) -> RewardsResult<()> {
+    if commission_bps > 10_000 {
+        Err(RewardsError::CommissionOutOfRange(commission_bps))
+    } else {
+        Ok(())
+    }
+}
+
+/// Safe division with rounding down.
+fn safe_div(a: u128, b: u128) -> u128 {
+    if b == 0 {
+        0
+    } else {
+        a / b
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Core reward distribution
+// -----------------------------------------------------------------------------
+
 /// Distribute epoch rewards.
 ///
 /// Returns an `EpochReward` summary and mutates:
 /// - `kv_state.balances` — validator and delegator balances increased
 /// - `staking.validators` — stakes increased proportionally (auto-compounding)
+///
+/// # Errors
+///
+/// Returns `RewardsError` if:
+/// - total staked is zero (no inflation minted)
+/// - commission rates are out of bounds
+/// - arithmetic overflow occurs
 ///
 /// Called from `after_commit` when `is_epoch_boundary(height)`.
 pub fn distribute_epoch_rewards(
@@ -69,10 +122,27 @@ pub fn distribute_epoch_rewards(
     kv_state: &mut KvState,
     staking: &mut StakingState,
     params: &EconomicsParams,
-) -> EpochReward {
+) -> RewardsResult<EpochReward> {
     let epoch = epoch_at(height);
 
-    // ── 1. Compute total staked across all active (non-jailed) validators ──
+    // 1. Validate parameters
+    if params.base_inflation_bps > 10_000 {
+        return Err(RewardsError::InvalidParam(format!(
+            "base_inflation_bps {} > 10_000",
+            params.base_inflation_bps
+        )));
+    }
+    if params.treasury_bps > 10_000 {
+        return Err(RewardsError::InvalidParam(format!(
+            "treasury_bps {} > 10_000",
+            params.treasury_bps
+        )));
+    }
+    for v in staking.validators.values() {
+        validate_commission(v.commission_bps)?;
+    }
+
+    // 2. Compute total staked across active (non-jailed) validators
     let total_staked: u128 = staking
         .validators
         .values()
@@ -81,26 +151,28 @@ pub fn distribute_epoch_rewards(
         .sum();
 
     if total_staked == 0 {
-        return EpochReward {
-            epoch,
-            height,
-            total_staked: 0,
-            inflation_minted: 0,
-            treasury_share: 0,
-            validator_rewards: BTreeMap::new(),
-        };
+        return Err(RewardsError::ZeroTotalStaked);
     }
 
-    // ── 2. Inflation reward for this epoch ──────────────────────────────────
-    // epoch_inflation = total_staked * base_inflation_bps / 10_000 / epochs_per_year
-    let inflation_minted: u128 = total_staked.saturating_mul(params.base_inflation_bps as u128)
-        / 10_000
-        / EPOCHS_PER_YEAR as u128;
+    // 3. Inflation reward for this epoch
+    //    epoch_inflation = total_staked * base_inflation_bps / 10_000 / epochs_per_year
+    let inflation_minted: u128 = total_staked
+        .checked_mul(params.base_inflation_bps as u128)
+        .ok_or(RewardsError::Overflow)?
+        .checked_div(10_000)
+        .ok_or(RewardsError::Overflow)?
+        .checked_div(EPOCHS_PER_YEAR as u128)
+        .ok_or(RewardsError::Overflow)?;
 
-    // ── 3. Treasury cut ─────────────────────────────────────────────────────
-    let treasury_share: u128 =
-        inflation_minted.saturating_mul(params.treasury_bps as u128) / 10_000;
-    let distributable: u128 = inflation_minted.saturating_sub(treasury_share);
+    // 4. Treasury cut
+    let treasury_share: u128 = inflation_minted
+        .checked_mul(params.treasury_bps as u128)
+        .ok_or(RewardsError::Overflow)?
+        .checked_div(10_000)
+        .ok_or(RewardsError::Overflow)?;
+    let distributable = inflation_minted
+        .checked_sub(treasury_share)
+        .ok_or(RewardsError::Overflow)?;
 
     // Credit treasury balance
     let tb = kv_state
@@ -109,11 +181,7 @@ pub fn distribute_epoch_rewards(
         .or_insert(0);
     *tb = tb.saturating_add(treasury_share as u64);
 
-    // ── 4. Per-validator distribution ────────────────────────────────────────
-    // Each active validator earns: distributable * validator_stake / total_staked
-    // Of that, commission_bps goes to the validator operator.
-    // The rest goes to delegators proportionally to their delegated share.
-
+    // 5. Per-validator distribution
     let mut validator_rewards: BTreeMap<String, u128> = BTreeMap::new();
 
     let active_validators: Vec<(String, u128, u64)> = staking
@@ -129,11 +197,19 @@ pub fn distribute_epoch_rewards(
         }
 
         // Validator's share of the distributable pool
-        let val_total_reward: u128 = distributable.saturating_mul(*val_stake) / total_staked;
+        let val_total_reward = safe_div(
+            distributable.checked_mul(*val_stake).ok_or(RewardsError::Overflow)?,
+            total_staked,
+        );
 
         // Commission to operator
-        let commission: u128 = val_total_reward.saturating_mul(*commission_bps as u128) / 10_000;
-        let delegator_pool: u128 = val_total_reward.saturating_sub(commission);
+        let commission = safe_div(
+            val_total_reward.checked_mul(*commission_bps as u128).ok_or(RewardsError::Overflow)?,
+            10_000,
+        );
+        let delegator_pool = val_total_reward
+            .checked_sub(commission)
+            .ok_or(RewardsError::Overflow)?;
 
         // Credit commission to validator operator balance
         let op_bal = kv_state.balances.entry(val_addr.clone()).or_insert(0);
@@ -156,7 +232,10 @@ pub fn distribute_epoch_rewards(
 
         if total_delegated > 0 {
             for (delegator, del_amount) in &delegations_for_val {
-                let del_reward: u128 = delegator_pool.saturating_mul(*del_amount) / total_delegated;
+                let del_reward = safe_div(
+                    delegator_pool.checked_mul(*del_amount).ok_or(RewardsError::Overflow)?,
+                    total_delegated,
+                );
 
                 // Credit delegator's balance
                 let db = kv_state.balances.entry(delegator.clone()).or_insert(0);
@@ -164,13 +243,16 @@ pub fn distribute_epoch_rewards(
 
                 // Auto-compound: add reward back to delegation stake
                 let k = (delegator.clone(), val_addr.clone());
-                *staking.delegations.entry(k).or_insert(0) += del_reward;
+                *staking.delegations.entry(k).or_insert(0) = staking
+                    .delegations
+                    .get(&k)
+                    .unwrap_or(&0)
+                    .saturating_add(del_reward);
             }
         }
 
-        // Also credit the validator's self-stake (as if they delegated to themselves)
-        let self_reward = val_total_reward; // total already tracked; commission already credited
-        validator_rewards.insert(val_addr.clone(), self_reward);
+        // Record total reward (commission + delegator pool) for this validator
+        validator_rewards.insert(val_addr.clone(), val_total_reward);
 
         // Grow total stake for the validator (including delegations)
         if let Some(v) = staking.validators.get_mut(val_addr.as_str()) {
@@ -187,15 +269,19 @@ pub fn distribute_epoch_rewards(
         "epoch reward distributed"
     );
 
-    EpochReward {
+    Ok(EpochReward {
         epoch,
         height,
         total_staked,
         inflation_minted,
         treasury_share,
         validator_rewards,
-    }
+    })
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -230,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reward_distribution_basic() {
+    fn test_reward_distribution_basic() -> RewardsResult<()> {
         let mut kv = KvState::default();
         let mut staking = make_state(&[
             ("alice", 10_000_000_000, 1000), // 10% commission
@@ -238,72 +324,78 @@ mod tests {
         ]);
         let params = EconomicsParams::default();
 
-        let reward = distribute_epoch_rewards(100, &mut kv, &mut staking, &params);
+        let reward = distribute_epoch_rewards(100, &mut kv, &mut staking, &params)?;
 
         assert_eq!(reward.epoch, 1);
-        assert!(reward.inflation_minted > 0, "Should mint inflation");
-        assert!(reward.treasury_share > 0, "Treasury should receive share");
-        assert!(
-            reward.treasury_share < reward.inflation_minted,
-            "Treasury < total"
-        );
+        assert!(reward.inflation_minted > 0);
+        assert!(reward.treasury_share > 0);
+        assert!(reward.treasury_share < reward.inflation_minted);
 
-        // Validator balances should have increased
         let alice_bal = *kv.balances.get("alice").unwrap_or(&0);
         let bob_bal = *kv.balances.get("bob").unwrap_or(&0);
-        assert!(alice_bal > 0, "Alice should receive commission");
-        assert!(bob_bal > 0, "Bob should receive commission");
-
-        // Alice has higher commission so should have higher operator reward
-        assert!(
-            alice_bal >= bob_bal,
-            "Higher commission = more operator reward"
-        );
+        assert!(alice_bal > 0);
+        assert!(bob_bal > 0);
+        assert!(alice_bal >= bob_bal);
+        Ok(())
     }
 
     #[test]
-    fn test_reward_with_delegators() {
+    fn test_reward_with_delegators() -> RewardsResult<()> {
         let mut kv = KvState::default();
         let mut staking = make_state(&[("alice", 10_000_000_000, 1000)]);
-        // carol delegates to alice
         staking
             .delegations
             .insert(("carol".to_string(), "alice".to_string()), 5_000_000_000);
         let params = EconomicsParams::default();
 
-        let _reward = distribute_epoch_rewards(100, &mut kv, &mut staking, &params);
+        let _reward = distribute_epoch_rewards(100, &mut kv, &mut staking, &params)?;
 
         let carol_bal = *kv.balances.get("carol").unwrap_or(&0);
-        assert!(carol_bal > 0, "Delegator carol should receive reward");
+        assert!(carol_bal > 0);
+        Ok(())
     }
 
     #[test]
-    fn test_jailed_validator_gets_no_reward() {
+    fn test_jailed_validator_gets_no_reward() -> RewardsResult<()> {
         let mut kv = KvState::default();
         let mut staking = make_state(&[("alice", 1_000_000, 0)]);
         staking.validators.get_mut("alice").unwrap().jailed = true;
         let params = EconomicsParams::default();
 
-        let reward = distribute_epoch_rewards(100, &mut kv, &mut staking, &params);
-
-        assert_eq!(reward.inflation_minted, 0, "Jailed-only set: no inflation");
-        assert!(
-            kv.balances.get("alice").unwrap_or(&0) == &0,
-            "Jailed validator gets no reward"
-        );
+        let res = distribute_epoch_rewards(100, &mut kv, &mut staking, &params);
+        assert!(matches!(res, Err(RewardsError::ZeroTotalStaked)));
+        Ok(())
     }
 
     #[test]
-    fn test_treasury_accumulates() {
+    fn test_treasury_accumulates() -> RewardsResult<()> {
         let mut kv = KvState::default();
         let mut staking = make_state(&[("alice", 10_000_000_000, 0)]);
         let params = EconomicsParams::default();
 
-        distribute_epoch_rewards(100, &mut kv, &mut staking, &params);
+        distribute_epoch_rewards(100, &mut kv, &mut staking, &params)?;
         let t1 = *kv.balances.get(TREASURY_ADDR).unwrap_or(&0);
-        distribute_epoch_rewards(200, &mut kv, &mut staking, &params);
+        distribute_epoch_rewards(200, &mut kv, &mut staking, &params)?;
         let t2 = *kv.balances.get(TREASURY_ADDR).unwrap_or(&0);
+        assert!(t2 > t1);
+        Ok(())
+    }
 
-        assert!(t2 > t1, "Treasury should grow each epoch");
+    #[test]
+    fn test_invalid_commission_rejected() {
+        let mut kv = KvState::default();
+        let mut staking = make_state(&[("alice", 10_000_000_000, 10_001)]); // >100%
+        let params = EconomicsParams::default();
+        let res = distribute_epoch_rewards(100, &mut kv, &mut staking, &params);
+        assert!(matches!(res, Err(RewardsError::CommissionOutOfRange(10_001))));
+    }
+
+    #[test]
+    fn test_zero_total_staked_error() {
+        let mut kv = KvState::default();
+        let mut staking = StakingState::default(); // empty
+        let params = EconomicsParams::default();
+        let res = distribute_epoch_rewards(100, &mut kv, &mut staking, &params);
+        assert!(matches!(res, Err(RewardsError::ZeroTotalStaked)));
     }
 }
