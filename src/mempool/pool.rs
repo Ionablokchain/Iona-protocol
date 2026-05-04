@@ -30,16 +30,19 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 
 // -----------------------------------------------------------------------------
-// Constants
+// Constants with validation
 // -----------------------------------------------------------------------------
 
 /// Number of blocks after which a transaction expires.
+/// Must be > 0.
 const TTL_BLOCKS: u64 = 300;
 
 /// Maximum number of pending transactions per sender.
+/// Must be > 0.
 const MAX_PENDING_PER_SENDER: usize = 64;
 
 /// Minimum percentage tip increase required for RBF replacement.
+/// Must be between 1 and 100.
 const RBF_BUMP_PERCENT: u64 = 10;
 
 // -----------------------------------------------------------------------------
@@ -49,25 +52,30 @@ const RBF_BUMP_PERCENT: u64 = 10;
 #[derive(Clone, Debug)]
 struct PendingTx {
     tx: Tx,
-    score: u128,              // higher is better
+    score: u128,
     inserted_height: Height,
 }
 
 impl PendingTx {
     /// Create a new pending transaction, computing its priority score.
     ///
-    /// Score = (effective_tip * 1_000_000) / size, where size is payload length + 128.
+    /// Score = (effective_tip * GAS) * 1_000_000 / size
+    /// where:
+    /// - effective_tip = min(max_priority_fee, max_fee - base_fee)
+    /// - GAS = intrinsic gas
+    /// - size = payload length + 128 (minimum 1)
+    ///
     /// This favours high‑tip, small transactions.
     fn new(tx: Tx, current_height: Height, base_fee: u64) -> Self {
         let gas = intrinsic_gas(&tx) as u128;
-        // Effective tip = min(max_priority_fee, max_fee - base_fee)   (EIP‑1559)
-        let tip = if tx.max_fee_per_gas > base_fee {
+        let effective_tip = if tx.max_fee_per_gas > base_fee {
             tx.max_priority_fee_per_gas.min(tx.max_fee_per_gas - base_fee) as u128
         } else {
             0
         };
-        let tip_gas = tip.saturating_mul(gas);
+        let tip_gas = effective_tip.saturating_mul(gas);
         let size = (tx.payload.len() as u128 + 128).max(1);
+        // Multiply by 1_000_000 to keep precision; division by size will not overflow.
         let score = tip_gas.saturating_mul(1_000_000) / size;
         Self {
             tx,
@@ -139,7 +147,6 @@ pub struct MempoolMetrics {
 pub struct StandardMempool {
     cap: usize,
     current_height: Height,
-    /// Sender → (nonce → pending tx)
     queues: HashMap<String, BTreeMap<u64, PendingTx>>,
     pub metrics: MempoolMetrics,
 }
@@ -152,7 +159,11 @@ impl Default for StandardMempool {
 
 impl StandardMempool {
     /// Create a new mempool with the given capacity (max number of transactions).
+    ///
+    /// # Panics
+    /// If `cap` is zero.
     pub fn new(cap: usize) -> Self {
+        assert!(cap > 0, "mempool capacity must be > 0");
         Self {
             cap,
             current_height: 0,
@@ -173,13 +184,17 @@ impl StandardMempool {
 
     /// Advance the height, expiring old transactions.
     pub fn advance_height(&mut self, height: Height) {
+        if height <= self.current_height {
+            return;
+        }
         self.current_height = height;
         let h = self.current_height;
         let metrics = &mut self.metrics;
         self.queues.retain(|_, queue| {
             let before = queue.len();
             queue.retain(|_, ptx| !ptx.is_expired(h));
-            metrics.expired += (before - queue.len()) as u64;
+            let expired = before - queue.len();
+            metrics.expired += expired as u64;
             !queue.is_empty()
         });
     }
@@ -322,7 +337,7 @@ impl StandardMempool {
                 heap.push(HeapEntry {
                     score: next.score,
                     nonce: next.tx.nonce,
-                    sender: entry.sender.clone(),
+                    sender: entry.sender,
                 });
             } else {
                 self.queues.remove(&entry.sender);
@@ -333,7 +348,7 @@ impl StandardMempool {
 
     /// Return current metrics as JSON.
     pub fn metrics_json(&self) -> serde_json::Value {
-        serde_json::to_value(&self.metrics).unwrap_or(serde_json::Value::Null)
+        serde_json::to_value(&self.metrics).unwrap_or_else(|_| serde_json::Value::Null)
     }
 }
 
@@ -414,10 +429,9 @@ mod tests {
         let base_fee = 50;
         pool.push_with_base_fee(tx1, base_fee).unwrap();
         let replaced = pool.push_with_base_fee(tx2, base_fee).unwrap();
-        assert!(!replaced); // replaced returns false
+        assert!(!replaced);
         assert_eq!(pool.len(), 1);
 
-        // Check that the transaction is indeed the second one
         let drained = pool.drain_best(1);
         assert_eq!(drained[0].payload, "second");
         assert_eq!(pool.metrics.rbf_replaced, 1);
@@ -431,7 +445,6 @@ mod tests {
             let tx = dummy_tx("alice", i as u64, 100, 200, &format!("tx{}", i));
             pool.push(tx, base_fee).unwrap();
         }
-        // Next tx should be rejected
         let tx_extra = dummy_tx("alice", MAX_PENDING_PER_SENDER as u64, 100, 200, "extra");
         let res = pool.push(tx_extra, base_fee);
         assert!(res.is_err());
@@ -443,17 +456,15 @@ mod tests {
         let mut pool = StandardMempool::new(2);
         let base_fee = 0;
 
-        // Add two transactions from different senders
         let tx1 = dummy_tx("alice", 0, 100, 200, "high");
         let tx2 = dummy_tx("bob", 0, 50, 150, "low");
         pool.push(tx1, base_fee).unwrap();
         pool.push(tx2, base_fee).unwrap();
 
-        // Pool is full; adding a third should evict the lowest priority (bob)
         let tx3 = dummy_tx("carol", 0, 80, 180, "medium");
         pool.push(tx3, base_fee).unwrap();
 
-        assert_eq!(pool.len(), 2); // One evicted
+        assert_eq!(pool.len(), 2);
         assert_eq!(pool.metrics.evicted, 1);
 
         let drained = pool.drain_best(2);
@@ -469,7 +480,6 @@ mod tests {
         let tx = dummy_tx("alice", 0, 100, 200, "test");
         pool.push(tx, base_fee).unwrap();
 
-        // Advance far enough to expire
         pool.advance_height(TTL_BLOCKS + 1);
         assert_eq!(pool.len(), 0);
         assert_eq!(pool.metrics.expired, 1);
@@ -492,7 +502,7 @@ mod tests {
     fn test_fee_too_low() {
         let mut pool = StandardMempool::new(10);
         let tx = dummy_tx("alice", 0, 100, 150, "test");
-        let base_fee = 200; // higher than max_fee
+        let base_fee = 200;
         let res = pool.push_with_base_fee(tx, base_fee);
         assert!(res.is_err());
         assert_eq!(pool.metrics.rejected_dup, 1);
