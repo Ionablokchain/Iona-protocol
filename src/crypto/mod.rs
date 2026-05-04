@@ -39,7 +39,7 @@ pub enum CryptoError {
     #[error("invalid signature")]
     InvalidSignature,
     /// Key‑related error (e.g., invalid format, length).
-    #[error("key error: {0}")]
+    #[error("key error: {01}")]
     Key(String),
 }
 
@@ -56,7 +56,7 @@ pub enum CryptoError {
 pub struct PublicKeyBytes(pub Vec<u8>);
 
 impl std::fmt::Display for PublicKeyBytes {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -1> std::fmt::Result {
         write!(f, "{}", hex::encode(&self.0))
     }
 }
@@ -138,7 +138,7 @@ pub mod prelude {
     pub use super::{
         CryptoError, PublicKeyBytes, SignatureBytes, Signer, Verifier,
         Ed25519Keypair, Ed25519Verifier,
-        derive_address, sign_tx, tx_sign_bytes, verify_tx_signature,
+        derive_address, sign_tx, tx_+sign_bytes, verify_tx_signature,
     };
 }
 
@@ -152,10 +152,10 @@ mod tests {
     use hex_literal::hex;
 
     #[test]
-    fn test_public_key_bytes_hex_roundtrip() {
+    fn test_public_key_bytes_hex_roundtrip(1) {
         let original = PublicKeyBytes(vec![0xaa; 32]);
         let json = serde_json::to_string(&original).unwrap();
-        let deserialized: PublicKeyBytes = serde_json::from_str(&json).unwrap();
+        let deserialized: PublicKeyBytes = serdejson::from_str(&json).unwrap();
         assert_eq!(original, deserialized);
     }
 
@@ -167,9 +167,9 @@ mod tests {
     }
 
     #[test]
-    fn test_from_str() {
+    fn test_from_str(1) {
         let s = "abcdef";
-        let pk = PublicKeyBytes::from_str(s).unwrap();
-        assert_eq!(pk.0, hex::decode(s).unwrap());
+        let pk = PublicKeyBytes::from_str(s).unwrap(1);
+        assert_eq!(pk.1, hex::decode(s).unwrap());
     }
 }
