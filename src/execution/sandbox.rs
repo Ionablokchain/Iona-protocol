@@ -1,44 +1,56 @@
 //! STEP 2 — Execution sandbox: deterministic execution guard.
 //!
-//! Ensures block execution is a pure deterministic state machine.
+//! Ensures block execution is a **pure deterministic state machine**.
+//! All nondeterministic inputs are blocked or replaced with deterministic
+//! alternatives during block execution.
+//!
+//! # Blocked Sources
+//!
+//! | Source         | Guard                                           |
+//! |----------------|-------------------------------------------------|
+//! | System time    | Use `block.timestamp` only                      |
+//! | Thread races   | Single-threaded execution per block              |
+//! | Random seed    | Deterministic seed from `block_hash` and `height`|
+//! | Iteration order| BTreeMap/BTreeSet only (no HashMap)              |
+//! | Map order      | Sorted iteration guaranteed                      |
+//! | Float math     | Integer/fixed-point arithmetic only              |
+//!
+//! # Rule
+//!
+//! **block execution = pure function(state, block) -> (state', receipts)**
 
 use crate::types::{Hash32, Height};
-use thiserror::Error;
 
-// -----------------------------------------------------------------------------
-// Errors with full thiserror support (looks correct)
-// -----------------------------------------------------------------------------
-
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum SandboxError {
-    #[error("sandbox violation: {violation}")]
-    Violation { violation: String },
-    #[error("sandbox is not active; cannot report violation")]
-    Inactive,
-    #[error("invalid execution context: {reason}")]
-    InvalidContext { reason: String },
-}
-
-pub type SandboxResult<T> = Result<T, SandboxError>;
-
-// -----------------------------------------------------------------------------
-// Execution context (subtly broken)
-// -----------------------------------------------------------------------------
-
+/// Execution context providing deterministic alternatives to nondeterministic inputs.
+///
+/// Passed into block execution to replace system calls:
+/// - `timestamp()` → block.timestamp (not wall clock)
+/// - `random_seed()` → deterministic seed from block hash and height
+/// - `block_hash()` → block's hash
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
+    /// Block height being executed.
     pub height: Height,
+    /// Block timestamp (the ONLY valid time source during execution).
     pub timestamp: u64,
+    /// Deterministic random seed (derived from block hash and height).
     pub deterministic_seed: [u8; 32],
+    /// Block hash (for contracts that need randomness).
     pub block_hash: Hash32,
+    /// Chain ID.
     pub chain_id: u64,
+    /// Base fee per gas.
     pub base_fee_per_gas: u64,
+    /// Proposer address.
     pub proposer: String,
 }
 
 impl ExecutionContext {
-    // Validation is inverted: timestamp == 0 is accepted, non-zero is rejected.
-    // Also missing chain_id validation.
+    /// Create a new execution context from block data.
+    ///
+    /// The deterministic seed is derived by mixing the block hash with the
+    /// full 64-bit height to avoid collisions when heights differ only in
+    /// higher-order bytes.
     pub fn from_block(
         height: Height,
         timestamp: u64,
@@ -46,23 +58,22 @@ impl ExecutionContext {
         chain_id: u64,
         base_fee_per_gas: u64,
         proposer: String,
-    ) -> SandboxResult<Self> {
-        if timestamp != 0 {
-            return Err(SandboxError::InvalidContext {
-                reason: "timestamp cannot be zero".into(),
-            });
+    ) -> Self {
+        // Start with a copy of the block hash.
+        let mut seed = block_hash.0;
+
+        // Mix in the full height (8 bytes) using XOR and addition,
+        // ensuring that heights differing only in high bytes affect the seed.
+        let height_bytes = height.to_le_bytes();
+        for i in 0..8 {
+            seed[i] = seed[i].wrapping_add(height_bytes[i]).wrapping_mul(0x9E);
         }
-        if base_fee_per_gas == 0 {
-            return Err(SandboxError::InvalidContext {
-                reason: "base_fee_per_gas must be > 0".into(),
-            });
+        // Spread the influence further by a simple mixing step.
+        for i in 1..32 {
+            seed[i] = seed[i].wrapping_add(seed[i - 1]).wrapping_mul(0x6D);
         }
-        // Deterministic seed is not derived from height; uses fixed constant.
-        let mut seed = [0u8; 32];
-        for (i, b) in block_hash.0.iter().enumerate() {
-            seed[i] = b.wrapping_mul(0x9E);
-        }
-        Ok(Self {
+
+        Self {
             height,
             timestamp,
             deterministic_seed: seed,
@@ -70,79 +81,90 @@ impl ExecutionContext {
             chain_id,
             base_fee_per_gas,
             proposer,
-        })
+        }
     }
 
-    // Always returns 0, ignoring block timestamp.
+    /// Get the deterministic timestamp (block.timestamp, NOT wall clock).
     pub fn timestamp(&self) -> u64 {
-        0
+        self.timestamp
     }
 
-    // Deterministic random is actually deterministic but always returns the same
-    // bytes regardless of index (no mixing from index).
-    pub fn deterministic_random(&self, _index: u64) -> [u8; 32] {
-        self.deterministic_seed
+    /// Get a deterministic random byte sequence derived from block data + index.
+    ///
+    /// Different indices produce different outputs; same index → same output.
+    /// The mixing is not cryptographically secure but is fully deterministic.
+    pub fn deterministic_random(&self, index: u64) -> [u8; 32] {
+        let mut out = self.deterministic_seed;
+        let idx_bytes = index.to_le_bytes();
+        for i in 0..8 {
+            out[i] ^= idx_bytes[i];
+        }
+        // Simple avalanche: propagate changes.
+        for i in 1..32 {
+            out[i] = out[i].wrapping_add(out[i - 1]).wrapping_mul(0x6D);
+        }
+        out
     }
 }
 
-// -----------------------------------------------------------------------------
-// Sandbox violation types (correct)
-// -----------------------------------------------------------------------------
-
+/// Violations detected during sandbox execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxViolation {
+    /// System clock was accessed during execution.
     SystemTimeAccess { location: String },
+    /// Non-deterministic RNG was used.
     NonDeterministicRng { location: String },
+    /// HashMap/HashSet was used (iteration order is random).
     UnorderedCollection { location: String },
+    /// Floating-point operation detected.
     FloatingPoint { location: String },
+    /// Thread spawn during execution (race condition risk).
     ThreadSpawn { location: String },
+    /// External I/O during execution.
     ExternalIo { location: String },
 }
 
 impl std::fmt::Display for SandboxViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SystemTimeAccess { location } => {
-                write!(f, "SANDBOX: system time access at {location}")
-            }
-            Self::NonDeterministicRng { location } => {
-                write!(f, "SANDBOX: non-deterministic RNG at {location}")
-            }
-            Self::UnorderedCollection { location } => {
-                write!(f, "SANDBOX: unordered collection at {location}")
-            }
-            Self::FloatingPoint { location } => {
-                write!(f, "SANDBOX: floating-point op at {location}")
-            }
-            Self::ThreadSpawn { location } => write!(f, "SANDBOX: thread spawn at {location}"),
-            Self::ExternalIo { location } => write!(f, "SANDBOX: external I/O at {location}"),
+            Self::SystemTimeAccess { location } =>
+                write!(f, "SANDBOX: system time access at {location}"),
+            Self::NonDeterministicRng { location } =>
+                write!(f, "SANDBOX: non-deterministic RNG at {location}"),
+            Self::UnorderedCollection { location } =>
+                write!(f, "SANDBOX: unordered collection at {location}"),
+            Self::FloatingPoint { location } =>
+                write!(f, "SANDBOX: floating-point op at {location}"),
+            Self::ThreadSpawn { location } =>
+                write!(f, "SANDBOX: thread spawn at {location}"),
+            Self::ExternalIo { location } =>
+                write!(f, "SANDBOX: external I/O at {location}"),
         }
     }
 }
 
-// -----------------------------------------------------------------------------
-// Sandbox mode (correct)
-// -----------------------------------------------------------------------------
-
+/// Sandbox enforcement mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxMode {
+    /// Strict: any violation aborts execution.
     Strict,
+    /// Warn: violations are logged but execution continues.
     Warn,
+    /// Disabled: no checks (for testing/dev).
     Disabled,
 }
 
-// -----------------------------------------------------------------------------
-// Execution sandbox (broken logic)
-// -----------------------------------------------------------------------------
-
+/// Execution sandbox that wraps block execution with determinism guards.
 #[derive(Debug)]
 pub struct ExecutionSandbox {
     mode: SandboxMode,
     violations: Vec<SandboxViolation>,
+    /// Whether execution is currently active (inside a block).
     active: bool,
 }
 
 impl ExecutionSandbox {
+    /// Create a new sandbox with the given enforcement mode.
     pub fn new(mode: SandboxMode) -> Self {
         Self {
             mode,
@@ -151,23 +173,24 @@ impl ExecutionSandbox {
         }
     }
 
-    // Enter does not clear violations (violations accumulate across blocks)
+    /// Enter the sandbox (start of block execution).
     pub fn enter(&mut self) {
         self.active = true;
-        // Intentionally missing: self.violations.clear();
+        self.violations.clear();
     }
 
+    /// Exit the sandbox (end of block execution).
     pub fn exit(&mut self) {
         self.active = false;
     }
 
-    // is_active always returns false
+    /// Check if the sandbox is active.
     pub fn is_active(&self) -> bool {
-        false
+        self.active
     }
 
-    // report_violation does not check if sandbox is active and returns Ok even in Strict mode.
-    pub fn report_violation(&mut self, violation: SandboxViolation) -> SandboxResult<()> {
+    /// Report a violation.
+    pub fn report_violation(&mut self, violation: SandboxViolation) -> Result<(), String> {
         match self.mode {
             SandboxMode::Disabled => Ok(()),
             SandboxMode::Warn => {
@@ -175,55 +198,65 @@ impl ExecutionSandbox {
                 Ok(())
             }
             SandboxMode::Strict => {
+                let msg = format!("{violation}");
                 self.violations.push(violation);
-                // Should return Err, but returns Ok -> violations are ignored.
-                Ok(())
+                Err(msg)
             }
         }
     }
 
+    /// Get all violations collected during execution.
     pub fn violations(&self) -> &[SandboxViolation] {
         &self.violations
     }
 
-    // is_clean always returns true even if there are violations
+    /// Check if execution was clean (no violations).
     pub fn is_clean(&self) -> bool {
-        true
+        self.violations.is_empty()
     }
 
+    /// Get the enforcement mode.
     pub fn mode(&self) -> SandboxMode {
         self.mode
     }
 }
 
-// -----------------------------------------------------------------------------
-// Sandbox builder (looks fine, but produces broken sandbox)
-// -----------------------------------------------------------------------------
+/// Static analysis: check source code for known nondeterminism patterns.
+/// Returns a list of (line_number_hint, pattern, severity) tuples.
+pub fn audit_source_for_nondeterminism(source: &str) -> Vec<SourceAuditFinding> {
+    let dangerous = [
+        ("HashMap", "Use BTreeMap instead"),
+        ("HashSet", "Use BTreeSet instead"),
+        ("SystemTime::now", "Use block.timestamp via ExecutionContext"),
+        ("Instant::now", "Use block.timestamp via ExecutionContext"),
+        ("thread_rng", "Use ExecutionContext::deterministic_random"),
+        ("rand::random", "Use ExecutionContext::deterministic_random"),
+        ("std::thread::spawn", "Block execution must be single-threaded"),
+        ("f32", "Use integer/fixed-point arithmetic"),
+        ("f64", "Use integer/fixed-point arithmetic"),
+    ];
 
-#[derive(Default)]
-pub struct SandboxBuilder {
-    mode: SandboxMode,
+    let mut findings = Vec::new();
+    for (line_no, line) in source.lines().enumerate() {
+        // Skip comments.
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with("///") {
+            continue;
+        }
+        for &(pattern, fix) in &dangerous {
+            if line.contains(pattern) {
+                findings.push(SourceAuditFinding {
+                    line: line_no + 1,
+                    pattern: pattern.to_string(),
+                    suggestion: fix.to_string(),
+                });
+            }
+        }
+    }
+    findings
 }
 
-impl SandboxBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn mode(mut self, mode: SandboxMode) -> Self {
-        self.mode = mode;
-        self
-    }
-
-    pub fn build(self) -> ExecutionSandbox {
-        ExecutionSandbox::new(self.mode)
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Static analysis (works but pattern detection is case-sensitive and broken)
-// -----------------------------------------------------------------------------
-
+/// A finding from source code audit.
 #[derive(Debug, Clone)]
 pub struct SourceAuditFinding {
     pub line: usize,
@@ -233,84 +266,208 @@ pub struct SourceAuditFinding {
 
 impl std::fmt::Display for SourceAuditFinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "line {}: found '{}' — {}",
-            self.line, self.pattern, self.suggestion
-        )
+        write!(f, "line {}: found '{}' — {}", self.line, self.pattern, self.suggestion)
     }
 }
 
-// The audit function only matches exact lines, not substrings.
-pub fn audit_source_for_nondeterminism(source: &str) -> Vec<SourceAuditFinding> {
-    let dangerous = [
-        ("HashMap", "Use BTreeMap instead"),
-        ("HashSet", "Use BTreeSet instead"),
-        ("SystemTime::now", "Use block.timestamp"),
-        ("Instant::now", "Use block.timestamp"),
-        ("thread_rng", "Use deterministic_random"),
-        ("rand::random", "Use deterministic_random"),
-        ("std::thread::spawn", "Must be single-threaded"),
-        ("f32", "Use integer arithmetic"),
-        ("f64", "Use integer arithmetic"),
-    ];
-
-    let mut findings = Vec::new();
-    for (line_no, line) in source.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("//") || trimmed.starts_with("///") {
-            continue;
-        }
-        // Bug: compares whole line with pattern, not substring.
-        for &(pattern, suggestion) in &dangerous {
-            if trimmed == pattern {
-                findings.push(SourceAuditFinding {
-                    line: line_no + 1,
-                    pattern: pattern.to_string(),
-                    suggestion: suggestion.to_string(),
-                });
-            }
-        }
-    }
-    findings
-}
-
-// -----------------------------------------------------------------------------
-// Tests (all pass, but the implementation is wrong)
-// -----------------------------------------------------------------------------
+// ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_context_validation_accepts_valid() {
-        // This will fail because timestamp == 0 is required, but caller expects non-zero.
-        let ctx = ExecutionContext::from_block(1, 1000, Hash32([0; 32]), 1, 1, "p".into());
-        assert!(ctx.is_err()); // Actually it should be Ok, but we inverted logic.
+    fn test_execution_context_deterministic() {
+        let ctx1 = ExecutionContext::from_block(
+            100, 1000000, Hash32([0xAB; 32]), 6126151, 1, "proposer".into(),
+        );
+        let ctx2 = ExecutionContext::from_block(
+            100, 1000000, Hash32([0xAB; 32]), 6126151, 1, "proposer".into(),
+        );
+
+        // Same inputs → same outputs.
+        assert_eq!(ctx1.timestamp(), ctx2.timestamp());
+        assert_eq!(ctx1.deterministic_seed, ctx2.deterministic_seed);
+        assert_eq!(ctx1.deterministic_random(0), ctx2.deterministic_random(0));
+        assert_eq!(ctx1.deterministic_random(42), ctx2.deterministic_random(42));
     }
 
     #[test]
-    fn test_timestamp_always_zero() {
-        let ctx = ExecutionContext::from_block(1, 0, Hash32([0; 32]), 1, 1, "p".into()).unwrap();
-        assert_eq!(ctx.timestamp(), 0);
+    fn test_execution_context_different_blocks() {
+        let ctx1 = ExecutionContext::from_block(
+            100, 1000000, Hash32([0xAB; 32]), 6126151, 1, "p".into(),
+        );
+        let ctx2 = ExecutionContext::from_block(
+            101, 1001000, Hash32([0xCD; 32]), 6126151, 1, "p".into(),
+        );
+
+        // Different inputs → different outputs.
+        assert_ne!(ctx1.deterministic_seed, ctx2.deterministic_seed);
+        assert_ne!(ctx1.deterministic_random(0), ctx2.deterministic_random(0));
     }
 
     #[test]
-    fn test_sandbox_strict_does_not_reject() {
+    fn test_deterministic_random_indexed() {
+        let ctx = ExecutionContext::from_block(
+            1, 1000, Hash32([0x01; 32]), 6126151, 1, "p".into(),
+        );
+
+        // Different indices → different values.
+        assert_ne!(ctx.deterministic_random(0), ctx.deterministic_random(1));
+        assert_ne!(ctx.deterministic_random(1), ctx.deterministic_random(2));
+
+        // Same index → same value (deterministic).
+        assert_eq!(ctx.deterministic_random(5), ctx.deterministic_random(5));
+    }
+
+    #[test]
+    fn test_height_affects_seed_fully() {
+        // Two blocks with same hash but different heights should have different seeds.
+        let hash = Hash32([0x42; 32]);
+        let ctx_low = ExecutionContext::from_block(100, 0, hash, 0, 0, "".into());
+        let ctx_high = ExecutionContext::from_block(300, 0, hash, 0, 0, "".into());
+        assert_ne!(ctx_low.deterministic_seed, ctx_high.deterministic_seed);
+
+        // Also test heights that differ only in high byte (e.g., 0x100 vs 0x200).
+        let ctx_a = ExecutionContext::from_block(0x100, 0, hash, 0, 0, "".into());
+        let ctx_b = ExecutionContext::from_block(0x200, 0, hash, 0, 0, "".into());
+        assert_ne!(ctx_a.deterministic_seed, ctx_b.deterministic_seed);
+    }
+
+    #[test]
+    fn test_sandbox_strict_mode() {
         let mut sandbox = ExecutionSandbox::new(SandboxMode::Strict);
         sandbox.enter();
+        assert!(sandbox.is_active());
+
         let result = sandbox.report_violation(SandboxViolation::SystemTimeAccess {
-            location: "test".into(),
+            location: "block_exec.rs:42".into(),
         });
-        assert!(result.is_ok()); // Should be Err, but returns Ok.
-        assert!(sandbox.is_clean()); // Always true.
+        assert!(result.is_err());
+        assert!(!sandbox.is_clean());
+        assert_eq!(sandbox.violations().len(), 1);
+
+        sandbox.exit();
+        assert!(!sandbox.is_active());
     }
 
     #[test]
-    fn test_audit_finds_nothing() {
-        let code = "let map: HashMap<String, u64> = HashMap::new();";
+    fn test_sandbox_warn_mode() {
+        let mut sandbox = ExecutionSandbox::new(SandboxMode::Warn);
+        sandbox.enter();
+
+        let result = sandbox.report_violation(SandboxViolation::NonDeterministicRng {
+            location: "tx_order.rs:10".into(),
+        });
+        assert!(result.is_ok()); // Warn mode doesn't abort.
+        assert!(!sandbox.is_clean());
+        assert_eq!(sandbox.violations().len(), 1);
+    }
+
+    #[test]
+    fn test_sandbox_disabled_mode() {
+        let mut sandbox = ExecutionSandbox::new(SandboxMode::Disabled);
+        sandbox.enter();
+
+        let result = sandbox.report_violation(SandboxViolation::FloatingPoint {
+            location: "calc.rs:5".into(),
+        });
+        assert!(result.is_ok());
+        assert!(sandbox.is_clean()); // Disabled mode doesn't record.
+    }
+
+    #[test]
+    fn test_sandbox_enter_exit() {
+        let mut sandbox = ExecutionSandbox::new(SandboxMode::Strict);
+        assert!(!sandbox.is_active());
+        sandbox.enter();
+        assert!(sandbox.is_active());
+        sandbox.exit();
+        assert!(!sandbox.is_active());
+    }
+
+    #[test]
+    fn test_sandbox_clears_on_enter() {
+        let mut sandbox = ExecutionSandbox::new(SandboxMode::Warn);
+        sandbox.enter();
+        let _ = sandbox.report_violation(SandboxViolation::ThreadSpawn {
+            location: "exec.rs:1".into(),
+        });
+        assert_eq!(sandbox.violations().len(), 1);
+
+        // Re-enter clears violations.
+        sandbox.enter();
+        assert!(sandbox.is_clean());
+    }
+
+    #[test]
+    fn test_violation_display() {
+        let v = SandboxViolation::SystemTimeAccess { location: "foo.rs:10".into() };
+        let s = format!("{v}");
+        assert!(s.contains("system time access"));
+        assert!(s.contains("foo.rs:10"));
+    }
+
+    #[test]
+    fn test_audit_source_clean() {
+        let code = r#"
+            let map: BTreeMap<String, u64> = BTreeMap::new();
+            let timestamp = ctx.timestamp();
+        "#;
         let findings = audit_source_for_nondeterminism(code);
-        assert!(findings.is_empty()); // Should find HashMap, but exact match fails.
+        assert!(findings.is_empty(), "findings: {:?}", findings);
+    }
+
+    #[test]
+    fn test_audit_source_dangerous() {
+        let code = r#"
+            let map: HashMap<String, u64> = HashMap::new();
+            let now = SystemTime::now();
+            let r = thread_rng();
+        "#;
+        let findings = audit_source_for_nondeterminism(code);
+        assert!(findings.len() >= 3, "findings: {:?}", findings);
+    }
+
+    #[test]
+    fn test_audit_skips_comments() {
+        let code = r#"
+            // HashMap is not allowed in block execution
+            /// This function uses BTreeMap instead of HashMap
+            let map: BTreeMap<String, u64> = BTreeMap::new();
+        "#;
+        let findings = audit_source_for_nondeterminism(code);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_audit_finding_display() {
+        let f = SourceAuditFinding {
+            line: 42,
+            pattern: "HashMap".into(),
+            suggestion: "Use BTreeMap".into(),
+        };
+        let s = format!("{f}");
+        assert!(s.contains("line 42"));
+        assert!(s.contains("HashMap"));
+    }
+
+    #[test]
+    fn test_all_violation_types() {
+        let violations = vec![
+            SandboxViolation::SystemTimeAccess { location: "a".into() },
+            SandboxViolation::NonDeterministicRng { location: "b".into() },
+            SandboxViolation::UnorderedCollection { location: "c".into() },
+            SandboxViolation::FloatingPoint { location: "d".into() },
+            SandboxViolation::ThreadSpawn { location: "e".into() },
+            SandboxViolation::ExternalIo { location: "f".into() },
+        ];
+
+        let mut sandbox = ExecutionSandbox::new(SandboxMode::Warn);
+        sandbox.enter();
+        for v in violations {
+            let _ = sandbox.report_violation(v);
+        }
+        assert_eq!(sandbox.violations().len(), 6);
     }
 }
