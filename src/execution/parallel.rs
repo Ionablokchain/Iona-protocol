@@ -2,7 +2,8 @@
 //!
 //! Implements optimistic parallel execution with conflict detection and rollback.
 //!
-//! Strategy:
+//! # Strategy
+//!
 //! 1. **Dependency analysis**: Partition transactions by sender address.
 //!    Transactions from the same sender MUST be executed sequentially (nonce ordering).
 //!    Transactions from different senders CAN be executed in parallel.
@@ -17,36 +18,52 @@
 //! 4. **Deterministic ordering**: The final state is always equivalent to sequential execution
 //!    in the original transaction order — parallelism is an optimization, not a semantic change.
 //!
-//! Performance model:
-//!   - 4096 txs from 200 senders → ~20 txs/sender average
-//!   - 8 cores → 200 groups / 8 = 25 groups per core
-//!   - Each group: ~20 txs * 50μs = 1ms
-//!   - Total parallel time: ~25ms (vs ~200ms sequential)
-//!   - Speedup: ~8x on 8 cores
+//! # Performance model
+//!
+//! - 4096 txs from 200 senders → ~20 txs/sender average
+//! - 8 cores → 200 groups / 8 = 25 groups per core
+//! - Each group: ~20 txs * 50μs = 1ms
+//! - Total parallel time: ~25ms (vs ~200ms sequential)
+//! - Speedup: ~8x on 8 cores
+//!
+//! # Example
+//!
+//! ```
+//! use iona::execution::parallel::{execute_block_parallel, ParallelConfig, ParallelResult};
+//!
+//! let config = ParallelConfig::default();
+//! let result = execute_block_parallel(&prev_state, &txs, base_fee, proposer, &config)?;
+//! assert_eq!(result.gas_used, expected_gas);
+//! ```
 
-use crate::execution::{apply_tx, intrinsic_gas, verify_tx_signature, KvState};
-use crate::types::{Hash32, Receipt, Tx};
+use crate::execution::{apply_tx, verify_tx_signature, KvState};
+use crate::types::{Receipt, Tx};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use thiserror::Error;
 
-/// Result of parallel execution for a single transaction group.
-#[derive(Clone, Debug)]
-struct GroupResult {
-    /// Sender address (group key).
-    sender: String,
-    /// Receipts in original tx order within this group.
-    receipts: Vec<Receipt>,
-    /// Final state after applying all txs in this group.
-    final_state: KvState,
-    /// Set of KV keys written by this group.
-    written_keys: BTreeSet<String>,
-    /// Set of balance addresses modified by this group.
-    modified_balances: BTreeSet<String>,
-    /// Original global indices of transactions in this group.
-    global_indices: Vec<usize>,
-    /// Total gas used by this group.
-    gas_used: u64,
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during parallel execution.
+#[derive(Debug, Error)]
+pub enum ParallelExecError {
+    #[error("transaction signature verification failed for tx at index {index}")]
+    SignatureVerificationFailed { index: usize },
+
+    #[error("transaction application failed during sequential fallback at index {index}: {reason}")]
+    SequentialApplyFailed { index: usize, reason: String },
+
+    #[error("internal error: {0}")]
+    Internal(String),
 }
+
+pub type ParallelResult<T> = Result<T, ParallelExecError>;
+
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
 
 /// Configuration for the parallel executor.
 #[derive(Clone, Debug)]
@@ -69,6 +86,104 @@ impl Default for ParallelConfig {
         }
     }
 }
+
+impl ParallelConfig {
+    /// Validate configuration parameters.
+    pub fn validate(&self) -> ParallelResult<()> {
+        if self.min_txs_for_parallel == 0 {
+            return Err(ParallelExecError::Internal(
+                "min_txs_for_parallel must be > 0".into(),
+            ));
+        }
+        if self.min_senders_for_parallel == 0 {
+            return Err(ParallelExecError::Internal(
+                "min_senders_for_parallel must be > 0".into(),
+            ));
+        }
+        if self.max_parallel_groups == 0 {
+            return Err(ParallelExecError::Internal(
+                "max_parallel_groups must be > 0".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Result types
+// -----------------------------------------------------------------------------
+
+/// Result of executing a transaction group in parallel.
+#[derive(Clone, Debug)]
+struct GroupResult {
+    /// Sender address (group key).
+    sender: String,
+    /// Receipts in original tx order within this group.
+    receipts: Vec<Receipt>,
+    /// Final state after applying all txs in this group.
+    final_state: KvState,
+    /// Set of KV keys written by this group.
+    written_keys: BTreeSet<String>,
+    /// Set of balance addresses modified by this group.
+    modified_balances: BTreeSet<String>,
+    /// Original global indices of transactions in this group.
+    global_indices: Vec<usize>,
+    /// Total gas used by this group.
+    gas_used: u64,
+}
+
+/// Statistics about parallel execution performance.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ParallelExecStats {
+    /// Total blocks executed.
+    pub total_blocks: u64,
+    /// Blocks that used parallel execution.
+    pub parallel_blocks: u64,
+    /// Blocks that fell back to sequential (conflicts or too few txs).
+    pub sequential_blocks: u64,
+    /// Total conflicts detected.
+    pub conflicts_detected: u64,
+    /// Average speedup factor (estimated).
+    pub avg_sender_groups: f64,
+}
+
+impl ParallelExecStats {
+    /// Record a parallel execution with the given number of sender groups.
+    pub fn record_parallel(&mut self, num_groups: usize) {
+        self.total_blocks += 1;
+        self.parallel_blocks += 1;
+        let n = self.parallel_blocks as f64;
+        self.avg_sender_groups = (self.avg_sender_groups * (n - 1.0) + num_groups as f64) / n;
+    }
+
+    /// Record a sequential fallback execution.
+    pub fn record_sequential(&mut self) {
+        self.total_blocks += 1;
+        self.sequential_blocks += 1;
+    }
+
+    /// Record a conflict detection event.
+    pub fn record_conflict(&mut self) {
+        self.conflicts_detected += 1;
+    }
+}
+
+/// Output of parallel block execution.
+#[derive(Debug)]
+pub struct ParallelExecResult {
+    /// Final state after applying all transactions.
+    pub state: KvState,
+    /// Total gas used.
+    pub gas_used: u64,
+    /// Receipts in original transaction order.
+    pub receipts: Vec<Receipt>,
+    /// Whether parallel execution was used (true) or sequential (false).
+    pub used_parallel: bool,
+}
+
+// -----------------------------------------------------------------------------
+// Core execution logic
+// -----------------------------------------------------------------------------
 
 /// Partition transactions by sender address, preserving per-sender ordering.
 fn partition_by_sender(txs: &[Tx]) -> (HashMap<String, Vec<(usize, &Tx)>>, Vec<String>) {
@@ -101,7 +216,6 @@ fn execute_group(
     let mut global_indices = Vec::with_capacity(txs.len());
     let mut gas_used = 0u64;
 
-    // Track initial KV state for write detection
     let initial_kv = state.kv.clone();
     let initial_balances = state.balances.clone();
 
@@ -113,20 +227,19 @@ fn execute_group(
         global_indices.push(idx);
     }
 
-    // Detect which keys were written
+    // Detect which KV keys were written (modified or deleted)
     for (k, v) in &state.kv {
         if initial_kv.get(k) != Some(v) {
             written_keys.insert(k.clone());
         }
     }
-    // Keys that were deleted
     for k in initial_kv.keys() {
         if !state.kv.contains_key(k) {
             written_keys.insert(k.clone());
         }
     }
 
-    // Detect which balances were modified (beyond sender + proposer)
+    // Detect which balances were modified (excluding sender and proposer? We'll keep all)
     for (addr, bal) in &state.balances {
         if initial_balances.get(addr) != Some(bal) {
             modified_balances.insert(addr.clone());
@@ -144,7 +257,7 @@ fn execute_group(
     }
 }
 
-/// Check if two groups have conflicting writes.
+/// Check if two transaction groups have conflicting writes.
 fn groups_conflict(a: &GroupResult, b: &GroupResult) -> bool {
     // KV write-write conflict
     for key in &a.written_keys {
@@ -153,10 +266,12 @@ fn groups_conflict(a: &GroupResult, b: &GroupResult) -> bool {
         }
     }
 
-    // Balance conflict: if group A modifies an address that group B also modifies
-    // (beyond the proposer, which both will modify).
+    // Balance conflict: if both modify the same non-sender address
     for addr in &a.modified_balances {
-        if addr != &a.sender && b.modified_balances.contains(addr) && addr != &b.sender {
+        if addr != &a.sender
+            && addr != &b.sender
+            && b.modified_balances.contains(addr)
+        {
             return true;
         }
     }
@@ -165,13 +280,16 @@ fn groups_conflict(a: &GroupResult, b: &GroupResult) -> bool {
 }
 
 /// Merge non-conflicting group results into a single state.
-/// The merge applies deltas from each group onto the base state,
-/// in the original sender order, to maintain determinism.
-fn merge_states(base_state: &KvState, groups: &[GroupResult], proposer_addr: &str) -> KvState {
+/// Applies deltas from each group onto the base state in the original sender order.
+fn merge_states(
+    base_state: &KvState,
+    groups: &[GroupResult],
+    proposer_addr: &str,
+) -> KvState {
     let mut merged = base_state.clone();
 
     for group in groups {
-        // Apply KV changes
+        // Apply KV changes (new values)
         for (k, v) in &group.final_state.kv {
             if base_state.kv.get(k) != Some(v) {
                 merged.kv.insert(k.clone(), v.clone());
@@ -184,13 +302,11 @@ fn merge_states(base_state: &KvState, groups: &[GroupResult], proposer_addr: &st
             }
         }
 
-        // Apply balance changes (delta-based)
+        // Apply balance changes (delta-based for proposer)
         for (addr, new_bal) in &group.final_state.balances {
             if addr == proposer_addr {
-                // Proposer balance: accumulate tips from all groups
                 let base_bal = base_state.balances.get(addr).copied().unwrap_or(0);
-                let delta =
-                    new_bal.saturating_sub(base_state.balances.get(addr).copied().unwrap_or(0));
+                let delta = new_bal.saturating_sub(base_bal);
                 let current = merged.balances.get(addr).copied().unwrap_or(base_bal);
                 merged
                     .balances
@@ -205,11 +321,11 @@ fn merge_states(base_state: &KvState, groups: &[GroupResult], proposer_addr: &st
             merged.nonces.insert(addr.clone(), *nonce);
         }
 
-        // Accumulate burned
+        // Accumulate burned fee
         let burned_delta = group.final_state.burned.saturating_sub(base_state.burned);
         merged.burned = merged.burned.saturating_add(burned_delta);
 
-        // Merge VM state changes
+        // Merge VM state
         for (key, val) in &group.final_state.vm.storage {
             merged.vm.storage.insert(key.clone(), val.clone());
         }
@@ -224,34 +340,77 @@ fn merge_states(base_state: &KvState, groups: &[GroupResult], proposer_addr: &st
     merged
 }
 
+/// Sequential fallback (no parallelism).
+fn execute_sequential_fallback(
+    prev_state: &KvState,
+    txs: &[Tx],
+    base_fee_per_gas: u64,
+    proposer_addr: &str,
+) -> ParallelResult<ParallelExecResult> {
+    let mut st = prev_state.clone();
+    let mut gas_total = 0u64;
+    let mut receipts = Vec::with_capacity(txs.len());
+
+    for (idx, tx) in txs.iter().enumerate() {
+        let (rcpt, next) = apply_tx(&st, tx, base_fee_per_gas, proposer_addr);
+        if let Some(err) = &rcpt.error {
+            return Err(ParallelExecError::SequentialApplyFailed {
+                index: idx,
+                reason: err.clone(),
+            });
+        }
+        gas_total = gas_total.saturating_add(rcpt.gas_used);
+        st = next;
+        receipts.push(rcpt);
+    }
+
+    Ok(ParallelExecResult {
+        state: st,
+        gas_used: gas_total,
+        receipts,
+        used_parallel: false,
+    })
+}
+
 /// Execute a block of transactions with parallel execution where possible.
-///
-/// Returns (final_state, total_gas_used, receipts) — identical to sequential execution.
 ///
 /// The algorithm:
 /// 1. Partition txs by sender
 /// 2. Execute each sender's txs in parallel (independent groups)
 /// 3. Check for write-write conflicts between groups
 /// 4. If no conflicts: merge results (fast path)
-/// 5. If conflicts: fall back to sequential for conflicting groups
+/// 5. If conflicts: fall back to sequential execution
 pub fn execute_block_parallel(
     prev_state: &KvState,
     txs: &[Tx],
     base_fee_per_gas: u64,
     proposer_addr: &str,
     config: &ParallelConfig,
-) -> (KvState, u64, Vec<Receipt>) {
-    // Fall back to sequential for small batches
+    stats: Option<&mut ParallelExecStats>,
+) -> ParallelResult<ParallelExecResult> {
+    config.validate()?;
+
     let (groups, sender_order) = partition_by_sender(txs);
-    if txs.len() < config.min_txs_for_parallel || groups.len() < config.min_senders_for_parallel {
+    let should_use_parallel = txs.len() >= config.min_txs_for_parallel
+        && groups.len() >= config.min_senders_for_parallel
+        && groups.len() <= config.max_parallel_groups;
+
+    if !should_use_parallel {
+        if let Some(s) = stats {
+            s.record_sequential();
+        }
         return execute_sequential_fallback(prev_state, txs, base_fee_per_gas, proposer_addr);
     }
 
-    // Phase 1: Parallel signature verification
+    // Phase 1: Parallel signature pre‑verification (optional, but we do it for speed)
     let sig_valid: Vec<bool> = txs
         .par_iter()
-        .map(|tx| verify_tx_signature(tx).is_ok())
-        .collect();
+        .enumerate()
+        .map(|(idx, tx)| {
+            verify_tx_signature(tx)
+                .map_err(|_| ParallelExecError::SignatureVerificationFailed { index: idx })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Phase 2: Execute each sender group in parallel
     let group_entries: Vec<(&String, &Vec<(usize, &Tx)>)> = sender_order
@@ -274,20 +433,22 @@ pub fn execute_block_parallel(
 
     // Phase 3: Conflict detection
     let mut has_conflict = false;
-    for i in 0..group_results.len() {
-        if has_conflict {
-            break;
-        }
+    'outer: for i in 0..group_results.len() {
         for j in (i + 1)..group_results.len() {
             if groups_conflict(&group_results[i], &group_results[j]) {
                 has_conflict = true;
-                break;
+                if let Some(s) = stats.as_mut() {
+                    s.record_conflict();
+                }
+                break 'outer;
             }
         }
     }
 
     if has_conflict {
-        // Fall back to sequential execution for correctness
+        if let Some(s) = stats {
+            s.record_sequential();
+        }
         return execute_sequential_fallback(prev_state, txs, base_fee_per_gas, proposer_addr);
     }
 
@@ -306,61 +467,21 @@ pub fn execute_block_parallel(
     receipts_indexed.sort_by_key(|(idx, _)| *idx);
     let receipts: Vec<Receipt> = receipts_indexed.into_iter().map(|(_, r)| r).collect();
 
-    (merged_state, total_gas, receipts)
-}
-
-/// Sequential fallback (same as execute_block but without the parallel sig verify
-/// optimization, since we already know we need serial execution).
-fn execute_sequential_fallback(
-    prev_state: &KvState,
-    txs: &[Tx],
-    base_fee_per_gas: u64,
-    proposer_addr: &str,
-) -> (KvState, u64, Vec<Receipt>) {
-    let mut st = prev_state.clone();
-    let mut gas_total = 0u64;
-    let mut receipts = Vec::with_capacity(txs.len());
-    for tx in txs {
-        let (rcpt, next) = apply_tx(&st, tx, base_fee_per_gas, proposer_addr);
-        gas_total = gas_total.saturating_add(rcpt.gas_used);
-        st = next;
-        receipts.push(rcpt);
-    }
-    (st, gas_total, receipts)
-}
-
-/// Statistics about parallel execution performance.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub struct ParallelExecStats {
-    /// Total blocks executed.
-    pub total_blocks: u64,
-    /// Blocks that used parallel execution.
-    pub parallel_blocks: u64,
-    /// Blocks that fell back to sequential (conflicts or too few txs).
-    pub sequential_blocks: u64,
-    /// Total conflicts detected.
-    pub conflicts_detected: u64,
-    /// Average speedup factor (estimated).
-    pub avg_sender_groups: f64,
-}
-
-impl ParallelExecStats {
-    pub fn record_parallel(&mut self, num_groups: usize) {
-        self.total_blocks += 1;
-        self.parallel_blocks += 1;
-        let n = self.parallel_blocks as f64;
-        self.avg_sender_groups = (self.avg_sender_groups * (n - 1.0) + num_groups as f64) / n;
+    if let Some(s) = stats {
+        s.record_parallel(group_results.len());
     }
 
-    pub fn record_sequential(&mut self) {
-        self.total_blocks += 1;
-        self.sequential_blocks += 1;
-    }
-
-    pub fn record_conflict(&mut self) {
-        self.conflicts_detected += 1;
-    }
+    Ok(ParallelExecResult {
+        state: merged_state,
+        gas_used: total_gas,
+        receipts,
+        used_parallel: true,
+    })
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -379,7 +500,7 @@ mod tests {
 
         let mut tx = Tx {
             pubkey: pk.0.clone(),
-            from: from.clone(),
+            from,
             nonce,
             max_fee_per_gas: 100,
             max_priority_fee_per_gas: 10,
@@ -394,8 +515,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_matches_sequential() {
+    fn test_parallel_matches_sequential() -> ParallelResult<()> {
         let mut state = KvState::default();
+
         // Fund senders
         for seed in 1u64..=5 {
             let mut seed32 = [0u8; 32];
@@ -408,7 +530,6 @@ mod tests {
         let proposer_addr = "0000000000000000000000000000000000000000";
         let base_fee = 1u64;
 
-        // Create txs from different senders (no conflicts)
         let txs: Vec<Tx> = (1u64..=5)
             .map(|seed| make_signed_tx(seed, 0, &format!("set key{seed} val{seed}")))
             .collect();
@@ -419,18 +540,16 @@ mod tests {
             max_parallel_groups: 256,
         };
 
-        let (par_state, par_gas, par_receipts) =
-            execute_block_parallel(&state, &txs, base_fee, proposer_addr, &config);
-        let (seq_state, seq_gas, seq_receipts) =
-            execute_sequential_fallback(&state, &txs, base_fee, proposer_addr);
+        let par_result = execute_block_parallel(&state, &txs, base_fee, proposer_addr, &config, None)?;
+        let seq_result = execute_sequential_fallback(&state, &txs, base_fee, proposer_addr)?;
 
-        // Results should be equivalent
-        assert_eq!(par_gas, seq_gas);
-        assert_eq!(par_receipts.len(), seq_receipts.len());
-        for (pr, sr) in par_receipts.iter().zip(seq_receipts.iter()) {
+        assert_eq!(par_result.gas_used, seq_result.gas_used);
+        assert_eq!(par_result.receipts.len(), seq_result.receipts.len());
+        for (pr, sr) in par_result.receipts.iter().zip(seq_result.receipts.iter()) {
             assert_eq!(pr.success, sr.success);
             assert_eq!(pr.gas_used, sr.gas_used);
         }
+        Ok(())
     }
 
     #[test]
@@ -444,8 +563,33 @@ mod tests {
 
         assert_eq!(groups.len(), 2);
         assert_eq!(order.len(), 2);
-        // Sender 1 should have 2 txs
         let sender1 = &txs[0].from;
         assert_eq!(groups[sender1].len(), 2);
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let bad = ParallelConfig {
+            min_txs_for_parallel: 0,
+            ..Default::default()
+        };
+        assert!(bad.validate().is_err());
+
+        let good = ParallelConfig::default();
+        assert!(good.validate().is_ok());
+    }
+
+    #[test]
+    fn test_small_batch_falls_back_to_sequential() -> ParallelResult<()> {
+        let mut state = KvState::default();
+        let tx = make_signed_tx(1, 0, "set x 1");
+        let txs = vec![tx];
+        let config = ParallelConfig {
+            min_txs_for_parallel: 32,
+            ..Default::default()
+        };
+        let result = execute_block_parallel(&state, &txs, 1, "proposer", &config, None)?;
+        assert!(!result.used_parallel);
+        Ok(())
     }
 }
