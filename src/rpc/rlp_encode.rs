@@ -1,8 +1,8 @@
 //! RLP encoding utilities for Ethereum‑compatible data.
 //!
 //! Provides functions to encode lists of byte slices into RLP and compute
-//! their Keccak‑256 hash. These are used for simplified roots (placeholders)
-//! where a full Merkle Patricia Trie is not required.
+//! their Keccak‑256 hash. Used for simplified roots (placeholders) where
+//! a full Merkle Patricia Trie is not required.
 //!
 //! # Example
 //!
@@ -16,6 +16,34 @@
 
 use rlp::RlpStream;
 use sha3::{Digest, Keccak256};
+use thiserror::Error;
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Hex prefix for Ethereum‑compatible hex strings.
+const HEX_PREFIX: &str = "0x";
+
+/// Keccak‑256 hash of RLP‑encoded empty list.
+/// Known value: `rlp([]) = 0xc0`, keccak(0xc0) = 0x56e81f...
+pub const EMPTY_LIST_RIPEMD: &str = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421";
+
+/// Expected length of a hex‑encoded hash with prefix (2 + 64 = 66).
+const HEX_HASH_LEN: usize = 66;
+
+// -----------------------------------------------------------------------------
+// Errors (placeholder – no current fallible operations)
+// -----------------------------------------------------------------------------
+
+/// Possible errors during RLP encoding (currently none, but kept for future).
+#[derive(Debug, Error)]
+pub enum RlpEncodeError {
+    #[error("unexpected error: {0}")]
+    Internal(String),
+}
+
+pub type RlpEncodeResult<T> = Result<T, RlpEncodeError>;
 
 // -----------------------------------------------------------------------------
 // Core functions
@@ -27,7 +55,7 @@ use sha3::{Digest, Keccak256};
 /// * `items` – Slice of byte vectors to encode.
 ///
 /// # Returns
-/// The RLP‑encoded bytes of the list.
+/// The RLP‑encoded bytes of the list. This function never fails.
 #[must_use]
 pub fn rlp_list_bytes(items: &[Vec<u8>]) -> Vec<u8> {
     let mut stream = RlpStream::new_list(items.len());
@@ -48,7 +76,7 @@ pub fn rlp_list_bytes(items: &[Vec<u8>]) -> Vec<u8> {
 pub fn keccak_hex(bytes: &[u8]) -> String {
     let mut hasher = Keccak256::new();
     hasher.update(bytes);
-    format!("0x{}", hex::encode(hasher.finalize()))
+    format!("{}{}", HEX_PREFIX, hex::encode(hasher.finalize()))
 }
 
 /// Compute a simplified "root" as `keccak(rlp(list(items)))`.
@@ -112,41 +140,51 @@ mod tests {
     fn test_empty_list_root() {
         let empty: Vec<Vec<u8>> = vec![];
         let root = keccak_rlp_root(&empty);
-        // Known value: keccak(rlp([])) = 0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421
-        assert_eq!(
-            root,
-            "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-        );
+        assert_eq!(root, EMPTY_LIST_RIPEMD);
     }
 
     #[test]
-    fn test_single_item_root() {
-        let item = b"hello".to_vec();
-        let root = keccak_rlp_root(&[item]);
-        assert!(root.starts_with("0x"));
-        assert_eq!(root.len(), 66);
-    }
-
-    #[test]
-    fn test_keccak_hex() {
+    fn test_keccak_hex_empty() {
         let hash = keccak_hex(b"");
-        // Keccak-256 of empty string
+        // Keccak‑256 of empty string
         assert_eq!(
             hash,
             "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
         );
+        assert_eq!(hash.len(), HEX_HASH_LEN);
     }
 
     #[test]
-    fn test_rlp_list_bytes() {
+    fn test_keccak_hex_non_empty() {
+        let hash = keccak_hex(b"hello");
+        // Known value for "hello" (without 0x)
+        assert_eq!(
+            hash,
+            "0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8"
+        );
+    }
+
+    #[test]
+    fn test_rlp_list_bytes_non_empty() {
         let items = vec![b"a".to_vec(), b"bc".to_vec()];
         let encoded = rlp_list_bytes(&items);
-        // RLP of ["a", "bc"] is 0xc2 0x61 0xc2 0x62 0x63? Actually manual check: not needed.
+        // RLP of ["a", "bc"] = 0xc2 0x61 0xc2 0x62 0x63
+        // Let's check length: "a" is 1 byte (RLP: 0x61), "bc" is 2 bytes (RLP: 0xc2 0x62 0x63)
+        // List of 2 items: prefix 0xc2 gives 0xc2 + (0x61) + (0xc2 0x62 0x63)
         assert!(!encoded.is_empty());
+        // We could do a more precise check:
+        let expected = vec![0xc2, 0x61, 0xc2, 0x62, 0x63];
+        assert_eq!(encoded, expected);
     }
 
     #[test]
-    fn test_keccak_rlp_root_from_iter() {
+    fn test_rlp_list_bytes_empty() {
+        let encoded = rlp_list_bytes(&[]);
+        assert_eq!(encoded, vec![0xc0]); // RLP of empty list
+    }
+
+    #[test]
+    fn test_keccak_rlp_root_consistency() {
         let items = vec![b"hello".to_vec(), b"world".to_vec()];
         let root1 = keccak_rlp_root(&items);
         let root2 = keccak_rlp_root_from_iter(items.iter().map(|v| v.as_slice()));
@@ -159,6 +197,8 @@ mod tests {
         struct TestItem(u64);
         let items = vec![TestItem(1), TestItem(2)];
         let root = keccak_rlp_root_encodable(&items);
-        assert!(root.starts_with("0x"));
+        assert!(root.starts_with(HEX_PREFIX));
+        assert_eq!(root.len(), HEX_HASH_LEN);
+        // Verify manually? Not needed; just ensure no panic.
     }
 }
