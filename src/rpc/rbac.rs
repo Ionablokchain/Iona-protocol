@@ -30,9 +30,59 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
 
-// ── Role definitions ──────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Default RBAC policy file name.
+pub const DEFAULT_RBAC_FILENAME: &str = "rbac.toml";
+
+/// Admin endpoints and their required minimum role.
+pub mod endpoints {
+    pub const STATUS: &str = "/admin/status";
+    pub const AUDIT: &str = "/admin/audit";
+    pub const METRICS: &str = "/admin/metrics";
+    pub const SNAPSHOT: &str = "/admin/snapshot";
+    pub const PEER_KICK: &str = "/admin/peer-kick";
+    pub const CONFIG_RELOAD: &str = "/admin/config-reload";
+    pub const MEMPOOL_FLUSH: &str = "/admin/mempool-flush";
+    pub const KEY_ROTATE: &str = "/admin/key-rotate";
+    pub const UPGRADE_TRIGGER: &str = "/admin/upgrade-trigger";
+    pub const RESET_CHAIN: &str = "/admin/reset-chain";
+    pub const SCHEMA_MIGRATE: &str = "/admin/schema-migrate";
+}
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during RBAC operations.
+#[derive(Debug, Error)]
+pub enum RbacError {
+    #[error("I/O error reading RBAC file {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("TOML parse error in {path}: {source}")]
+    Toml {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("invalid RBAC policy: {0}")]
+    InvalidPolicy(String),
+}
+
+pub type RbacResult<T> = Result<T, RbacError>;
+
+// -----------------------------------------------------------------------------
+// Role definitions
+// -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -64,29 +114,33 @@ impl std::fmt::Display for Role {
     }
 }
 
-// ── Endpoint permission map ───────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Endpoint permission map
+// -----------------------------------------------------------------------------
 
 /// Returns the minimum role required to call an admin endpoint.
 pub fn required_role(endpoint: &str) -> Role {
     match endpoint {
         // Read-only — any authenticated identity
-        "/admin/status" | "/admin/audit" | "/admin/metrics" => Role::Auditor,
+        endpoints::STATUS | endpoints::AUDIT | endpoints::METRICS => Role::Auditor,
         // Node control — operator and above
-        "/admin/snapshot"
-        | "/admin/peer-kick"
-        | "/admin/config-reload"
-        | "/admin/mempool-flush" => Role::Operator,
+        endpoints::SNAPSHOT
+        | endpoints::PEER_KICK
+        | endpoints::CONFIG_RELOAD
+        | endpoints::MEMPOOL_FLUSH => Role::Operator,
         // Destructive / privileged — maintainer only
-        "/admin/key-rotate"
-        | "/admin/upgrade-trigger"
-        | "/admin/reset-chain"
-        | "/admin/schema-migrate" => Role::Maintainer,
+        endpoints::KEY_ROTATE
+        | endpoints::UPGRADE_TRIGGER
+        | endpoints::RESET_CHAIN
+        | endpoints::SCHEMA_MIGRATE => Role::Maintainer,
         // Default: deny unknown admin endpoints at the highest level
         _ => Role::Maintainer,
     }
 }
 
-// ── Identity ──────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Identity
+// -----------------------------------------------------------------------------
 
 /// A verified client identity extracted from a mTLS certificate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -108,17 +162,28 @@ impl std::fmt::Display for ClientIdentity {
     }
 }
 
-// ── RBAC policy file (rbac.toml) ─────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// RBAC policy file (rbac.toml)
+// -----------------------------------------------------------------------------
 
 /// A single identity→roles mapping entry in `rbac.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RbacIdentityEntry {
-    /// Optional CN match (case-insensitive prefix match).
     pub cn: Option<String>,
-    /// Optional SHA-256 fingerprint match (exact, colon-hex).
     pub fingerprint: Option<String>,
-    /// Roles granted to this identity.
     pub roles: Vec<Role>,
+}
+
+impl RbacIdentityEntry {
+    /// Validate that at least one of `cn` or `fingerprint` is provided.
+    pub fn validate(&self) -> RbacResult<()> {
+        if self.cn.is_none() && self.fingerprint.is_none() {
+            return Err(RbacError::InvalidPolicy(
+                "each identity must have at least `cn` or `fingerprint`".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The full RBAC policy loaded from `rbac.toml`.
@@ -129,28 +194,27 @@ pub struct RbacPolicy {
 
 impl RbacPolicy {
     /// Load from a TOML file.
-    pub fn load(path: &Path) -> std::io::Result<Self> {
-        let s = std::fs::read_to_string(path)?;
-        toml::from_str(&s).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("rbac.toml parse: {e}"),
-            )
-        })
+    pub fn load(path: impl AsRef<Path>) -> RbacResult<Self> {
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| RbacError::Io { path: path.to_path_buf(), source: e })?;
+        let policy: Self = toml::from_str(&content)
+            .map_err(|e| RbacError::Toml { path: path.to_path_buf(), source: e })?;
+        // Validate each entry
+        for entry in &policy.identities {
+            entry.validate()?;
+        }
+        Ok(policy)
     }
 
     /// Returns the set of roles granted to `identity` based on this policy.
-    /// An identity matches an entry if:
-    ///   - The entry has a `cn` and it case-insensitively matches the cert CN, AND
-    ///   - The entry has a `fingerprint` and it exactly matches the cert fingerprint.
-    /// If only one of cn/fingerprint is present in the entry, only that field is checked.
     pub fn roles_for(&self, identity: &ClientIdentity) -> HashSet<Role> {
         let mut result = HashSet::new();
         for entry in &self.identities {
             let cn_ok = match (&entry.cn, &identity.cn) {
                 (Some(ecn), Some(icn)) => ecn.to_lowercase() == icn.to_lowercase(),
-                (Some(_), None) => false, // entry requires CN but cert has none
-                (None, _) => true,        // entry doesn't restrict by CN
+                (Some(_), None) => false,
+                (None, _) => true,
             };
             let fp_ok = match (&entry.fingerprint, &identity.fingerprint) {
                 (Some(efp), Some(ifp)) => efp == ifp,
@@ -158,9 +222,7 @@ impl RbacPolicy {
                 (None, _) => true,
             };
             if cn_ok && fp_ok {
-                for role in &entry.roles {
-                    result.insert(role.clone());
-                }
+                result.extend(entry.roles.iter().cloned());
             }
         }
         result
@@ -174,7 +236,9 @@ impl RbacPolicy {
     }
 }
 
-// ── Runtime RBAC checker ──────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Runtime RBAC checker
+// -----------------------------------------------------------------------------
 
 /// Thread-safe runtime wrapper over an [`RbacPolicy`] with hot-reload support.
 #[derive(Debug)]
@@ -193,16 +257,17 @@ impl RbacChecker {
     }
 
     /// Load from file and record path for hot-reload.
-    pub fn from_file(path: &Path) -> std::io::Result<Self> {
-        let policy = RbacPolicy::load(path)?;
+    pub fn from_file(path: impl AsRef<Path>) -> RbacResult<Self> {
+        let path = path.as_ref().to_path_buf();
+        let policy = RbacPolicy::load(&path)?;
         Ok(Self {
             policy: parking_lot::RwLock::new(policy),
-            path: Some(path.to_path_buf()),
+            path: Some(path),
         })
     }
 
-    /// Hot-reload the policy from disk.
-    pub fn reload(&self) -> std::io::Result<()> {
+    /// Hot-reload the policy from disk (if path was set).
+    pub fn reload(&self) -> RbacResult<()> {
         if let Some(p) = &self.path {
             let new = RbacPolicy::load(p)?;
             *self.policy.write() = new;
@@ -210,12 +275,13 @@ impl RbacChecker {
         Ok(())
     }
 
-    /// Replace the in-memory policy directly (useful for tests and runtime reload without disk).
+    /// Replace the in-memory policy directly (useful for tests).
     pub fn reload_policy(&self, new_policy: RbacPolicy) {
         *self.policy.write() = new_policy;
     }
 
-    /// Returns the reason for denial, or `Ok(roles)` if access is granted.
+    /// Check if the identity is allowed to access the endpoint.
+    /// Returns `Ok(roles)` if allowed, otherwise `Err(RbacDenial)`.
     pub fn check(
         &self,
         identity: &ClientIdentity,
@@ -236,6 +302,10 @@ impl RbacChecker {
         }
     }
 }
+
+// -----------------------------------------------------------------------------
+// Denial reason
+// -----------------------------------------------------------------------------
 
 /// Reason why an RBAC check failed — returned as structured data for logging.
 #[derive(Debug, Clone)]
@@ -260,10 +330,12 @@ impl std::fmt::Display for RbacDenial {
     }
 }
 
-// ── Sample RBAC config generator ─────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Sample config generator
+// -----------------------------------------------------------------------------
 
 /// Write a sample `rbac.toml` to `path` for new deployments.
-pub fn write_sample_rbac(path: &Path) -> std::io::Result<()> {
+pub fn write_sample_rbac(path: impl AsRef<Path>) -> std::io::Result<()> {
     let sample = r#"# IONA RBAC policy — maps mTLS client identities to roles.
 #
 # Roles (in ascending order of privilege):
@@ -287,14 +359,17 @@ roles       = ["auditor"]
 cn    = "node-maintainer"
 roles = ["maintainer"]
 "#;
-    std::fs::write(path, sample)
+    std::fs::write(path.as_ref(), sample)
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
 
     fn alice() -> ClientIdentity {
         ClientIdentity {
@@ -372,7 +447,7 @@ roles = ["maintainer"]
         let p = policy();
         let bad_fp = ClientIdentity {
             cn: Some("ci-bot".into()),
-            fingerprint: Some("00:00".into()), // wrong fingerprint
+            fingerprint: Some("00:00".into()),
         };
         assert!(p.roles_for(&bad_fp).is_empty());
     }
@@ -385,9 +460,45 @@ roles = ["maintainer"]
     #[test]
     fn checker_denies_stranger() {
         let checker = RbacChecker::new(policy());
-        let result = checker.check(&stranger(), "/admin/status");
+        let result = checker.check(&stranger(), endpoints::STATUS);
         assert!(result.is_err());
         let denial = result.unwrap_err();
         assert_eq!(denial.required, Role::Auditor);
+    }
+
+    #[test]
+    fn load_invalid_file() {
+        let temp = NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), b"invalid toml {").unwrap();
+        let result = RbacPolicy::load(temp.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_missing_file() {
+        let result = RbacPolicy::load("/nonexistent/file.toml");
+        assert!(result.is_err());
+        if let Err(RbacError::Io { .. }) = result {
+            // ok
+        } else {
+            panic!("expected Io error");
+        }
+    }
+
+    #[test]
+    fn entry_validation() {
+        let valid = RbacIdentityEntry {
+            cn: Some("alice".into()),
+            fingerprint: None,
+            roles: vec![Role::Auditor],
+        };
+        assert!(valid.validate().is_ok());
+
+        let invalid = RbacIdentityEntry {
+            cn: None,
+            fingerprint: None,
+            roles: vec![Role::Auditor],
+        };
+        assert!(invalid.validate().is_err());
     }
 }
