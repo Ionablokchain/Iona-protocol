@@ -4,114 +4,209 @@
 //! `ecdsa::RecoveryId` + `VerifyingKey::recover_from_prehash`.
 //!
 //! Supports:
-//!   - Legacy (EIP-155 + pre-EIP-155)
-//!   - EIP-2930 (type 0x01)
-//!   - EIP-1559 (type 0x02)
+//!   - Legacy (EIP‑155 + pre‑EIP‑155)
+//!   - EIP‑2930 (type 0x01)
+//!   - EIP‑1559 (type 0x02)
 
 use crate::types::tx_evm::EvmTx;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use rlp::Rlp;
 use sha3::{Digest, Keccak256};
+use thiserror::Error;
 
-// ── Helpers ───────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
 
-pub fn keccak256(data: &[u8]) -> [u8; 32] {
-    let mut h = Keccak256::new();
-    h.update(data);
-    h.finalize().into()
+/// Errors that can occur during transaction decoding and sender recovery.
+#[derive(Debug, Error)]
+pub enum TxDecodeError {
+    #[error("RLP decoding error: {0}")]
+    Rlp(String),
+
+    #[error("invalid transaction type byte: 0x{type_byte:02X}")]
+    InvalidTxType { type_byte: u8 },
+
+    #[error("empty transaction data")]
+    EmptyData,
+
+    #[error("invalid signature component length: expected 32 bytes, got {len}")]
+    InvalidSignatureLength { len: usize },
+
+    #[error("invalid signature: {0}")]
+    InvalidSignature(String),
+
+    #[error("invalid recovery id: {0}")]
+    InvalidRecoveryId(u8),
+
+    #[error("sender recovery failed: {0}")]
+    RecoveryFailed(String),
+
+    #[error("invalid address length: expected 20 bytes, got {len}")]
+    InvalidAddressLength { len: usize },
+
+    #[error("invalid storage key length: expected <= 32 bytes, got {len}")]
+    InvalidStorageKeyLength { len: usize },
+
+    #[error("unexpected v value in legacy transaction: {v}")]
+    UnexpectedV { v: u64 },
+
+    #[error("missing field in RLP list: {field}")]
+    MissingField { field: &'static str },
 }
 
-/// Recover 20-byte address from a prehash + (v, r, s) as used in Legacy txs.
-///
-/// For EIP-155: recovery_id = (v - chain_id * 2 - 35) & 1
-/// For pre-EIP-155: recovery_id = v - 27
-pub fn recover_sender(
-    sighash: &[u8; 32],
-    v: u64,
-    r: [u8; 32],
-    s: [u8; 32],
-    chain_id: Option<u64>,
-) -> Result<[u8; 20], String> {
-    let recovery_id_byte: u8 = if let Some(cid) = chain_id {
-        // EIP-155
-        let base = cid * 2 + 35;
-        if v < base {
-            return Err(format!("v={v} < base={base} for chain_id={cid}"));
-        }
-        ((v - base) & 1) as u8
+pub type TxDecodeResult<T> = Result<T, TxDecodeError>;
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Transaction type for legacy transactions (no type byte).
+pub const TX_TYPE_LEGACY: u8 = 0x00;
+
+/// Transaction type for EIP‑2930.
+pub const TX_TYPE_EIP2930: u8 = 0x01;
+
+/// Transaction type for EIP‑1559.
+pub const TX_TYPE_EIP1559: u8 = 0x02;
+
+/// Length of a 20‑byte Ethereum address.
+const ADDR_LEN: usize = 20;
+
+/// Length of a 32‑byte hash.
+const HASH_LEN: usize = 32;
+
+/// Length of a 64‑byte signature (r + s).
+const SIG_LEN: usize = 64;
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+/// Compute Keccak‑256 hash of data.
+#[must_use]
+pub fn keccak256(data: &[u8]) -> [u8; HASH_LEN] {
+    let mut hasher = Keccak256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// Append a `u128` value to an RLP stream as minimal big‑endian bytes.
+fn rlp_append_u128(s: &mut rlp::RlpStream, value: u128) {
+    if value == 0 {
+        s.append(&0u8);
     } else {
-        // pre-EIP-155
-        if v < 27 {
-            return Err(format!("v={v} < 27"));
-        }
-        ((v - 27) & 1) as u8
-    };
-
-    recover_from_components(sighash, recovery_id_byte, r, s)
-}
-
-/// Recover sender from typed tx (y_parity is 0 or 1 directly).
-pub fn recover_sender_typed(
-    sighash: &[u8; 32],
-    y_parity: u8,
-    r: [u8; 32],
-    s: [u8; 32],
-) -> Result<[u8; 20], String> {
-    recover_from_components(sighash, y_parity & 1, r, s)
-}
-
-fn recover_from_components(
-    sighash: &[u8; 32],
-    recovery_id_byte: u8,
-    r: [u8; 32],
-    s: [u8; 32],
-) -> Result<[u8; 20], String> {
-    // Build 64-byte compact signature [r || s]
-    let mut sig_bytes = [0u8; 64];
-    sig_bytes[..32].copy_from_slice(&r);
-    sig_bytes[32..].copy_from_slice(&s);
-
-    let sig = Signature::from_bytes((&sig_bytes).into())
-        .map_err(|e| format!("invalid signature: {e}"))?;
-
-    let rec_id = RecoveryId::try_from(recovery_id_byte)
-        .map_err(|e| format!("invalid recovery id {recovery_id_byte}: {e}"))?;
-
-    let vk = VerifyingKey::recover_from_prehash(sighash, &sig, rec_id)
-        .map_err(|e| format!("recovery failed: {e}"))?;
-
-    // Uncompressed public key → keccak256 of last 64 bytes → take last 20 bytes
-    let point = vk.to_encoded_point(false);
-    let pk_bytes = point.as_bytes();
-    if pk_bytes.len() != 65 {
-        return Err(format!("unexpected pubkey len {}", pk_bytes.len()));
+        let bytes = value.to_be_bytes();
+        let start = bytes.iter().position(|&b| b != 0).unwrap_or(0);
+        s.append(&bytes[start..]);
     }
-    let hash = keccak256(&pk_bytes[1..]); // skip 0x04 prefix
-    let mut addr = [0u8; 20];
-    addr.copy_from_slice(&hash[12..]);
-    Ok(addr)
 }
 
-// ── Legacy transaction ────────────────────────────────────────────────────
+/// Decode an address from RLP bytes (empty means `None`).
+fn decode_address(bytes: &[u8]) -> TxDecodeResult<Option<[u8; ADDR_LEN]>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() != ADDR_LEN {
+        return Err(TxDecodeError::InvalidAddressLength { len: bytes.len() });
+    }
+    let mut addr = [0u8; ADDR_LEN];
+    addr.copy_from_slice(bytes);
+    Ok(Some(addr))
+}
+
+/// Encode an optional address to RLP.
+fn rlp_encode_address(s: &mut rlp::RlpStream, addr: &Option<[u8; ADDR_LEN]>) {
+    match addr {
+        Some(a) => s.append(&a.as_slice()),
+        None => s.append_empty_data(),
+    }
+}
+
+/// Decode `r` and `s` signature components from RLP indices.
+fn decode_rlp_rs(rlp: &Rlp, r_idx: usize, s_idx: usize) -> TxDecodeResult<([u8; HASH_LEN], [u8; HASH_LEN])> {
+    let r_vec: Vec<u8> = rlp.val_at(r_idx).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let s_vec: Vec<u8> = rlp.val_at(s_idx).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    if r_vec.len() > HASH_LEN || s_vec.len() > HASH_LEN {
+        return Err(TxDecodeError::InvalidSignatureLength {
+            len: r_vec.len().max(s_vec.len()),
+        });
+    }
+    let mut r = [0u8; HASH_LEN];
+    let mut s = [0u8; HASH_LEN];
+    r[HASH_LEN - r_vec.len()..].copy_from_slice(&r_vec);
+    s[HASH_LEN - s_vec.len()..].copy_from_slice(&s_vec);
+    Ok((r, s))
+}
+
+/// Decode an EIP‑2930/EIP‑1559 access list.
+fn decode_access_list(al_rlp: &Rlp) -> TxDecodeResult<Vec<([u8; ADDR_LEN], Vec<[u8; HASH_LEN]>)>> {
+    if !al_rlp.is_list() {
+        return Ok(vec![]);
+    }
+    let item_count = al_rlp.item_count().map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let mut out = Vec::with_capacity(item_count);
+    for i in 0..item_count {
+        let item = al_rlp.at(i).map_err(|_| TxDecodeError::MissingField { field: "access_list_item" })?;
+        let addr_bytes: Vec<u8> = item.val_at(0).map_err(|_| TxDecodeError::MissingField { field: "address" })?;
+        if addr_bytes.len() != ADDR_LEN {
+            return Err(TxDecodeError::InvalidAddressLength { len: addr_bytes.len() });
+        }
+        let mut addr = [0u8; ADDR_LEN];
+        addr.copy_from_slice(&addr_bytes);
+        let keys_rlp = item.at(1).map_err(|_| TxDecodeError::MissingField { field: "storage_keys" })?;
+        let keys_count = keys_rlp.item_count().map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+        let mut keys = Vec::with_capacity(keys_count);
+        for j in 0..keys_count {
+            let k: Vec<u8> = keys_rlp.val_at(j).map_err(|_| TxDecodeError::MissingField { field: "storage_key" })?;
+            if k.len() > HASH_LEN {
+                return Err(TxDecodeError::InvalidStorageKeyLength { len: k.len() });
+            }
+            let mut key = [0u8; HASH_LEN];
+            key[HASH_LEN - k.len()..].copy_from_slice(&k);
+            keys.push(key);
+        }
+        out.push((addr, keys));
+    }
+    Ok(out)
+}
+
+/// Encode an access list to RLP.
+fn rlp_encode_access_list(s: &mut rlp::RlpStream, al: &[([u8; ADDR_LEN], Vec<[u8; HASH_LEN]>)]) {
+    s.begin_list(al.len());
+    for (addr, keys) in al {
+        s.begin_list(2);
+        s.append(&addr.as_slice());
+        s.begin_list(keys.len());
+        for key in keys {
+            s.append(&key.as_slice());
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Legacy transaction
+// -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct LegacySignedTx {
     pub nonce: u64,
     pub gas_price: u128,
     pub gas_limit: u64,
-    pub to: Option<[u8; 20]>,
+    pub to: Option<[u8; ADDR_LEN]>,
     pub value: u128,
     pub data: Vec<u8>,
     pub v: u64,
-    pub r: [u8; 32],
-    pub s: [u8; 32],
-    pub from: [u8; 20],
-    /// Extracted chain_id (None for pre-EIP-155 txs).
+    pub r: [u8; HASH_LEN],
+    pub s: [u8; HASH_LEN],
+    pub from: [u8; ADDR_LEN],
     pub chain_id: Option<u64>,
 }
 
 impl LegacySignedTx {
+    /// Convert to `EvmTx`.
+    #[must_use]
     pub fn to_evm_tx(&self) -> EvmTx {
         EvmTx::Legacy {
             from: self.from,
@@ -127,54 +222,38 @@ impl LegacySignedTx {
 }
 
 /// Decode a raw legacy transaction (no type prefix).
-///
-/// Handles both EIP-155 (v = chain_id*2 + 35/36) and
-/// pre-EIP-155 (v = 27/28) encoding.
-pub fn decode_legacy_signed_tx(raw: &[u8]) -> Result<LegacySignedTx, String> {
+pub fn decode_legacy_signed_tx(raw: &[u8]) -> TxDecodeResult<LegacySignedTx> {
     let rlp = Rlp::new(raw);
-    if !rlp.is_list() || rlp.item_count().unwrap_or(0) < 9 {
-        return Err("not a legacy tx (need RLP list of 9)".into());
+    if !rlp.is_list() {
+        return Err(TxDecodeError::Rlp("expected RLP list".into()));
+    }
+    let item_count = rlp.item_count().map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    if item_count < 9 {
+        return Err(TxDecodeError::MissingField { field: "one of required fields (need at least 9 items)" });
     }
 
-    let nonce: u64 = rlp.val_at(0).map_err(|_| "nonce")?;
-    let gas_price: u128 = rlp.val_at(1).map_err(|_| "gas_price")?;
-    let gas_limit: u64 = rlp.val_at(2).map_err(|_| "gas_limit")?;
-    let to_bytes: Vec<u8> = rlp.val_at(3).map_err(|_| "to")?;
-    let to = if to_bytes.is_empty() {
-        None
-    } else {
-        if to_bytes.len() != 20 {
-            return Err("to: expected 20 bytes".into());
-        }
-        let mut a = [0u8; 20];
-        a.copy_from_slice(&to_bytes);
-        Some(a)
-    };
-    let value: u128 = rlp.val_at(4).map_err(|_| "value")?;
-    let data: Vec<u8> = rlp.val_at(5).map_err(|_| "data")?;
-    let v: u64 = rlp.val_at(6).map_err(|_| "v")?;
-    let r_vec: Vec<u8> = rlp.val_at(7).map_err(|_| "r")?;
-    let s_vec: Vec<u8> = rlp.val_at(8).map_err(|_| "s")?;
+    let nonce: u64 = rlp.val_at(0).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let gas_price: u128 = rlp.val_at(1).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let gas_limit: u64 = rlp.val_at(2).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let to_bytes: Vec<u8> = rlp.val_at(3).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
 
-    let (mut r, mut s) = ([0u8; 32], [0u8; 32]);
-    if r_vec.len() > 32 || s_vec.len() > 32 {
-        return Err("sig component > 32 bytes".into());
-    }
-    r[32 - r_vec.len()..].copy_from_slice(&r_vec);
-    s[32 - s_vec.len()..].copy_from_slice(&s_vec);
+    let to = decode_address(&to_bytes)?;
+    let value: u128 = rlp.val_at(4).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let data: Vec<u8> = rlp.val_at(5).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let v: u64 = rlp.val_at(6).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let (r, s) = decode_rlp_rs(&rlp, 7, 8)?;
 
-    // Extract chain_id and build signing hash
+    // Determine chain ID and signing hash
     let (chain_id, sighash) = if v >= 35 {
-        // EIP-155: chain_id = (v - 35) / 2
+        // EIP‑155: chain_id = (v - 35) / 2
         let cid = (v - 35) / 2;
         let hash = legacy_signing_hash(nonce, gas_price, gas_limit, &to, value, &data, Some(cid));
         (Some(cid), hash)
     } else if v == 27 || v == 28 {
-        // pre-EIP-155
         let hash = legacy_signing_hash(nonce, gas_price, gas_limit, &to, value, &data, None);
         (None, hash)
     } else {
-        return Err(format!("unexpected v={v}"));
+        return Err(TxDecodeError::UnexpectedV { v });
     };
 
     let from = recover_sender(&sighash, v, r, s, chain_id)?;
@@ -194,28 +273,25 @@ pub fn decode_legacy_signed_tx(raw: &[u8]) -> Result<LegacySignedTx, String> {
     })
 }
 
-/// Build the signing pre-image for a legacy tx.
+/// Build the signing pre‑image for a legacy transaction.
 fn legacy_signing_hash(
     nonce: u64,
     gas_price: u128,
     gas_limit: u64,
-    to: &Option<[u8; 20]>,
+    to: &Option<[u8; ADDR_LEN]>,
     value: u128,
     data: &[u8],
     chain_id: Option<u64>,
-) -> [u8; 32] {
-    let mut s = rlp::RlpStream::new_list(if chain_id.is_some() { 9 } else { 6 });
+) -> [u8; HASH_LEN] {
+    let list_len = if chain_id.is_some() { 9 } else { 6 };
+    let mut s = rlp::RlpStream::new_list(list_len);
     s.append(&nonce);
-    append_u128(&mut s, gas_price);
+    rlp_append_u128(&mut s, gas_price);
     s.append(&gas_limit);
-    match to {
-        Some(a) => s.append(&a.as_slice()),
-        None => s.append_empty_data(),
-    };
-    append_u128(&mut s, value);
+    rlp_encode_address(&mut s, to);
+    rlp_append_u128(&mut s, value);
     s.append(&data);
     if let Some(cid) = chain_id {
-        // EIP-155 replay protection fields
         s.append(&cid);
         s.append(&0u8);
         s.append(&0u8);
@@ -223,7 +299,9 @@ fn legacy_signing_hash(
     keccak256(&s.out())
 }
 
-// ── EIP-2930 transaction (type 0x01) ─────────────────────────────────────
+// -----------------------------------------------------------------------------
+// EIP‑2930 transaction (type 0x01)
+// -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct Eip2930SignedTx {
@@ -231,17 +309,19 @@ pub struct Eip2930SignedTx {
     pub nonce: u64,
     pub gas_price: u128,
     pub gas_limit: u64,
-    pub to: Option<[u8; 20]>,
+    pub to: Option<[u8; ADDR_LEN]>,
     pub value: u128,
     pub data: Vec<u8>,
-    pub access_list: Vec<([u8; 20], Vec<[u8; 32]>)>,
+    pub access_list: Vec<([u8; ADDR_LEN], Vec<[u8; HASH_LEN]>)>,
     pub y_parity: u8,
-    pub r: [u8; 32],
-    pub s: [u8; 32],
-    pub from: [u8; 20],
+    pub r: [u8; HASH_LEN],
+    pub s: [u8; HASH_LEN],
+    pub from: [u8; ADDR_LEN],
 }
 
 impl Eip2930SignedTx {
+    /// Convert to `EvmTx`.
+    #[must_use]
     pub fn to_evm_tx(&self) -> EvmTx {
         EvmTx::Eip2930 {
             from: self.from,
@@ -264,37 +344,27 @@ impl Eip2930SignedTx {
     }
 }
 
-/// Decode an EIP-2930 transaction.
-/// Caller must strip the `0x01` type byte before passing `payload`.
-pub fn decode_eip2930_signed_tx(payload: &[u8]) -> Result<Eip2930SignedTx, String> {
+/// Decode an EIP‑2930 transaction. Caller must strip the `0x01` type byte.
+pub fn decode_eip2930_signed_tx(payload: &[u8]) -> TxDecodeResult<Eip2930SignedTx> {
     let rlp = Rlp::new(payload);
     if !rlp.is_list() {
-        return Err("EIP-2930: expected RLP list".into());
+        return Err(TxDecodeError::Rlp("EIP-2930: expected RLP list".into()));
     }
 
-    let chain_id: u64 = rlp.val_at(0).map_err(|_| "chain_id")?;
-    let nonce: u64 = rlp.val_at(1).map_err(|_| "nonce")?;
-    let gas_price: u128 = rlp.val_at(2).map_err(|_| "gas_price")?;
-    let gas_limit: u64 = rlp.val_at(3).map_err(|_| "gas")?;
-    let to_bytes: Vec<u8> = rlp.val_at(4).map_err(|_| "to")?;
-    let to = decode_to(&to_bytes)?;
-    let value: u128 = rlp.val_at(5).map_err(|_| "value")?;
-    let data: Vec<u8> = rlp.val_at(6).map_err(|_| "data")?;
-    let access_list = decode_access_list(&rlp.at(7).map_err(|_| "access_list")?)?;
-    let y_parity: u8 = rlp.val_at(8).map_err(|_| "y_parity")?;
-    let (r, s) = decode_rs(&rlp, 9, 10)?;
+    let chain_id: u64 = rlp.val_at(0).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let nonce: u64 = rlp.val_at(1).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let gas_price: u128 = rlp.val_at(2).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let gas_limit: u64 = rlp.val_at(3).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let to_bytes: Vec<u8> = rlp.val_at(4).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let to = decode_address(&to_bytes)?;
+    let value: u128 = rlp.val_at(5).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let data: Vec<u8> = rlp.val_at(6).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let access_list_rlp = rlp.at(7).map_err(|_| TxDecodeError::MissingField { field: "access_list" })?;
+    let access_list = decode_access_list(&access_list_rlp)?;
+    let y_parity: u8 = rlp.val_at(8).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let (r, s) = decode_rlp_rs(&rlp, 9, 10)?;
 
-    // Signing hash: keccak256(0x01 || rlp([chainId,nonce,gasPrice,gas,to,value,data,accessList]))
-    let sighash = eip2930_signing_hash(
-        chain_id,
-        nonce,
-        gas_price,
-        gas_limit,
-        &to,
-        value,
-        &data,
-        &access_list,
-    );
+    let sighash = eip2930_signing_hash(chain_id, nonce, gas_price, gas_limit, &to, value, &data, &access_list);
     let from = recover_sender_typed(&sighash, y_parity, r, s)?;
 
     Ok(Eip2930SignedTx {
@@ -318,49 +388,29 @@ fn eip2930_signing_hash(
     nonce: u64,
     gas_price: u128,
     gas_limit: u64,
-    to: &Option<[u8; 20]>,
+    to: &Option<[u8; ADDR_LEN]>,
     value: u128,
     data: &[u8],
-    access_list: &[([u8; 20], Vec<[u8; 32]>)],
-) -> [u8; 32] {
-    let inner = encode_eip2930_body(
-        chain_id,
-        nonce,
-        gas_price,
-        gas_limit,
-        to,
-        value,
-        data,
-        access_list,
-    );
-    let mut preimage = vec![0x01u8];
+    access_list: &[([u8; ADDR_LEN], Vec<[u8; HASH_LEN]>)],
+) -> [u8; HASH_LEN] {
+    let mut s = rlp::RlpStream::new_list(8);
+    s.append(&chain_id);
+    s.append(&nonce);
+    rlp_append_u128(&mut s, gas_price);
+    s.append(&gas_limit);
+    rlp_encode_address(&mut s, to);
+    rlp_append_u128(&mut s, value);
+    s.append(&data);
+    rlp_encode_access_list(&mut s, access_list);
+    let inner = s.out();
+    let mut preimage = vec![TX_TYPE_EIP2930];
     preimage.extend_from_slice(&inner);
     keccak256(&preimage)
 }
 
-fn encode_eip2930_body(
-    chain_id: u64,
-    nonce: u64,
-    gas_price: u128,
-    gas_limit: u64,
-    to: &Option<[u8; 20]>,
-    value: u128,
-    data: &[u8],
-    access_list: &[([u8; 20], Vec<[u8; 32]>)],
-) -> Vec<u8> {
-    let mut s = rlp::RlpStream::new_list(8);
-    s.append(&chain_id);
-    s.append(&nonce);
-    append_u128(&mut s, gas_price);
-    s.append(&gas_limit);
-    encode_to(&mut s, to);
-    append_u128(&mut s, value);
-    s.append(&data);
-    encode_access_list(&mut s, access_list);
-    s.out().to_vec()
-}
-
-// ── EIP-1559 transaction (type 0x02) ─────────────────────────────────────
+// -----------------------------------------------------------------------------
+// EIP‑1559 transaction (type 0x02)
+// -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct Eip1559SignedTx {
@@ -369,17 +419,19 @@ pub struct Eip1559SignedTx {
     pub max_priority_fee_per_gas: u128,
     pub max_fee_per_gas: u128,
     pub gas_limit: u64,
-    pub to: Option<[u8; 20]>,
+    pub to: Option<[u8; ADDR_LEN]>,
     pub value: u128,
     pub data: Vec<u8>,
-    pub access_list: Vec<([u8; 20], Vec<[u8; 32]>)>,
+    pub access_list: Vec<([u8; ADDR_LEN], Vec<[u8; HASH_LEN]>)>,
     pub y_parity: u8,
-    pub r: [u8; 32],
-    pub s: [u8; 32],
-    pub from: [u8; 20],
+    pub r: [u8; HASH_LEN],
+    pub s: [u8; HASH_LEN],
+    pub from: [u8; ADDR_LEN],
 }
 
 impl Eip1559SignedTx {
+    /// Convert to `EvmTx`.
+    #[must_use]
     pub fn to_evm_tx(&self) -> EvmTx {
         EvmTx::Eip1559 {
             from: self.from,
@@ -403,28 +455,27 @@ impl Eip1559SignedTx {
     }
 }
 
-/// Decode an EIP-1559 transaction.
-/// Caller must strip the `0x02` type byte before passing `payload`.
-pub fn decode_eip1559_signed_tx(payload: &[u8]) -> Result<Eip1559SignedTx, String> {
+/// Decode an EIP‑1559 transaction. Caller must strip the `0x02` type byte.
+pub fn decode_eip1559_signed_tx(payload: &[u8]) -> TxDecodeResult<Eip1559SignedTx> {
     let rlp = Rlp::new(payload);
     if !rlp.is_list() {
-        return Err("EIP-1559: expected RLP list".into());
+        return Err(TxDecodeError::Rlp("EIP-1559: expected RLP list".into()));
     }
 
-    let chain_id: u64 = rlp.val_at(0).map_err(|_| "chain_id")?;
-    let nonce: u64 = rlp.val_at(1).map_err(|_| "nonce")?;
-    let max_priority_fee_per_gas: u128 = rlp.val_at(2).map_err(|_| "max_priority_fee")?;
-    let max_fee_per_gas: u128 = rlp.val_at(3).map_err(|_| "max_fee")?;
-    let gas_limit: u64 = rlp.val_at(4).map_err(|_| "gas")?;
-    let to_bytes: Vec<u8> = rlp.val_at(5).map_err(|_| "to")?;
-    let to = decode_to(&to_bytes)?;
-    let value: u128 = rlp.val_at(6).map_err(|_| "value")?;
-    let data: Vec<u8> = rlp.val_at(7).map_err(|_| "data")?;
-    let access_list = decode_access_list(&rlp.at(8).map_err(|_| "access_list")?)?;
-    let y_parity: u8 = rlp.val_at(9).map_err(|_| "y_parity")?;
-    let (r, s) = decode_rs(&rlp, 10, 11)?;
+    let chain_id: u64 = rlp.val_at(0).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let nonce: u64 = rlp.val_at(1).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let max_priority_fee_per_gas: u128 = rlp.val_at(2).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let max_fee_per_gas: u128 = rlp.val_at(3).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let gas_limit: u64 = rlp.val_at(4).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let to_bytes: Vec<u8> = rlp.val_at(5).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let to = decode_address(&to_bytes)?;
+    let value: u128 = rlp.val_at(6).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let data: Vec<u8> = rlp.val_at(7).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let access_list_rlp = rlp.at(8).map_err(|_| TxDecodeError::MissingField { field: "access_list" })?;
+    let access_list = decode_access_list(&access_list_rlp)?;
+    let y_parity: u8 = rlp.val_at(9).map_err(|e| TxDecodeError::Rlp(e.to_string()))?;
+    let (r, s) = decode_rlp_rs(&rlp, 10, 11)?;
 
-    // Signing hash: keccak256(0x02 || rlp([chainId,...]))
     let sighash = eip1559_signing_hash(
         chain_id,
         nonce,
@@ -461,47 +512,112 @@ fn eip1559_signing_hash(
     max_priority: u128,
     max_fee: u128,
     gas_limit: u64,
-    to: &Option<[u8; 20]>,
+    to: &Option<[u8; ADDR_LEN]>,
     value: u128,
     data: &[u8],
-    access_list: &[([u8; 20], Vec<[u8; 32]>)],
-) -> [u8; 32] {
+    access_list: &[([u8; ADDR_LEN], Vec<[u8; HASH_LEN]>)],
+) -> [u8; HASH_LEN] {
     let mut s = rlp::RlpStream::new_list(9);
     s.append(&chain_id);
     s.append(&nonce);
-    append_u128(&mut s, max_priority);
-    append_u128(&mut s, max_fee);
+    rlp_append_u128(&mut s, max_priority);
+    rlp_append_u128(&mut s, max_fee);
     s.append(&gas_limit);
-    encode_to(&mut s, to);
-    append_u128(&mut s, value);
+    rlp_encode_address(&mut s, to);
+    rlp_append_u128(&mut s, value);
     s.append(&data);
-    encode_access_list(&mut s, access_list);
-    let inner = s.out().to_vec();
-    let mut preimage = vec![0x02u8];
+    rlp_encode_access_list(&mut s, access_list);
+    let inner = s.out();
+    let mut preimage = vec![TX_TYPE_EIP1559];
     preimage.extend_from_slice(&inner);
     keccak256(&preimage)
 }
 
-// ── Public dispatcher ─────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Sender recovery (low‑level, public)
+// -----------------------------------------------------------------------------
 
-/// Decode any supported raw transaction type and return the typed tx + sender.
-pub fn decode_raw_tx(raw: &[u8]) -> Result<(EvmTx, [u8; 20]), String> {
+/// Recover address from legacy signature (with optional chain_id for EIP‑155).
+pub fn recover_sender(
+    sighash: &[u8; HASH_LEN],
+    v: u64,
+    r: [u8; HASH_LEN],
+    s: [u8; HASH_LEN],
+    chain_id: Option<u64>,
+) -> TxDecodeResult<[u8; ADDR_LEN]> {
+    let recovery_id_byte: u8 = if let Some(cid) = chain_id {
+        let base = cid * 2 + 35;
+        if v < base {
+            return Err(TxDecodeError::UnexpectedV { v });
+        }
+        ((v - base) & 1) as u8
+    } else {
+        if v < 27 {
+            return Err(TxDecodeError::UnexpectedV { v });
+        }
+        ((v - 27) & 1) as u8
+    };
+    recover_from_components(sighash, recovery_id_byte, r, s)
+}
+
+/// Recover address from typed transaction (y_parity directly 0 or 1).
+pub fn recover_sender_typed(
+    sighash: &[u8; HASH_LEN],
+    y_parity: u8,
+    r: [u8; HASH_LEN],
+    s: [u8; HASH_LEN],
+) -> TxDecodeResult<[u8; ADDR_LEN]> {
+    recover_from_components(sighash, y_parity & 1, r, s)
+}
+
+fn recover_from_components(
+    sighash: &[u8; HASH_LEN],
+    recovery_id_byte: u8,
+    r: [u8; HASH_LEN],
+    s: [u8; HASH_LEN],
+) -> TxDecodeResult<[u8; ADDR_LEN]> {
+    let mut sig_bytes = [0u8; SIG_LEN];
+    sig_bytes[..HASH_LEN].copy_from_slice(&r);
+    sig_bytes[HASH_LEN..].copy_from_slice(&s);
+    let sig = Signature::from_bytes(&sig_bytes.into())
+        .map_err(|e| TxDecodeError::InvalidSignature(e.to_string()))?;
+    let rec_id = RecoveryId::try_from(recovery_id_byte)
+        .map_err(|_| TxDecodeError::InvalidRecoveryId(recovery_id_byte))?;
+    let vk = VerifyingKey::recover_from_prehash(sighash, &sig, rec_id)
+        .map_err(|e| TxDecodeError::RecoveryFailed(e.to_string()))?;
+    let point = vk.to_encoded_point(false);
+    let pk_bytes = point.as_bytes();
+    if pk_bytes.len() != 65 {
+        return Err(TxDecodeError::RecoveryFailed(format!("unexpected pubkey length {}", pk_bytes.len())));
+    }
+    let hash = keccak256(&pk_bytes[1..]); // skip 0x04 prefix
+    let mut addr = [0u8; ADDR_LEN];
+    addr.copy_from_slice(&hash[12..]);
+    Ok(addr)
+}
+
+// -----------------------------------------------------------------------------
+// Public dispatcher
+// -----------------------------------------------------------------------------
+
+/// Decode any supported raw transaction type and return `(EvmTx, sender_address)`.
+pub fn decode_raw_tx(raw: &[u8]) -> TxDecodeResult<(EvmTx, [u8; ADDR_LEN])> {
     if raw.is_empty() {
-        return Err("empty tx".into());
+        return Err(TxDecodeError::EmptyData);
     }
     match raw[0] {
-        0x01 => {
+        TX_TYPE_EIP2930 => {
             let tx = decode_eip2930_signed_tx(&raw[1..])?;
             let from = tx.from;
             Ok((tx.to_evm_tx(), from))
         }
-        0x02 => {
+        TX_TYPE_EIP1559 => {
             let tx = decode_eip1559_signed_tx(&raw[1..])?;
             let from = tx.from;
             Ok((tx.to_evm_tx(), from))
         }
         _ => {
-            // Legacy: no type prefix
+            // Legacy transaction (no type prefix)
             let tx = decode_legacy_signed_tx(raw)?;
             let from = tx.from;
             Ok((tx.to_evm_tx(), from))
@@ -509,92 +625,9 @@ pub fn decode_raw_tx(raw: &[u8]) -> Result<(EvmTx, [u8; 20]), String> {
     }
 }
 
-// ── Shared RLP helpers ────────────────────────────────────────────────────
-
-fn decode_to(bytes: &[u8]) -> Result<Option<[u8; 20]>, String> {
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    if bytes.len() != 20 {
-        return Err(format!("to: expected 20 bytes, got {}", bytes.len()));
-    }
-    let mut a = [0u8; 20];
-    a.copy_from_slice(bytes);
-    Ok(Some(a))
-}
-
-fn decode_rs(rlp: &Rlp, r_idx: usize, s_idx: usize) -> Result<([u8; 32], [u8; 32]), String> {
-    let r_vec: Vec<u8> = rlp.val_at(r_idx).map_err(|_| "r")?;
-    let s_vec: Vec<u8> = rlp.val_at(s_idx).map_err(|_| "s")?;
-    if r_vec.len() > 32 || s_vec.len() > 32 {
-        return Err("sig component > 32 bytes".into());
-    }
-    let (mut r, mut s) = ([0u8; 32], [0u8; 32]);
-    r[32 - r_vec.len()..].copy_from_slice(&r_vec);
-    s[32 - s_vec.len()..].copy_from_slice(&s_vec);
-    Ok((r, s))
-}
-
-fn decode_access_list(al: &Rlp) -> Result<Vec<([u8; 20], Vec<[u8; 32]>)>, String> {
-    let mut out = vec![];
-    if !al.is_list() {
-        return Ok(out);
-    }
-    for i in 0..al.item_count().unwrap_or(0) {
-        let item = al.at(i).map_err(|_| "al item")?;
-        let addr_bytes: Vec<u8> = item.val_at(0).map_err(|_| "al addr")?;
-        if addr_bytes.len() != 20 {
-            return Err("al addr: expected 20 bytes".into());
-        }
-        let mut addr = [0u8; 20];
-        addr.copy_from_slice(&addr_bytes);
-        let keys_rlp = item.at(1).map_err(|_| "al keys")?;
-        let mut keys = vec![];
-        for j in 0..keys_rlp.item_count().unwrap_or(0) {
-            let k: Vec<u8> = keys_rlp.val_at(j).map_err(|_| "key")?;
-            if k.len() > 32 {
-                return Err("storage key > 32 bytes".into());
-            }
-            let mut hh = [0u8; 32];
-            hh[32 - k.len()..].copy_from_slice(&k);
-            keys.push(hh);
-        }
-        out.push((addr, keys));
-    }
-    Ok(out)
-}
-
-fn encode_to(s: &mut rlp::RlpStream, to: &Option<[u8; 20]>) {
-    match to {
-        Some(a) => s.append(&a.as_slice()),
-        None => s.append_empty_data(),
-    };
-}
-
-fn encode_access_list(s: &mut rlp::RlpStream, al: &[([u8; 20], Vec<[u8; 32]>)]) {
-    s.begin_list(al.len());
-    for (addr, keys) in al {
-        s.begin_list(2);
-        s.append(&addr.as_slice());
-        s.begin_list(keys.len());
-        for k in keys {
-            s.append(&k.as_slice());
-        }
-    }
-}
-
-/// Append u128 as minimal big-endian bytes (RLP integer encoding).
-fn append_u128(s: &mut rlp::RlpStream, v: u128) {
-    if v == 0 {
-        s.append(&0u8);
-    } else {
-        let bytes = v.to_be_bytes();
-        let trimmed: &[u8] = bytes.as_ref();
-        let start = trimmed.iter().position(|&b| b != 0).unwrap_or(15);
-        let tail: &[u8] = &trimmed[start..];
-        s.append(&tail);
-    }
-}
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
