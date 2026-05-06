@@ -1,73 +1,129 @@
 //! State trie computation — revm primitives compatible (v9).
 //!
-//! revm v9 AccountInfo uses:
-//!   - `nonce: u64`           (not Option<u64>)
-//!   - `code_hash: B256`      (not Option<B256>)
-//!   - `balance: U256`
-//!   - `code: Option<Bytecode>`
+//! Provides functions to compute:
+//! - State root (Keccak‑256 over either a simplified hash or a real Merkle Patricia Trie)
+//! - Storage root for a single account
+//! - Transactions root and receipts root (delegated to `mpt`)
 //!
-//! U256::to_be_bytes::<32>() was removed in newer ruint.
-//! Use `U256::to_be_bytes_vec()` or manual conversion via `to_be_bytes_trimmed_vec`.
+//! # Feature flags
+//!
+//! - `state_trie` (enabled by default) – use a full MPT for state root.
+//!   Otherwise, uses a deterministic hash of sorted account RLPs (simpler, smaller binary).
+//!
+//! # revm v9 compatibility notes
+//!
+//! - `AccountInfo.nonce` is `u64` (not `Option<u64>`)
+//! - `AccountInfo.code_hash` is `B256` (not `Option<B256>`)
+//! - `U256::to_be_bytes::<32>()` exists in ruint ≥ 1.12, but we use a custom helper.
 
 use crate::evm::db::MemDb;
 use revm::primitives::{Address, B256, U256};
 use sha3::{Digest, Keccak256};
+use thiserror::Error;
 
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Hex prefix for Ethereum‑compatible hex strings.
+const HEX_PREFIX: &str = "0x";
+
+/// RLP encoding of an empty string (`0x80`), used for empty byte slices.
+const EMPTY_RLP: u8 = 0x80;
+
+/// Known empty trie root (Keccak‑256 of `0x80`) – matches Ethereum spec.
+pub const EMPTY_TRIE_ROOT: &str = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421";
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during state trie computation.
+#[derive(Debug, Error)]
+pub enum StateTrieError {
+    #[error("RLP encoding error: {0}")]
+    RlpError(String),
+    #[error("MPT insertion failed: {0}")]
+    TrieInsertion(String),
+}
+
+pub type StateTrieResult<T> = Result<T, StateTrieError>;
+
+// -----------------------------------------------------------------------------
+// Core helpers (no fallible operations)
+// -----------------------------------------------------------------------------
+
+/// Compute Keccak‑256 hash of data and return as a 32‑byte array.
+#[must_use]
 pub fn keccak256(data: &[u8]) -> [u8; 32] {
-    let mut h = Keccak256::new();
-    h.update(data);
-    h.finalize().into()
+    let mut hasher = Keccak256::new();
+    hasher.update(data);
+    hasher.finalize().into()
 }
 
+/// Compute Keccak‑256 hash and return as a hex string with `0x` prefix.
+#[must_use]
 pub fn keccak_hex(data: &[u8]) -> String {
-    format!("0x{}", hex::encode(keccak256(data)))
+    format!("{}{}", HEX_PREFIX, hex::encode(keccak256(data)))
 }
 
-/// RLP-encode an Ethereum account: [nonce, balance, storageRoot, codeHash]
-fn rlp_account(nonce: u64, balance: U256, storage_root: [u8; 32], code_hash: [u8; 32]) -> Vec<u8> {
-    let mut s = rlp::RlpStream::new_list(4);
-    s.append(&nonce);
-    // U256 → minimal big-endian bytes (no leading zeros)
-    let bal_bytes = u256_to_be_trimmed(balance);
-    if bal_bytes.is_empty() {
-        s.append(&0u8);
-    } else {
-        s.append(&bal_bytes.as_slice());
-    }
-    s.append(&storage_root.as_slice());
-    s.append(&code_hash.as_slice());
-    s.out().to_vec()
-}
-
-/// Convert U256 to minimal big-endian bytes (trim leading zeros).
-/// Compatible with ruint U256 used in revm v9.
-pub fn u256_to_be_trimmed(v: U256) -> Vec<u8> {
-    if v == U256::ZERO {
+/// Convert `U256` to minimal big‑endian bytes (trim leading zeros).
+/// Returns an empty slice for zero.
+#[must_use]
+pub fn u256_to_be_trimmed(value: U256) -> Vec<u8> {
+    if value == U256::ZERO {
         return vec![];
     }
-    // U256 in ruint has to_be_bytes::<32>() returning [u8;32]
-    let bytes: [u8; 32] = v.to_be_bytes();
-    let start = bytes.iter().position(|&b| b != 0).unwrap_or(31);
+    let bytes = value.to_be_bytes();
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(0);
     bytes[start..].to_vec()
 }
 
-/// Compute storage root for a single account from MemDb.
+/// RL Еncode an Ethereum account: `[nonce, balance, storageRoot, codeHash]`.
+/// This never fails.
+#[must_use]
+pub fn rlp_account(
+    nonce: u64,
+    balance: U256,
+    storage_root: [u8; 32],
+    code_hash: [u8; 32],
+) -> Vec<u8> {
+    let mut stream = rlp::RlpStream::new_list(4);
+    stream.append(&nonce);
+    let bal_bytes = u256_to_be_trimmed(balance);
+    if bal_bytes.is_empty() {
+        stream.append(&0u8);
+    } else {
+        stream.append(&bal_bytes.as_slice());
+    }
+    stream.append(&storage_root.as_slice());
+    stream.append(&code_hash.as_slice());
+    stream.out().to_vec()
+}
+
+/// Compute storage root for a single account from `MemDb` using a simplified hash.
+/// Returns the empty trie root if no non‑zero storage entries exist.
+#[must_use]
 pub fn compute_storage_root(addr: &Address, db: &MemDb) -> [u8; 32] {
     let mut entries: Vec<([u8; 32], [u8; 32])> = db
         .storage
         .iter()
         .filter(|((a, _), _)| a == addr)
-        .filter_map(|((_, key), val)| {
-            if *val == U256::ZERO {
+        .filter_map(|((_, key), &val)| {
+            if val == U256::ZERO {
                 return None;
             }
-            let k: [u8; 32] = key.to_be_bytes();
-            let v_bytes = u256_to_be_trimmed(*val);
-            // RLP encode value as a single-item list for storage trie leaves
+            let key_bytes = key.to_be_bytes();
+            let value_bytes = u256_to_be_trimmed(val);
+            // RLP‑encode the value (as a single‑item list)
             let mut s = rlp::RlpStream::new();
-            s.append(&v_bytes.as_slice());
-            let v_rlp = s.out().to_vec();
-            Some((k, v_rlp.try_into().unwrap_or([0u8; 32])))
+            s.append(&value_bytes.as_slice());
+            let value_rlp = s.out().to_vec();
+            // Truncate or pad to 32 bytes (for deterministic hashing)
+            let mut value_hash = [0u8; 32];
+            let copy_len = value_rlp.len().min(32);
+            value_hash[..copy_len].copy_from_slice(&value_rlp[..copy_len]);
+            Some((key_bytes, value_hash))
         })
         .collect();
 
@@ -77,57 +133,64 @@ pub fn compute_storage_root(addr: &Address, db: &MemDb) -> [u8; 32] {
 
     entries.sort_by_key(|(k, _)| *k);
 
-    // Simple deterministic hash of sorted (key, value) pairs
-    // In production this would be a real secure MPT; here it's a stable placeholder.
-    let mut h = Keccak256::new();
-    for (k, v) in &entries {
-        h.update(keccak256(k)); // secure MPT: key = keccak(slot)
-        h.update(v);
+    // Simple deterministic hash (placeholder). For a real secure MPT, use `trie-db`.
+    let mut hasher = Keccak256::new();
+    for (key, val) in entries {
+        // Secure trie: key = keccak(slot)
+        hasher.update(keccak256(&key));
+        hasher.update(val);
     }
-    h.finalize().into()
+    hasher.finalize().into()
 }
 
-/// Empty trie root = keccak256(RLP(0x80)) — matches Ethereum spec.
+/// Return the Ethereum empty trie root (Keccak‑256 of `0x80`).
+#[must_use]
 pub fn empty_trie_root() -> [u8; 32] {
-    keccak256(&[0x80])
+    keccak256(&[EMPTY_RLP])
 }
 
-/// Compute stateRoot hex from MemDb.
+// -----------------------------------------------------------------------------
+// State root (conditional feature)
+// -----------------------------------------------------------------------------
+
+/// Compute the state root of the entire `MemDb`.
 ///
-/// Without the `state_trie` feature: returns a deterministic keccak of all
-/// account RLP encodings (correct structure, not a real MPT).
-///
-/// With the `state_trie` feature: uses a real secure MPT backed by memory-db.
+/// If the `state_trie` feature is enabled, uses a real Merkle Patricia Trie
+/// (via `trie-db`). Otherwise, uses a deterministic hash of sorted account RLPs
+/// (simpler, but not cryptographically provable).
 pub fn compute_state_root_hex(db: &MemDb) -> String {
     #[cfg(feature = "state_trie")]
     {
-        return compute_state_root_hex_mpt(db);
+        compute_state_root_hex_mpt(db)
     }
     #[cfg(not(feature = "state_trie"))]
     {
-        let mut items: Vec<Vec<u8>> = db
-            .accounts
-            .iter()
-            .map(|(addr, info)| {
-                // revm v9: nonce is u64 (not Option)
-                let nonce = info.nonce;
-                let balance = info.balance;
-                let stor_root = compute_storage_root(addr, db);
-                // revm v9: code_hash is B256 (not Option)
-                let code_hash: [u8; 32] = info.code_hash.0;
-                rlp_account(nonce, balance, stor_root, code_hash)
-            })
-            .collect();
-
-        items.sort();
-        let mut h = Keccak256::new();
-        for it in &items {
-            h.update(it);
-        }
-        return format!("0x{}", hex::encode(h.finalize()));
+        compute_state_root_hex_simple(db)
     }
 }
 
+/// Simplified state root (no MPT). Sorts account RLPs and hashes them.
+#[cfg(not(feature = "state_trie"))]
+fn compute_state_root_hex_simple(db: &MemDb) -> String {
+    let mut items: Vec<Vec<u8>> = db
+        .accounts
+        .iter()
+        .map(|(addr, info)| {
+            let storage_root = compute_storage_root(addr, db);
+            let code_hash: [u8; 32] = info.code_hash.0;
+            rlp_account(info.nonce, info.balance, storage_root, code_hash)
+        })
+        .collect();
+
+    items.sort();
+    let mut hasher = Keccak256::new();
+    for item in &items {
+        hasher.update(item);
+    }
+    format!("{}{}", HEX_PREFIX, hex::encode(hasher.finalize()))
+}
+
+/// Full MPT state root using `trie-db` (feature‑gated).
 #[cfg(feature = "state_trie")]
 fn compute_state_root_hex_mpt(db: &MemDb) -> String {
     use hash_db::Hasher;
@@ -141,41 +204,44 @@ fn compute_state_root_hex_mpt(db: &MemDb) -> String {
     {
         let mut trie = TrieDBMut::new(&mut memdb, &mut root);
         for (addr, info) in &db.accounts {
-            let nonce = info.nonce;
-            let balance = info.balance;
-            let stor_root = compute_storage_root(addr, db);
+            let storage_root = compute_storage_root(addr, db);
             let code_hash: [u8; 32] = info.code_hash.0;
-            let account_rlp = rlp_account(nonce, balance, stor_root, code_hash);
-            // Secure trie: key = keccak256(address)
+            let account_rlp = rlp_account(info.nonce, info.balance, storage_root, code_hash);
             let key = keccak256(addr.as_slice());
             let _ = trie.insert(&key, &account_rlp);
         }
     }
 
-    format!("0x{}", hex::encode(root))
+    format!("{}{}", HEX_PREFIX, hex::encode(root))
 }
 
-/// Compute receipts root from a list of RLP-encoded receipts.
+// -----------------------------------------------------------------------------
+// Transactions and receipts roots (delegate to `mpt` module)
+// -----------------------------------------------------------------------------
+
+/// Compute receipts root from a list of RLP‑encoded receipts.
 pub fn compute_receipts_root_hex(receipt_rlps: &[Vec<u8>]) -> String {
     crate::rpc::mpt::eth_ordered_trie_root_hex(receipt_rlps)
 }
 
-/// Compute transactions root from a list of RLP-encoded transactions.
+/// Compute transactions root from a list of RLP‑encoded transactions.
 pub fn compute_txs_root_hex(tx_rlps: &[Vec<u8>]) -> String {
     crate::rpc::mpt::eth_ordered_trie_root_hex(tx_rlps)
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn empty_trie_root_stable() {
-        // Must match Ethereum's empty trie root
-        let r = empty_trie_root();
-        // keccak256(0x80) = 56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421
+    fn empty_trie_root_matches_ethereum() {
+        let root = empty_trie_root();
         assert_eq!(
-            hex::encode(r),
+            hex::encode(root),
             "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
         );
     }
@@ -187,14 +253,35 @@ mod tests {
 
     #[test]
     fn u256_trimmed_one() {
-        let b = u256_to_be_trimmed(U256::from(1u64));
-        assert_eq!(b, vec![1u8]);
+        let trimmed = u256_to_be_trimmed(U256::from(1u64));
+        assert_eq!(trimmed, vec![1]);
     }
 
     #[test]
     fn state_root_empty_db() {
         let db = MemDb::default();
-        let r = compute_state_root_hex(&db);
-        assert!(r.starts_with("0x"));
+        let root_hex = compute_state_root_hex(&db);
+        assert!(root_hex.starts_with(HEX_PREFIX));
+        assert_eq!(root_hex.len(), 66);
+        // For empty DB, the root should be the empty trie root.
+        // The simple version also yields a specific hash (not empty) but both are OK.
+    }
+
+    #[test]
+    fn rlp_account_encoding() {
+        let nonce = 42;
+        let balance = U256::from(1_000_000);
+        let storage_root = [0xAA; 32];
+        let code_hash = [0xBB; 32];
+        let rlp = rlp_account(nonce, balance, storage_root, code_hash);
+        assert!(!rlp.is_empty());
+    }
+
+    #[test]
+    fn compute_storage_root_empty_account() {
+        let db = MemDb::default();
+        let addr = Address::new([0x01; 20]);
+        let root = compute_storage_root(&addr, &db);
+        assert_eq!(root, empty_trie_root());
     }
 }
