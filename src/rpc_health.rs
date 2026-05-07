@@ -1,17 +1,70 @@
 //! Health, status, and metrics RPC endpoints for IONA v28.
 //!
-//! GET /health  → ok/fail + reason
-//! GET /status  → height, round, peers, validator set, commit info
-//! GET /metrics → prometheus-format metrics (optional)
+//! Provides JSON responses for:
+//! - `GET /health`  → overall node health (ok/degraded/error)
+//! - `GET /status`  → detailed node status (consensus, peers, validator set)
+//! - `GET /metrics` → Prometheus metrics (handled separately)
+//!
+//! # Example
+//!
+//! ```rust
+//! use iona::rpc_health::{HealthResponse, StatusBuilder, StatusResponse};
+//!
+//! let health = HealthResponse::ok(100, 5, true);
+//! assert_eq!(health.status, "ok");
+//! ```
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Health status constant for fully operational node.
+pub const HEALTH_OK: &str = "ok";
+
+/// Health status constant for degraded but still serving.
+pub const HEALTH_DEGRADED: &str = "degraded";
+
+/// Health status constant for non‑operational node.
+pub const HEALTH_ERROR: &str = "error";
+
+/// Default health degradation reason: no quorum.
+pub const REASON_NO_QUORUM: &str = "no_quorum";
+
+/// Default health degradation reason: syncing in progress.
+pub const REASON_SYNCING: &str = "syncing";
+
+/// Default health degradation reason: no connected peers.
+pub const REASON_NO_PEERS: &str = "no_peers";
+
+/// Version string (from Cargo.toml).
+pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur when building health or status responses (currently infallible).
+#[derive(Debug, Error)]
+pub enum RpcHealthError {
+    #[error("invalid health status: {0}")]
+    InvalidStatus(String),
+}
+
+pub type RpcHealthResult<T> = Result<T, RpcHealthError>;
+
+// -----------------------------------------------------------------------------
+// HealthResponse
+// -----------------------------------------------------------------------------
 
 /// Health check response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
-    /// "ok" or "degraded" or "error".
+    /// `"ok"`, `"degraded"` or `"error"`.
     pub status: String,
-    /// Reason if not ok (e.g. "no_quorum", "syncing", "no_peers").
+    /// Optional reason (e.g., `"no_quorum"`, `"syncing"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Current block height.
@@ -25,72 +78,72 @@ pub struct HealthResponse {
 }
 
 impl HealthResponse {
+    /// Create a healthy response.
     pub fn ok(height: u64, peers: usize, producing: bool) -> Self {
         Self {
-            status: "ok".into(),
+            status: HEALTH_OK.to_string(),
             reason: None,
             height,
             peers,
             producing,
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: NODE_VERSION.to_string(),
         }
     }
 
+    /// Create a degraded response with a human‑readable reason.
     pub fn degraded(reason: &str, height: u64, peers: usize, producing: bool) -> Self {
         Self {
-            status: "degraded".into(),
-            reason: Some(reason.into()),
+            status: HEALTH_DEGRADED.to_string(),
+            reason: Some(reason.to_string()),
             height,
             peers,
             producing,
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: NODE_VERSION.to_string(),
         }
     }
 
+    /// Create an error response (node cannot serve).
     pub fn error(reason: &str) -> Self {
         Self {
-            status: "error".into(),
-            reason: Some(reason.into()),
+            status: HEALTH_ERROR.to_string(),
+            reason: Some(reason.to_string()),
             height: 0,
             peers: 0,
             producing: false,
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: NODE_VERSION.to_string(),
+        }
+    }
+
+    /// Validate the response status.
+    pub fn validate(&self) -> RpcHealthResult<()> {
+        match self.status.as_str() {
+            HEALTH_OK | HEALTH_DEGRADED | HEALTH_ERROR => Ok(()),
+            other => Err(RpcHealthError::InvalidStatus(other.to_string())),
         }
     }
 }
 
-/// Status response (detailed node info).
+// -----------------------------------------------------------------------------
+// StatusResponse
+// -----------------------------------------------------------------------------
+
+/// Detailed node status response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
-    /// Node software version.
     pub node_version: String,
-    /// Current protocol version.
     pub protocol_version: u32,
-    /// Chain ID.
     pub chain_id: u64,
-    /// Current block height.
     pub height: u64,
-    /// Current consensus round.
     pub round: u32,
-    /// Current consensus step (Propose/Prevote/Precommit/Commit).
     pub step: String,
-    /// Number of connected peers.
     pub peers: usize,
-    /// Connected peer IDs (truncated).
     pub peer_ids: Vec<String>,
-    /// Validator set info.
     pub validators: ValidatorSetInfo,
-    /// Whether this node is a validator.
     pub is_validator: bool,
-    /// Whether this node is producing blocks.
     pub is_producing: bool,
-    /// Last commit timestamp (unix seconds).
     pub last_commit_time: u64,
-    /// Blocks since last check (for monitoring).
     pub blocks_per_minute: f64,
-    /// Mempool size.
     pub mempool_size: usize,
-    /// Consensus diagnostic summary (one-line "why no commit" if stalled).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
 }
@@ -101,11 +154,10 @@ pub struct ValidatorSetInfo {
     pub total: usize,
     pub total_power: u64,
     pub quorum_threshold: u64,
-    /// Short hex of each validator's public key.
     pub validators: Vec<ValidatorInfo>,
 }
 
-/// Single validator info.
+/// Single validator information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidatorInfo {
     pub pubkey_short: String,
@@ -113,7 +165,11 @@ pub struct ValidatorInfo {
     pub connected: bool,
 }
 
-/// Builder for constructing a StatusResponse from node state.
+// -----------------------------------------------------------------------------
+// StatusBuilder
+// -----------------------------------------------------------------------------
+
+/// Builder for constructing a `StatusResponse` from node state.
 #[derive(Debug, Default)]
 pub struct StatusBuilder {
     pub protocol_version: u32,
@@ -135,9 +191,15 @@ pub struct StatusBuilder {
 }
 
 impl StatusBuilder {
+    /// Create a new empty builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build the final `StatusResponse`.
     pub fn build(self) -> StatusResponse {
         StatusResponse {
-            node_version: env!("CARGO_PKG_VERSION").into(),
+            node_version: NODE_VERSION.to_string(),
             protocol_version: self.protocol_version,
             chain_id: self.chain_id,
             height: self.height,
@@ -161,6 +223,33 @@ impl StatusBuilder {
     }
 }
 
+impl Default for StatusBuilder {
+    fn default() -> Self {
+        Self {
+            protocol_version: 0,
+            chain_id: 0,
+            height: 0,
+            round: 0,
+            step: String::new(),
+            peers: 0,
+            peer_ids: Vec::new(),
+            is_validator: false,
+            is_producing: false,
+            last_commit_time: 0,
+            blocks_per_minute: 0.0,
+            mempool_size: 0,
+            diagnostic: None,
+            validator_infos: Vec::new(),
+            total_power: 0,
+            quorum_threshold: 0,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,27 +257,53 @@ mod tests {
     #[test]
     fn test_health_ok() {
         let h = HealthResponse::ok(100, 5, true);
-        assert_eq!(h.status, "ok");
+        assert_eq!(h.status, HEALTH_OK);
         assert!(h.reason.is_none());
         assert_eq!(h.height, 100);
+        assert_eq!(h.version, NODE_VERSION);
+        assert!(h.validate().is_ok());
     }
 
     #[test]
     fn test_health_degraded() {
-        let h = HealthResponse::degraded("no_quorum", 50, 2, false);
-        assert_eq!(h.status, "degraded");
-        assert_eq!(h.reason.as_deref(), Some("no_quorum"));
+        let h = HealthResponse::degraded(REASON_NO_QUORUM, 50, 2, false);
+        assert_eq!(h.status, HEALTH_DEGRADED);
+        assert_eq!(h.reason.as_deref(), Some(REASON_NO_QUORUM));
+        assert!(h.validate().is_ok());
     }
 
     #[test]
     fn test_health_error() {
         let h = HealthResponse::error("startup_failed");
-        assert_eq!(h.status, "error");
+        assert_eq!(h.status, HEALTH_ERROR);
         assert_eq!(h.height, 0);
+        assert!(h.validate().is_ok());
+    }
+
+    #[test]
+    fn test_health_validate_invalid() {
+        let h = HealthResponse {
+            status: "unknown".to_string(),
+            reason: None,
+            height: 0,
+            peers: 0,
+            producing: false,
+            version: NODE_VERSION.to_string(),
+        };
+        assert!(h.validate().is_err());
     }
 
     #[test]
     fn test_status_builder() {
+        let status = StatusBuilder::new()
+            .build();
+        assert_eq!(status.node_version, NODE_VERSION);
+        assert_eq!(status.height, 0);
+        assert_eq!(status.validators.total, 0);
+    }
+
+    #[test]
+    fn test_status_builder_with_values() {
         let status = StatusBuilder {
             protocol_version: 1,
             chain_id: 6126151,
@@ -204,15 +319,28 @@ mod tests {
             mempool_size: 50,
             diagnostic: None,
             validator_infos: vec![
-                ValidatorInfo { pubkey_short: "aabb..".into(), power: 1, connected: true },
-                ValidatorInfo { pubkey_short: "ccdd..".into(), power: 1, connected: true },
-                ValidatorInfo { pubkey_short: "eeff..".into(), power: 1, connected: false },
+                ValidatorInfo {
+                    pubkey_short: "aabb..".into(),
+                    power: 1,
+                    connected: true,
+                },
+                ValidatorInfo {
+                    pubkey_short: "ccdd..".into(),
+                    power: 1,
+                    connected: true,
+                },
+                ValidatorInfo {
+                    pubkey_short: "eeff..".into(),
+                    power: 1,
+                    connected: false,
+                },
             ],
             total_power: 3,
             quorum_threshold: 3,
-        }.build();
+        }
+        .build();
 
-        assert_eq!(status.node_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(status.node_version, NODE_VERSION);
         assert_eq!(status.height, 42);
         assert_eq!(status.validators.total, 3);
         assert_eq!(status.validators.quorum_threshold, 3);
@@ -223,6 +351,14 @@ mod tests {
         let h = HealthResponse::ok(100, 5, true);
         let json = serde_json::to_string(&h).unwrap();
         assert!(json.contains("\"status\":\"ok\""));
-        assert!(!json.contains("reason")); // None fields skipped
+        assert!(!json.contains("reason"));
+    }
+
+    #[test]
+    fn test_status_serialization() {
+        let status = StatusBuilder::new().build();
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"node_version\""));
+        assert!(json.contains("\"height\":0"));
     }
 }
