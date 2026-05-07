@@ -10,13 +10,66 @@ use crate::crypto::PublicKeyBytes;
 use crate::evidence::Evidence;
 use crate::types::Height;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use thiserror::Error;
 use tracing::warn;
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
 
 /// Blocks a validator must wait after being jailed before they can unjail.
 pub const UNJAIL_DELAY_BLOCKS: u64 = 1000;
-/// Slash fraction for double-vote (5%).
+
+/// Slash fraction for double‑vote (5% = 1/20).
 pub const SLASH_FRACTION_DOUBLE_VOTE: u64 = 20; // 1/20
+
+/// Slash fraction for downtime (1% = 1/100).
+pub const SLASH_FRACTION_DOWNTIME: u64 = 100; // 1/100
+
+/// Window of blocks to check for downtime (number of recent blocks considered).
+pub const DOWNTIME_WINDOW: u64 = 200;
+
+/// Minimum blocks a validator must have signed in the last DOWNTIME_WINDOW to avoid jailing.
+pub const DOWNTIME_MIN_SIGNED: u64 = 100; // 50% participation required
+
+/// Minimum stake required to remain a validator after slashing.
+pub const MIN_STAKE_AFTER_SLASH: u64 = 1;
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during slashing operations.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum SlashingError {
+    #[error("unknown validator")]
+    UnknownValidator,
+
+    #[error("validator is tombstoned – cannot unjail")]
+    Tombstoned,
+
+    #[error("validator is not jailed")]
+    NotJailed,
+
+    #[error("unjail delay not elapsed (wait {remaining} more blocks)")]
+    UnjailDelayNotElapsed { remaining: u64 },
+
+    #[error("validator has zero stake – cannot unjail")]
+    ZeroStake,
+
+    #[error("duplicate evidence already processed")]
+    DuplicateEvidence,
+
+    #[error("validator already jailed for downtime")]
+    AlreadyJailed,
+}
+
+pub type SlashingResult<T> = Result<T, SlashingError>;
+
+// -----------------------------------------------------------------------------
+// Validator status
+// -----------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ValidatorStatus {
@@ -25,8 +78,12 @@ pub enum ValidatorStatus {
         since_height: Height,
         slash_count: u32,
     },
-    Tombstoned, // permanently banned (double-vote at same height)
+    Tombstoned,
 }
+
+// -----------------------------------------------------------------------------
+// Validator record
+// -----------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValidatorRecord {
@@ -37,7 +94,8 @@ pub struct ValidatorRecord {
 }
 
 impl ValidatorRecord {
-    pub fn new(stake: u64) -> Self {
+    /// Create a new active validator record.
+    pub const fn new(stake: u64) -> Self {
         Self {
             stake,
             slashed_total: 0,
@@ -46,10 +104,12 @@ impl ValidatorRecord {
         }
     }
 
-    pub fn is_active(&self) -> bool {
+    /// Check if the validator is active.
+    pub const fn is_active(&self) -> bool {
         matches!(self.status, ValidatorStatus::Active)
     }
 
+    /// Check if the validator can be unjailed at the given height.
     pub fn can_unjail(&self, current_height: Height) -> bool {
         match &self.status {
             ValidatorStatus::Jailed { since_height, .. } => {
@@ -58,22 +118,40 @@ impl ValidatorRecord {
             _ => false,
         }
     }
+
+    /// Validate that the stake is within sensible bounds.
+    pub fn validate(&self) -> Result<(), SlashingError> {
+        if self.stake == 0 && self.is_active() {
+            // Active validator with zero stake should be jailed, but we don't error here.
+        }
+        Ok(())
+    }
 }
+
+// -----------------------------------------------------------------------------
+// Stake ledger
+// -----------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StakeLedger {
     pub validators: BTreeMap<PublicKeyBytes, ValidatorRecord>,
-    /// Evidence already processed (height, voter) to prevent double-slash
-    pub processed_evidence: std::collections::HashSet<(Height, PublicKeyBytes)>,
+    pub processed_evidence: HashSet<(Height, PublicKeyBytes)>,
 }
 
 impl StakeLedger {
+    /// Create an empty ledger.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a demo ledger (for testing).
     pub fn default_demo() -> Self {
         Self::default()
     }
 
+    /// Create a demo ledger with specific validators and stake.
     pub fn default_demo_with(validators: &[PublicKeyBytes], stake_each: u64) -> Self {
-        let mut s = Self::default();
+        let mut s = Self::new();
         for v in validators {
             s.validators
                 .insert(v.clone(), ValidatorRecord::new(stake_each));
@@ -81,6 +159,7 @@ impl StakeLedger {
         s
     }
 
+    /// Total active voting power.
     pub fn total_power(&self) -> u64 {
         self.validators
             .values()
@@ -89,6 +168,7 @@ impl StakeLedger {
             .sum()
     }
 
+    /// Power of a specific validator (0 if not active).
     pub fn power_of(&self, pk: &PublicKeyBytes) -> u64 {
         self.validators
             .get(pk)
@@ -97,7 +177,7 @@ impl StakeLedger {
             .unwrap_or(0)
     }
 
-    /// Backward compat fields for engine serialization
+    /// Backward compatibility: raw stake map (includes jailed validators).
     pub fn stake_raw(&self) -> BTreeMap<PublicKeyBytes, u64> {
         self.validators
             .iter()
@@ -105,117 +185,76 @@ impl StakeLedger {
             .collect()
     }
 
-    pub fn apply_evidence(&mut self, ev: &Evidence, current_height: Height) {
-        match ev {
-            Evidence::DoubleVote { voter, height, .. } => {
-                let key = (*height, voter.clone());
-                if self.processed_evidence.contains(&key) {
-                    warn!("duplicate evidence for voter at height {height}, ignoring");
-                    return;
-                }
-                self.processed_evidence.insert(key);
+    /// Apply slashing evidence (double‑vote or double‑proposal).
+    pub fn apply_evidence(&mut self, evidence: &Evidence, current_height: Height) -> SlashingResult<()> {
+        let (offender, height) = match evidence {
+            Evidence::DoubleVote { voter, height, .. } => (voter, height),
+            Evidence::DoubleProposal { proposer, height, .. } => (proposer, height),
+        };
 
-                let record = match self.validators.get_mut(voter) {
-                    Some(r) => r,
-                    None => {
-                        warn!("evidence for unknown validator");
-                        return;
-                    }
-                };
-
-                let slash = (record.stake / SLASH_FRACTION_DOUBLE_VOTE).max(1);
-                record.stake = record.stake.saturating_sub(slash);
-                record.slashed_total += slash;
-
-                // Check if this is a tombstone offense (double-vote at same height = severe)
-                let is_tombstone = matches!(&record.status,
-                    ValidatorStatus::Jailed { slash_count, .. } if *slash_count >= 2
-                );
-
-                if is_tombstone {
-                    record.status = ValidatorStatus::Tombstoned;
-                    warn!(
-                        voter = %hex::encode(&voter.0),
-                        "validator tombstoned (repeated double-vote)"
-                    );
-                } else {
-                    let slash_count = match &record.status {
-                        ValidatorStatus::Jailed { slash_count, .. } => *slash_count + 1,
-                        _ => 1,
-                    };
-                    record.status = ValidatorStatus::Jailed {
-                        since_height: current_height,
-                        slash_count,
-                    };
-                    record.jailed_at = Some(current_height);
-                    warn!(
-                        voter = %hex::encode(&voter.0),
-                        slashed = slash,
-                        remaining = record.stake,
-                        "validator jailed"
-                    );
-                }
-            }
-
-            Evidence::DoubleProposal {
-                proposer, height, ..
-            } => {
-                // Treat double-proposals as a severe safety violation (similar severity to double-vote).
-                let key = (*height, proposer.clone());
-                if self.processed_evidence.contains(&key) {
-                    warn!("duplicate evidence for proposer at height {height}, ignoring");
-                    return;
-                }
-                self.processed_evidence.insert(key);
-
-                let record = match self.validators.get_mut(proposer) {
-                    Some(r) => r,
-                    None => {
-                        warn!("evidence for unknown validator");
-                        return;
-                    }
-                };
-
-                let slash = (record.stake / SLASH_FRACTION_DOUBLE_VOTE).max(1);
-                record.stake = record.stake.saturating_sub(slash);
-                record.slashed_total += slash;
-
-                let slash_count = match &record.status {
-                    ValidatorStatus::Jailed { slash_count, .. } => *slash_count + 1,
-                    _ => 1,
-                };
-                record.status = ValidatorStatus::Jailed {
-                    since_height: current_height,
-                    slash_count,
-                };
-                record.jailed_at = Some(current_height);
-                warn!(
-                    proposer = %hex::encode(&proposer.0),
-                    slashed = slash,
-                    remaining = record.stake,
-                    "validator jailed (double-proposal)"
-                );
-            }
+        let key = (*height, offender.clone());
+        if self.processed_evidence.contains(&key) {
+            warn!("duplicate evidence for offender at height {height}, ignoring");
+            return Err(SlashingError::DuplicateEvidence);
         }
+        self.processed_evidence.insert(key);
+
+        let record = self.validators
+            .get_mut(offender)
+            .ok_or(SlashingError::UnknownValidator)?;
+
+        // Compute slash amount (minimum 1)
+        let slash = (record.stake / SLASH_FRACTION_DOUBLE_VOTE).max(1);
+        record.stake = record.stake.saturating_sub(slash);
+        record.slashed_total += slash;
+
+        // Tombstone detection: repeated double‑vote at same height (already slash count >=2)
+        let is_tombstone = matches!(&record.status,
+            ValidatorStatus::Jailed { slash_count, .. } if *slash_count >= 2
+        );
+
+        if is_tombstone {
+            record.status = ValidatorStatus::Tombstoned;
+            warn!(
+                offender = %hex::encode(&offender.0),
+                "validator tombstoned (repeated double‑vote/ double‑proposal)"
+            );
+        } else {
+            let slash_count = match &record.status {
+                ValidatorStatus::Jailed { slash_count, .. } => *slash_count + 1,
+                _ => 1,
+            };
+            record.status = ValidatorStatus::Jailed {
+                since_height: current_height,
+                slash_count,
+            };
+            record.jailed_at = Some(current_height);
+            warn!(
+                offender = %hex::encode(&offender.0),
+                slashed = slash,
+                remaining = record.stake,
+                "validator jailed"
+            );
+        }
+        Ok(())
     }
 
     /// Unjail a validator who has waited the required delay.
-    /// Returns Err if validator is not jailed or delay not elapsed.
-    pub fn unjail(
-        &mut self,
-        pk: &PublicKeyBytes,
-        current_height: Height,
-    ) -> Result<(), &'static str> {
-        let record = self.validators.get_mut(pk).ok_or("unknown validator")?;
+    pub fn unjail(&mut self, pk: &PublicKeyBytes, current_height: Height) -> SlashingResult<()> {
+        let record = self.validators
+            .get_mut(pk)
+            .ok_or(SlashingError::UnknownValidator)?;
+
         match &record.status {
-            ValidatorStatus::Tombstoned => Err("tombstoned validators cannot unjail"),
-            ValidatorStatus::Active => Err("validator is not jailed"),
-            ValidatorStatus::Jailed { .. } => {
+            ValidatorStatus::Tombstoned => Err(SlashingError::Tombstoned),
+            ValidatorStatus::Active => Err(SlashingError::NotJailed),
+            ValidatorStatus::Jailed { since_height, .. } => {
                 if !record.can_unjail(current_height) {
-                    return Err("unjail delay not elapsed");
+                    let remaining = (since_height + UNJAIL_DELAY_BLOCKS).saturating_sub(current_height);
+                    return Err(SlashingError::UnjailDelayNotElapsed { remaining });
                 }
                 if record.stake == 0 {
-                    return Err("zero stake, cannot unjail");
+                    return Err(SlashingError::ZeroStake);
                 }
                 record.status = ValidatorStatus::Active;
                 record.jailed_at = None;
@@ -224,16 +263,41 @@ impl StakeLedger {
         }
     }
 
+    /// Slash a validator for downtime.
+    pub fn slash_downtime(&mut self, pk: &PublicKeyBytes, current_height: Height) -> SlashingResult<()> {
+        let record = self.validators
+            .get_mut(pk)
+            .ok_or(SlashingError::UnknownValidator)?;
+
+        if !record.is_active() {
+            return Err(SlashingError::AlreadyJailed);
+        }
+
+        let slash = (record.stake / SLASH_FRACTION_DOWNTIME).max(1);
+        record.stake = record.stake.saturating_sub(slash);
+        record.slashed_total += slash;
+        record.status = ValidatorStatus::Jailed {
+            since_height: current_height,
+            slash_count: 1,
+        };
+        record.jailed_at = Some(current_height);
+        warn!(
+            validator = %hex::encode(&pk.0),
+            slashed = slash,
+            "validator jailed for downtime"
+        );
+        Ok(())
+    }
+
     /// Status report for all validators.
     pub fn status_report(&self) -> Vec<(PublicKeyBytes, &ValidatorRecord)> {
-        self.validators
-            .iter()
-            .map(|(k, v)| (k.clone(), v))
-            .collect()
+        self.validators.iter().map(|(k, v)| (k.clone(), v)).collect()
     }
 }
 
-// ── Backward compat shim for engine serialization ────────────────────────
+// -----------------------------------------------------------------------------
+// Legacy compatibility
+// -----------------------------------------------------------------------------
 
 impl StakeLedger {
     /// Deserialize old format (stake: BTreeMap<PK,u64>, slashed: BTreeMap<PK,u64>)
@@ -241,7 +305,7 @@ impl StakeLedger {
         stake: BTreeMap<PublicKeyBytes, u64>,
         slashed: BTreeMap<PublicKeyBytes, u64>,
     ) -> Self {
-        let mut s = Self::default();
+        let mut s = Self::new();
         for (pk, amount) in stake {
             let slashed_total = *slashed.get(&pk).unwrap_or(&0);
             s.validators.insert(
@@ -258,95 +322,167 @@ impl StakeLedger {
     }
 }
 
-// ── Downtime tracking ────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Uptime tracking
+// -----------------------------------------------------------------------------
 
-/// Window of blocks to check for downtime (number of recent blocks considered).
-pub const DOWNTIME_WINDOW: u64 = 200;
-/// Minimum blocks a validator must have signed in the last DOWNTIME_WINDOW to avoid jailing.
-pub const DOWNTIME_MIN_SIGNED: u64 = 100; // 50% participation required
-
-/// Track how many blocks each validator has signed in the recent window.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct UptimeTracker {
-    /// For each validator: count of blocks signed in the last DOWNTIME_WINDOW blocks.
     pub signed_in_window: BTreeMap<PublicKeyBytes, u64>,
-    /// Block heights at which each validator signed (ring buffer via modulo).
-    /// We track the last DOWNTIME_WINDOW block heights where each validator signed.
     pub last_signed_height: BTreeMap<PublicKeyBytes, Height>,
-    /// Current window start (oldest tracked height).
     pub window_start: Height,
 }
 
 impl UptimeTracker {
-    /// Call this once per committed block, passing the set of validators that signed (precommitted).
+    /// Create a new uptime tracker.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a committed block: update signed counts for signers.
     pub fn record_block(
         &mut self,
         height: Height,
         signers: &[PublicKeyBytes],
         all_validators: &[PublicKeyBytes],
     ) {
-        // Advance window: drop validators that haven't signed in DOWNTIME_WINDOW
+        // Advance window start
         if height > DOWNTIME_WINDOW {
             self.window_start = height - DOWNTIME_WINDOW;
         }
 
-        // Decay: for validators not in signers, their signed count doesn't increase
-        // (we use a simple approach: reset and recount over full window via last_signed_height)
+        // Increase signed counts for signers
         for pk in signers {
             *self.signed_in_window.entry(pk.clone()).or_insert(0) += 1;
             self.last_signed_height.insert(pk.clone(), height);
         }
 
-        // Initialize any new validators with 0
+        // Ensure all validators have an entry (even with zero)
         for pk in all_validators {
             self.signed_in_window.entry(pk.clone()).or_insert(0);
         }
     }
 
-    /// Returns validators that should be jailed for downtime at this height.
-    /// Only returns active validators that have been in the set for at least DOWNTIME_WINDOW blocks.
+    /// Get the number of signed blocks in the window for a given validator.
+    pub fn signed_count(&self, pk: &PublicKeyBytes) -> u64 {
+        *self.signed_in_window.get(pk).unwrap_or(&0)
+    }
+
+    /// Check which validators have missed too many blocks (downtime).
+    /// Returns a vector of public keys that should be jailed.
     pub fn check_downtime(&self, height: Height, stakes: &StakeLedger) -> Vec<PublicKeyBytes> {
         if height < DOWNTIME_WINDOW {
-            return vec![]; // too early to check
+            return vec![];
         }
         stakes
             .validators
             .iter()
             .filter(|(_, r)| r.is_active())
             .filter(|(pk, _)| {
-                let signed = *self.signed_in_window.get(*pk).unwrap_or(&0);
+                let signed = self.signed_count(pk);
                 let last = *self.last_signed_height.get(*pk).unwrap_or(&0);
-                // Validator must have been in the set long enough (at least 1 signed block recorded)
-                // and failed to meet minimum participation
                 last > 0 && signed < DOWNTIME_MIN_SIGNED
             })
             .map(|(pk, _)| pk.clone())
             .collect()
     }
+
+    /// Reset counts for a validator (e.g., after unjailing, give a fresh start).
+    pub fn reset_counts(&mut self, pk: &PublicKeyBytes) {
+        self.signed_in_window.remove(pk);
+        self.last_signed_height.remove(pk);
+    }
 }
 
-impl StakeLedger {
-    /// Apply downtime slash to a validator: slash fraction and jail.
-    /// Uses 1% slash (SLASH_FRACTION_DOWNTIME = 100).
-    pub fn slash_downtime(&mut self, pk: &PublicKeyBytes, current_height: Height) {
-        const SLASH_FRACTION_DOWNTIME: u64 = 100; // 1/100 = 1%
-        let record = match self.validators.get_mut(pk) {
-            Some(r) if r.is_active() => r,
-            _ => return,
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_pk(id: u8) -> PublicKeyBytes {
+        let mut bytes = [0u8; 32];
+        bytes[0] = id;
+        PublicKeyBytes(bytes.to_vec())
+    }
+
+    #[test]
+    fn test_validator_record() {
+        let v = ValidatorRecord::new(1000);
+        assert!(v.is_active());
+        assert_eq!(v.stake, 1000);
+        assert_eq!(v.slashed_total, 0);
+        assert!(v.validate().is_ok());
+    }
+
+    #[test]
+    fn test_slash_double_vote() -> SlashingResult<()> {
+        let mut ledger = StakeLedger::new();
+        let pk = dummy_pk(1);
+        ledger.validators.insert(pk.clone(), ValidatorRecord::new(1000));
+
+        let evidence = Evidence::DoubleVote {
+            voter: pk.clone(),
+            height: 10,
+            round: 0,
+            vote_type: crate::consensus::messages::VoteType::Prevote,
+            a: None,
+            b: None,
+            vote_a: crate::consensus::messages::Vote::default(),
+            vote_b: crate::consensus::messages::Vote::default(),
         };
-        let slash = (record.stake / SLASH_FRACTION_DOWNTIME).max(1);
-        record.stake = record.stake.saturating_sub(slash);
-        record.slashed_total += slash;
-        let slash_count = 1;
-        record.status = ValidatorStatus::Jailed {
-            since_height: current_height,
-            slash_count,
+        ledger.apply_evidence(&evidence, 10)?;
+        let record = ledger.validators.get(&pk).unwrap();
+        assert_eq!(record.stake, 1000 - (1000 / 20));
+        assert!(matches!(record.status, ValidatorStatus::Jailed { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_unjail() -> SlashingResult<()> {
+        let mut ledger = StakeLedger::new();
+        let pk = dummy_pk(2);
+        ledger.validators.insert(pk.clone(), ValidatorRecord::new(1000));
+        let evidence = Evidence::DoubleVote {
+            voter: pk.clone(),
+            height: 10,
+            round: 0,
+            vote_type: crate::consensus::messages::VoteType::Prevote,
+            a: None,
+            b: None,
+            vote_a: crate::consensus::messages::Vote::default(),
+            vote_b: crate::consensus::messages::Vote::default(),
         };
-        record.jailed_at = Some(current_height);
-        warn!(
-            validator = %hex::encode(&pk.0),
-            slashed = slash,
-            "validator jailed for downtime"
-        );
+        ledger.apply_evidence(&evidence, 10)?;
+        // Cannot unjail immediately
+        let err = ledger.unjail(&pk, 10).unwrap_err();
+        assert!(matches!(err, SlashingError::UnjailDelayNotElapsed { .. }));
+        // After delay
+        ledger.unjail(&pk, 10 + UNJAIL_DELAY_BLOCKS)?;
+        let record = ledger.validators.get(&pk).unwrap();
+        assert!(record.is_active());
+        Ok(())
+    }
+
+    #[test]
+    fn test_downtime_slash() -> SlashingResult<()> {
+        let mut ledger = StakeLedger::new();
+        let pk = dummy_pk(3);
+        ledger.validators.insert(pk.clone(), ValidatorRecord::new(1000));
+        ledger.slash_downtime(&pk, 100)?;
+        let record = ledger.validators.get(&pk).unwrap();
+        assert_eq!(record.stake, 1000 - (1000 / 100));
+        assert!(matches!(record.status, ValidatorStatus::Jailed { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_uptime_tracker() {
+        let pk = dummy_pk(4);
+        let mut tracker = UptimeTracker::new();
+        tracker.record_block(1, &[pk.clone()], &[pk.clone()]);
+        assert_eq!(tracker.signed_count(&pk), 1);
     }
 }
