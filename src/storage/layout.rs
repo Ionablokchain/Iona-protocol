@@ -15,12 +15,12 @@
 //!     validator_key.json   # ed25519 signing key (only if this node is a validator)
 //!   chain/
 //!     blocks/              # committed blocks (one JSON per height)
-//!     wal/                 # write-ahead log segments
+//!     wal/                 # write‑ahead log segments
 //!     state/               # state_full.json, stakes.json, evidence
 //!     receipts/            # transaction receipts
 //!     snapshots/           # periodic state snapshots
 //!   peerstore/
-//!     peers.json           # known peers with last-seen timestamps
+//!     peers.json           # known peers with last‑seen timestamps
 //!     quarantine.json      # quarantined peers
 //! ```
 //!
@@ -36,17 +36,100 @@
 //! use iona::storage::layout::DataLayout;
 //!
 //! let layout = DataLayout::new("./data/node");
-//! layout.ensure_all().unwrap();
-//! let peer_id = layout.peer_id().unwrap();
+//! layout.ensure_all()?;
+//! let peer_id = layout.peer_id()?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 use crate::crypto::ed25519::{Ed25519Keypair, Ed25519Signer};
-use crate::crypto::PublicKeyBytes;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use thiserror::Error;
 use tracing::{debug, info, warn};
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// File name for the P2P key.
+const P2P_KEY_FILE: &str = "p2p_key.json";
+
+/// File name for node metadata.
+const NODE_META_FILE: &str = "node_meta.json";
+
+/// File name for the plaintext validator key.
+const VALIDATOR_KEY_FILE: &str = "validator_key.json";
+
+/// File name for the encrypted validator key.
+const VALIDATOR_KEY_ENC_FILE: &str = "validator_key.enc";
+
+/// File name for the full state JSON.
+const STATE_FULL_FILE: &str = "state_full.json";
+
+/// File name for the stakes JSON.
+const STAKES_FILE: &str = "stakes.json";
+
+/// File name for the evidence store (JSONL).
+const EVIDENCE_FILE: &str = "evidence.jsonl";
+
+/// File name for the schema metadata.
+const SCHEMA_FILE: &str = "schema.json";
+
+/// File name for the transaction index.
+const TX_INDEX_FILE: &str = "tx_index.json";
+
+/// File name for the known peers list.
+const PEERS_FILE: &str = "peers.json";
+
+/// File name for the quarantine list.
+const QUARANTINE_FILE: &str = "quarantine.json";
+
+/// Subdirectory names.
+const IDENTITY_DIR: &str = "identity";
+const VALIDATOR_DIR: &str = "validator";
+const CHAIN_DIR: &str = "chain";
+const PEERSTORE_DIR: &str = "peerstore";
+const BLOCKS_DIR: &str = "blocks";
+const WAL_DIR: &str = "wal";
+const STATE_DIR: &str = "state";
+const RECEIPTS_DIR: &str = "receipts";
+const SNAPSHOTS_DIR: &str = "snapshots";
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during layout operations.
+#[derive(Debug, Error)]
+pub enum LayoutError {
+    #[error("I/O error: {source}")]
+    Io {
+        #[from]
+        source: io::Error,
+    },
+
+    #[error("JSON error: {source}")]
+    Json {
+        #[from]
+        source: serde_json::Error,
+    },
+
+    #[error("invalid hex: {source}")]
+    Hex {
+        #[from]
+        source: hex::FromHexError,
+    },
+
+    #[error("invalid seed length: expected 32 bytes, got {len}")]
+    InvalidSeedLength { len: usize },
+
+    #[error("invalid peer ID derivation")]
+    InvalidPeerId,
+}
+
+pub type LayoutResult<T> = Result<T, LayoutError>;
 
 // -----------------------------------------------------------------------------
 // DataLayout
@@ -60,6 +143,7 @@ pub struct DataLayout {
 
 impl DataLayout {
     /// Create a new layout rooted at the given path.
+    #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
@@ -71,25 +155,25 @@ impl DataLayout {
     /// Directory for node identity (P2P key, node metadata).
     #[must_use]
     pub fn identity_dir(&self) -> PathBuf {
-        self.root.join("identity")
+        self.root.join(IDENTITY_DIR)
     }
 
     /// Directory for validator signing key (if any).
     #[must_use]
     pub fn validator_dir(&self) -> PathBuf {
-        self.root.join("validator")
+        self.root.join(VALIDATOR_DIR)
     }
 
     /// Directory for chain data (blocks, WAL, state, receipts, snapshots).
     #[must_use]
     pub fn chain_dir(&self) -> PathBuf {
-        self.root.join("chain")
+        self.root.join(CHAIN_DIR)
     }
 
     /// Directory for peer store (known peers, quarantine).
     #[must_use]
     pub fn peerstore_dir(&self) -> PathBuf {
-        self.root.join("peerstore")
+        self.root.join(PEERSTORE_DIR)
     }
 
     // -------------------------------------------------------------------------
@@ -99,31 +183,31 @@ impl DataLayout {
     /// Directory for committed blocks.
     #[must_use]
     pub fn blocks_dir(&self) -> PathBuf {
-        self.chain_dir().join("blocks")
+        self.chain_dir().join(BLOCKS_DIR)
     }
 
     /// Directory for write‑ahead log segments.
     #[must_use]
     pub fn wal_dir(&self) -> PathBuf {
-        self.chain_dir().join("wal")
+        self.chain_dir().join(WAL_DIR)
     }
 
     /// Directory for state files.
     #[must_use]
     pub fn state_dir(&self) -> PathBuf {
-        self.chain_dir().join("state")
+        self.chain_dir().join(STATE_DIR)
     }
 
     /// Directory for transaction receipts.
     #[must_use]
     pub fn receipts_dir(&self) -> PathBuf {
-        self.chain_dir().join("receipts")
+        self.chain_dir().join(RECEIPTS_DIR)
     }
 
     /// Directory for snapshots.
     #[must_use]
     pub fn snapshots_dir(&self) -> PathBuf {
-        self.chain_dir().join("snapshots")
+        self.chain_dir().join(SNAPSHOTS_DIR)
     }
 
     // -------------------------------------------------------------------------
@@ -133,13 +217,13 @@ impl DataLayout {
     /// Path to the P2P key file (JSON).
     #[must_use]
     pub fn p2p_key_path(&self) -> PathBuf {
-        self.identity_dir().join("p2p_key.json")
+        self.identity_dir().join(P2P_KEY_FILE)
     }
 
     /// Path to the node metadata file.
     #[must_use]
     pub fn node_meta_path(&self) -> PathBuf {
-        self.identity_dir().join("node_meta.json")
+        self.identity_dir().join(NODE_META_FILE)
     }
 
     // -------------------------------------------------------------------------
@@ -149,13 +233,13 @@ impl DataLayout {
     /// Path to the plaintext validator key file (JSON).
     #[must_use]
     pub fn validator_key_path(&self) -> PathBuf {
-        self.validator_dir().join("validator_key.json")
+        self.validator_dir().join(VALIDATOR_KEY_FILE)
     }
 
     /// Path to the encrypted validator key file.
     #[must_use]
     pub fn validator_key_enc_path(&self) -> PathBuf {
-        self.validator_dir().join("validator_key.enc")
+        self.validator_dir().join(VALIDATOR_KEY_ENC_FILE)
     }
 
     // -------------------------------------------------------------------------
@@ -165,31 +249,31 @@ impl DataLayout {
     /// Path to the full state JSON file.
     #[must_use]
     pub fn state_full_path(&self) -> PathBuf {
-        self.state_dir().join("state_full.json")
+        self.state_dir().join(STATE_FULL_FILE)
     }
 
     /// Path to the stakes file.
     #[must_use]
     pub fn stakes_path(&self) -> PathBuf {
-        self.state_dir().join("stakes.json")
+        self.state_dir().join(STAKES_FILE)
     }
 
     /// Path to the evidence store (JSONL).
     #[must_use]
     pub fn evidence_path(&self) -> PathBuf {
-        self.state_dir().join("evidence.jsonl")
+        self.state_dir().join(EVIDENCE_FILE)
     }
 
     /// Path to the schema metadata file.
     #[must_use]
     pub fn schema_path(&self) -> PathBuf {
-        self.state_dir().join("schema.json")
+        self.state_dir().join(SCHEMA_FILE)
     }
 
     /// Path to the transaction index file.
     #[must_use]
     pub fn tx_index_path(&self) -> PathBuf {
-        self.state_dir().join("tx_index.json")
+        self.state_dir().join(TX_INDEX_FILE)
     }
 
     // -------------------------------------------------------------------------
@@ -199,13 +283,13 @@ impl DataLayout {
     /// Path to the known peers file.
     #[must_use]
     pub fn peers_path(&self) -> PathBuf {
-        self.peerstore_dir().join("peers.json")
+        self.peerstore_dir().join(PEERS_FILE)
     }
 
     /// Path to the quarantine list file.
     #[must_use]
     pub fn quarantine_path(&self) -> PathBuf {
-        self.peerstore_dir().join("quarantine.json")
+        self.peerstore_dir().join(QUARANTINE_FILE)
     }
 
     // -------------------------------------------------------------------------
@@ -213,7 +297,7 @@ impl DataLayout {
     // -------------------------------------------------------------------------
 
     /// Ensure all required directories exist.
-    pub fn ensure_all(&self) -> io::Result<()> {
+    pub fn ensure_all(&self) -> LayoutResult<()> {
         let dirs = [
             self.identity_dir(),
             self.validator_dir(),
@@ -267,15 +351,13 @@ impl DataLayout {
     /// Load the P2P keypair (libp2p) as an Ed25519 keypair.
     ///
     /// The key is stored as a JSON file with a 32‑byte seed.
-    pub fn load_p2p_keypair(&self) -> io::Result<Ed25519Keypair> {
+    pub fn load_p2p_keypair(&self) -> LayoutResult<Ed25519Keypair> {
         let path = self.p2p_key_path();
         let content = fs::read_to_string(&path)?;
-        let seed_hex: String = serde_json::from_str(&content)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let seed = hex::decode(seed_hex)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let seed_hex: String = serde_json::from_str(&content)?;
+        let seed = hex::decode(seed_hex)?;
         if seed.len() != 32 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "seed must be 32 bytes"));
+            return Err(LayoutError::InvalidSeedLength { len: seed.len() });
         }
         let mut seed_arr = [0u8; 32];
         seed_arr.copy_from_slice(&seed);
@@ -283,34 +365,31 @@ impl DataLayout {
     }
 
     /// Save the P2P keypair (libp2p) as an Ed25519 keypair.
-    pub fn save_p2p_keypair(&self, keypair: &Ed25519Keypair) -> io::Result<()> {
+    pub fn save_p2p_keypair(&self, keypair: &Ed25519Keypair) -> LayoutResult<()> {
         let path = self.p2p_key_path();
         let seed = keypair.to_seed();
         let seed_hex = hex::encode(seed);
-        let json = serde_json::to_string_pretty(&seed_hex)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let json = serde_json::to_string_pretty(&seed_hex)?;
         fs::write(&path, json)?;
         debug!(path = %path.display(), "saved P2P keypair");
         Ok(())
     }
 
     /// Generate a new random P2P keypair and save it.
-    pub fn generate_p2p_keypair(&self) -> io::Result<Ed25519Keypair> {
+    pub fn generate_p2p_keypair(&self) -> LayoutResult<Ed25519Keypair> {
         let keypair = Ed25519Keypair::random();
         self.save_p2p_keypair(&keypair)?;
         Ok(keypair)
     }
 
     /// Load the validator keypair (Ed25519) from the plaintext file.
-    pub fn load_validator_keypair(&self) -> io::Result<Ed25519Keypair> {
+    pub fn load_validator_keypair(&self) -> LayoutResult<Ed25519Keypair> {
         let path = self.validator_key_path();
         let content = fs::read_to_string(&path)?;
-        let seed_hex: String = serde_json::from_str(&content)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let seed = hex::decode(seed_hex)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let seed_hex: String = serde_json::from_str(&content)?;
+        let seed = hex::decode(seed_hex)?;
         if seed.len() != 32 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "seed must be 32 bytes"));
+            return Err(LayoutError::InvalidSeedLength { len: seed.len() });
         }
         let mut seed_arr = [0u8; 32];
         seed_arr.copy_from_slice(&seed);
@@ -318,35 +397,33 @@ impl DataLayout {
     }
 
     /// Save the validator keypair to the plaintext file.
-    pub fn save_validator_keypair(&self, keypair: &Ed25519Keypair) -> io::Result<()> {
+    pub fn save_validator_keypair(&self, keypair: &Ed25519Keypair) -> LayoutResult<()> {
         let path = self.validator_key_path();
         let seed = keypair.to_seed();
         let seed_hex = hex::encode(seed);
-        let json = serde_json::to_string_pretty(&seed_hex)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let json = serde_json::to_string_pretty(&seed_hex)?;
         fs::write(&path, json)?;
         debug!(path = %path.display(), "saved validator keypair");
         Ok(())
     }
 
     /// Generate a new random validator keypair and save it.
-    pub fn generate_validator_keypair(&self) -> io::Result<Ed25519Keypair> {
+    pub fn generate_validator_keypair(&self) -> LayoutResult<Ed25519Keypair> {
         let keypair = Ed25519Keypair::random();
         self.save_validator_keypair(&keypair)?;
         Ok(keypair)
     }
 
     /// Get the peer ID (libp2p) from the P2P key.
-    pub fn peer_id(&self) -> io::Result<String> {
+    pub fn peer_id(&self) -> LayoutResult<String> {
         let keypair = self.load_p2p_keypair()?;
         let public_key = keypair.public_key();
-        // Derive peer ID as blake3 of the public key (first 16 bytes hex).
         let hash = blake3::hash(&public_key.0);
         Ok(hex::encode(&hash.as_bytes()[..16]))
     }
 
     /// Create an Ed25519 signer from the validator key.
-    pub fn validator_signer(&self) -> io::Result<Ed25519Signer> {
+    pub fn validator_signer(&self) -> LayoutResult<Ed25519Signer> {
         let keypair = self.load_validator_keypair()?;
         Ok(Ed25519Signer::from_keypair(keypair))
     }
@@ -356,7 +433,7 @@ impl DataLayout {
     // -------------------------------------------------------------------------
 
     /// Perform a controlled reset of the data directory.
-    pub fn reset(&self, scope: ResetScope) -> io::Result<ResetResult> {
+    pub fn reset(&self, scope: ResetScope) -> LayoutResult<ResetResult> {
         let mut removed = Vec::new();
         let mut preserved = Vec::new();
 
@@ -382,7 +459,7 @@ impl DataLayout {
                 preserved.push("peerstore/".into());
             }
             ResetScope::Full => {
-                for name in ["identity", "validator", "chain", "peerstore"] {
+                for name in [IDENTITY_DIR, VALIDATOR_DIR, CHAIN_DIR, PEERSTORE_DIR] {
                     let p = self.root.join(name);
                     if p.exists() {
                         fs::remove_dir_all(&p)?;
@@ -560,20 +637,21 @@ mod tests {
     }
 
     #[test]
-    fn test_fresh_layout() {
-        let tmp = tempdir().unwrap();
+    fn test_fresh_layout() -> LayoutResult<()> {
+        let tmp = tempdir()?;
         let layout = DataLayout::new(tmp.path());
         assert!(layout.is_fresh());
         assert!(!layout.has_chain_data());
         assert!(!layout.has_identity());
         assert!(!layout.has_validator_key());
+        Ok(())
     }
 
     #[test]
-    fn test_ensure_all() {
-        let tmp = tempdir().unwrap();
+    fn test_ensure_all() -> LayoutResult<()> {
+        let tmp = tempdir()?;
         let layout = DataLayout::new(tmp.path());
-        layout.ensure_all().unwrap();
+        layout.ensure_all()?;
         assert!(layout.identity_dir().exists());
         assert!(layout.validator_dir().exists());
         assert!(layout.blocks_dir().exists());
@@ -582,101 +660,97 @@ mod tests {
         assert!(layout.receipts_dir().exists());
         assert!(layout.snapshots_dir().exists());
         assert!(layout.peerstore_dir().exists());
+        Ok(())
     }
 
     #[test]
-    fn test_keypair_roundtrip() {
-        let tmp = tempdir().unwrap();
+    fn test_keypair_roundtrip() -> LayoutResult<()> {
+        let tmp = tempdir()?;
         let layout = DataLayout::new(tmp.path());
-        layout.ensure_all().unwrap();
-
+        layout.ensure_all()?;
         let keypair = Ed25519Keypair::random();
-        layout.save_p2p_keypair(&keypair).unwrap();
-        let loaded = layout.load_p2p_keypair().unwrap();
+        layout.save_p2p_keypair(&keypair)?;
+        let loaded = layout.load_p2p_keypair()?;
         assert_eq!(keypair.to_seed(), loaded.to_seed());
+        Ok(())
     }
 
     #[test]
-    fn test_generate_p2p_keypair() {
-        let tmp = tempdir().unwrap();
+    fn test_generate_p2p_keypair() -> LayoutResult<()> {
+        let tmp = tempdir()?;
         let layout = DataLayout::new(tmp.path());
-        layout.ensure_all().unwrap();
-        let keypair = layout.generate_p2p_keypair().unwrap();
+        layout.ensure_all()?;
+        let keypair = layout.generate_p2p_keypair()?;
         assert!(layout.p2p_key_path().exists());
-        let loaded = layout.load_p2p_keypair().unwrap();
+        let loaded = layout.load_p2p_keypair()?;
         assert_eq!(keypair.to_seed(), loaded.to_seed());
+        Ok(())
     }
 
     #[test]
-    fn test_peer_id() {
-        let tmp = tempdir().unwrap();
+    fn test_peer_id() -> LayoutResult<()> {
+        let tmp = tempdir()?;
         let layout = DataLayout::new(tmp.path());
-        layout.ensure_all().unwrap();
-        layout.generate_p2p_keypair().unwrap();
-        let id = layout.peer_id().unwrap();
+        layout.ensure_all()?;
+        layout.generate_p2p_keypair()?;
+        let id = layout.peer_id()?;
         assert!(!id.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_reset_chain_only() {
-        let tmp = tempdir().unwrap();
+    fn test_reset_chain_only() -> LayoutResult<()> {
+        let tmp = tempdir()?;
         let layout = DataLayout::new(tmp.path());
-        layout.ensure_all().unwrap();
-
-        fs::write(layout.p2p_key_path(), "identity").unwrap();
-        fs::write(layout.state_full_path(), "{}").unwrap();
-        fs::write(layout.peers_path(), "{}").unwrap();
-
-        let result = layout.reset(ResetScope::Chain).unwrap();
+        layout.ensure_all()?;
+        fs::write(layout.p2p_key_path(), "identity")?;
+        fs::write(layout.state_full_path(), "{}")?;
+        fs::write(layout.peers_path(), "{}")?;
+        let result = layout.reset(ResetScope::Chain)?;
         assert!(result.dirs_removed.contains(&"chain/".to_string()));
         assert!(result.dirs_preserved.contains(&"identity/".to_string()));
-
         assert!(layout.p2p_key_path().exists());
         assert!(!layout.state_full_path().exists());
         assert!(layout.peers_path().exists());
+        Ok(())
     }
 
     #[test]
-    fn test_reset_identity_only() {
-        let tmp = tempdir().unwrap();
+    fn test_reset_identity_only() -> LayoutResult<()> {
+        let tmp = tempdir()?;
         let layout = DataLayout::new(tmp.path());
-        layout.ensure_all().unwrap();
-
-        fs::write(layout.p2p_key_path(), "identity").unwrap();
-        fs::write(layout.state_full_path(), "{}").unwrap();
-
-        let result = layout.reset(ResetScope::Identity).unwrap();
+        layout.ensure_all()?;
+        fs::write(layout.p2p_key_path(), "identity")?;
+        fs::write(layout.state_full_path(), "{}")?;
+        let result = layout.reset(ResetScope::Identity)?;
         assert!(result.dirs_removed.contains(&"identity/".to_string()));
         assert!(result.dirs_preserved.contains(&"chain/".to_string()));
-
         assert!(!layout.p2p_key_path().exists());
         assert!(layout.state_full_path().exists());
+        Ok(())
     }
 
     #[test]
-    fn test_reset_full() {
-        let tmp = tempdir().unwrap();
+    fn test_reset_full() -> LayoutResult<()> {
+        let tmp = tempdir()?;
         let layout = DataLayout::new(tmp.path());
-        layout.ensure_all().unwrap();
-
-        fs::write(layout.p2p_key_path(), "identity").unwrap();
-        fs::write(layout.state_full_path(), "{}").unwrap();
-        fs::write(layout.peers_path(), "{}").unwrap();
-
-        let result = layout.reset(ResetScope::Full).unwrap();
+        layout.ensure_all()?;
+        fs::write(layout.p2p_key_path(), "identity")?;
+        fs::write(layout.state_full_path(), "{}")?;
+        fs::write(layout.peers_path(), "{}")?;
+        let result = layout.reset(ResetScope::Full)?;
         assert!(!result.dirs_removed.is_empty());
-
         assert!(!layout.p2p_key_path().exists());
         assert!(!layout.state_full_path().exists());
         assert!(!layout.peers_path().exists());
+        Ok(())
     }
 
     #[test]
-    fn test_status() {
-        let tmp = tempdir().unwrap();
+    fn test_status() -> LayoutResult<()> {
+        let tmp = tempdir()?;
         let layout = DataLayout::new(tmp.path());
-        layout.ensure_all().unwrap();
-
+        layout.ensure_all()?;
         let status = layout.status();
         assert_eq!(status.blocks_count, 0);
         assert_eq!(status.snapshots_count, 0);
@@ -684,5 +758,6 @@ mod tests {
         assert!(!status.has_validator_key);
         assert!(!status.has_chain_data);
         assert!(status.schema_version.is_none());
+        Ok(())
     }
 }
