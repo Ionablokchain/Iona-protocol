@@ -6,10 +6,10 @@
 //! - Height index (height → block ID)
 //! - Transaction hash index (tx_hash → block location)
 //! - Atomic writes (temporary file + rename)
-//! - fsync on block writes
+//! - `fsync` on block writes
 //! - Pruning of old blocks
 
-use crate::types::{Block, Hash32, Height};
+use crate::types::{Block, Hash32, Height, Tx};
 use lru::LruCache;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 // -----------------------------------------------------------------------------
@@ -25,13 +26,59 @@ use tracing::{debug, error, info, warn};
 // -----------------------------------------------------------------------------
 
 /// Number of blocks to keep in the LRU cache.
-const CACHE_SIZE: usize = 256;
+pub const DEFAULT_CACHE_SIZE: usize = 256;
 
 /// File name for the height index.
 const INDEX_FILE: &str = "index.json";
 
 /// File name for the transaction index.
 const TX_INDEX_FILE: &str = "tx_index.json";
+
+/// Extension used for temporary files during atomic writes.
+const TMP_EXTENSION: &str = "tmp";
+
+/// File extension for block files.
+const BLOCK_EXTENSION: &str = "bin";
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during block store operations.
+#[derive(Debug, Error)]
+pub enum BlockStoreError {
+    #[error("I/O error: {source}")]
+    Io {
+        #[from]
+        source: io::Error,
+    },
+
+    #[error("serialisation error: {source}")]
+    Serialization {
+        #[from]
+        source: bincode::Error,
+    },
+
+    #[error("JSON index error: {source}")]
+    Json {
+        #[from]
+        source: serde_json::Error,
+    },
+
+    #[error("block ID mismatch: expected {expected}, got {actual}")]
+    IdMismatch { expected: String, actual: String },
+
+    #[error("invalid hex string: {0}")]
+    InvalidHex(#[from] hex::FromHexError),
+
+    #[error("invalid hash length: expected 32 bytes, got {0}")]
+    InvalidHashLength(usize),
+
+    #[error("block not found: height {height}")]
+    BlockNotFound { height: Height },
+}
+
+pub type BlockStoreResult<T> = Result<T, BlockStoreError>;
 
 // -----------------------------------------------------------------------------
 // Index structures
@@ -79,7 +126,7 @@ pub struct FsBlockStore {
 
 impl FsBlockStore {
     /// Open or create a block store at the given directory.
-    pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
+    pub fn open(root: impl Into<PathBuf>, cache_size: Option<usize>) -> BlockStoreResult<Self> {
         let dir = root.into();
         fs::create_dir_all(&dir)?;
         debug!(path = %dir.display(), "opening block store");
@@ -107,31 +154,30 @@ impl FsBlockStore {
             TxIndexFile::default()
         };
 
+        let cache_cap = cache_size.unwrap_or(DEFAULT_CACHE_SIZE);
+        let cap = NonZeroUsize::new(cache_cap)
+            .unwrap_or_else(|| NonZeroUsize::new(1).unwrap());
+
         Ok(Self {
             dir,
             idx_path,
             tx_idx_path,
             idx: Mutex::new(idx),
             tx_idx: Mutex::new(tx_idx),
-            cache: Mutex::new({
-                let cap = NonZeroUsize::new(CACHE_SIZE)
-                    .unwrap_or_else(|| NonZeroUsize::new(1).unwrap());
-                LruCache::new(cap)
-            }),
+            cache: Mutex::new(LruCache::new(cap)),
         })
     }
 
     /// Return the path for a block file.
     fn path_for(&self, id: &Hash32) -> PathBuf {
-        self.dir.join(format!("{}.bin", hex(id)))
+        self.dir.join(format!("{}.{}", hex(id), BLOCK_EXTENSION))
     }
 
     /// Write the height index atomically.
-    fn persist_index(&self) -> io::Result<()> {
+    fn persist_index(&self) -> BlockStoreResult<()> {
         let idx = self.idx.lock();
-        let tmp = self.idx_path.with_extension("tmp");
-        let data = serde_json::to_string_pretty(&*idx)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tmp = self.idx_path.with_extension(TMP_EXTENSION);
+        let data = serde_json::to_string_pretty(&*idx)?;
         fs::write(&tmp, &data)?;
         fs::rename(&tmp, &self.idx_path)?;
         debug!(path = %self.idx_path.display(), "index persisted");
@@ -139,11 +185,10 @@ impl FsBlockStore {
     }
 
     /// Write the transaction index atomically.
-    fn persist_tx_index(&self) -> io::Result<()> {
+    fn persist_tx_index(&self) -> BlockStoreResult<()> {
         let tx_idx = self.tx_idx.lock();
-        let tmp = self.tx_idx_path.with_extension("tmp");
-        let data = serde_json::to_string_pretty(&*tx_idx)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tmp = self.tx_idx_path.with_extension(TMP_EXTENSION);
+        let data = serde_json::to_string_pretty(&*tx_idx)?;
         fs::write(&tmp, &data)?;
         fs::rename(&tmp, &self.tx_idx_path)?;
         debug!(path = %self.tx_idx_path.display(), "tx index persisted");
@@ -200,14 +245,13 @@ impl FsBlockStore {
 
     /// Store a block. Updates height index, transaction index, and cache.
     /// If a block with the same height already exists, it is overwritten.
-    pub fn put_block(&self, block: Block) -> io::Result<()> {
+    pub fn put_block(&self, block: Block) -> BlockStoreResult<()> {
         let id = block.id();
         let id_hex = hex(&id);
         let path = self.path_for(&id);
 
         // Write block to disk with fsync
-        let bytes = bincode::serialize(&block)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let bytes = bincode::serialize(&block)?;
         {
             let mut f = fs::File::create(&path)?;
             f.write_all(&bytes)?;
@@ -233,7 +277,7 @@ impl FsBlockStore {
         // Update height index
         {
             let mut idx = self.idx.lock();
-            idx.by_height.insert(block.header.height, id_hex.clone());
+            idx.by_height.insert(block.header.height, id_hex);
             if block.header.height > idx.best_height {
                 idx.best_height = block.header.height;
             }
@@ -247,7 +291,7 @@ impl FsBlockStore {
 
     /// Remove a block by its hash.
     /// Returns `true` if the block existed.
-    pub fn remove_block(&self, id: &Hash32) -> io::Result<bool> {
+    pub fn remove_block(&self, id: &Hash32) -> BlockStoreResult<bool> {
         let path = self.path_for(id);
         let existed = path.exists();
         if existed {
@@ -289,7 +333,7 @@ impl FsBlockStore {
 
     /// Prune old blocks, keeping only the most recent `keep` blocks.
     /// Returns the number of blocks removed.
-    pub fn prune(&self, keep: usize) -> io::Result<usize> {
+    pub fn prune(&self, keep: usize) -> BlockStoreResult<usize> {
         let heights: Vec<Height> = {
             let idx = self.idx.lock();
             idx.by_height.keys().copied().collect()
@@ -317,18 +361,17 @@ impl FsBlockStore {
     }
 
     /// Read a block file and verify its ID matches the expected one.
-    fn read_block_file(&self, path: &Path, expected_id: &Hash32) -> io::Result<Block> {
+    fn read_block_file(&self, path: &Path, expected_id: &Hash32) -> BlockStoreResult<Block> {
         let mut f = fs::File::open(path)?;
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
-        let block: Block = bincode::deserialize(&buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let block: Block = bincode::deserialize(&buf)?;
         let actual_id = block.id();
         if &actual_id != expected_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("block id mismatch: expected {}, got {}", hex(expected_id), hex(&actual_id)),
-            ));
+            return Err(BlockStoreError::IdMismatch {
+                expected: hex(expected_id),
+                actual: hex(&actual_id),
+            });
         }
         Ok(block)
     }
@@ -403,86 +446,89 @@ mod tests {
     }
 
     #[test]
-    fn test_put_and_get() {
+    fn test_put_and_get() -> BlockStoreResult<()> {
         let dir = tempdir().unwrap();
-        let store = FsBlockStore::open(dir.path()).unwrap();
+        let store = FsBlockStore::open(dir.path(), None)?;
         let block = dummy_block(1, 0xAA);
-        store.put_block(block.clone()).unwrap();
+        store.put_block(block.clone())?;
         let retrieved = store.get_block(&block.id()).unwrap();
         assert_eq!(retrieved.header.height, block.header.height);
         assert_eq!(retrieved.header.state_root, block.header.state_root);
+        Ok(())
     }
 
     #[test]
-    fn test_best_height() {
+    fn test_best_height() -> BlockStoreResult<()> {
         let dir = tempdir().unwrap();
-        let store = FsBlockStore::open(dir.path()).unwrap();
+        let store = FsBlockStore::open(dir.path(), None)?;
         assert_eq!(store.best_height(), 0);
         let b1 = dummy_block(1, 0x01);
         let b2 = dummy_block(2, 0x02);
-        store.put_block(b1).unwrap();
+        store.put_block(b1)?;
         assert_eq!(store.best_height(), 1);
-        store.put_block(b2).unwrap();
+        store.put_block(b2)?;
         assert_eq!(store.best_height(), 2);
+        Ok(())
     }
 
     #[test]
-    fn test_block_id_by_height() {
+    fn test_block_id_by_height() -> BlockStoreResult<()> {
         let dir = tempdir().unwrap();
-        let store = FsBlockStore::open(dir.path()).unwrap();
+        let store = FsBlockStore::open(dir.path(), None)?;
         let b1 = dummy_block(5, 0x05);
         let b2 = dummy_block(10, 0x0A);
-        store.put_block(b1.clone()).unwrap();
-        store.put_block(b2.clone()).unwrap();
+        store.put_block(b1.clone())?;
+        store.put_block(b2.clone())?;
         let id1 = store.block_id_by_height(5).unwrap();
         let id2 = store.block_id_by_height(10).unwrap();
         assert_eq!(id1, b1.id());
         assert_eq!(id2, b2.id());
         assert!(store.block_id_by_height(7).is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_tx_location() {
-        // Need a block with transactions to test.
-        // For now, just ensure the method doesn't panic.
+    fn test_tx_location() -> BlockStoreResult<()> {
         let dir = tempdir().unwrap();
-        let store = FsBlockStore::open(dir.path()).unwrap();
+        let store = FsBlockStore::open(dir.path(), None)?;
         let tx_hash = Hash32([0x11; 32]);
         assert!(store.tx_location(&tx_hash).is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_remove_block() {
+    fn test_remove_block() -> BlockStoreResult<()> {
         let dir = tempdir().unwrap();
-        let store = FsBlockStore::open(dir.path()).unwrap();
+        let store = FsBlockStore::open(dir.path(), None)?;
         let block = dummy_block(42, 0x42);
-        store.put_block(block.clone()).unwrap();
+        store.put_block(block.clone())?;
         assert!(store.contains_block(&block.id()));
-        let removed = store.remove_block(&block.id()).unwrap();
+        let removed = store.remove_block(&block.id())?;
         assert!(removed);
         assert!(!store.contains_block(&block.id()));
         assert!(store.get_block(&block.id()).is_none());
         assert_eq!(store.best_height(), 0);
+        Ok(())
     }
 
     #[test]
-    fn test_prune() {
+    fn test_prune() -> BlockStoreResult<()> {
         let dir = tempdir().unwrap();
-        let store = FsBlockStore::open(dir.path()).unwrap();
+        let store = FsBlockStore::open(dir.path(), None)?;
         for i in 1..=10 {
             let block = dummy_block(i, i as u8);
-            store.put_block(block).unwrap();
+            store.put_block(block)?;
         }
         assert_eq!(store.best_height(), 10);
-        let removed = store.prune(5).unwrap();
+        let removed = store.prune(5)?;
         assert_eq!(removed, 5);
         assert_eq!(store.best_height(), 10);
-        // Blocks 1-5 should be gone, 6-10 should remain.
         for i in 1..=5 {
             assert!(store.block_id_by_height(i).is_none());
         }
         for i in 6..=10 {
             assert!(store.block_id_by_height(i).is_some());
         }
+        Ok(())
     }
 }
