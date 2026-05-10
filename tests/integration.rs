@@ -1,4 +1,4 @@
-//! Integration tests for IONA v22.
+//! Integration tests for IONA v30.
 //!
 //! Tests run multiple engine instances in-process, simulating a 4-validator
 //! network with a mock message bus. No actual networking needed.
@@ -16,8 +16,122 @@ use iona::slashing::StakeLedger;
 use iona::types::{Block, Hash32, Receipt, Tx};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use thiserror::Error;
+use tempfile::TempDir;
 
-// ── In-memory block store ─────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Number of validators in the test network.
+const NUM_VALIDATORS: usize = 4;
+
+/// Default stake per validator.
+const DEFAULT_STAKE: u64 = 100;
+
+/// Default gas target for block processing.
+const GAS_TARGET: u64 = 1_000_000;
+
+/// Default propose timeout in milliseconds.
+const PROPOSE_TIMEOUT_MS: u64 = 5000;
+
+/// Default prevote timeout in milliseconds.
+const PREVOTE_TIMEOUT_MS: u64 = 5000;
+
+/// Default precommit timeout in milliseconds.
+const PRECOMMIT_TIMEOUT_MS: u64 = 5000;
+
+/// Default maximum rounds before consensus restarts.
+const MAX_ROUNDS: u64 = 10;
+
+/// Default maximum transactions per block.
+const MAX_TXS_PER_BLOCK: usize = 100;
+
+/// Initial base fee per gas.
+const INITIAL_BASE_FEE: u64 = 1;
+
+/// Chain ID for tests.
+const TEST_CHAIN_ID: u64 = 6126151;
+
+/// Genesis height.
+const GENESIS_HEIGHT: u64 = 1;
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Integration test errors.
+#[derive(Debug, Error)]
+pub enum IntegrationTestError {
+    #[error("consensus did not commit within {rounds} rounds")]
+    Timeout { rounds: u64 },
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("mempool error: {0}")]
+    Mempool(String),
+
+    #[error("serialisation error: {0}")]
+    Serialization(#[from] serde_json::Error),
+}
+
+pub type IntegrationTestResult<T> = Result<T, IntegrationTestError>;
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+/// Generate `n` Ed25519 keypairs with deterministic seeds.
+fn make_keypairs(n: usize) -> Vec<Ed25519Keypair> {
+    (1..=n)
+        .map(|i| {
+            let mut seed = [0u8; 32];
+            seed[0] = i as u8;
+            Ed25519Keypair::from_seed(seed)
+        })
+        .collect()
+}
+
+/// Create a validator set from a list of keypairs.
+fn make_validator_set(keys: &[Ed25519Keypair]) -> ValidatorSet {
+    ValidatorSet {
+        vals: keys
+            .iter()
+            .map(|k| Validator {
+                pk: k.public_key(),
+                power: DEFAULT_STAKE,
+            })
+            .collect(),
+    }
+}
+
+/// Create a stake ledger for the given validators.
+fn make_stake_ledger(keys: &[Ed25519Keypair]) -> StakeLedger {
+    StakeLedger::default_demo_with(
+        &keys.iter().map(|k| k.public_key()).collect::<Vec<_>>(),
+        DEFAULT_STAKE,
+    )
+}
+
+/// Fast consensus configuration for tests.
+fn fast_config() -> Config {
+    Config {
+        propose_timeout_ms: PROPOSE_TIMEOUT_MS,
+        prevote_timeout_ms: PREVOTE_TIMEOUT_MS,
+        precommit_timeout_ms: PRECOMMIT_TIMEOUT_MS,
+        max_rounds: MAX_ROUNDS,
+        max_txs_per_block: MAX_TXS_PER_BLOCK,
+        gas_target: GAS_TARGET,
+        initial_base_fee_per_gas: INITIAL_BASE_FEE,
+        include_block_in_proposal: true,
+        fast_quorum: true,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// In‑memory block store
+// -----------------------------------------------------------------------------
 
 #[derive(Default, Clone)]
 struct MemBlockStore(Arc<Mutex<HashMap<Hash32, Block>>>);
@@ -26,26 +140,31 @@ impl BlockStore for MemBlockStore {
     fn get(&self, id: &Hash32) -> Option<Block> {
         self.0.lock().unwrap().get(id).cloned()
     }
+
     fn put(&self, block: Block) {
         let id = block.id();
         self.0.lock().unwrap().insert(id, block);
     }
 }
 
-// ── Message collector outbox ──────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Recording outbox for message collection
+// -----------------------------------------------------------------------------
 
 #[derive(Default, Clone)]
 struct RecordingOutbox {
-    pub broadcasts: Arc<Mutex<Vec<ConsensusMsg>>>,
-    pub commits: Arc<Mutex<Vec<CommitCertificate>>>,
-    pub store: MemBlockStore,
+    broadcasts: Arc<Mutex<Vec<ConsensusMsg>>>,
+    commits: Arc<Mutex<Vec<CommitCertificate>>>,
+    store: MemBlockStore,
 }
 
 impl Outbox for RecordingOutbox {
     fn broadcast(&mut self, msg: ConsensusMsg) {
         self.broadcasts.lock().unwrap().push(msg);
     }
+
     fn request_block(&mut self, _id: Hash32) {}
+
     fn on_commit(
         &mut self,
         cert: &CommitCertificate,
@@ -58,64 +177,22 @@ impl Outbox for RecordingOutbox {
     }
 }
 
-// ── Test helpers ──────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Message delivery
+// -----------------------------------------------------------------------------
 
-fn make_keypairs(n: usize) -> Vec<Ed25519Keypair> {
-    (1..=n)
-        .map(|i| {
-            let mut seed = [0u8; 32];
-            seed[0] = i as u8;
-            Ed25519Keypair::from_seed(seed)
-        })
-        .collect()
-}
-
-fn make_vset(keys: &[Ed25519Keypair]) -> ValidatorSet {
-    ValidatorSet {
-        vals: keys
-            .iter()
-            .map(|k| Validator {
-                pk: k.public_key(),
-                power: 100,
-            })
-            .collect(),
-    }
-}
-
-fn make_stakes(keys: &[Ed25519Keypair]) -> StakeLedger {
-    StakeLedger::default_demo_with(
-        &keys.iter().map(|k| k.public_key()).collect::<Vec<_>>(),
-        100,
-    )
-}
-
-fn fast_config() -> Config {
-    Config {
-        propose_timeout_ms: 5000,
-        prevote_timeout_ms: 5000,
-        precommit_timeout_ms: 5000,
-        max_rounds: 10,
-        max_txs_per_block: 100,
-        gas_target: 1_000_000,
-        initial_base_fee_per_gas: 1,
-        include_block_in_proposal: true,
-        fast_quorum: true,
-    }
-}
-
+/// Collect all pending messages from outboxes and deliver them to all engines.
 fn drain_and_deliver(
-    engines: &mut Vec<Engine<Ed25519Verifier>>,
-    outboxes: &mut Vec<RecordingOutbox>,
+    engines: &mut [Engine<Ed25519Verifier>],
+    outboxes: &mut [RecordingOutbox],
     stores: &[MemBlockStore],
     keys: &[Ed25519Keypair],
 ) {
-    // Collect all messages produced this round
-    let mut pending: Vec<ConsensusMsg> = Vec::new();
+    let mut pending = Vec::new();
     for ob in outboxes.iter_mut() {
         pending.extend(ob.broadcasts.lock().unwrap().drain(..));
     }
 
-    // Deliver to every engine (including sender — simplest correct model)
     for (i, engine) in engines.iter_mut().enumerate() {
         for msg in &pending {
             let mut ob = outboxes[i].clone();
@@ -124,25 +201,29 @@ fn drain_and_deliver(
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
-/// 4 validators, 1 block commit without any Byzantine behavior.
+/// 4 validators, 1 block commit without any Byzantine behaviour.
 #[test]
-fn test_single_block_commit() {
-    let keys = make_keypairs(4);
-    let vset = make_vset(&keys);
-    let cfg = fast_config();
+fn test_single_block_commit() -> IntegrationTestResult<()> {
+    let keys = make_keypairs(NUM_VALIDATORS);
+    let vset = make_validator_set(&keys);
+    let config = fast_config();
     let state = KvState::default();
-    let stakes = make_stakes(&keys);
-    let stores: Vec<MemBlockStore> = (0..4).map(|_| MemBlockStore::default()).collect();
+    let stakes = make_stake_ledger(&keys);
+    let stores: Vec<MemBlockStore> = (0..NUM_VALIDATORS)
+        .map(|_| MemBlockStore::default())
+        .collect();
 
     let mut engines: Vec<Engine<Ed25519Verifier>> = keys
         .iter()
         .map(|_| {
             Engine::new(
-                cfg.clone(),
+                config.clone(),
                 vset.clone(),
-                1,
+                GENESIS_HEIGHT,
                 Hash32::zero(),
                 state.clone(),
                 stakes.clone(),
@@ -151,45 +232,50 @@ fn test_single_block_commit() {
         })
         .collect();
 
-    let mut outboxes: Vec<RecordingOutbox> = (0..4)
+    let mut outboxes: Vec<RecordingOutbox> = (0..NUM_VALIDATORS)
         .map(|_| RecordingOutbox {
             store: stores[0].clone(),
             ..Default::default()
         })
         .collect();
 
-    // Tick the proposer — it will produce a proposal
     let proposer_idx = vset
         .vals
         .iter()
         .position(|v| v.pk == keys[0].public_key())
         .unwrap_or(0);
+
+    // Tick the proposer – it will produce a proposal
     {
         let mut ob = outboxes[proposer_idx].clone();
         engines[proposer_idx].tick(
             &keys[proposer_idx],
             &stores[proposer_idx],
             &mut ob,
-            5001,
+            PROPOSE_TIMEOUT_MS + 1,
             |_| vec![],
         );
     }
 
-    // Deliver messages and run until all commit
-    for _round in 0..10 {
+    let max_rounds = MAX_ROUNDS as u64;
+    for round in 0..max_rounds {
         drain_and_deliver(&mut engines, &mut outboxes, &stores, &keys);
         if engines.iter().all(|e| e.state.decided.is_some()) {
             break;
         }
         // Tick all to advance timeouts if needed
-        for i in 0..4 {
+        for i in 0..NUM_VALIDATORS {
             let mut ob = outboxes[i].clone();
             engines[i].tick(&keys[i], &stores[i], &mut ob, 100, |_| vec![]);
         }
         drain_and_deliver(&mut engines, &mut outboxes, &stores, &keys);
+
+        if round == max_rounds - 1 {
+            return Err(IntegrationTestError::Timeout { rounds: max_rounds });
+        }
     }
 
-    // All 4 validators must have decided
+    // All validators must have decided
     for (i, engine) in engines.iter().enumerate() {
         assert!(engine.state.decided.is_some(), "engine {i} did not commit");
     }
@@ -205,18 +291,21 @@ fn test_single_block_commit() {
         block_ids
     );
 
-    // All commits must be at height 1
+    // All commits must be at the genesis height
     for engine in &engines {
-        assert_eq!(engine.state.decided.as_ref().unwrap().height, 1);
+        assert_eq!(engine.state.decided.as_ref().unwrap().height, GENESIS_HEIGHT);
     }
+
+    Ok(())
 }
 
 /// Deterministic block ID: same header → same ID.
 #[test]
 fn test_block_id_deterministic() {
     use iona::types::BlockHeader;
+
     let header = BlockHeader {
-        height: 1,
+        height: GENESIS_HEIGHT,
         round: 0,
         prev: Hash32::zero(),
         proposer_pk: vec![0u8; 32],
@@ -229,7 +318,7 @@ fn test_block_id_deterministic() {
         exec_gas_used: 0,
         vm_gas_used: 0,
         evm_gas_used: 0,
-        chain_id: 6126151,
+        chain_id: TEST_CHAIN_ID,
         timestamp: 0,
         protocol_version: 1,
     };
@@ -238,13 +327,13 @@ fn test_block_id_deterministic() {
         txs: vec![],
     };
     let block2 = Block {
-        header: header.clone(),
+        header,
         txs: vec![],
     };
     assert_eq!(block1.id(), block2.id(), "block ID not deterministic");
 }
 
-/// tx_hash: same tx content → same hash regardless of insertion order.
+/// `tx_hash`: same transaction content → same hash regardless of insertion order.
 #[test]
 fn test_tx_hash_deterministic() {
     let tx = Tx {
@@ -266,45 +355,45 @@ fn test_tx_hash_deterministic() {
 /// State Merkle root: same KV content → same root regardless of insertion order.
 #[test]
 fn test_merkle_root_deterministic() {
-    let mut s1 = KvState::default();
-    s1.kv.insert("a".into(), "1".into());
-    s1.kv.insert("b".into(), "2".into());
-    s1.balances.insert("addr".into(), 100);
+    let mut state1 = KvState::default();
+    state1.kv.insert("a".into(), "1".into());
+    state1.kv.insert("b".into(), "2".into());
+    state1.balances.insert("addr".into(), 100);
 
-    let mut s2 = KvState::default();
-    s2.balances.insert("addr".into(), 100);
-    s2.kv.insert("b".into(), "2".into());
-    s2.kv.insert("a".into(), "1".into());
+    let mut state2 = KvState::default();
+    state2.balances.insert("addr".into(), 100);
+    state2.kv.insert("b".into(), "2".into());
+    state2.kv.insert("a".into(), "1".into());
 
-    assert_eq!(s1.root(), s2.root(), "Merkle root not deterministic");
+    assert_eq!(state1.root(), state2.root(), "Merkle root not deterministic");
 }
 
 /// State Merkle root: different values → different root.
 #[test]
 fn test_merkle_root_sensitive() {
-    let mut s1 = KvState::default();
-    s1.kv.insert("k".into(), "v1".into());
-    let mut s2 = KvState::default();
-    s2.kv.insert("k".into(), "v2".into());
-    assert_ne!(s1.root(), s2.root());
+    let mut state1 = KvState::default();
+    state1.kv.insert("k".into(), "v1".into());
+    let mut state2 = KvState::default();
+    state2.kv.insert("k".into(), "v2".into());
+    assert_ne!(state1.root(), state2.root());
 }
 
-/// EIP-1559 base fee: fills up → fee goes up; empty → fee goes down.
+/// EIP‑1559 base fee: full block → fee increases; empty block → fee decreases.
 #[test]
 fn test_base_fee_adjustment() {
     let base = 100u64;
-    let target = 1_000_000u64;
+    let target = GAS_TARGET;
 
-    let full = next_base_fee(base, target * 2, target); // full block
-    let empty = next_base_fee(base, 0, target); // empty block
+    let full = next_base_fee(base, target * 2, target);
+    let empty = next_base_fee(base, 0, target);
 
     assert!(full > base, "full block should increase base fee");
     assert!(empty < base, "empty block should decrease base fee");
 }
 
-/// Mempool: nonce ordering — must drain in ascending nonce order per sender.
+/// Mempool: nonce ordering – must drain in ascending nonce order per sender.
 #[test]
-fn test_mempool_nonce_ordering() {
+fn test_mempool_nonce_ordering() -> IntegrationTestResult<()> {
     let mut mp = Mempool::new(1000);
     let make_tx = |nonce: u64, tip: u64| Tx {
         pubkey: vec![0u8; 32],
@@ -317,18 +406,21 @@ fn test_mempool_nonce_ordering() {
         signature: vec![0u8; 64],
         chain_id: 1,
     };
-    mp.push(make_tx(2, 10)).unwrap();
-    mp.push(make_tx(0, 10)).unwrap();
-    mp.push(make_tx(1, 10)).unwrap();
+
+    mp.push(make_tx(2, 10)).map_err(|e| IntegrationTestError::Mempool(e.to_string()))?;
+    mp.push(make_tx(0, 10)).map_err(|e| IntegrationTestError::Mempool(e.to_string()))?;
+    mp.push(make_tx(1, 10)).map_err(|e| IntegrationTestError::Mempool(e.to_string()))?;
+
     let drained = mp.drain_best(3);
     assert_eq!(drained[0].nonce, 0);
     assert_eq!(drained[1].nonce, 1);
     assert_eq!(drained[2].nonce, 2);
+    Ok(())
 }
 
-/// Mempool: RBF — replacement needs ≥10% bump, else rejected.
+/// Mempool: RBF – replacement needs ≥10% bump, otherwise rejected.
 #[test]
-fn test_mempool_rbf() {
+fn test_mempool_rbf() -> IntegrationTestResult<()> {
     let mut mp = Mempool::new(1000);
     let make_tx = |tip: u64| Tx {
         pubkey: vec![0u8; 32],
@@ -341,18 +433,23 @@ fn test_mempool_rbf() {
         signature: vec![0u8; 64],
         chain_id: 1,
     };
-    mp.push(make_tx(100)).unwrap();
+
+    mp.push(make_tx(100)).map_err(|e| IntegrationTestError::Mempool(e.to_string()))?;
     assert!(
         mp.push(make_tx(100)).is_err(),
         "same tip should be rejected"
     );
-    assert!(mp.push(make_tx(110)).is_ok(), "10% bump should be accepted");
+    assert!(
+        mp.push(make_tx(110)).is_ok(),
+        "10% bump should be accepted"
+    );
     assert_eq!(mp.metrics.rbf_replaced, 1);
+    Ok(())
 }
 
 /// Mempool: TTL expiry.
 #[test]
-fn test_mempool_ttl() {
+fn test_mempool_ttl() -> IntegrationTestResult<()> {
     let mut mp = Mempool::new(1000);
     let tx = Tx {
         pubkey: vec![0u8; 32],
@@ -365,20 +462,22 @@ fn test_mempool_ttl() {
         signature: vec![0u8; 64],
         chain_id: 1,
     };
-    mp.push(tx).unwrap();
+    mp.push(tx).map_err(|e| IntegrationTestError::Mempool(e.to_string()))?;
     assert_eq!(mp.len(), 1);
-    mp.advance_height(10_000); // way past TTL
+    mp.advance_height(10_000);
     assert_eq!(mp.len(), 0);
     assert_eq!(mp.metrics.expired, 1);
+    Ok(())
 }
 
 /// Block verification: modified block rejected, original accepted.
 #[test]
 fn test_verify_block_tamper() {
     use iona::execution::build_block;
+
     let state = KvState::default();
     let (block, _next_state, _receipts) = build_block(
-        1,
+        GENESIS_HEIGHT,
         0,
         Hash32::zero(),
         vec![0u8; 32],
@@ -387,13 +486,13 @@ fn test_verify_block_tamper() {
         1,
         vec![],
     );
+
     // Valid block passes
     assert!(
         verify_block(&state, &block, "proposer").is_some(),
         "valid block should pass"
     );
 
-    // Tampered state root fails
     let mut tampered = block.clone();
     tampered.header.state_root = Hash32([99u8; 32]);
     assert!(
@@ -401,16 +500,15 @@ fn test_verify_block_tamper() {
         "tampered state root should fail"
     );
 
-    // Tampered gas_used fails
-    let mut tampered2 = block.clone();
+    let mut tampered2 = block;
     tampered2.header.gas_used += 1;
     assert!(
         verify_block(&state, &tampered2, "proposer").is_none(),
-        "tampered gas_used should fail"
+        "tampered gas used should fail"
     );
 }
 
-/// verify_block_with_vset: wrong proposer_pk rejected.
+/// `verify_block_with_vset`: wrong proposer key rejected.
 #[test]
 fn test_verify_block_wrong_proposer() {
     use iona::crypto::PublicKeyBytes;
@@ -421,7 +519,7 @@ fn test_verify_block_wrong_proposer() {
     let fake_pk = vec![2u8; 32];
 
     let (block, _, _) = build_block(
-        1,
+        GENESIS_HEIGHT,
         0,
         Hash32::zero(),
         real_pk.clone(),
@@ -437,31 +535,31 @@ fn test_verify_block_wrong_proposer() {
     assert!(verify_block_with_vset(&state, &block, "proposer", &correct).is_some());
     assert!(
         verify_block_with_vset(&state, &block, "proposer", &wrong).is_none(),
-        "block with wrong proposer_pk should be rejected"
+        "block with wrong proposer should be rejected"
     );
 }
 
-/// WAL: write + replay round-trips events.
+/// WAL: write + replay round‑trips events.
 #[test]
-fn test_wal_roundtrip() {
+fn test_wal_roundtrip() -> IntegrationTestResult<()> {
     use iona::wal::{Wal, WalEvent};
-    let dir = tempfile::tempdir().unwrap();
-    let wal_path = dir.path().to_str().unwrap();
+
+    let dir = TempDir::new()?;
+    let path = dir.path();
     {
-        let mut wal = Wal::open(wal_path).unwrap();
+        let mut wal = Wal::open(path)?;
         wal.append(&WalEvent::Note {
             msg: "hello".into(),
-        })
-        .unwrap();
+        })?;
         wal.append(&WalEvent::Step {
             height: 5,
             round: 0,
             step: "Propose".into(),
-        })
-        .unwrap();
+        })?;
     }
-    let events = Wal::replay(wal_path).unwrap();
+    let events = Wal::replay(path)?;
     assert_eq!(events.len(), 2);
     assert!(matches!(&events[0], WalEvent::Note { msg } if msg == "hello"));
     assert!(matches!(&events[1], WalEvent::Step { height: 5, .. }));
+    Ok(())
 }
