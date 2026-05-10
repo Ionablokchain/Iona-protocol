@@ -12,6 +12,7 @@
 //!   F. Batch size limits
 //!   G. Error response opacity (no internal leaks)
 //!   H. Request-ID uniqueness
+//!   I. Metrics snapshot
 
 use iona::rpc_limits::{
     new_request_id, validate_batch_size, validate_body_size, validate_tx, RpcLimitResult,
@@ -21,27 +22,70 @@ use iona::rpc_limits::{
 use iona::types::Tx;
 use std::net::{IpAddr, Ipv4Addr};
 
-// ── Helpers ───────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
 
-fn ip(a: u8) -> IpAddr {
-    IpAddr::V4(Ipv4Addr::new(10, 0, 0, a))
+/// Test IP address octets (different for each test to avoid interference).
+const BASE_IP_OCTET: u8 = 10;
+
+/// Public key length for a valid transaction (Ed25519 = 32 bytes).
+const VALID_PUBKEY_LEN: usize = 32;
+
+/// Valid signature length for a transaction (Ed25519 = 64 bytes).
+const VALID_SIG_LEN: usize = 64;
+
+/// Valid chain ID used in transaction tests.
+const VALID_CHAIN_ID: u64 = 1;
+
+/// Valid gas limit for transaction tests.
+const VALID_GAS_LIMIT: u64 = 21_000;
+
+/// Valid max fee per gas for transaction tests.
+const VALID_MAX_FEE: u64 = 1;
+
+/// Valid max priority fee per gas for transaction tests.
+const VALID_MAX_PRIORITY_FEE: u64 = 1;
+
+/// Confirmed nonce for nonce gap tests.
+const CONFIRMED_NONCE: u64 = 5;
+
+/// Future nonce for queue tests.
+const FUTURE_NONCE: u64 = 10;
+
+/// Number of request IDs to generate for uniqueness test.
+const UNIQUE_ID_COUNT: usize = 500;
+
+/// Over‑sized body length for payload tests.
+const OVERSIZED_BODY_LEN: usize = 1_000_000;
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+/// Create a test IP address with the given trailing octet.
+fn test_ip(octet: u8) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(BASE_IP_OCTET, 0, 0, octet))
 }
 
-fn minimal_tx(chain_id: u64, nonce: u64, gas: u64, fee: u64, payload: &str) -> Tx {
+/// Create a minimal valid transaction with customizable fields.
+fn minimal_tx(chain_id: u64, nonce: u64, gas_limit: u64, max_fee: u64, payload: &str) -> Tx {
     Tx {
-        pubkey: vec![0u8; 32],
+        pubkey: vec![0u8; VALID_PUBKEY_LEN],
         from: "alice".into(),
         nonce,
-        max_fee_per_gas: fee,
-        max_priority_fee_per_gas: 1,
-        gas_limit: gas,
+        max_fee_per_gas: max_fee,
+        max_priority_fee_per_gas: VALID_MAX_PRIORITY_FEE,
+        gas_limit,
         payload: payload.to_string(),
-        signature: vec![0u8; 64],
+        signature: vec![0u8; VALID_SIG_LEN],
         chain_id,
     }
 }
 
-// ── A. Body size limits ───────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// A. Body size limits
+// -----------------------------------------------------------------------------
 
 #[test]
 fn reject_body_exactly_one_byte_over_limit() {
@@ -59,10 +103,10 @@ fn reject_body_exactly_one_byte_over_limit() {
 
 #[test]
 fn reject_body_far_over_limit() {
-    let body = vec![0u8; 1_000_000]; // 1 MB
+    let body = vec![0u8; OVERSIZED_BODY_LEN];
     assert!(
         validate_body_size(&body, MAX_BODY_BYTES).is_err(),
-        "1 MB body must be rejected"
+        "1 MB body must be rejected"
     );
 }
 
@@ -80,97 +124,97 @@ fn allow_empty_body() {
     assert!(validate_body_size(&[], MAX_BODY_BYTES).is_ok());
 }
 
-// ── B. Input validation ───────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// B. Input validation
+// -----------------------------------------------------------------------------
 
 #[test]
 fn reject_tx_payload_too_long() {
     let payload = "x".repeat(MAX_BODY_BYTES + 1);
-    let tx = minimal_tx(1, 0, 21000, 1, &payload);
-    let err = validate_tx(&tx, 1, 0).unwrap_err();
+    let tx = minimal_tx(VALID_CHAIN_ID, 0, VALID_GAS_LIMIT, VALID_MAX_FEE, &payload);
+    let err = validate_tx(&tx, VALID_CHAIN_ID, 0).unwrap_err();
     assert!(matches!(err, ValidationError::PayloadTooLong { .. }));
 }
 
 #[test]
 fn reject_tx_zero_gas_limit() {
-    let tx = minimal_tx(1, 0, 0, 1, "ok");
+    let tx = minimal_tx(VALID_CHAIN_ID, 0, 0, VALID_MAX_FEE, "ok");
     assert!(matches!(
-        validate_tx(&tx, 1, 0).unwrap_err(),
+        validate_tx(&tx, VALID_CHAIN_ID, 0).unwrap_err(),
         ValidationError::GasLimitZero
     ));
 }
 
 #[test]
 fn reject_tx_zero_max_fee() {
-    let tx = minimal_tx(1, 0, 21000, 0, "ok");
+    let tx = minimal_tx(VALID_CHAIN_ID, 0, VALID_GAS_LIMIT, 0, "ok");
     assert!(matches!(
-        validate_tx(&tx, 1, 0).unwrap_err(),
+        validate_tx(&tx, VALID_CHAIN_ID, 0).unwrap_err(),
         ValidationError::MaxFeeZero
     ));
 }
 
 #[test]
 fn reject_tx_wrong_chain_id() {
-    let tx = minimal_tx(9999, 0, 21000, 1, "ok");
-    let err = validate_tx(&tx, 1, 0).unwrap_err();
+    let wrong_chain = VALID_CHAIN_ID + 9998;
+    let tx = minimal_tx(wrong_chain, 0, VALID_GAS_LIMIT, VALID_MAX_FEE, "ok");
+    let err = validate_tx(&tx, VALID_CHAIN_ID, 0).unwrap_err();
     assert!(matches!(
         err,
         ValidationError::ChainIdMismatch {
-            got: 9999,
-            expected: 1
+            got: wrong_chain,
+            expected: VALID_CHAIN_ID
         }
     ));
 }
 
 #[test]
 fn reject_tx_nonce_in_past() {
-    let tx = minimal_tx(1, 2, 21000, 1, "ok");
-    // Confirmed nonce is 5, tx nonce is 2 → gap
-    let err = validate_tx(&tx, 1, 5).unwrap_err();
+    let tx = minimal_tx(VALID_CHAIN_ID, 2, VALID_GAS_LIMIT, VALID_MAX_FEE, "ok");
+    let err = validate_tx(&tx, VALID_CHAIN_ID, CONFIRMED_NONCE).unwrap_err();
     assert!(matches!(err, ValidationError::NonceGap { .. }));
 }
 
 #[test]
 fn allow_tx_nonce_equal_to_confirmed() {
-    let tx = minimal_tx(1, 5, 21000, 1, "ok");
-    assert!(validate_tx(&tx, 1, 5).is_ok());
+    let tx = minimal_tx(VALID_CHAIN_ID, CONFIRMED_NONCE, VALID_GAS_LIMIT, VALID_MAX_FEE, "ok");
+    assert!(validate_tx(&tx, VALID_CHAIN_ID, CONFIRMED_NONCE).is_ok());
 }
 
 #[test]
 fn allow_tx_nonce_ahead_of_confirmed() {
-    let tx = minimal_tx(1, 10, 21000, 1, "ok");
+    let tx = minimal_tx(VALID_CHAIN_ID, FUTURE_NONCE, VALID_GAS_LIMIT, VALID_MAX_FEE, "ok");
     assert!(
-        validate_tx(&tx, 1, 5).is_ok(),
+        validate_tx(&tx, VALID_CHAIN_ID, CONFIRMED_NONCE).is_ok(),
         "future nonce should be queued"
     );
 }
 
 #[test]
 fn reject_tx_pubkey_too_long() {
-    let mut tx = minimal_tx(1, 0, 21000, 1, "ok");
-    tx.pubkey = vec![0u8; 65]; // > 64
+    let mut tx = minimal_tx(VALID_CHAIN_ID, 0, VALID_GAS_LIMIT, VALID_MAX_FEE, "ok");
+    tx.pubkey = vec![0u8; VALID_PUBKEY_LEN * 2 + 1]; // > 64
     assert!(matches!(
-        validate_tx(&tx, 1, 0).unwrap_err(),
+        validate_tx(&tx, VALID_CHAIN_ID, 0).unwrap_err(),
         ValidationError::PubkeyTooLong
     ));
 }
 
-// ── C. Rate limiting ──────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// C. Rate limiting
+// -----------------------------------------------------------------------------
 
 #[test]
 fn rate_limit_submit_after_burst_exhausted() {
     let limiter = RpcLimiter::new();
-    let peer = ip(1);
-    // Drain the burst bucket.
+    let peer = test_ip(1);
     for _ in 0..SUBMIT_RATE_PER_SEC {
         limiter.check_submit(peer, "req");
     }
     let result = limiter.check_submit(peer, "req-overflow");
     assert!(
-        matches!(
-            result,
-            RpcLimitResult::RateLimited | RpcLimitResult::Blocked
-        ),
-        "must be rate-limited after burst, got {result:?}"
+        matches!(result, RpcLimitResult::RateLimited | RpcLimitResult::Blocked),
+        "must be rate‑limited after burst, got {result:?}"
     );
 }
 
@@ -178,7 +222,7 @@ fn rate_limit_submit_after_burst_exhausted() {
 fn rate_limit_increments_metric() {
     use std::sync::atomic::Ordering;
     let limiter = RpcLimiter::new();
-    let peer = ip(2);
+    let peer = test_ip(2);
     for _ in 0..SUBMIT_RATE_PER_SEC {
         limiter.check_submit(peer, "req");
     }
@@ -193,21 +237,28 @@ fn rate_limit_increments_metric() {
 #[test]
 fn independent_ips_do_not_interfere() {
     let limiter = RpcLimiter::new();
-    // Drain ip(3)'s budget.
+    let ip_a = test_ip(3);
+    let ip_b = test_ip(4);
+    // Drain ip_a's budget
     for _ in 0..SUBMIT_RATE_PER_SEC {
-        limiter.check_submit(ip(3), "req");
+        limiter.check_submit(ip_a, "req");
     }
-    // ip(4) must be unaffected.
-    assert_eq!(limiter.check_submit(ip(4), "req"), RpcLimitResult::Allowed);
+    // ip_b must be unaffected
+    assert_eq!(
+        limiter.check_submit(ip_b, "req"),
+        RpcLimitResult::Allowed
+    );
 }
 
-// ── D. IP quarantine/ban escalation ──────────────────────────────────────
+// -----------------------------------------------------------------------------
+// D. IP quarantine/ban escalation
+// -----------------------------------------------------------------------------
 
 #[test]
 fn decode_error_penalises_streak() {
     use std::sync::atomic::Ordering;
     let limiter = RpcLimiter::new();
-    let peer = ip(10);
+    let peer = test_ip(10);
     limiter.record_decode_error(peer, "req");
     assert_eq!(limiter.metric_decode_errors.load(Ordering::Relaxed), 1);
 }
@@ -216,7 +267,7 @@ fn decode_error_penalises_streak() {
 fn payload_too_large_penalises_streak() {
     use std::sync::atomic::Ordering;
     let limiter = RpcLimiter::new();
-    let peer = ip(11);
+    let peer = test_ip(11);
     limiter.record_payload_too_large(peer, "req", MAX_BODY_BYTES + 1024);
     assert_eq!(limiter.metric_payload_too_large.load(Ordering::Relaxed), 1);
 }
@@ -224,23 +275,21 @@ fn payload_too_large_penalises_streak() {
 #[test]
 fn repeated_violations_escalate_to_quarantine() {
     let limiter = RpcLimiter::new();
-    let peer = ip(20);
-    // Drain burst + trigger enough violations for quarantine.
-    for _ in 0..(SUBMIT_RATE_PER_SEC + VIOLATIONS_BEFORE_QUARANTINE + 5) {
+    let peer = test_ip(20);
+    let total_requests = SUBMIT_RATE_PER_SEC + VIOLATIONS_BEFORE_QUARANTINE + 5;
+    for _ in 0..total_requests {
         limiter.check_submit(peer, "req");
     }
-    // Should now be quarantined or banned.
     let result = limiter.check_submit(peer, "req-after");
     assert!(
-        matches!(
-            result,
-            RpcLimitResult::RateLimited | RpcLimitResult::Blocked
-        ),
+        matches!(result, RpcLimitResult::RateLimited | RpcLimitResult::Blocked),
         "IP should be quarantined after sustained violations, got {result:?}"
     );
 }
 
-// ── E. Concurrency cap ────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// E. Concurrency cap
+// -----------------------------------------------------------------------------
 
 #[test]
 fn concurrency_cap_enforced() {
@@ -253,7 +302,7 @@ fn concurrency_cap_enforced() {
                 .expect("slot must be available"),
         );
     }
-    // At cap — next must fail.
+    // At cap – next must fail.
     assert!(
         limiter.try_concurrency_slot("req-overflow").is_none(),
         "concurrency cap must reject at {MAX_CONCURRENT_REQUESTS}"
@@ -270,9 +319,10 @@ fn concurrency_cap_enforced() {
 fn concurrency_metric_increments_on_rejection() {
     use std::sync::atomic::Ordering;
     let limiter = RpcLimiter::new();
-    let mut tickets: Vec<_> = (0..MAX_CONCURRENT_REQUESTS)
-        .map(|_| limiter.try_concurrency_slot("req").unwrap())
-        .collect();
+    let mut tickets = Vec::new();
+    for _ in 0..MAX_CONCURRENT_REQUESTS {
+        tickets.push(limiter.try_concurrency_slot("req").unwrap());
+    }
     limiter.try_concurrency_slot("req-over");
     assert_eq!(
         limiter.metric_concurrency_rejected.load(Ordering::Relaxed),
@@ -281,7 +331,9 @@ fn concurrency_metric_increments_on_rejection() {
     drop(tickets);
 }
 
-// ── F. Batch size limits ──────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// F. Batch size limits
+// -----------------------------------------------------------------------------
 
 #[test]
 fn batch_exactly_at_limit_allowed() {
@@ -299,11 +351,13 @@ fn batch_zero_allowed() {
     assert!(validate_batch_size(0).is_ok());
 }
 
-// ── G. Error response opacity ─────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// G. Error response opacity
+// -----------------------------------------------------------------------------
 
 #[test]
 fn error_messages_contain_no_src_paths() {
-    let errors = vec![
+    let errors: Vec<ValidationError> = vec![
         ValidationError::PayloadTooLong {
             len: 9999,
             max: 4096,
@@ -337,25 +391,26 @@ fn error_messages_contain_no_src_paths() {
 
 #[test]
 fn validation_error_display_is_safe() {
-    // Every error variant must produce a non-empty, non-whitespace-only message.
-    let errs: Vec<Box<dyn std::fmt::Display>> = vec![
-        Box::new(ValidationError::PayloadTooLong { len: 1, max: 0 }),
-        Box::new(ValidationError::InvalidUtf8),
-        Box::new(ValidationError::PubkeyTooLong),
-        Box::new(ValidationError::GasLimitZero),
-        Box::new(ValidationError::MaxFeeZero),
+    let errors: Vec<ValidationError> = vec![
+        ValidationError::PayloadTooLong { len: 1, max: 0 },
+        ValidationError::InvalidUtf8,
+        ValidationError::PubkeyTooLong,
+        ValidationError::GasLimitZero,
+        ValidationError::MaxFeeZero,
     ];
-    for e in errs {
-        let s = e.to_string();
+    for err in &errors {
+        let s = err.to_string();
         assert!(!s.trim().is_empty(), "error display must not be empty");
     }
 }
 
-// ── H. Request-ID uniqueness ─────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// H. Request‑ID uniqueness
+// -----------------------------------------------------------------------------
 
 #[test]
 fn request_ids_are_unique() {
-    let ids: Vec<_> = (0..500).map(|_| new_request_id()).collect();
+    let ids: Vec<_> = (0..UNIQUE_ID_COUNT).map(|_| new_request_id()).collect();
     let set: std::collections::HashSet<_> = ids.iter().cloned().collect();
     assert_eq!(ids.len(), set.len(), "all request IDs must be unique");
 }
@@ -363,14 +418,15 @@ fn request_ids_are_unique() {
 #[test]
 fn request_id_format_is_safe() {
     let id = new_request_id();
-    // Must not contain slashes, quotes, or JSON special chars.
     assert!(!id.contains('/'));
     assert!(!id.contains('"'));
     assert!(!id.contains('{'));
     assert!(id.starts_with("req-"), "ID must start with req-");
 }
 
-// ── I. Metrics snapshot ───────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// I. Metrics snapshot
+// -----------------------------------------------------------------------------
 
 #[test]
 fn metrics_snapshot_starts_at_zero() {
