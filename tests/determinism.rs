@@ -15,14 +15,33 @@ use iona::types::{
     hash_bytes, receipts_root, tx_hash, tx_root, Block, BlockHeader, Hash32, Receipt, Tx,
 };
 
-// ── Golden vectors ───────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
 
-/// blake3("IONA_DETERMINISM_TEST") — computed once, frozen forever.
-const GOLDEN_HASH_HEX: &str = "a]PLACEHOLDER"; // Will be computed below
+/// Test message used for golden hash.
+const TEST_MESSAGE: &[u8] = b"IONA_DETERMINISM_TEST";
 
-/// tx_hash of a canonical test transaction.
-const GOLDEN_TX_HASH_HEX: &str = "b]PLACEHOLDER";
+/// Canonical chain ID used in test transactions.
+const TEST_CHAIN_ID: u64 = 6126151;
 
+/// Canonical gas limit.
+const TEST_GAS_LIMIT: u64 = 21_000;
+
+/// Canonical block height.
+const TEST_BLOCK_HEIGHT: u64 = 1;
+
+/// Canonical block round.
+const TEST_BLOCK_ROUND: u32 = 0;
+
+/// Canonical block timestamp.
+const TEST_BLOCK_TIMESTAMP: u64 = 1000;
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+/// Canonical test transaction used across multiple determinism tests.
 fn canonical_tx() -> Tx {
     Tx {
         pubkey: vec![1u8; 32],
@@ -30,19 +49,20 @@ fn canonical_tx() -> Tx {
         nonce: 42,
         max_fee_per_gas: 100,
         max_priority_fee_per_gas: 10,
-        gas_limit: 21_000,
+        gas_limit: TEST_GAS_LIMIT,
         payload: "set key value".into(),
         signature: vec![0u8; 64],
-        chain_id: 6126151,
+        chain_id: TEST_CHAIN_ID,
     }
 }
 
+/// Canonical test receipt used for receipts root tests.
 fn canonical_receipt() -> Receipt {
     Receipt {
         tx_hash: Hash32([0xAA; 32]),
         success: true,
-        gas_used: 21_000,
-        intrinsic_gas_used: 21_000,
+        gas_used: TEST_GAS_LIMIT,
+        intrinsic_gas_used: TEST_GAS_LIMIT,
         exec_gas_used: 0,
         vm_gas_used: 0,
         evm_gas_used: 0,
@@ -54,20 +74,45 @@ fn canonical_receipt() -> Receipt {
     }
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
+/// Create a minimal block header for ID determinism tests.
+fn test_block_header() -> BlockHeader {
+    BlockHeader {
+        height: TEST_BLOCK_HEIGHT,
+        round: TEST_BLOCK_ROUND,
+        prev: Hash32::zero(),
+        proposer_pk: vec![0u8; 32],
+        tx_root: Hash32::zero(),
+        receipts_root: Hash32::zero(),
+        state_root: Hash32::zero(),
+        base_fee_per_gas: 1,
+        gas_used: 0,
+        intrinsic_gas_used: 0,
+        exec_gas_used: 0,
+        vm_gas_used: 0,
+        evm_gas_used: 0,
+        chain_id: TEST_CHAIN_ID,
+        timestamp: TEST_BLOCK_TIMESTAMP,
+        protocol_version: 1,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Core hash determinism
+// -----------------------------------------------------------------------------
 
 #[test]
 fn determinism_hash_bytes_stable() {
-    let h = hash_bytes(b"IONA_DETERMINISM_TEST");
-    let hex_str = hex::encode(&h.0);
-    // First run: print the value so we can freeze it.
-    // After freezing, uncomment the assert and remove the println.
-    println!("hash_bytes golden: {hex_str}");
+    let h1 = hash_bytes(TEST_MESSAGE);
+    let h2 = hash_bytes(TEST_MESSAGE);
+    assert_eq!(h1, h2, "hash_bytes is not deterministic across calls");
 
-    // Re-compute: must be identical.
-    let h2 = hash_bytes(b"IONA_DETERMINISM_TEST");
-    assert_eq!(h, h2, "hash_bytes is not deterministic across calls");
+    let hex_str = hex::encode(&h1.0);
+    println!("hash_bytes golden: {hex_str}");
 }
+
+// -----------------------------------------------------------------------------
+// Transaction hash determinism
+// -----------------------------------------------------------------------------
 
 #[test]
 fn determinism_tx_hash_stable() {
@@ -79,6 +124,10 @@ fn determinism_tx_hash_stable() {
     let hex_str = hex::encode(&h1.0);
     println!("tx_hash golden: {hex_str}");
 }
+
+// -----------------------------------------------------------------------------
+// Transaction root determinism
+// -----------------------------------------------------------------------------
 
 #[test]
 fn determinism_tx_root_empty() {
@@ -95,6 +144,10 @@ fn determinism_tx_root_with_txs() {
     assert_eq!(r1, r2, "tx_root is not deterministic");
 }
 
+// -----------------------------------------------------------------------------
+// Receipts root determinism
+// -----------------------------------------------------------------------------
+
 #[test]
 fn determinism_receipts_root_stable() {
     let receipts = vec![canonical_receipt()];
@@ -103,26 +156,13 @@ fn determinism_receipts_root_stable() {
     assert_eq!(r1, r2, "receipts_root is not deterministic");
 }
 
+// -----------------------------------------------------------------------------
+// Block ID determinism
+// -----------------------------------------------------------------------------
+
 #[test]
 fn determinism_block_id_stable() {
-    let header = BlockHeader {
-        height: 1,
-        round: 0,
-        prev: Hash32::zero(),
-        proposer_pk: vec![0u8; 32],
-        tx_root: Hash32::zero(),
-        receipts_root: Hash32::zero(),
-        state_root: Hash32::zero(),
-        base_fee_per_gas: 1,
-        gas_used: 0,
-        intrinsic_gas_used: 0,
-        exec_gas_used: 0,
-        vm_gas_used: 0,
-        evm_gas_used: 0,
-        chain_id: 6126151,
-        timestamp: 1000,
-        protocol_version: 1,
-    };
+    let header = test_block_header();
     let block = Block {
         header,
         txs: vec![],
@@ -134,6 +174,10 @@ fn determinism_block_id_stable() {
     let hex_str = hex::encode(&id1.0);
     println!("block_id golden: {hex_str}");
 }
+
+// -----------------------------------------------------------------------------
+// State root insertion‑order independence
+// -----------------------------------------------------------------------------
 
 #[test]
 fn determinism_state_root_order_independent() {
@@ -156,7 +200,9 @@ fn determinism_state_root_order_independent() {
     );
 }
 
-// ── Cross-migration equivalence tests (UPGRADE_SPEC section 10.2) ───────────
+// -----------------------------------------------------------------------------
+// Migration invariants (UPGRADE_SPEC section 10.2)
+// -----------------------------------------------------------------------------
 
 /// M3 equivalence: state root must be identical before and after a
 /// format-only migration (no semantic changes).
@@ -164,7 +210,6 @@ fn determinism_state_root_order_independent() {
 fn determinism_migration_root_equivalence() {
     use iona::execution::KvState;
 
-    // Build a state with balances, nonces, KV entries.
     let mut state = KvState::default();
     state.balances.insert("alice".into(), 1_000_000);
     state.balances.insert("bob".into(), 500_000);
@@ -174,19 +219,17 @@ fn determinism_migration_root_equivalence() {
 
     let root_before = state.root();
 
-    // Simulate a "format-only" migration: clone the state (as if re-serialized
-    // in a different format) and verify the root is identical.
     let state_after: KvState =
         serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
-
     let root_after = state_after.root();
+
     assert_eq!(
         root_before, root_after,
         "state root changed after format-only migration (M3 violation)"
     );
 }
 
-/// M1 invariant: migration must not lose account keys.
+/// M1 invariant: migration must not lose account or KV keys.
 #[test]
 fn determinism_migration_no_key_loss() {
     use iona::execution::KvState;
@@ -201,7 +244,6 @@ fn determinism_migration_no_key_loss() {
     let keys_before: Vec<String> = state.balances.keys().cloned().collect();
     let kv_keys_before: Vec<String> = state.kv.keys().cloned().collect();
 
-    // Simulate migration via serialize/deserialize
     let migrated: KvState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
 
     let keys_after: Vec<String> = migrated.balances.keys().cloned().collect();
@@ -227,18 +269,21 @@ fn determinism_migration_value_conservation() {
     state.balances.insert("bob".into(), 500_000);
     state.burned = 50_000;
 
-    let supply_before: u64 = state.balances.values().sum::<u64>() + state.burned;
+    let supply_before = state.balances.values().sum::<u64>() + state.burned;
 
-    // Simulate migration
     let migrated: KvState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+    let supply_after = migrated.balances.values().sum::<u64>() + migrated.burned;
 
-    let supply_after: u64 = migrated.balances.values().sum::<u64>() + migrated.burned;
-
-    assert_eq!(supply_before, supply_after,
-        "total supply changed during migration (M2 violation): before={supply_before}, after={supply_after}");
+    assert_eq!(
+        supply_before, supply_after,
+        "total supply changed during migration (M2 violation): before={supply_before}, after={supply_after}"
+    );
 }
 
-/// PV function determinism: same inputs always produce same PV.
+// -----------------------------------------------------------------------------
+// Protocol version function determinism
+// -----------------------------------------------------------------------------
+
 #[test]
 fn determinism_pv_function_stable() {
     use iona::protocol::version::{version_for_height, ProtocolActivation};
@@ -256,7 +301,6 @@ fn determinism_pv_function_stable() {
         },
     ];
 
-    // Compute PV for many heights, verify stability
     for height in [0, 1, 50, 99, 100, 105, 110, 200] {
         let pv1 = version_for_height(height, &activations);
         let pv2 = version_for_height(height, &activations);
