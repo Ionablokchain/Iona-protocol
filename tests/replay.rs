@@ -10,82 +10,138 @@ use iona::crypto::Signer;
 use iona::execution::{execute_block, KvState};
 use iona::types::{receipts_root, tx_root, Block, BlockHeader, Hash32, Tx};
 
-// ── Helpers ──────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
 
+/// Number of test accounts (seeds 1..=NUM_ACCOUNTS).
+const NUM_ACCOUNTS: u64 = 5;
+
+/// Number of senders per block (seeds 1..=NUM_SENDERS_PER_BLOCK).
+const NUM_SENDERS_PER_BLOCK: u64 = 3;
+
+/// Number of blocks in the test chain.
+const NUM_BLOCKS: usize = 20;
+
+/// Number of blocks to skip for snapshot replay (first 10, then replay 11..20).
+const SNAPSHOT_SKIP_BLOCKS: usize = 10;
+
+/// Number of empty blocks to test.
+const NUM_EMPTY_BLOCKS: usize = 5;
+
+/// Number of blocks for receipt determinism test.
+const NUM_RECEIPT_BLOCKS: usize = 10;
+
+/// Number of blocks for serialisation roundtrip test.
+const NUM_SERIALIZATION_BLOCKS: usize = 5;
+
+/// Chain ID used in test transactions.
+const TEST_CHAIN_ID: u64 = 1;
+
+/// Gas limit per transaction.
+const TEST_GAS_LIMIT: u64 = 100_000;
+
+/// Max fee per gas for test transactions.
+const TEST_MAX_FEE: u64 = 10;
+
+/// Max priority fee per gas for test transactions.
+const TEST_MAX_PRIORITY_FEE: u64 = 1;
+
+/// Base fee per gas used in block execution.
+const BASE_FEE_PER_GAS: u64 = 1;
+
+/// Proposer address for block building (placeholder).
+const PROPOSER_ADDR: &str = "proposer_addr";
+
+/// Initial funding amount for each test account.
+const INITIAL_BALANCE: u64 = 10_000_000;
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+/// Create a keypair, its public key bytes, and derived address from a seed.
 fn make_keypair(seed: u64) -> (Ed25519Keypair, Vec<u8>, String) {
     let mut seed_bytes = [0u8; 32];
     seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
     let signer = Ed25519Keypair::from_seed(seed_bytes);
-    let pk = signer.public_key().0;
-    let addr = derive_address(&pk);
-    (signer, pk, addr)
+    let pubkey = signer.public_key().0;
+    let address = derive_address(&pubkey);
+    (signer, pubkey, address)
 }
 
-fn make_signed_tx(signer: &Ed25519Keypair, pk: &[u8], addr: &str, nonce: u64, payload: &str) -> Tx {
+/// Create a signed transaction with the given parameters.
+fn make_signed_tx(
+    signer: &Ed25519Keypair,
+    pubkey: &[u8],
+    address: &str,
+    nonce: u64,
+    payload: &str,
+) -> Tx {
     let mut tx = Tx {
-        from: addr.to_string(),
+        from: address.to_string(),
         nonce,
         payload: payload.to_string(),
-        pubkey: pk.to_vec(),
+        pubkey: pubkey.to_vec(),
         signature: vec![],
-        gas_limit: 100_000,
-        max_fee_per_gas: 10,
-        max_priority_fee_per_gas: 1,
-        chain_id: 1,
+        gas_limit: TEST_GAS_LIMIT,
+        max_fee_per_gas: TEST_MAX_FEE,
+        max_priority_fee_per_gas: TEST_MAX_PRIORITY_FEE,
+        chain_id: TEST_CHAIN_ID,
     };
     let msg = tx_sign_bytes(&tx);
     tx.signature = signer.sign(&msg).0;
     tx
 }
 
+/// Create the genesis state with funded test accounts.
 fn genesis_state() -> KvState {
     let mut state = KvState::default();
-    // Fund test accounts
-    for seed in 1..=5u64 {
-        let (_, _, addr) = make_keypair(seed);
-        state.balances.insert(addr, 10_000_000);
+    for seed in 1..=NUM_ACCOUNTS {
+        let (_, _, address) = make_keypair(seed);
+        state.balances.insert(address, INITIAL_BALANCE);
     }
     state
 }
 
-/// Build a chain of N blocks with transactions.
+/// Build a chain of `n` blocks with transactions from multiple senders.
+/// Returns `(initial_state, vector of (transactions, expected_state_root))`.
 fn build_chain(n: usize) -> (KvState, Vec<(Vec<Tx>, Hash32)>) {
-    let initial = genesis_state();
-    let proposer = "proposer_addr".to_string();
-    let mut state = initial.clone();
+    let initial_state = genesis_state();
+    let mut state = initial_state.clone();
     let mut chain = Vec::new();
 
     for height in 1..=n {
-        // Each block has transactions from different senders
         let mut txs = Vec::new();
-        for sender_seed in 1..=3u64 {
-            let (signer, pk, addr) = make_keypair(sender_seed);
-            let nonce = (height - 1) as u64; // each sender sends 1 tx per block
+        for sender_seed in 1..=NUM_SENDERS_PER_BLOCK {
+            let (signer, pubkey, address) = make_keypair(sender_seed);
+            // Each sender sends one transaction per block, nonce increases by height.
+            let nonce = (height - 1) as u64;
             let payload = format!("set block_{height}_sender_{sender_seed} value_{height}");
-            txs.push(make_signed_tx(&signer, &pk, &addr, nonce, &payload));
+            txs.push(make_signed_tx(&signer, &pubkey, &address, nonce, &payload));
         }
 
-        let (new_state, _gas, _receipts) = execute_block(&state, &txs, 1, &proposer);
+        let (new_state, _gas, _receipts) = execute_block(&state, &txs, BASE_FEE_PER_GAS, PROPOSER_ADDR);
         let root = new_state.root();
         chain.push((txs, root));
         state = new_state;
     }
 
-    (initial, chain)
+    (initial_state, chain)
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 /// Replay the exact same chain twice and verify all state roots match.
 #[test]
 fn replay_chain_deterministic() {
-    let (initial, chain) = build_chain(20);
-    let proposer = "proposer_addr".to_string();
+    let (initial_state, chain) = build_chain(NUM_BLOCKS);
 
-    // Replay
-    let mut state = initial.clone();
+    let mut state = initial_state;
     for (i, (txs, expected_root)) in chain.iter().enumerate() {
-        let (new_state, _gas, _receipts) = execute_block(&state, txs, 1, &proposer);
+        let (new_state, _gas, _receipts) = execute_block(&state, txs, BASE_FEE_PER_GAS, PROPOSER_ADDR);
         let got_root = new_state.root();
         assert_eq!(
             got_root,
@@ -97,29 +153,28 @@ fn replay_chain_deterministic() {
     }
 }
 
-/// Replay from a mid-chain snapshot (simulate crash recovery).
+/// Replay from a mid‑chain snapshot (simulate crash recovery).
 #[test]
 fn replay_from_snapshot() {
-    let (initial, chain) = build_chain(20);
-    let proposer = "proposer_addr".to_string();
+    let (initial_state, chain) = build_chain(NUM_BLOCKS);
 
     // Execute first 10 blocks to get snapshot state
-    let mut snapshot_state = initial.clone();
-    for (txs, _) in chain.iter().take(10) {
-        let (new_state, _, _) = execute_block(&snapshot_state, txs, 1, &proposer);
+    let mut snapshot_state = initial_state;
+    for (txs, _) in chain.iter().take(SNAPSHOT_SKIP_BLOCKS) {
+        let (new_state, _gas, _receipts) = execute_block(&snapshot_state, txs, BASE_FEE_PER_GAS, PROPOSER_ADDR);
         snapshot_state = new_state;
     }
 
     // Replay blocks 11..20 from snapshot
     let mut state = snapshot_state;
-    for (i, (txs, expected_root)) in chain.iter().skip(10).enumerate() {
-        let (new_state, _, _) = execute_block(&state, txs, 1, &proposer);
+    for (i, (txs, expected_root)) in chain.iter().skip(SNAPSHOT_SKIP_BLOCKS).enumerate() {
+        let (new_state, _gas, _receipts) = execute_block(&state, txs, BASE_FEE_PER_GAS, PROPOSER_ADDR);
         let got_root = new_state.root();
         assert_eq!(
             got_root,
             *expected_root,
             "State root mismatch at height {} on replay from snapshot",
-            i + 11
+            i + SNAPSHOT_SKIP_BLOCKS + 1
         );
         state = new_state;
     }
@@ -129,49 +184,47 @@ fn replay_from_snapshot() {
 #[test]
 fn replay_empty_blocks() {
     let state = genesis_state();
-    let proposer = "proposer_addr".to_string();
 
     let mut roots = Vec::new();
-    let mut s = state.clone();
-    for _ in 0..5 {
-        let (new_state, _, _) = execute_block(&s, &[], 1, &proposer);
+    let mut current_state = state.clone();
+    for _ in 0..NUM_EMPTY_BLOCKS {
+        let (new_state, _gas, _receipts) = execute_block(&current_state, &[], BASE_FEE_PER_GAS, PROPOSER_ADDR);
         roots.push(new_state.root());
-        s = new_state;
+        current_state = new_state;
     }
 
-    // Replay
-    let mut s2 = state;
+    // Replay and compare
+    let mut replay_state = state;
     for (i, expected) in roots.iter().enumerate() {
-        let (new_state, _, _) = execute_block(&s2, &[], 1, &proposer);
+        let (new_state, _gas, _receipts) = execute_block(&replay_state, &[], BASE_FEE_PER_GAS, PROPOSER_ADDR);
         assert_eq!(
             new_state.root(),
             *expected,
-            "Empty block root mismatch at {}",
+            "Empty block root mismatch at height {}",
             i
         );
-        s2 = new_state;
+        replay_state = new_state;
     }
 }
 
 /// Verify receipts are deterministic across replays.
 #[test]
 fn replay_receipts_deterministic() {
-    let (initial, chain) = build_chain(10);
-    let proposer = "proposer_addr".to_string();
+    let (initial_state, chain) = build_chain(NUM_RECEIPT_BLOCKS);
 
     // First pass: collect receipts
-    let mut state1 = initial.clone();
+    let mut state1 = initial_state.clone();
     let mut all_receipts1 = Vec::new();
     for (txs, _) in &chain {
-        let (new_state, _, receipts) = execute_block(&state1, txs, 1, &proposer);
+        let (new_state, _gas, receipts) = execute_block(&state1, txs, BASE_FEE_PER_GAS, PROPOSER_ADDR);
         all_receipts1.push(receipts);
         state1 = new_state;
     }
 
     // Second pass: verify receipts match
-    let mut state2 = initial;
+    let mut state2 = initial_state;
     for (i, (txs, _)) in chain.iter().enumerate() {
-        let (new_state, _, receipts) = execute_block(&state2, txs, 1, &proposer);
+        let (new_state, _gas, receipts) = execute_block(&state2, txs, BASE_FEE_PER_GAS, PROPOSER_ADDR);
         assert_eq!(
             receipts.len(),
             all_receipts1[i].len(),
@@ -180,47 +233,39 @@ fn replay_receipts_deterministic() {
         );
         for (j, (r1, r2)) in all_receipts1[i].iter().zip(receipts.iter()).enumerate() {
             assert_eq!(
-                r1.tx_hash,
-                r2.tx_hash,
-                "tx_hash mismatch h={} tx={}",
-                i + 1,
-                j
+                r1.tx_hash, r2.tx_hash,
+                "tx_hash mismatch height={} tx={}",
+                i + 1, j
             );
             assert_eq!(
-                r1.success,
-                r2.success,
-                "success mismatch h={} tx={}",
-                i + 1,
-                j
+                r1.success, r2.success,
+                "success mismatch height={} tx={}",
+                i + 1, j
             );
             assert_eq!(
-                r1.gas_used,
-                r2.gas_used,
-                "gas_used mismatch h={} tx={}",
-                i + 1,
-                j
+                r1.gas_used, r2.gas_used,
+                "gas_used mismatch height={} tx={}",
+                i + 1, j
             );
         }
         state2 = new_state;
     }
 }
 
-/// Verify state serialization roundtrip preserves root.
+/// Verify state serialisation roundtrip preserves the root.
 #[test]
 fn replay_state_serialization_roundtrip() {
-    let (initial, chain) = build_chain(5);
-    let proposer = "proposer_addr".to_string();
+    let (initial_state, chain) = build_chain(NUM_SERIALIZATION_BLOCKS);
 
-    let mut state = initial;
+    let mut state = initial_state;
     for (txs, _) in &chain {
-        let (new_state, _, _) = execute_block(&state, txs, 1, &proposer);
-        // Serialize and deserialize
+        let (new_state, _gas, _receipts) = execute_block(&state, txs, BASE_FEE_PER_GAS, PROPOSER_ADDR);
         let json = serde_json::to_vec(&new_state).expect("serialize");
         let deserialized: KvState = serde_json::from_slice(&json).expect("deserialize");
         assert_eq!(
             new_state.root(),
             deserialized.root(),
-            "State root changed after serialization roundtrip"
+            "State root changed after serialisation roundtrip"
         );
         state = new_state;
     }
