@@ -18,9 +18,57 @@ use iona::execution::KvState;
 use iona::slashing::StakeLedger;
 use iona::types::{Block, Hash32, Receipt};
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
-// ── Shared in-memory block store ──────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Default number of validators in tests.
+const DEFAULT_NUM_VALIDATORS: usize = 4;
+
+/// Maximum rounds before giving up.
+const DEFAULT_MAX_ROUNDS: u64 = 10;
+
+/// Timeout values for fast configuration (milliseconds).
+const PROPOSE_TIMEOUT_MS: u64 = 5000;
+const PREVOTE_TIMEOUT_MS: u64 = 5000;
+const PRECOMMIT_TIMEOUT_MS: u64 = 5000;
+
+/// Tick duration in milliseconds.
+const TICK_DURATION_MS: u64 = 200;
+
+/// Gas target for tests.
+const GAS_TARGET: u64 = 1_000_000;
+
+/// Initial base fee per gas.
+const INITIAL_BASE_FEE: u64 = 1;
+
+/// Target block height for happy path test.
+const TARGET_HEIGHT: u64 = 3;
+
+/// Maximum number of iterations for consensus loops.
+const MAX_ITERATIONS: usize = 300;
+
+/// Number of iterations for partition test before healing.
+const PARTITION_ITERATIONS: usize = 50;
+
+/// Number of catch‑up rounds after healing.
+const CATCHUP_ROUNDS: usize = 50;
+
+/// Drop probability (0.0 – 1.0) for drop test.
+const DROP_PROBABILITY: f64 = 0.20;
+
+/// Number of validators online in the offline‑one test.
+const ONLINE_VALIDATOR_INDICES: &[usize] = &[0, 1, 2];
+
+/// Maximum height to attempt in happy path test.
+const HAPPY_PATH_MAX_ITERATIONS: usize = 200;
+
+// -----------------------------------------------------------------------------
+// Shared in‑memory block store
+// -----------------------------------------------------------------------------
 
 #[derive(Default, Clone)]
 struct MemBlockStore(Arc<Mutex<HashMap<Hash32, Block>>>);
@@ -35,13 +83,15 @@ impl BlockStore for MemBlockStore {
     }
 }
 
-// ── Recording outbox ──────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Recording outbox
+// -----------------------------------------------------------------------------
 
 #[derive(Default, Clone)]
 struct RecordingOutbox {
-    pub broadcasts: Arc<Mutex<Vec<ConsensusMsg>>>,
-    pub commits: Arc<Mutex<Vec<CommitCertificate>>>,
-    pub store: MemBlockStore,
+    broadcasts: Arc<Mutex<Vec<ConsensusMsg>>>,
+    commits: Arc<Mutex<Vec<CommitCertificate>>>,
+    store: MemBlockStore,
 }
 
 impl Outbox for RecordingOutbox {
@@ -61,8 +111,185 @@ impl Outbox for RecordingOutbox {
     }
 }
 
-// ── Test helpers ──────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Simulation harness
+// -----------------------------------------------------------------------------
 
+/// A harness for running simulated consensus networks.
+struct SimNet {
+    keys: Vec<Ed25519Keypair>,
+    stores: Vec<MemBlockStore>,
+    engines: Vec<Engine<Ed25519Verifier>>,
+    outboxes: Vec<RecordingOutbox>,
+    config: Config,
+    validator_set: ValidatorSet,
+    stakes: StakeLedger,
+    genesis_state: KvState,
+}
+
+impl SimNet {
+    /// Create a new simulation network with `n` validators.
+    fn new(n: usize) -> Self {
+        let keys = make_keypairs(n);
+        let validator_set = make_validator_set(&keys);
+        let config = fast_config();
+        let genesis_state = KvState::default();
+        let stakes = make_stake_ledger(&keys);
+        let stores = (0..n).map(|_| MemBlockStore::default()).collect();
+        let engines = keys
+            .iter()
+            .map(|_| {
+                Engine::new(
+                    config.clone(),
+                    validator_set.clone(),
+                    1,
+                    Hash32::zero(),
+                    genesis_state.clone(),
+                    stakes.clone(),
+                    None,
+                )
+            })
+            .collect();
+        let outboxes = (0..n).map(|_| RecordingOutbox::default()).collect();
+
+        Self {
+            keys,
+            stores,
+            engines,
+            outboxes,
+            config,
+            validator_set,
+            stakes,
+            genesis_state,
+        }
+    }
+
+    /// Tick all engines once.
+    fn tick_all(&mut self) {
+        for i in 0..self.engines.len() {
+            let mut ob = self.outboxes[i].clone();
+            self.engines[i].tick(&self.keys[i], &self.stores[i], &mut ob, TICK_DURATION_MS, |_| vec![]);
+            let new = ob.broadcasts.lock().unwrap().drain(..).collect::<Vec<_>>();
+            self.outboxes[i].broadcasts.lock().unwrap().extend(new);
+        }
+    }
+
+    /// Collect all pending broadcasts from all outboxes.
+    fn collect_pending_messages(&mut self) -> Vec<ConsensusMsg> {
+        self.outboxes
+            .iter_mut()
+            .flat_map(|ob| ob.broadcasts.lock().unwrap().drain(..).collect::<Vec<_>>())
+            .collect()
+    }
+
+    /// Deliver a collection of messages to all engines (full mesh).
+    fn deliver_to_all(&mut self, messages: &[ConsensusMsg]) {
+        for (i, engine) in self.engines.iter_mut().enumerate() {
+            for msg in messages {
+                let mut ob = self.outboxes[i].clone();
+                let _ = engine.on_message(&self.keys[i], &self.stores[i], &mut ob, msg.clone());
+            }
+        }
+    }
+
+    /// Deliver a collection of messages to a specific set of validators (by index).
+    fn deliver_to_subset(&mut self, indices: &[usize], messages: &[ConsensusMsg]) {
+        for &i in indices {
+            if i >= self.engines.len() {
+                continue;
+            }
+            for msg in messages {
+                let mut ob = self.outboxes[i].clone();
+                let _ = self.engines[i].on_message(&self.keys[i], &self.stores[i], &mut ob, msg.clone());
+            }
+        }
+    }
+
+    /// Full mesh broadcast of all pending messages.
+    fn broadcast_all(&mut self) {
+        let msgs = self.collect_pending_messages();
+        self.deliver_to_all(&msgs);
+    }
+
+    /// Broadcast with a drop probability (deterministic pseudo‑random based on (i, j)).
+    fn broadcast_with_drop(&mut self, drop_prob: f64) {
+        let msgs = self.collect_pending_messages();
+        for (i, engine) in self.engines.iter_mut().enumerate() {
+            for (j, msg) in msgs.iter().enumerate() {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                (i as u64 * 10000 + j as u64).hash(&mut hasher);
+                let hash_val = hasher.finish();
+                let frac = (hash_val % 10000) as f64 / 10000.0;
+                if frac < drop_prob {
+                    continue; // drop this message
+                }
+                let mut ob = self.outboxes[i].clone();
+                let _ = engine.on_message(&self.keys[i], &self.stores[i], &mut ob, msg.clone());
+            }
+        }
+    }
+
+    /// Deliver pending messages only to a given set of validators (partition).
+    fn broadcast_to_partition(&mut self, indices: &[usize]) {
+        let msgs = self.collect_pending_messages();
+        self.deliver_to_subset(indices, &msgs);
+    }
+
+    /// Get the number of commits recorded by each outbox.
+    fn commit_counts(&self) -> Vec<usize> {
+        self.outboxes
+            .iter()
+            .map(|ob| ob.commits.lock().unwrap().len())
+            .collect()
+    }
+
+    /// Check if all validators have committed at least `target_height` blocks.
+    fn all_committed_at_least(&self, target_height: usize) -> bool {
+        self.outboxes
+            .iter()
+            .all(|ob| ob.commits.lock().unwrap().len() >= target_height)
+    }
+
+    /// Get all commits at a given height (list of block IDs).
+    fn commits_at_height(&self, height: u64) -> Vec<Hash32> {
+        self.outboxes
+            .iter()
+            .flat_map(|ob| {
+                ob.commits
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| c.height == height)
+                    .map(|c| c.block_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Assert the safety invariant: no two different commits at the same height.
+    fn assert_safety(&self) {
+        let mut height_to_id: HashMap<u64, Hash32> = HashMap::new();
+        for ob in &self.outboxes {
+            for cert in ob.commits.lock().unwrap().iter() {
+                if let Some(existing) = height_to_id.get(&cert.height) {
+                    assert_eq!(
+                        *existing, cert.block_id,
+                        "SAFETY VIOLATION: two different commits at height {}",
+                        cert.height
+                    );
+                } else {
+                    height_to_id.insert(cert.height, cert.block_id);
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Test helpers (standalone functions)
+// -----------------------------------------------------------------------------
+
+/// Generate `n` Ed25519 keypairs with deterministic seeds.
 fn make_keypairs(n: usize) -> Vec<Ed25519Keypair> {
     (1..=n)
         .map(|i| {
@@ -73,7 +300,8 @@ fn make_keypairs(n: usize) -> Vec<Ed25519Keypair> {
         .collect()
 }
 
-fn make_vset(keys: &[Ed25519Keypair]) -> ValidatorSet {
+/// Create a validator set from the given keypairs.
+fn make_validator_set(keys: &[Ed25519Keypair]) -> ValidatorSet {
     ValidatorSet {
         vals: keys
             .iter()
@@ -85,213 +313,67 @@ fn make_vset(keys: &[Ed25519Keypair]) -> ValidatorSet {
     }
 }
 
-fn make_stakes(keys: &[Ed25519Keypair]) -> StakeLedger {
+/// Create a stake ledger for the given validators.
+fn make_stake_ledger(keys: &[Ed25519Keypair]) -> StakeLedger {
     StakeLedger::default_demo_with(
         &keys.iter().map(|k| k.public_key()).collect::<Vec<_>>(),
         100,
     )
 }
 
+/// Fast consensus configuration for tests.
 fn fast_config() -> Config {
     Config {
-        propose_timeout_ms: 5000,
-        prevote_timeout_ms: 5000,
-        precommit_timeout_ms: 5000,
-        max_rounds: 10,
+        propose_timeout_ms: PROPOSE_TIMEOUT_MS,
+        prevote_timeout_ms: PREVOTE_TIMEOUT_MS,
+        precommit_timeout_ms: PRECOMMIT_TIMEOUT_MS,
+        max_rounds: DEFAULT_MAX_ROUNDS,
         max_txs_per_block: 100,
-        gas_target: 1_000_000,
-        initial_base_fee_per_gas: 1,
+        gas_target: GAS_TARGET,
+        initial_base_fee_per_gas: INITIAL_BASE_FEE,
         include_block_in_proposal: true,
         fast_quorum: true,
     }
 }
 
-/// Broadcast all pending messages to all engines (full mesh, no drops).
-fn broadcast_all(
-    engines: &mut Vec<Engine<Ed25519Verifier>>,
-    outboxes: &mut Vec<RecordingOutbox>,
-    stores: &[MemBlockStore],
-    keys: &[Ed25519Keypair],
-) {
-    let msgs: Vec<ConsensusMsg> = outboxes
-        .iter_mut()
-        .flat_map(|o| o.broadcasts.lock().unwrap().drain(..).collect::<Vec<_>>())
-        .collect();
-
-    for (i, engine) in engines.iter_mut().enumerate() {
-        for msg in &msgs {
-            let mut ob = outboxes[i].clone();
-            let _ = engine.on_message(&keys[i], &stores[i], &mut ob, msg.clone());
-        }
-    }
+/// Require that all commits at a given height agree on the same block ID.
+fn assert_commits_agree_at_height(sim: &SimNet, height: u64) {
+    let ids = sim.commits_at_height(height);
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), 1, "Conflicting commits at height {height}");
 }
 
-/// Simulate with a drop probability: each message is dropped with `drop_prob` (0.0–1.0).
-fn broadcast_with_drop(
-    engines: &mut Vec<Engine<Ed25519Verifier>>,
-    outboxes: &mut Vec<RecordingOutbox>,
-    stores: &[MemBlockStore],
-    keys: &[Ed25519Keypair],
-    drop_prob: f64,
-) {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let msgs: Vec<ConsensusMsg> = outboxes
-        .iter_mut()
-        .flat_map(|o| o.broadcasts.lock().unwrap().drain(..).collect::<Vec<_>>())
-        .collect();
-
-    for (i, engine) in engines.iter_mut().enumerate() {
-        for (j, msg) in msgs.iter().enumerate() {
-            // Deterministic "random" drop based on (i, j)
-            let mut h = DefaultHasher::new();
-            (i as u64 * 10000 + j as u64).hash(&mut h);
-            let hash_val = h.finish();
-            let frac = (hash_val % 10000) as f64 / 10000.0;
-            if frac < drop_prob {
-                continue; // drop this message
-            }
-            let mut ob = outboxes[i].clone();
-            let _ = engine.on_message(&keys[i], &stores[i], &mut ob, msg.clone());
-        }
-    }
-}
-
-/// Broadcast only to a subset of validators (simulating partition).
-fn broadcast_to_partition(
-    partition: &[usize],
-    engines: &mut Vec<Engine<Ed25519Verifier>>,
-    outboxes: &mut Vec<RecordingOutbox>,
-    stores: &[MemBlockStore],
-    keys: &[Ed25519Keypair],
-) {
-    let msgs: Vec<ConsensusMsg> = outboxes
-        .iter_mut()
-        .flat_map(|o| o.broadcasts.lock().unwrap().drain(..).collect::<Vec<_>>())
-        .collect();
-
-    for &i in partition {
-        if i >= engines.len() {
-            continue;
-        }
-        for msg in &msgs {
-            let mut ob = outboxes[i].clone();
-            let _ = engines[i].on_message(&keys[i], &stores[i], &mut ob, msg.clone());
-        }
-    }
-}
-
-fn tick_all(
-    engines: &mut Vec<Engine<Ed25519Verifier>>,
-    outboxes: &mut Vec<RecordingOutbox>,
-    stores: &[MemBlockStore],
-    keys: &[Ed25519Keypair],
-) {
-    for (i, engine) in engines.iter_mut().enumerate() {
-        let mut ob = outboxes[i].clone();
-        engine.tick(&keys[i], &stores[i], &mut ob, 200, |_| vec![]);
-        // Merge new broadcasts back
-        let new: Vec<_> = ob.broadcasts.lock().unwrap().drain(..).collect();
-        outboxes[i].broadcasts.lock().unwrap().extend(new);
-    }
-}
-
-fn commits_at(outboxes: &[RecordingOutbox], height: u64) -> Vec<Hash32> {
-    outboxes
-        .iter()
-        .flat_map(|o| {
-            o.commits
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|c| c.height == height)
-                .map(|c| c.block_id.clone())
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
-// ── Safety invariant helper ───────────────────────────────────────────────
-
-/// Assert that no two commits at the same height produced different block IDs.
-/// This is the core SAFETY property of BFT consensus.
-fn assert_safety(outboxes: &[RecordingOutbox]) {
-    let mut height_to_id: HashMap<u64, Hash32> = HashMap::new();
-    for ob in outboxes {
-        for cert in ob.commits.lock().unwrap().iter() {
-            if let Some(existing) = height_to_id.get(&cert.height) {
-                assert_eq!(
-                    *existing, cert.block_id,
-                    "SAFETY VIOLATION: two different commits at height {}",
-                    cert.height
-                );
-            } else {
-                height_to_id.insert(cert.height, cert.block_id.clone());
-            }
-        }
-    }
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 /// Happy path: 4 validators commit 3 consecutive blocks with no faults.
 #[test]
 #[ignore]
 fn simnet_happy_path_multi_block() {
-    let n = 4;
-    let keys = make_keypairs(n);
-    let vset = make_vset(&keys);
-    let cfg = fast_config();
-    let state = KvState::default();
-    let stakes = make_stakes(&keys);
-    let stores: Vec<MemBlockStore> = (0..n).map(|_| MemBlockStore::default()).collect();
+    let mut sim = SimNet::new(DEFAULT_NUM_VALIDATORS);
 
-    let mut engines: Vec<Engine<Ed25519Verifier>> = keys
-        .iter()
-        .map(|_| {
-            Engine::new(
-                cfg.clone(),
-                vset.clone(),
-                1,
-                Hash32::zero(),
-                state.clone(),
-                stakes.clone(),
-                None,
-            )
-        })
-        .collect();
-    let mut outboxes: Vec<RecordingOutbox> = (0..n).map(|_| RecordingOutbox::default()).collect();
+    for _ in 0..HAPPY_PATH_MAX_ITERATIONS {
+        sim.tick_all();
+        sim.broadcast_all();
 
-    let target_height = 3;
-    for _ in 0..200 {
-        tick_all(&mut engines, &mut outboxes, &stores, &keys);
-        broadcast_all(&mut engines, &mut outboxes, &stores, &keys);
-
-        let all_committed = outboxes
-            .iter()
-            .all(|o| o.commits.lock().unwrap().len() >= target_height);
-        if all_committed {
+        if sim.all_committed_at_least(TARGET_HEIGHT as usize) {
             break;
         }
     }
 
-    assert_safety(&outboxes);
+    sim.assert_safety();
 
-    // All validators must have committed at least `target_height` blocks
-    for (i, ob) in outboxes.iter().enumerate() {
-        let count = ob.commits.lock().unwrap().len();
+    for i in 0..DEFAULT_NUM_VALIDATORS {
+        let count = sim.commit_counts()[i];
         assert!(
-            count >= target_height,
-            "Validator {i} only committed {count} blocks, expected {target_height}"
+            count >= TARGET_HEIGHT as usize,
+            "Validator {i} committed {count} blocks, expected at least {TARGET_HEIGHT}"
         );
     }
 
-    // All commits at same height must agree on block_id
-    for h in 1..=target_height as u64 {
-        let ids = commits_at(&outboxes, h);
-        let unique: std::collections::HashSet<_> = ids.iter().collect();
-        assert_eq!(unique.len(), 1, "Multiple different commits at height {h}");
+    for h in 1..=TARGET_HEIGHT {
+        assert_commits_agree_at_height(&sim, h);
     }
 }
 
@@ -299,74 +381,39 @@ fn simnet_happy_path_multi_block() {
 #[test]
 #[ignore]
 fn simnet_partition_and_heal() {
-    let n = 4;
-    let keys = make_keypairs(n);
-    let vset = make_vset(&keys);
-    let cfg = fast_config();
-    let state = KvState::default();
-    let stakes = make_stakes(&keys);
-    let stores: Vec<MemBlockStore> = (0..n).map(|_| MemBlockStore::default()).collect();
+    let mut sim = SimNet::new(DEFAULT_NUM_VALIDATORS);
+    let partition_a = &[0, 1];
+    let partition_b = &[2, 3];
 
-    let mut engines: Vec<Engine<Ed25519Verifier>> = keys
-        .iter()
-        .map(|_| {
-            Engine::new(
-                cfg.clone(),
-                vset.clone(),
-                1,
-                Hash32::zero(),
-                state.clone(),
-                stakes.clone(),
-                None,
-            )
-        })
-        .collect();
-    let mut outboxes: Vec<RecordingOutbox> = (0..n).map(|_| RecordingOutbox::default()).collect();
-
-    // Phase 1: partition — two groups [0,1] and [2,3], no progress expected
-    let partition_a = [0usize, 1];
-    let partition_b = [2usize, 3];
-
-    for _ in 0..50 {
-        tick_all(&mut engines, &mut outboxes, &stores, &keys);
-        // Only deliver within partitions (no cross-partition messages)
-        broadcast_to_partition(&partition_a, &mut engines, &mut outboxes, &stores, &keys);
-        broadcast_to_partition(&partition_b, &mut engines, &mut outboxes, &stores, &keys);
+    // Phase 1: partition – no cross‑partition messages
+    for _ in 0..PARTITION_ITERATIONS {
+        sim.tick_all();
+        sim.broadcast_to_partition(partition_a);
+        sim.broadcast_to_partition(partition_b);
     }
 
-    // During partition, neither side should have committed (2 of 4 = below 2/3 quorum)
-    for ob in &outboxes {
-        let count = ob.commits.lock().unwrap().len();
+    // During partition, neither side should have committed (2 of 4 < 2/3)
+    for count in sim.commit_counts() {
         assert_eq!(count, 0, "Should not commit during 2+2 partition");
     }
+    sim.assert_safety();
 
-    assert_safety(&outboxes);
-
-    // Phase 2: heal — resume full mesh delivery
-    for _ in 0..200 {
-        tick_all(&mut engines, &mut outboxes, &stores, &keys);
-        broadcast_all(&mut engines, &mut outboxes, &stores, &keys);
-
-        let some_committed = outboxes
-            .iter()
-            .any(|o| !o.commits.lock().unwrap().is_empty());
-        if some_committed {
+    // Phase 2: heal – resume full mesh delivery
+    for _ in 0..MAX_ITERATIONS {
+        sim.tick_all();
+        sim.broadcast_all();
+        if sim.commit_counts().iter().any(|&c| c > 0) {
             // Give others a few more rounds to catch up
-            for _ in 0..50 {
-                tick_all(&mut engines, &mut outboxes, &stores, &keys);
-                broadcast_all(&mut engines, &mut outboxes, &stores, &keys);
+            for _ in 0..CATCHUP_ROUNDS {
+                sim.tick_all();
+                sim.broadcast_all();
             }
             break;
         }
     }
 
-    assert_safety(&outboxes);
-
-    // After heal, at least some validators should have committed
-    let total_commits: usize = outboxes
-        .iter()
-        .map(|o| o.commits.lock().unwrap().len())
-        .sum();
+    sim.assert_safety();
+    let total_commits: usize = sim.commit_counts().iter().sum();
     assert!(total_commits > 0, "No commits after network heal");
 }
 
@@ -374,49 +421,20 @@ fn simnet_partition_and_heal() {
 #[test]
 #[ignore]
 fn simnet_message_drop_resilience() {
-    let n = 4;
-    let keys = make_keypairs(n);
-    let vset = make_vset(&keys);
-    let cfg = fast_config();
-    let state = KvState::default();
-    let stakes = make_stakes(&keys);
-    let stores: Vec<MemBlockStore> = (0..n).map(|_| MemBlockStore::default()).collect();
+    let mut sim = SimNet::new(DEFAULT_NUM_VALIDATORS);
 
-    let mut engines: Vec<Engine<Ed25519Verifier>> = keys
-        .iter()
-        .map(|_| {
-            Engine::new(
-                cfg.clone(),
-                vset.clone(),
-                1,
-                Hash32::zero(),
-                state.clone(),
-                stakes.clone(),
-                None,
-            )
-        })
-        .collect();
-    let mut outboxes: Vec<RecordingOutbox> = (0..n).map(|_| RecordingOutbox::default()).collect();
+    for _ in 0..MAX_ITERATIONS {
+        sim.tick_all();
+        sim.broadcast_with_drop(DROP_PROBABILITY);
 
-    for _ in 0..300 {
-        tick_all(&mut engines, &mut outboxes, &stores, &keys);
-        broadcast_with_drop(&mut engines, &mut outboxes, &stores, &keys, 0.20);
-
-        let committed = outboxes
-            .iter()
-            .filter(|o| !o.commits.lock().unwrap().is_empty())
-            .count();
-        if committed >= n - 1 {
+        let online_commits = sim.commit_counts().iter().filter(|&&c| c > 0).count();
+        if online_commits >= DEFAULT_NUM_VALIDATORS - 1 {
             break;
         }
     }
 
-    assert_safety(&outboxes);
-
-    let total_commits: usize = outboxes
-        .iter()
-        .map(|o| o.commits.lock().unwrap().len())
-        .sum();
+    sim.assert_safety();
+    let total_commits: usize = sim.commit_counts().iter().sum();
     assert!(total_commits > 0, "No commits under 20% drop rate");
 }
 
@@ -425,59 +443,34 @@ fn simnet_message_drop_resilience() {
 #[test]
 #[ignore]
 fn simnet_one_validator_offline() {
-    let n = 4;
-    let keys = make_keypairs(n);
-    let vset = make_vset(&keys);
-    let cfg = fast_config();
-    let state = KvState::default();
-    let stakes = make_stakes(&keys);
-    let stores: Vec<MemBlockStore> = (0..n).map(|_| MemBlockStore::default()).collect();
+    let mut sim = SimNet::new(DEFAULT_NUM_VALIDATORS);
+    let online = ONLINE_VALIDATOR_INDICES;
 
-    let mut engines: Vec<Engine<Ed25519Verifier>> = keys
-        .iter()
-        .map(|_| {
-            Engine::new(
-                cfg.clone(),
-                vset.clone(),
-                1,
-                Hash32::zero(),
-                state.clone(),
-                stakes.clone(),
-                None,
-            )
-        })
-        .collect();
-    let mut outboxes: Vec<RecordingOutbox> = (0..n).map(|_| RecordingOutbox::default()).collect();
-
-    // Validator 3 is offline (never ticks or delivers)
-    let online = [0usize, 1, 2];
-
-    for _ in 0..300 {
+    for _ in 0..MAX_ITERATIONS {
         // Only tick online validators
-        for &i in &online {
-            let mut ob = outboxes[i].clone();
-            engines[i].tick(&keys[i], &stores[i], &mut ob, 200, |_| vec![]);
-            let new: Vec<_> = ob.broadcasts.lock().unwrap().drain(..).collect();
-            outboxes[i].broadcasts.lock().unwrap().extend(new);
+        for &i in online {
+            let mut ob = sim.outboxes[i].clone();
+            sim.engines[i].tick(&sim.keys[i], &sim.stores[i], &mut ob, TICK_DURATION_MS, |_| vec![]);
+            let new = ob.broadcasts.lock().unwrap().drain(..).collect::<Vec<_>>();
+            sim.outboxes[i].broadcasts.lock().unwrap().extend(new);
         }
-
-        // Only deliver to/from online validators
-        broadcast_to_partition(&online, &mut engines, &mut outboxes, &stores, &keys);
+        // Deliver messages only among online validators
+        let msgs = sim.collect_pending_messages();
+        sim.deliver_to_subset(online, &msgs);
 
         let online_commits: usize = online
             .iter()
-            .map(|&i| outboxes[i].commits.lock().unwrap().len())
+            .map(|&i| sim.outboxes[i].commits.lock().unwrap().len())
             .sum();
         if online_commits >= 3 {
             break;
         }
     }
 
-    assert_safety(&outboxes);
+    sim.assert_safety();
 
-    // All online validators should have committed at least 1 block
-    for &i in &online {
-        let count = outboxes[i].commits.lock().unwrap().len();
+    for &i in online {
+        let count = sim.outboxes[i].commits.lock().unwrap().len();
         assert!(
             count >= 1,
             "Online validator {i} failed to commit with one offline node"
