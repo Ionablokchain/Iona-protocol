@@ -1,3 +1,6 @@
+//! Test that after a network partition heals, all nodes converge on the same
+//! proposal and no double proposals are produced for the same height and round.
+
 use iona::consensus::{
     BlockStore, Config, ConsensusMsg, Engine, Outbox, SimpleBlockProducer, SimpleProducerCfg, Step,
     Validator, ValidatorSet,
@@ -13,29 +16,80 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Number of validators in the test network.
+const NUM_VALIDATORS: usize = 4;
+
+/// Initial consensus height.
+const INITIAL_HEIGHT: u64 = 1;
+
+/// Round for the initial proposal.
+const INITIAL_ROUND: u32 = 0;
+
+/// Power assigned to each validator.
+const VALIDATOR_POWER: u64 = 1;
+
+/// Drop rates – none for this test.
+const DROP_PPM_CONSENSUS: u32 = 0;
+const DROP_PPM_BLOCK: u32 = 0;
+
+/// Minimum and maximum message delay (ms).
+const MIN_DELAY_MS: u64 = 0;
+const MAX_DELAY_MS: u64 = 10;
+
+/// History limit for network replay.
+const HISTORY_LIMIT: usize = 64;
+
+/// Seed for deterministic behaviour.
+const NETWORK_SEED: u64 = 0xDEAD_BEEF_1111_2222;
+
+/// Partition groups: validators 0‑1 in group 0, 2‑3 in group 1.
+const PARTITION_GROUP_0: &[usize] = &[0, 1];
+const PARTITION_GROUP_1: &[usize] = &[2, 3];
+
+/// Interval for message propagation (ms).
+const PROPAGATION_SLEEP_MS: u64 = 30;
+
+/// Time to wait after healing for store synchronisation (ms).
+const HEALING_SLEEP_MS: u64 = 80;
+
+/// Number of replay attempts to ensure late‑joiners receive consensus history.
+const REPLAY_ATTEMPTS: usize = 3;
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+/// In‑memory block store.
 #[derive(Default)]
 struct MemStore {
     blocks: Mutex<HashMap<Hash32, Block>>,
 }
+
 impl BlockStore for MemStore {
     fn get(&self, id: &Hash32) -> Option<Block> {
-        self.blocks.lock().ok()?.get(id).cloned()
+        self.blocks.lock().unwrap().get(id).cloned()
     }
     fn put(&self, block: Block) {
-        if let Ok(mut m) = self.blocks.lock() {
-            m.insert(block.id(), block);
-        }
+        let id = block.id();
+        self.blocks.lock().unwrap().insert(id, block);
     }
 }
 
+/// Outbox that forwards messages to the simulated network.
 struct SimOutbox {
     net: SimNet,
 }
+
 impl SimOutbox {
     fn new(net: SimNet) -> Self {
         Self { net }
     }
 }
+
 impl Outbox for SimOutbox {
     fn broadcast(&mut self, msg: ConsensusMsg) {
         self.net.broadcast_consensus(msg);
@@ -51,9 +105,11 @@ impl Outbox for SimOutbox {
         _new_base_fee: u64,
         _receipts: &[iona::types::Receipt],
     ) {
+        // Not used in this test.
     }
 }
 
+/// Create a consensus engine with the given configuration.
 fn make_engine(
     height: u64,
     vset: ValidatorSet,
@@ -65,71 +121,90 @@ fn make_engine(
         cfg,
         vset,
         height,
-        Hash32([0u8; 32]),
+        Hash32::zero(),
         KvState::default(),
         StakeLedger::default(),
         None,
     )
 }
 
+/// Generate keypairs for the specified number of validators.
+fn make_keypairs(n: usize) -> Vec<Ed25519Keypair> {
+    (1..=n as u8)
+        .map(|seed| Ed25519Keypair::from_seed([seed; 32]))
+        .collect()
+}
+
+/// Create a validator set from a list of keypairs.
+fn make_validator_set(keys: &[Ed25519Keypair]) -> ValidatorSet {
+    ValidatorSet {
+        vals: keys
+            .iter()
+            .map(|k| Validator {
+                pk: k.public_key(),
+                power: VALIDATOR_POWER,
+            })
+            .collect(),
+    }
+}
+
+/// Background task that pumps network messages into a consensus engine.
 async fn pump(
     mut rx: mpsc::UnboundedReceiver<NetMsg>,
     engine: Arc<tokio::sync::Mutex<Engine<Ed25519Verifier>>>,
     signer: Ed25519Keypair,
     store: Arc<MemStore>,
-    out: Arc<tokio::sync::Mutex<SimOutbox>>,
+    outbox: Arc<tokio::sync::Mutex<SimOutbox>>,
     net: SimNet,
-    self_id: u64,
+    node_id: u64,
 ) {
-    while let Some(nm) = rx.recv().await {
-        match nm {
-            NetMsg::Consensus { from: _from, msg } => {
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            NetMsg::Consensus { from: _, msg } => {
                 let mut eng = engine.lock().await;
-                let mut ob = out.lock().await;
+                let mut ob = outbox.lock().await;
                 let _ = eng.on_message(&signer, store.as_ref(), &mut *ob, msg);
             }
             NetMsg::BlockRequest { from, id } => {
-                if let Some(b) = store.get(&id) {
+                if let Some(block) = store.get(&id) {
                     net.send_to(
                         from,
                         NetMsg::BlockResponse {
-                            from: self_id,
-                            block: b,
+                            from: node_id,
+                            block,
                         },
                     );
                 }
             }
-            NetMsg::BlockResponse { from: _from, block } => {
+            NetMsg::BlockResponse { from: _, block } => {
                 store.put(block);
             }
         }
     }
 }
 
+// -----------------------------------------------------------------------------
+// Test
+// -----------------------------------------------------------------------------
+
 #[tokio::test]
 async fn partition_then_heal_converges_without_double_proposals() {
-    let ks: Vec<Ed25519Keypair> = (1u8..=4u8)
-        .map(|i| Ed25519Keypair::from_seed([i; 32]))
-        .collect();
-    let vset = ValidatorSet {
-        vals: ks
-            .iter()
-            .map(|k| Validator {
-                pk: k.public_key(),
-                power: 1,
-            })
-            .collect(),
+    // 1. Create keypairs and validator set.
+    let keys = make_keypairs(NUM_VALIDATORS);
+    let validator_set = make_validator_set(&keys);
+
+    // 2. Configure the simulated network (no loss, small delay).
+    let config = SimNetConfig {
+        drop_ppm_consensus: DROP_PPM_CONSENSUS,
+        drop_ppm_block: DROP_PPM_BLOCK,
+        min_delay_ms: MIN_DELAY_MS,
+        max_delay_ms: MAX_DELAY_MS,
+        history_limit: HISTORY_LIMIT,
+        seed: NETWORK_SEED,
     };
 
-    let cfg = SimNetConfig {
-        drop_ppm_consensus: 0,
-        drop_ppm_block: 0,
-        min_delay_ms: 0,
-        max_delay_ms: 10,
-        history_limit: 64,
-        seed: 0xDEAD_BEEF_1111_2222,
-    };
-    let (net1, rx1) = SimNet::with_config(1, cfg.clone());
+    // 3. Create the network and register all nodes.
+    let (net1, rx1) = SimNet::with_config(1, config);
     let rx2 = net1.register(2);
     let rx3 = net1.register(3);
     let rx4 = net1.register(4);
@@ -137,118 +212,167 @@ async fn partition_then_heal_converges_without_double_proposals() {
     let net3 = net1.handle(3);
     let net4 = net1.handle(4);
 
-    // Enable partitioning and split into {1,2} and {3,4}
+    // 4. Enable partitioning and assign nodes to groups.
     net1.enable_partitioning(true);
-    net1.set_partition(1, 0);
-    net1.set_partition(2, 0);
-    net1.set_partition(3, 1);
-    net1.set_partition(4, 1);
+    for &node in PARTITION_GROUP_0 {
+        net1.set_partition((node + 1) as u64, 0);
+    }
+    for &node in PARTITION_GROUP_1 {
+        net1.set_partition((node + 1) as u64, 1);
+    }
 
-    let stores: Vec<Arc<MemStore>> = (0..4).map(|_| Arc::new(MemStore::default())).collect();
-    let engines: Vec<Arc<tokio::sync::Mutex<Engine<Ed25519Verifier>>>> = (0..4)
-        .map(|_| Arc::new(tokio::sync::Mutex::new(make_engine(1, vset.clone(), false))))
+    // 5. Create per‑node stores, engines, and outboxes.
+    let stores: Vec<Arc<MemStore>> = (0..NUM_VALIDATORS)
+        .map(|_| Arc::new(MemStore::default()))
         .collect();
-    let outs: Vec<Arc<tokio::sync::Mutex<SimOutbox>>> = vec![
+    let engines: Vec<Arc<tokio::sync::Mutex<Engine<Ed25519Verifier>>>> = (0..NUM_VALIDATORS)
+        .map(|_| Arc::new(tokio::sync::Mutex::new(make_engine(
+            INITIAL_HEIGHT,
+            validator_set.clone(),
+            false,
+        ))))
+        .collect();
+    let outboxes: Vec<Arc<tokio::sync::Mutex<SimOutbox>>> = vec![
         Arc::new(tokio::sync::Mutex::new(SimOutbox::new(net1.clone()))),
         Arc::new(tokio::sync::Mutex::new(SimOutbox::new(net2.clone()))),
         Arc::new(tokio::sync::Mutex::new(SimOutbox::new(net3.clone()))),
         Arc::new(tokio::sync::Mutex::new(SimOutbox::new(net4.clone()))),
     ];
 
-    let t1 = tokio::spawn(pump(
-        rx1,
-        engines[0].clone(),
-        ks[0].clone(),
-        stores[0].clone(),
-        outs[0].clone(),
-        net1.clone(),
-        1,
-    ));
-    let t2 = tokio::spawn(pump(
-        rx2,
-        engines[1].clone(),
-        ks[0].clone(),
-        stores[1].clone(),
-        outs[1].clone(),
-        net2.clone(),
-        2,
-    ));
-    let t3 = tokio::spawn(pump(
-        rx3,
-        engines[2].clone(),
-        ks[0].clone(),
-        stores[2].clone(),
-        outs[2].clone(),
-        net3.clone(),
-        3,
-    ));
-    let t4 = tokio::spawn(pump(
-        rx4,
-        engines[3].clone(),
-        ks[0].clone(),
-        stores[3].clone(),
-        outs[3].clone(),
-        net4.clone(),
-        4,
-    ));
+    // 6. Spawn background pumps.
+    let pumps = vec![
+        tokio::spawn(pump(
+            rx1,
+            engines[0].clone(),
+            keys[0].clone(),
+            stores[0].clone(),
+            outboxes[0].clone(),
+            net1.clone(),
+            1,
+        )),
+        tokio::spawn(pump(
+            rx2,
+            engines[1].clone(),
+            keys[0].clone(),
+            stores[1].clone(),
+            outboxes[1].clone(),
+            net2.clone(),
+            2,
+        )),
+        tokio::spawn(pump(
+            rx3,
+            engines[2].clone(),
+            keys[0].clone(),
+            stores[2].clone(),
+            outboxes[2].clone(),
+            net3.clone(),
+            3,
+        )),
+        tokio::spawn(pump(
+            rx4,
+            engines[3].clone(),
+            keys[0].clone(),
+            stores[3].clone(),
+            outboxes[3].clone(),
+            net4.clone(),
+            4,
+        )),
+    ];
 
-    // Producer is validator idx=(1+0)%4 = 1 => key #2, node 1 triggers producer logic
+    // 7. Produce a block using the first node’s engine.
+    // The producer is validator #2 (index 1) because round‑robin at height 1, round 0.
     let producer = SimpleBlockProducer::new(SimpleProducerCfg {
         max_txs: 0,
-        include_block_in_proposal: false,
+        include_block_in_proposal: false, // light proposal
     });
-
     let block_id: Hash32;
     {
-        let mut eng = engines[0].lock().await;
-        assert_eq!(eng.state.step, Step::Propose);
-        let mut ob = outs[0].lock().await;
-        assert!(producer.try_produce(&mut *eng, &ks[1], stores[0].as_ref(), &mut *ob, vec![]));
-        block_id = eng.state.proposal.as_ref().unwrap().block_id.clone();
-        assert!(stores[0].get(&block_id).is_some());
+        let mut engine = engines[0].lock().await;
+        assert_eq!(engine.state.step, Step::Propose);
+        let mut outbox = outboxes[0].lock().await;
+        assert!(producer.try_produce(
+            &mut *engine,
+            &keys[1],
+            stores[0].as_ref(),
+            &mut *outbox,
+            vec![],
+        ));
+        block_id = engine
+            .state
+            .proposal
+            .as_ref()
+            .unwrap()
+            .block_id
+            .clone();
+        assert!(
+            stores[0].get(&block_id).is_some(),
+            "Producer must have the block in its store"
+        );
     }
 
-    // Partitioned nodes (3,4) should NOT have proposal yet.
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    assert!(engines[2].lock().await.state.proposal.is_none());
-    assert!(engines[3].lock().await.state.proposal.is_none());
-
-    // Heal partition and replay history to nodes 3 and 4.
-    net1.enable_partitioning(false);
-    for _ in 0..3 {
-        net1.replay_consensus_to(3);
-        net1.replay_consensus_to(4);
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    }
-
-    // Allow time for block request/response and store sync.
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-
-    // All nodes should now have the same proposal block_id and the block in store.
-    for i in 0..4 {
-        let eng = engines[i].lock().await;
-        let pid = eng.state.proposal.as_ref().unwrap().block_id.clone();
-        assert_eq!(pid, block_id);
-        assert!(stores[i].get(&block_id).is_some());
-    }
-
-    // Safety: no double proposals for (height=1, round=0) in simnet history.
-    let hist = net1.consensus_history();
-    let mut proposals = 0;
-    for m in hist {
-        if let ConsensusMsg::Proposal(p) = m {
-            if p.height == 1 && p.round == 0 {
-                proposals += 1;
-            }
-        }
-    }
-    assert_eq!(
-        proposals, 1,
-        "expected exactly one proposal for height=1 round=0"
+    // 8. Partitioned nodes (indices 2 and 3) should NOT have the proposal yet.
+    tokio::time::sleep(std::time::Duration::from_millis(PROPAGATION_SLEEP_MS)).await;
+    assert!(
+        engines[2].lock().await.state.proposal.is_none(),
+        "Node 3 (index 2) received proposal while partitioned"
+    );
+    assert!(
+        engines[3].lock().await.state.proposal.is_none(),
+        "Node 4 (index 3) received proposal while partitioned"
     );
 
-    t1.abort();
-    t2.abort();
-    t3.abort();
-    t4.abort();
+    // 9. Heal the partition and replay consensus history to the isolated nodes.
+    net1.enable_partitioning(false);
+    for _ in 0..REPLAY_ATTEMPTS {
+        net1.replay_consensus_to(3);
+        net1.replay_consensus_to(4);
+        tokio::time::sleep(std::time::Duration::from_millis(PROPAGATION_SLEEP_MS)).await;
+    }
+
+    // 10. Allow time for block request/response and store synchronisation.
+    tokio::time::sleep(std::time::Duration::from_millis(HEALING_SLEEP_MS)).await;
+
+    // 11. Verify that all nodes now have the same proposal and the block in store.
+    for i in 0..NUM_VALIDATORS {
+        let engine_guard = engines[i].lock().await;
+        let proposal = engine_guard
+            .state
+            .proposal
+            .as_ref()
+            .expect("Node should have a proposal after healing");
+        assert_eq!(
+            proposal.block_id, block_id,
+            "Node {} has a different block ID",
+            i + 1
+        );
+        assert!(
+            stores[i].get(&block_id).is_some(),
+            "Node {} does not have the block in its store",
+            i + 1
+        );
+    }
+
+    // 12. Safety: there must be exactly one proposal for height 1, round 0 in the
+    // entire consensus history (no double proposal).
+    let history = net1.consensus_history();
+    let proposal_count = history
+        .iter()
+        .filter(|msg| {
+            if let ConsensusMsg::Proposal(p) = msg {
+                p.height == INITIAL_HEIGHT && p.round == INITIAL_ROUND
+            } else {
+                false
+            }
+        })
+        .count();
+    assert_eq!(
+        proposal_count, 1,
+        "Expected exactly one proposal for height={}, round={}, found {}",
+        INITIAL_HEIGHT, INITIAL_ROUND, proposal_count
+    );
+
+    // 13. Clean up.
+    for pump in pumps {
+        pump.abort();
+    }
 }
