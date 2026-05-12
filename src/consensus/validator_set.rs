@@ -25,6 +25,23 @@ use crate::crypto::PublicKeyBytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Panic message when `proposer_for` is called on an empty validator set.
+const ERR_EMPTY_VALIDATOR_SET: &str = "ValidatorSet::proposer_for called with empty set";
+
+/// Numerator for quorum threshold (2/3).
+const QUORUM_NUMERATOR: u64 = 2;
+
+/// Denominator for quorum threshold (3).
+const QUORUM_DENOMINATOR: u64 = 3;
+
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
+
 /// Voting power of a validator.
 pub type VotingPower = u64;
 
@@ -45,14 +62,20 @@ pub struct ValidatorSet {
     pub vals: Vec<Validator>,
 }
 
+// -----------------------------------------------------------------------------
+// Implementation
+// -----------------------------------------------------------------------------
+
 impl ValidatorSet {
     /// Total voting power of all validators.
+    #[must_use]
     pub fn total_power(&self) -> VotingPower {
         self.vals.iter().map(|v| v.power).sum()
     }
 
     /// Get the voting power of a validator by public key.
     /// Returns 0 if the validator is not in the set.
+    #[must_use]
     pub fn power_of(&self, pk: &PublicKeyBytes) -> VotingPower {
         self.vals
             .iter()
@@ -62,6 +85,7 @@ impl ValidatorSet {
     }
 
     /// Check if a validator is in the set (has power > 0).
+    #[must_use]
     pub fn contains(&self, pk: &PublicKeyBytes) -> bool {
         self.power_of(pk) > 0
     }
@@ -73,21 +97,24 @@ impl ValidatorSet {
     ///
     /// # Panics
     /// Panics if the validator set is empty (should never happen in production).
+    #[must_use]
     pub fn proposer_for(&self, height: u64, round: u32) -> &Validator {
         let n = self.vals.len();
         if n == 0 {
-            panic!("ValidatorSet::proposer_for called with empty set");
+            panic!("{}", ERR_EMPTY_VALIDATOR_SET);
         }
         let idx = ((height as usize).wrapping_add(round as usize)) % n;
         &self.vals[idx]
     }
 
     /// Check if the validator set is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.vals.is_empty()
     }
 
     /// Number of validators.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.vals.len()
     }
@@ -97,19 +124,35 @@ impl ValidatorSet {
         self.vals.iter()
     }
 
+    /// Compute the quorum threshold (minimum voting power required) for this validator set.
+    ///
+    /// In Tendermint‑style consensus, a quorum is reached when more than 2/3
+    /// of the total voting power has voted for the same block.
+    /// Formula: `(total_power * 2) / 3 + 1`.
+    #[must_use]
+    pub fn quorum_threshold(&self) -> VotingPower {
+        let total = self.total_power();
+        (total * QUORUM_NUMERATOR / QUORUM_DENOMINATOR) + 1
+    }
+
     /// Deterministic hash of the validator set (used to bind snapshot attestations to a specific epoch).
     ///
     /// The set is sorted by public key bytes before hashing to ensure the same set
     /// always produces the same hash, regardless of insertion order.
+    #[must_use]
     pub fn hash_hex(&self) -> String {
         let mut vals = self.vals.clone();
         vals.sort_by(|a, b| a.pk.0.cmp(&b.pk.0));
-        // Use bincode for deterministic serialization.
+        // Use bincode for deterministic serialisation.
         let bytes = bincode::serialize(&vals).unwrap_or_default();
         let h = blake3::hash(&bytes);
         h.to_hex().to_string()
     }
 }
+
+// -----------------------------------------------------------------------------
+// Display
+// -----------------------------------------------------------------------------
 
 impl fmt::Display for ValidatorSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -121,6 +164,10 @@ impl fmt::Display for ValidatorSet {
         )
     }
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -175,19 +222,14 @@ mod tests {
             make_validator(2, 20),
             make_validator(3, 30),
         ]);
-        // height 0, round 0 -> index 0
         let p0 = vset.proposer_for(0, 0);
         assert_eq!(p0.pk.0[0], 1);
-        // height 1, round 0 -> index 1
         let p1 = vset.proposer_for(1, 0);
         assert_eq!(p1.pk.0[0], 2);
-        // height 2, round 0 -> index 2
         let p2 = vset.proposer_for(2, 0);
         assert_eq!(p2.pk.0[0], 3);
-        // height 3, round 0 -> index 0 (wrap)
         let p3 = vset.proposer_for(3, 0);
         assert_eq!(p3.pk.0[0], 1);
-        // height 0, round 1 -> index 1
         let p4 = vset.proposer_for(0, 1);
         assert_eq!(p4.pk.0[0], 2);
     }
@@ -218,6 +260,16 @@ mod tests {
         ]);
         let pks: Vec<u8> = vset.iter().map(|v| v.pk.0[0]).collect();
         assert_eq!(pks, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_quorum_threshold() {
+        let vset1 = make_vset(vec![make_validator(1, 1), make_validator(2, 1), make_validator(3, 1)]);
+        assert_eq!(vset1.quorum_threshold(), 3);
+        let vset2 = make_vset(vec![make_validator(1, 1), make_validator(2, 1), make_validator(3, 1), make_validator(4, 1)]);
+        assert_eq!(vset2.quorum_threshold(), 3);
+        let vset3 = make_vset(vec![make_validator(1, 100)]);
+        assert_eq!(vset3.quorum_threshold(), 67);
     }
 
     #[test]
