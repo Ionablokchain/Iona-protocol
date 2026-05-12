@@ -16,6 +16,21 @@ use crate::types::{Hash32, Height, Round};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Default timeout used in tests (milliseconds).
+#[cfg(test)]
+pub(crate) const TEST_PROPOSE_TIMEOUT_MS: u64 = 300;
+
+/// Prefix for hex‑shortened public keys in logs (first 8 bytes).
+const HEX_SHORT_LEN: usize = 8;
+
+// -----------------------------------------------------------------------------
+// Stall reasons
+// -----------------------------------------------------------------------------
+
 /// Possible reasons for consensus not committing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "reason")]
@@ -52,12 +67,16 @@ pub enum StallReason {
     },
     /// Already committed at this height.
     AlreadyCommitted { height: Height },
-    /// Round is advancing (timeout-driven).
+    /// Round is advancing (timeout‑driven).
     RoundAdvancing {
         current_round: Round,
         max_rounds: u32,
     },
 }
+
+// -----------------------------------------------------------------------------
+// Diagnostic snapshot
+// -----------------------------------------------------------------------------
 
 /// Full diagnostic snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,7 +89,57 @@ pub struct ConsensusDiagnostic {
     pub summary: String,
 }
 
+// -----------------------------------------------------------------------------
+// Helper: format a short public key (first 8 hex bytes)
+// -----------------------------------------------------------------------------
+
+fn short_pk(pk: &PublicKeyBytes) -> String {
+    hex::encode(&pk.0[..HEX_SHORT_LEN])
+}
+
+// -----------------------------------------------------------------------------
+// Helper: generate stall reason summary strings
+// -----------------------------------------------------------------------------
+
+fn stall_reason_summary(reason: &StallReason) -> String {
+    match reason {
+        StallReason::WaitingForProposal {
+            proposer,
+            elapsed_ms,
+            timeout_ms,
+        } => format!(
+            "waiting_proposal(from={}, {}/{}ms)",
+            proposer, elapsed_ms, timeout_ms
+        ),
+        StallReason::MissingBlock { block_id } => format!("missing_block(id={})", block_id),
+        StallReason::InsufficientPrevotes { have, need, .. } => {
+            format!("low_prevotes(have={} need={})", have, need)
+        }
+        StallReason::InsufficientPrecommits { have, need, .. } => {
+            format!("low_precommits(have={} need={})", have, need)
+        }
+        StallReason::NoConnectedValidators { total_validators } => {
+            format!("no_connected_validators(total={})", total_validators)
+        }
+        StallReason::InsufficientConnectedValidators {
+            connected,
+            total,
+            needed,
+        } => format!("low_connectivity(connected={}/{} need={})", connected, total, needed),
+        StallReason::AlreadyCommitted { height } => format!("committed(height={})", height),
+        StallReason::RoundAdvancing {
+            current_round,
+            max_rounds,
+        } => format!("round_advancing({}/{})", current_round, max_rounds),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Main diagnostic function
+// -----------------------------------------------------------------------------
+
 /// Analyze the current consensus state and return diagnostics.
+#[must_use]
 pub fn diagnose(
     state: &ConsensusState,
     vset: &ValidatorSet,
@@ -79,7 +148,7 @@ pub fn diagnose(
     propose_timeout_ms: u64,
 ) -> ConsensusDiagnostic {
     let mut reasons = Vec::new();
-    let qc = QuorumCalculator::new(vset);
+    let quorum_calc = QuorumCalculator::new(vset);
 
     // Check if already committed.
     if state.decided.is_some() {
@@ -117,13 +186,13 @@ pub fn diagnose(
         }
     }
 
-    // Check based on current step.
+    // Step‑specific checks.
     match state.step {
         Step::Propose => {
             if state.proposal.is_none() {
                 let proposer = vset.proposer_for(state.height, state.round);
                 reasons.push(StallReason::WaitingForProposal {
-                    proposer: hex::encode(&proposer.pk.0[..8]),
+                    proposer: short_pk(&proposer.pk),
                     elapsed_ms: step_elapsed_ms,
                     timeout_ms: propose_timeout_ms,
                 });
@@ -131,20 +200,19 @@ pub fn diagnose(
                 let block_id = state
                     .proposal
                     .as_ref()
-                    .map(|p| hex::encode(&p.block_id.0[..8]))
+                    .map(|p| hex::encode(&p.block_id.0[..HEX_SHORT_LEN]))
                     .unwrap_or_default();
                 reasons.push(StallReason::MissingBlock { block_id });
             }
         }
         Step::Prevote => {
-            // Tally prevotes.
             let voters: Vec<PublicKeyBytes> = state
                 .votes
                 .get(&state.round)
                 .and_then(|rv| rv.get(&crate::consensus::messages::VoteType::Prevote))
                 .map(|m| m.keys().cloned().collect())
                 .unwrap_or_default();
-            let diag = qc.check(&voters);
+            let diag = quorum_calc.check(&voters);
             if !diag.has_quorum {
                 reasons.push(StallReason::InsufficientPrevotes {
                     have: diag.current_power,
@@ -161,7 +229,7 @@ pub fn diagnose(
                 .and_then(|rv| rv.get(&crate::consensus::messages::VoteType::Precommit))
                 .map(|m| m.keys().cloned().collect())
                 .unwrap_or_default();
-            let diag = qc.check(&voters);
+            let diag = quorum_calc.check(&voters);
             if !diag.has_quorum {
                 reasons.push(StallReason::InsufficientPrecommits {
                     have: diag.current_power,
@@ -172,7 +240,7 @@ pub fn diagnose(
             }
         }
         Step::Commit => {
-            // Should have been caught by decided check above.
+            // Already handled by decided check above.
         }
     }
 
@@ -183,43 +251,7 @@ pub fn diagnose(
             state.height, state.round, state.step
         )
     } else {
-        let reason_strs: Vec<String> = reasons
-            .iter()
-            .map(|r| match r {
-                StallReason::WaitingForProposal {
-                    proposer,
-                    elapsed_ms,
-                    timeout_ms,
-                } => format!(
-                    "waiting_proposal(from={}, {}/{}ms)",
-                    proposer, elapsed_ms, timeout_ms
-                ),
-                StallReason::MissingBlock { block_id } => format!("missing_block(id={})", block_id),
-                StallReason::InsufficientPrevotes { have, need, .. } => {
-                    format!("low_prevotes(have={} need={})", have, need)
-                }
-                StallReason::InsufficientPrecommits { have, need, .. } => {
-                    format!("low_precommits(have={} need={})", have, need)
-                }
-                StallReason::NoConnectedValidators { total_validators } => {
-                    format!("no_connected_validators(total={})", total_validators)
-                }
-                StallReason::InsufficientConnectedValidators {
-                    connected,
-                    total,
-                    needed,
-                } => format!(
-                    "low_connectivity(connected={}/{} need={})",
-                    connected, total, needed
-                ),
-                StallReason::AlreadyCommitted { height } => format!("committed(height={})", height),
-                StallReason::RoundAdvancing {
-                    current_round,
-                    max_rounds,
-                } => format!("round_advancing({}/{})", current_round, max_rounds),
-            })
-            .collect();
-
+        let reason_strs: Vec<String> = reasons.iter().map(stall_reason_summary).collect();
         format!(
             "NO_COMMIT height={} round={} step={:?}: {}",
             state.height,
@@ -237,6 +269,10 @@ pub fn diagnose(
         summary,
     }
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -272,7 +308,7 @@ mod tests {
             precommits: vec![],
         });
 
-        let diag = diagnose(&state, &vset, &pks, 0, 300);
+        let diag = diagnose(&state, &vset, &pks, 0, TEST_PROPOSE_TIMEOUT_MS);
         assert!(diag.summary.contains("COMMITTED"));
     }
 
@@ -281,7 +317,7 @@ mod tests {
         let (vset, pks) = make_vset_and_pks(3);
         let state = ConsensusState::new(1);
 
-        let diag = diagnose(&state, &vset, &pks, 100, 300);
+        let diag = diagnose(&state, &vset, &pks, 100, TEST_PROPOSE_TIMEOUT_MS);
         assert!(diag.summary.contains("waiting_proposal"));
     }
 
@@ -290,7 +326,7 @@ mod tests {
         let (vset, _pks) = make_vset_and_pks(3);
         let state = ConsensusState::new(1);
 
-        let diag = diagnose(&state, &vset, &[], 100, 300);
+        let diag = diagnose(&state, &vset, &[], 100, TEST_PROPOSE_TIMEOUT_MS);
         assert!(
             diag.summary.contains("no_connected_validators")
                 || diag.summary.contains("low_connectivity")
@@ -303,7 +339,7 @@ mod tests {
         let state = ConsensusState::new(1);
 
         // Only 1 of 4 connected — not enough for quorum of 3.
-        let diag = diagnose(&state, &vset, &pks[..1], 100, 300);
+        let diag = diagnose(&state, &vset, &pks[..1], 100, TEST_PROPOSE_TIMEOUT_MS);
         assert!(diag.summary.contains("low_connectivity"));
     }
 
@@ -312,9 +348,8 @@ mod tests {
         let (vset, pks) = make_vset_and_pks(3);
         let state = ConsensusState::new(1);
 
+        let diag = diagnose(&state, &vset, &pks, 0, TEST_PROPOSE_TIMEOUT_MS);
         // All connected, step=Propose, no proposal yet → waiting_proposal.
-        let diag = diagnose(&state, &vset, &pks, 0, 300);
-        // This will show waiting_proposal, not connectivity issues.
         assert!(!diag.summary.contains("low_connectivity"));
         assert!(!diag.summary.contains("no_connected"));
     }
