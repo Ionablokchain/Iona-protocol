@@ -30,6 +30,20 @@ use crate::crypto::PublicKeyBytes;
 use crate::types::Hash32;
 use std::collections::HashMap;
 
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Numerator of the quorum fraction (2/3 of total voting power).
+pub const QUORUM_NUMERATOR: u64 = 2;
+
+/// Denominator of the quorum fraction (3).
+pub const QUORUM_DENOMINATOR: u64 = 3;
+
+// -----------------------------------------------------------------------------
+// VoteTally
+// -----------------------------------------------------------------------------
+
 /// Tally of votes, grouped by the block they vote for.
 ///
 /// Used to compute the total voting power that has voted for each block,
@@ -89,6 +103,10 @@ impl VoteTally {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Quorum calculation
+// -----------------------------------------------------------------------------
+
 /// Compute the quorum threshold for a given total validator power.
 ///
 /// In Tendermint‑style consensus, a quorum is reached when more than 2/3
@@ -96,7 +114,7 @@ impl VoteTally {
 ///
 /// # Formula
 /// ```text
-/// threshold = (total * 2) / 3 + 1
+/// threshold = (total * QUORUM_NUMERATOR) / QUORUM_DENOMINATOR + 1
 /// ```
 ///
 /// # Examples
@@ -107,8 +125,20 @@ impl VoteTally {
 /// assert_eq!(quorum_threshold(4), 3);
 /// ```
 pub fn quorum_threshold(total: VotingPower) -> VotingPower {
-    (total * 2 / 3) + 1
+    (total * QUORUM_NUMERATOR / QUORUM_DENOMINATOR) + 1
 }
+
+/// Extension: compute quorum threshold directly from a validator set.
+impl ValidatorSet {
+    /// Returns the quorum threshold (minimum voting power required) for this validator set.
+    pub fn quorum_threshold(&self) -> VotingPower {
+        quorum_threshold(self.total_power())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -163,6 +193,12 @@ mod tests {
         assert_eq!(quorum_threshold(4), 3);
         assert_eq!(quorum_threshold(5), 4);
         assert_eq!(quorum_threshold(100), 67);
+    }
+
+    #[test]
+    fn test_vset_quorum_threshold() {
+        let vset = test_vset();
+        assert_eq!(vset.quorum_threshold(), (3 * 2 / 3) + 1);
     }
 
     #[test]
