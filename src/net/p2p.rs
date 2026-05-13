@@ -13,7 +13,7 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use iona::net::p2p::{P2p, P2pConfig};
+//! use iona::net::p2p::{P2p, P2pConfig, P2pError};
 //!
 //! let config = P2pConfig::default();
 //! let mut p2p = P2p::new(config)?;
@@ -24,6 +24,7 @@
 //!         // ...
 //!     }
 //! }
+//! # Ok::<(), P2pError>(())
 //! ```
 
 use crate::consensus::ConsensusMsg;
@@ -50,12 +51,51 @@ use libp2p::{
 };
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::{
     collections::{BTreeMap, HashSet},
     io,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use thiserror::Error;
 use tracing::{debug, error, info, warn};
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Maximum message size for request/response (16 MiB).
+pub const MAX_MSG_SIZE: usize = 16 * 1024 * 1024;
+
+/// Maximum number of blocks served or accepted in a single range response.
+pub const MAX_RANGE_BLOCKS: u64 = 200;
+
+/// Default heartbeat interval for Gossipsub (ms).
+const GOSSIPSUB_HEARTBEAT_MS: u64 = 100;
+
+/// Default mesh parameters.
+const GOSSIPSUB_MESH_N: usize = 6;
+const GOSSIPSUB_MESH_N_LOW: usize = 4;
+const GOSSIPSUB_MESH_N_HIGH: usize = 12;
+const GOSSIPSUB_GOSSIP_LAZY: usize = 3;
+const GOSSIPSUB_FANOUT_TTL_SECS: u64 = 60;
+const GOSSIPSUB_HISTORY_LENGTH: usize = 10;
+const GOSSIPSUB_HISTORY_GOSSIP: usize = 3;
+
+/// Identify protocol interval (seconds).
+const IDENTIFY_INTERVAL_SECS: u64 = 30;
+
+/// Kademlia query timeout (seconds).
+const KAD_QUERY_TIMEOUT_SECS: u64 = 30;
+
+/// Request‑response timeout (seconds).
+const RR_TIMEOUT_SECS: u64 = 10;
+
+/// Minimum quarantine seconds.
+const MIN_QUARANTINE_SECS: u64 = 1;
+
+/// Minimum score before banning.
+const BAN_THRESHOLD: i32 = -50;
 
 // -----------------------------------------------------------------------------
 // Protocol definitions
@@ -86,7 +126,7 @@ pub fn proto_state() -> StreamProtocol {
 }
 
 // -----------------------------------------------------------------------------
-// Message types
+// Message types (unchanged)
 // -----------------------------------------------------------------------------
 
 /// Request for a single block by hash.
@@ -245,10 +285,6 @@ pub struct StateChunkResponse {
 // Enums for request/response
 // -----------------------------------------------------------------------------
 
-/// Maximum blocks served or accepted in a single range response.
-/// Prevents OOM from malicious peers sending enormous responses.
-pub const MAX_RANGE_BLOCKS: u64 = 200;
-
 /// State sync request variants.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum StateReq {
@@ -371,8 +407,6 @@ struct QuarantineFile {
 // Codec
 // -----------------------------------------------------------------------------
 
-const MAX_MSG_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
-
 /// Request‑response codec using bincode serialization.
 #[derive(Clone)]
 pub struct Codec;
@@ -457,7 +491,7 @@ pub struct Behaviour {
 }
 
 // -----------------------------------------------------------------------------
-// P2p configuration
+// Configuration
 // -----------------------------------------------------------------------------
 
 /// Configuration for the P2P stack.
@@ -472,42 +506,34 @@ pub struct P2pConfig {
     pub reconnect_s: u64,
     pub max_connections_total: usize,
     pub max_connections_per_peer: usize,
-    // Per‑protocol rate limits (req/sec)
     pub rr_max_req_per_sec_block: u32,
     pub rr_max_req_per_sec_status: u32,
     pub rr_max_req_per_sec_range: u32,
     pub rr_max_req_per_sec_state: u32,
-    // Per‑protocol inbound bandwidth caps (bytes/sec)
     pub rr_max_bytes_per_sec_block: u32,
     pub rr_max_bytes_per_sec_status: u32,
     pub rr_max_bytes_per_sec_range: u32,
     pub rr_max_bytes_per_sec_state: u32,
-    // Global inbound/outbound caps for RR (bytes/sec)
     pub rr_global_in_bytes_per_sec: u32,
     pub rr_global_out_bytes_per_sec: u32,
-    // Abuse handling
     pub peer_strike_decay_s: u64,
     pub peer_score_decay_s: u64,
     pub peer_quarantine_s: u64,
     pub rr_strikes_before_quarantine: u32,
     pub rr_strikes_before_ban: u32,
     pub rr_quarantines_before_ban: u32,
-    // Gossipsub caps
     pub gs_max_publish_msgs_per_sec: u32,
     pub gs_max_publish_bytes_per_sec: u32,
     pub gs_max_in_msgs_per_sec: u32,
     pub gs_max_in_bytes_per_sec: u32,
-    // Gossipsub ACL + per‑topic overrides
     pub gs_allowed_topics: Vec<String>,
     pub gs_deny_unknown_topics: bool,
     pub gs_topic_limits: Vec<(String, u32, u32)>,
-    // Diversity / eclipse resistance
     pub diversity_bucket_kind: String,
     pub max_inbound_per_bucket: usize,
     pub max_outbound_per_bucket: usize,
     pub eclipse_detection_min_buckets: usize,
     pub reseed_cooldown_s: u64,
-    // Quarantine persistence
     pub quarantine_path: PathBuf,
     pub persist_quarantine: bool,
 }
@@ -555,6 +581,99 @@ impl Default for P2pConfig {
             quarantine_path: PathBuf::from("./data/quarantine.json"),
             persist_quarantine: true,
         }
+    }
+}
+
+impl P2pConfig {
+    /// Validate the configuration, returning an error if any parameter is invalid.
+    pub fn validate(&self) -> Result<(), P2pError> {
+        if self.max_connections_total == 0 {
+            return Err(P2pError::InvalidConfig("max_connections_total must be > 0"));
+        }
+        if self.max_connections_per_peer == 0 {
+            return Err(P2pError::InvalidConfig("max_connections_per_peer must be > 0"));
+        }
+        if self.peer_quarantine_s == 0 {
+            return Err(P2pError::InvalidConfig("peer_quarantine_s must be > 0"));
+        }
+        if self.rr_strikes_before_ban == 0 && self.rr_strikes_before_quarantine == 0 {
+            return Err(P2pError::InvalidConfig("at least one of rr_strikes_before_ban or rr_strikes_before_quarantine must be > 0"));
+        }
+        if self.gs_max_publish_msgs_per_sec == 0 {
+            return Err(P2pError::InvalidConfig("gs_max_publish_msgs_per_sec must be > 0"));
+        }
+        if self.gs_max_in_msgs_per_sec == 0 {
+            return Err(P2pError::InvalidConfig("gs_max_in_msgs_per_sec must be > 0"));
+        }
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// P2p error
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during P2P operations.
+#[derive(Debug, Error)]
+pub enum P2pError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+
+    #[error("libp2p error: {0}")]
+    Libp2p(String),
+
+    #[error("serialisation error: {0}")]
+    Serialization(#[from] bincode::Error),
+
+    #[error("Gossipsub configuration error: {0}")]
+    Gossipsub(String),
+
+    #[error("MDNS error: {0}")]
+    Mdns(String),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(&'static str),
+
+    #[error("Peer not found: {0}")]
+    PeerNotFound(PeerId),
+}
+
+pub type P2pResult<T> = Result<T, P2pError>;
+
+// -----------------------------------------------------------------------------
+// Helper: extract IP bucket from multiaddress
+// -----------------------------------------------------------------------------
+
+fn bucket_from_multiaddr(addr: &Multiaddr, kind: &str) -> Option<String> {
+    let mut ip4: Option<[u8; 4]> = None;
+    let mut ip6: Option<[u8; 16]> = None;
+    for p in addr.iter() {
+        match p {
+            Protocol::Ip4(v4) => {
+                ip4 = Some(v4.octets());
+                break;
+            }
+            Protocol::Ip6(v6) => {
+                ip6 = Some(v6.octets());
+                break;
+            }
+            _ => {}
+        }
+    }
+    match (kind, ip4, ip6) {
+        ("ip24", Some(o), _) => Some(format!("ip4:{}.{}.{}", o[0], o[1], o[2])),
+        ("ip16", Some(o), _) => Some(format!("ip4:{}.{}", o[0], o[1])),
+        ("ip16", None, Some(o)) => Some(format!(
+            "ip6:{:02x}{:02x}{:02x}{:02x}",
+            o[0], o[1], o[2], o[3]
+        )),
+        ("ip24", None, Some(o)) => Some(format!(
+            "ip6:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            o[0], o[1], o[2], o[3], o[4], o[5]
+        )),
+        ("asn", Some(o), _) => Some(format!("asn_scaffold:{}.{}", o[0], o[1])),
+        ("asn", None, Some(o)) => Some(format!("asn_scaffold:{:02x}{:02x}", o[0], o[1])),
+        _ => None,
     }
 }
 
@@ -616,78 +735,7 @@ pub struct P2p {
 }
 
 // -----------------------------------------------------------------------------
-// Helper: seed Kademlia and dial
-// -----------------------------------------------------------------------------
-
-/// If `addr` contains a trailing `/p2p/<peerid>`, seed that peer + base address into Kademlia.
-/// Always attempts to dial the full address.
-fn seed_kad_and_dial(swarm: &mut Swarm<Behaviour>, addr: Multiaddr) {
-    let mut peer_opt: Option<PeerId> = None;
-    let mut base_addr = addr.clone();
-
-    if let Some(Protocol::P2p(pid)) = addr.iter().last() {
-        peer_opt = Some(pid);
-        let mut a2 = Multiaddr::empty();
-        for proto in addr.iter() {
-            if let Protocol::P2p(_) = proto {
-                break;
-            }
-            a2.push(proto);
-        }
-        base_addr = a2;
-    }
-
-    if let Some(pid) = peer_opt {
-        if let Some(kad) = swarm.behaviour_mut().kad.as_mut() {
-            kad.add_address(&pid, base_addr);
-            let _ = kad.bootstrap();
-        }
-    }
-
-    let _ = swarm.dial(addr);
-}
-
-// -----------------------------------------------------------------------------
-// Helper: bucket from multiaddress
-// -----------------------------------------------------------------------------
-
-/// Extract a diversity bucket string from a multiaddress based on the bucket kind.
-#[must_use]
-fn bucket_from_multiaddr(addr: &Multiaddr, kind: &str) -> Option<String> {
-    let mut ip4: Option<[u8; 4]> = None;
-    let mut ip6: Option<[u8; 16]> = None;
-    for p in addr.iter() {
-        match p {
-            Protocol::Ip4(v4) => {
-                ip4 = Some(v4.octets());
-                break;
-            }
-            Protocol::Ip6(v6) => {
-                ip6 = Some(v6.octets());
-                break;
-            }
-            _ => {}
-        }
-    }
-    match (kind, ip4, ip6) {
-        ("ip24", Some(o), _) => Some(format!("ip4:{}.{}.{}", o[0], o[1], o[2])),
-        ("ip16", Some(o), _) => Some(format!("ip4:{}.{}", o[0], o[1])),
-        ("ip16", None, Some(o)) => Some(format!(
-            "ip6:{:02x}{:02x}{:02x}{:02x}",
-            o[0], o[1], o[2], o[3]
-        )),
-        ("ip24", None, Some(o)) => Some(format!(
-            "ip6:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            o[0], o[1], o[2], o[3], o[4], o[5]
-        )),
-        ("asn", Some(o), _) => Some(format!("asn_scaffold:{}.{}", o[0], o[1])),
-        ("asn", None, Some(o)) => Some(format!("asn_scaffold:{:02x}{:02x}", o[0], o[1])),
-        _ => None,
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Implementation of P2p
+// Implementation
 // -----------------------------------------------------------------------------
 
 impl P2p {
@@ -695,7 +743,7 @@ impl P2p {
     fn now_unix() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
+            .unwrap_or(Duration::ZERO)
             .as_secs()
     }
 
@@ -751,7 +799,7 @@ impl P2p {
 
     /// Quarantine a peer for a given number of seconds.
     fn quarantine_peer(&mut self, peer: PeerId, secs: u64, reason: &str) {
-        let until = std::time::Instant::now() + Duration::from_secs(secs.max(1));
+        let until = std::time::Instant::now() + Duration::from_secs(secs.max(MIN_QUARANTINE_SECS));
         self.peer_quarantine.insert(peer, until);
         warn!(%peer, reason, "peer quarantined");
         self.persist_quarantine_file();
@@ -781,10 +829,8 @@ impl P2p {
         if now.duration_since(self.last_score_decay) < every {
             return;
         }
-        let mut steps = now.duration_since(self.last_score_decay).as_secs() / every.as_secs().max(1);
-        if steps == 0 {
-            steps = 1;
-        }
+        let steps = now.duration_since(self.last_score_decay).as_secs() / every.as_secs().max(1);
+        let steps = steps.max(1);
         for _ in 0..steps {
             for v in self.peer_scores.values_mut() {
                 if *v > 0 {
@@ -824,18 +870,18 @@ impl P2p {
     /// Check local publish quota.
     fn gs_allow_publish(&mut self, bytes: u32) -> bool {
         let now = std::time::Instant::now();
-        let st = &mut self.gs_publish_window;
-        if now.duration_since(st.window_start) > Duration::from_secs(1) {
-            st.window_start = now;
-            st.msg_count = 0;
-            st.byte_count = 0;
+        if now.duration_since(self.gs_publish_window.window_start) > Duration::from_secs(1) {
+            self.gs_publish_window.window_start = now;
+            self.gs_publish_window.msg_count = 0;
+            self.gs_publish_window.byte_count = 0;
         }
-        st.msg_count = st.msg_count.saturating_add(1);
-        st.byte_count = st.byte_count.saturating_add(bytes);
+        self.gs_publish_window.msg_count = self.gs_publish_window.msg_count.saturating_add(1);
+        self.gs_publish_window.byte_count = self.gs_publish_window.byte_count.saturating_add(bytes);
 
-        if (self.gs_max_publish_msgs_per_sec > 0 && st.msg_count > self.gs_max_publish_msgs_per_sec)
+        if (self.gs_max_publish_msgs_per_sec > 0
+            && self.gs_publish_window.msg_count > self.gs_max_publish_msgs_per_sec)
             || (self.gs_max_publish_bytes_per_sec > 0
-                && st.byte_count > self.gs_max_publish_bytes_per_sec)
+                && self.gs_publish_window.byte_count > self.gs_max_publish_bytes_per_sec)
         {
             return false;
         }
@@ -843,13 +889,15 @@ impl P2p {
     }
 
     /// Create a new P2P instance.
-    pub fn new(cfg: P2pConfig) -> anyhow::Result<Self> {
+    pub fn new(cfg: P2pConfig) -> P2pResult<Self> {
+        cfg.validate()?;
+
         let peer_id = PeerId::from(cfg.local_key.public());
         info!(%peer_id, "local peer id");
 
         let transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
             .upgrade(upgrade::Version::V1)
-            .authenticate(noise::Config::new(&cfg.local_key)?)
+            .authenticate(noise::Config::new(&cfg.local_key).map_err(|e| P2pError::Libp2p(e.to_string()))?)
             .multiplex(yamux::Config::default())
             .boxed();
 
@@ -861,55 +909,56 @@ impl P2p {
             .map(IdentTopic::new)
             .collect();
 
-        let gossipsub_config = gossipsub::ConfigBuilder::default()
-            .heartbeat_interval(Duration::from_millis(100))
+        let mut gs_config = gossipsub::ConfigBuilder::default();
+        gs_config
+            .heartbeat_interval(Duration::from_millis(GOSSIPSUB_HEARTBEAT_MS))
             .validation_mode(ValidationMode::Strict)
             .max_transmit_size(MAX_MSG_SIZE)
-            .mesh_n(6)
-            .mesh_n_low(4)
-            .mesh_n_high(12)
-            .gossip_lazy(3)
-            .fanout_ttl(Duration::from_secs(60))
-            .history_length(10)
-            .history_gossip(3)
-            .build()?;
+            .mesh_n(GOSSIPSUB_MESH_N)
+            .mesh_n_low(GOSSIPSUB_MESH_N_LOW)
+            .mesh_n_high(GOSSIPSUB_MESH_N_HIGH)
+            .gossip_lazy(GOSSIPSUB_GOSSIP_LAZY)
+            .fanout_ttl(Duration::from_secs(GOSSIPSUB_FANOUT_TTL_SECS))
+            .history_length(GOSSIPSUB_HISTORY_LENGTH)
+            .history_gossip(GOSSIPSUB_HISTORY_GOSSIP);
+        let gs_config = gs_config.build().map_err(|e| P2pError::Gossipsub(e.to_string()))?;
 
         let mut gossipsub = gossipsub::Behaviour::new(
             MessageAuthenticity::Signed(cfg.local_key.clone()),
-            gossipsub_config,
+            gs_config,
         )
-        .map_err(anyhow::Error::msg)?;
+        .map_err(|e| P2pError::Gossipsub(e.to_string()))?;
 
         gossipsub
             .with_peer_score(
                 gossipsub::PeerScoreParams::default(),
                 gossipsub::PeerScoreThresholds::default(),
             )
-            .map_err(anyhow::Error::msg)?;
-        for t in allowed_topics.iter() {
-            let _ = gossipsub.subscribe(t);
+            .map_err(|e| P2pError::Gossipsub(e.to_string()))?;
+        for topic in allowed_topics.iter() {
+            gossipsub.subscribe(topic).map_err(|e| P2pError::Gossipsub(e.to_string()))?;
         }
-        let _ = gossipsub.subscribe(&consensus_topic);
+        gossipsub.subscribe(&consensus_topic).map_err(|e| P2pError::Gossipsub(e.to_string()))?;
 
         let mdns = if cfg.enable_mdns {
-            Toggle::from(Some(mdns::tokio::Behaviour::new(
-                mdns::Config::default(),
-                peer_id,
-            )?))
+            let mdns_behaviour =
+                mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+                    .map_err(|e| P2pError::Mdns(e.to_string()))?;
+            Toggle::from(Some(mdns_behaviour))
         } else {
             Toggle::from(None)
         };
 
         let identify = identify::Behaviour::new(
             identify::Config::new("/iona/1.0.0".into(), cfg.local_key.public())
-                .with_interval(Duration::from_secs(30)),
+                .with_interval(Duration::from_secs(IDENTIFY_INTERVAL_SECS)),
         );
 
         let kad = if cfg.enable_kad {
             let store = MemoryStore::new(peer_id);
-            let mut kcfg = kad::Config::default();
-            kcfg.set_query_timeout(Duration::from_secs(30));
-            Toggle::from(Some(kad::Behaviour::with_config(peer_id, store, kcfg)))
+            let mut kad_config = kad::Config::default();
+            kad_config.set_query_timeout(Duration::from_secs(KAD_QUERY_TIMEOUT_SECS));
+            Toggle::from(Some(kad::Behaviour::with_config(peer_id, store, kad_config)))
         } else {
             Toggle::from(None)
         };
@@ -920,8 +969,9 @@ impl P2p {
             (proto_range(), ProtocolSupport::Full),
             (proto_state(), ProtocolSupport::Full),
         ];
-        let rr_cfg = request_response::Config::default().with_request_timeout(Duration::from_secs(10));
-        let rr = RequestResponse::with_codec(Codec, protocols, rr_cfg);
+        let rr_config = request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(RR_TIMEOUT_SECS));
+        let rr = RequestResponse::with_codec(Codec, protocols, rr_config);
 
         let behaviour = Behaviour {
             gossipsub,
@@ -936,10 +986,10 @@ impl P2p {
             peer_id,
             libp2p::swarm::Config::with_tokio_executor(),
         );
-        swarm.listen_on(cfg.listen)?;
+        swarm.listen_on(cfg.listen.clone()).map_err(|e| P2pError::Libp2p(e.to_string()))?;
 
         for addr in cfg.bootnodes.iter().cloned() {
-            seed_kad_and_dial(&mut swarm, addr);
+            Self::seed_kad_and_dial(&mut swarm, addr);
         }
 
         let quarantine_path = cfg.quarantine_path.clone();
@@ -1007,10 +1057,37 @@ impl P2p {
         })
     }
 
+    /// Helper: seed Kademlia and dial a multiaddress.
+    fn seed_kad_and_dial(swarm: &mut Swarm<Behaviour>, addr: Multiaddr) {
+        let mut peer_opt: Option<PeerId> = None;
+        let mut base_addr = addr.clone();
+
+        if let Some(Protocol::P2p(pid)) = addr.iter().last() {
+            peer_opt = Some(pid);
+            let mut a2 = Multiaddr::empty();
+            for proto in addr.iter() {
+                if let Protocol::P2p(_) = proto {
+                    break;
+                }
+                a2.push(proto);
+            }
+            base_addr = a2;
+        }
+
+        if let Some(pid) = peer_opt {
+            if let Some(kad) = swarm.behaviour_mut().kad.as_mut() {
+                kad.add_address(&pid, base_addr);
+                let _ = kad.bootstrap();
+            }
+        }
+
+        let _ = swarm.dial(addr);
+    }
+
     /// Dial all static peers and bootnodes. Call at startup and periodically for reconnects.
     pub fn dial_static_peers(&mut self) {
         for addr in self.bootnodes.clone() {
-            seed_kad_and_dial(&mut self.swarm, addr);
+            Self::seed_kad_and_dial(&mut self.swarm, addr);
         }
         for addr in self.static_peers.clone() {
             match self.swarm.dial(addr.clone()) {
@@ -1022,23 +1099,25 @@ impl P2p {
 
     /// Publish a consensus message via Gossipsub.
     pub fn publish(&mut self, msg: &ConsensusMsg) {
-        if let Ok(bytes) = bincode::serialize(msg) {
-            let b = bytes.len() as u32;
-            if !self.gs_allow_publish(b) {
-                warn!(
-                    bytes = b,
-                    "gossipsub publish cap hit; dropping local publish"
-                );
+        let bytes = match bincode::serialize(msg) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("failed to serialize consensus message: {e}");
                 return;
             }
-            if let Err(e) = self
-                .swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(self.topic.clone(), bytes)
-            {
-                warn!("gossipsub publish: {e:?}");
-            }
+        };
+        let b = bytes.len() as u32;
+        if !self.gs_allow_publish(b) {
+            warn!(bytes = b, "gossipsub publish cap hit; dropping local publish");
+            return;
+        }
+        if let Err(e) = self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(self.topic.clone(), bytes)
+        {
+            warn!("gossipsub publish: {e:?}");
         }
     }
 
@@ -1127,38 +1206,26 @@ impl P2p {
     }
 
     /// Send a response on a given request channel.
-    pub fn respond(&mut self, ch: request_response::ResponseChannel<Resp>, resp: Resp) {
+    pub fn respond(&mut self, channel: request_response::ResponseChannel<Resp>, resp: Resp) {
         let now = std::time::Instant::now();
         let est = bincode::serialized_size(&resp).unwrap_or(0) as u32;
         if self.rr_allow_global_out(now, est) {
-            let _ = self.swarm.behaviour_mut().rr.send_response(ch, resp);
+            let _ = self.swarm.behaviour_mut().rr.send_response(channel, resp);
         } else {
-            warn!(
-                bytes = est,
-                "global RR outbound bandwidth cap hit; dropping response"
-            );
+            warn!(bytes = est, "global RR outbound bandwidth cap hit; dropping response");
         }
     }
 
-    /// Return per‑protocol rate limits.
+    // -------------------------------------------------------------------------
+    // Internal rate‑limit helpers
+    // -------------------------------------------------------------------------
+
     fn rr_limits_for(&self, kind: ProtoKind) -> (u32, u32) {
         match kind {
-            ProtoKind::Block => (
-                self.rr_max_req_per_sec_block,
-                self.rr_max_bytes_per_sec_block,
-            ),
-            ProtoKind::Status => (
-                self.rr_max_req_per_sec_status,
-                self.rr_max_bytes_per_sec_status,
-            ),
-            ProtoKind::Range => (
-                self.rr_max_req_per_sec_range,
-                self.rr_max_bytes_per_sec_range,
-            ),
-            ProtoKind::State => (
-                self.rr_max_req_per_sec_state,
-                self.rr_max_bytes_per_sec_state,
-            ),
+            ProtoKind::Block => (self.rr_max_req_per_sec_block, self.rr_max_bytes_per_sec_block),
+            ProtoKind::Status => (self.rr_max_req_per_sec_status, self.rr_max_bytes_per_sec_status),
+            ProtoKind::Range => (self.rr_max_req_per_sec_range, self.rr_max_bytes_per_sec_range),
+            ProtoKind::State => (self.rr_max_req_per_sec_state, self.rr_max_bytes_per_sec_state),
         }
     }
 
@@ -1199,16 +1266,17 @@ impl P2p {
             return false;
         }
 
-        let key = (peer, kind);
         let (max_req, max_bytes) = self.rr_limits_for(kind);
+        let key = (peer, kind);
 
+        #[derive(Debug)]
         enum Act {
             Allow,
+            Boost(i32),
             Drop(i32),
             Disconnect(i32),
             Quarantine(i32),
             Ban(i32),
-            Boost(i32),
         }
 
         let mut act = Act::Allow;
@@ -1327,7 +1395,7 @@ impl P2p {
     fn bump_score(&mut self, peer: PeerId, delta: i32) {
         let score = self.peer_scores.entry(peer).or_insert(0);
         *score = score.saturating_add(delta);
-        if *score < -50 {
+        if *score < BAN_THRESHOLD {
             self.ban_peer(peer);
         }
     }
@@ -1361,13 +1429,13 @@ impl P2p {
             "possible eclipse (low diversity); reseeding via bootnodes"
         );
         self.last_reseed = std::time::Instant::now();
-        for a in self.bootnodes.iter().cloned() {
-            seed_kad_and_dial(&mut self.swarm, a);
+        for addr in self.bootnodes.iter().cloned() {
+            Self::seed_kad_and_dial(&mut self.swarm, addr);
         }
     }
 
     /// Process the next network event.
-    pub async fn next_event(&mut self) -> anyhow::Result<P2pEvent> {
+    pub async fn next_event(&mut self) -> P2pResult<P2pEvent> {
         loop {
             self.maybe_decay_peer_scores();
             self.maybe_eclipse_reseed();
@@ -1399,32 +1467,33 @@ impl P2p {
                     info,
                     ..
                 })) => {
-                    if !self.banned_peers.contains(&peer_id) {
-                        if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut() {
-                            for a in info.listen_addrs.iter().cloned() {
-                                kad.add_address(&peer_id, a);
-                            }
-                            let _ = kad.bootstrap();
-                        }
-
-                        if let Some(bucket) = self.bucket_from_addrs(&info.listen_addrs) {
-                            let c = self.bucket_counts.entry(bucket.clone()).or_insert(0);
-                            *c = c.saturating_add(1);
-                            if *c > self.max_inbound_per_bucket.max(1) {
-                                warn!(%peer_id, bucket=%bucket, count=*c, "diversity bucket cap hit; disconnecting");
-                                *c = c.saturating_sub(1);
-                                let _ = self.swarm.disconnect_peer_id(peer_id);
-                                continue;
-                            }
-                            self.peer_bucket.insert(peer_id, bucket);
-                        }
-                        self.swarm
-                            .behaviour_mut()
-                            .gossipsub
-                            .add_explicit_peer(&peer_id);
-                        self.peer_scores.entry(peer_id).or_insert(0);
-                        info!(%peer_id, "identify: peer connected");
+                    if self.banned_peers.contains(&peer_id) {
+                        continue;
                     }
+                    if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut() {
+                        for a in info.listen_addrs.iter().cloned() {
+                            kad.add_address(&peer_id, a);
+                        }
+                        let _ = kad.bootstrap();
+                    }
+
+                    if let Some(bucket) = self.bucket_from_addrs(&info.listen_addrs) {
+                        let c = self.bucket_counts.entry(bucket.clone()).or_insert(0);
+                        *c = c.saturating_add(1);
+                        if *c > self.max_inbound_per_bucket.max(1) {
+                            warn!(%peer_id, bucket=%bucket, count=*c, "diversity bucket cap hit; disconnecting");
+                            *c = c.saturating_sub(1);
+                            let _ = self.swarm.disconnect_peer_id(peer_id);
+                            continue;
+                        }
+                        self.peer_bucket.insert(peer_id, bucket);
+                    }
+                    self.swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .add_explicit_peer(&peer_id);
+                    self.peer_scores.entry(peer_id).or_insert(0);
+                    info!(%peer_id, "identify: peer connected");
                 }
 
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -1514,17 +1583,21 @@ impl P2p {
                     }
 
                     let score = self.peer_scores.entry(propagation_source).or_insert(0);
-                    if let Ok(m) = bincode::deserialize::<ConsensusMsg>(&message.data) {
-                        *score = (*score).saturating_add(1);
-                        return Ok(P2pEvent::Consensus {
-                            from: propagation_source,
-                            msg: m,
-                            raw: message.data,
-                        });
-                    } else {
-                        *score = (*score).saturating_sub(5);
-                        if *score < -50 {
-                            self.ban_peer(propagation_source);
+                    match bincode::deserialize::<ConsensusMsg>(&message.data) {
+                        Ok(msg) => {
+                            *score = (*score).saturating_add(1);
+                            return Ok(P2pEvent::Consensus {
+                                from: propagation_source,
+                                msg,
+                                raw: message.data,
+                            });
+                        }
+                        Err(e) => {
+                            warn!(peer=%propagation_source, "failed to decode consensus message: {e}");
+                            *score = (*score).saturating_sub(5);
+                            if *score < BAN_THRESHOLD {
+                                self.ban_peer(propagation_source);
+                            }
                         }
                     }
                 }
@@ -1561,7 +1634,7 @@ impl P2p {
                             return Ok(P2pEvent::Response {
                                 from: peer,
                                 resp: response,
-                            })
+                            });
                         }
                     }
                 }
@@ -1630,5 +1703,25 @@ mod tests {
         assert_eq!(proto_status().as_ref(), "/iona/status/1.0.0");
         assert_eq!(proto_range().as_ref(), "/iona/blockrange/1.0.0");
         assert_eq!(proto_state().as_ref(), "/iona/state/1.0.0");
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let mut cfg = P2pConfig::default();
+        cfg.max_connections_total = 0;
+        assert!(cfg.validate().is_err());
+        cfg.max_connections_total = 10;
+
+        cfg.max_connections_per_peer = 0;
+        assert!(cfg.validate().is_err());
+        cfg.max_connections_per_peer = 8;
+
+        cfg.peer_quarantine_s = 0;
+        assert!(cfg.validate().is_err());
+        cfg.peer_quarantine_s = 60;
+
+        cfg.rr_strikes_before_ban = 0;
+        cfg.rr_strikes_before_quarantine = 0;
+        assert!(cfg.validate().is_err());
     }
 }
