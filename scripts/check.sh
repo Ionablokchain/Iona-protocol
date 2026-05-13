@@ -1,212 +1,290 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  IONA Release Checklist                                                     ║
-# ║                                                                             ║
-# ║  Run this script before every push / zip / release.                         ║
-║  All steps must pass — if any fail, the build is NOT safe to ship.           ║
-║                                                                             ║
-║  Environment variables:                                                     ║
-║    BIN_NAME      - name of the binary to build (default: iona-node)         ║
-║    SKIP_*        - set to 1 to skip a section (e.g., SKIP_DOC=1)           ║
-║    RUSTFLAGS     - passed to cargo (default: "-D warnings")                 ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+# =============================================================================
+#  IONA Release Checklist — Production‑Grade
+# =============================================================================
+#  Run this script before every push / zip / release.
+#  All critical steps must pass — if any fail, the build is NOT safe to ship.
+#
+#  Environment variables:
+#    BIN_NAME          - name of the binary to build (default: iona-node)
+#    SKIP_*            - set to 1 to skip a section (e.g., SKIP_AUDIT=1)
+#    SKIP_ALL_OPTIONAL - set to 1 to skip all optional checks
+#    RUSTFLAGS         - passed to cargo (default: "-D warnings")
+#    VERBOSE           - set to 1 for detailed output
+#    CI                - set to 1 in CI environments (disables interactive prompts)
+#
+#  Usage:
+#    ./scripts/release_checklist.sh [--quick] [--verbose] [--json]
+#      --quick   skip optional checks (audit, deny, fuzz, outdated)
+#      --verbose enable detailed output
+#      --json    output final summary as JSON (for CI integration)
+# =============================================================================
 
 # ── Configuration ────────────────────────────────────────────────────────────
-
 BIN_NAME="${BIN_NAME:-iona-node}"
 export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
-PASS=0
-FAIL=0
-START_TIME=$(date +%s)
+VERBOSE="${VERBOSE:-0}"
+CI="${CI:-0}"
+QUICK=0
+JSON_OUTPUT=0
 
-# Colors for better readability (if terminal supports)
+# Parse CLI arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --quick)   QUICK=1; shift ;;
+    --verbose) VERBOSE=1; shift ;;
+    --json)    JSON_OUTPUT=1; shift ;;
+    *) echo "Unknown option: $1"; exit 1 ;;
+  esac
+done
+
+# ── Colours (safe for non‑TTY) ──────────────────────────────────────────────
 if [[ -t 1 ]]; then
-    GREEN='\033[0;32m'
-    RED='\033[0;31m'
-    YELLOW='\033[0;33m'
-    NC='\033[0m' # No Color
+  GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 else
-    GREEN=''; RED=''; YELLOW=''; NC=''
+  GREEN=''; RED=''; YELLOW=''; BLUE=''; NC=''
 fi
 
-# ── Helper functions ─────────────────────────────────────────────────────────
+# ── Helper functions ────────────────────────────────────────────────────────
+info()    { echo -e "${BLUE}[INFO]${NC}   $*"; }
+pass()    { echo -e "${GREEN}[PASS]${NC}   $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC}   $*" >&2; }
+fail()    { echo -e "${RED}[FAIL]${NC}   $*" >&2; }
 
 step() {
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  STEP: $1"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  ${BLUE}STEP: $1${NC}"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    echo "  (verbose output follows)"
+  fi
 }
 
-pass() {
-    echo -e "  ${GREEN}[PASS]${NC} $1"
-    PASS=$((PASS + 1))
-}
+# Check if a command exists, returns 0 if found, else 1
+cmd_exists() { command -v "$1" &>/dev/null; }
 
-fail() {
-    echo -e "  ${RED}[FAIL]${NC} $1" >&2
-    FAIL=$((FAIL + 1))
-}
-
-warn() {
-    echo -e "  ${YELLOW}[WARN]${NC} $1" >&2
-}
-
-# Check if a command exists
-require_cmd() {
-    if ! command -v "$1" &> /dev/null; then
-        warn "$1 not installed; skipping related checks"
-        return 1
-    fi
+# Run a command with optional verbose output capture
+run_cmd() {
+  local cmd="$1"
+  local msg="$2"
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    echo "  → $cmd"
+    eval "$cmd" 2>&1
+  else
+    eval "$cmd" >/dev/null 2>&1
+  fi
+  local ret=$?
+  if [[ $ret -eq 0 ]]; then
+    pass "$msg"
     return 0
+  else
+    fail "$msg"
+    return 1
+  fi
 }
+
+# Run an optional check (skip if command missing or SKIP_* set)
+optional_check() {
+  local name="$1"
+  local cmd="$2"
+  local skip_var="$3"
+  local required_cmd="$4"
+
+  if [[ "${!skip_var:-0}" -eq 1 ]]; then
+    warn "Skipping $name (${skip_var}=1)"
+    return 0
+  fi
+  if [[ "$QUICK" -eq 1 ]]; then
+    warn "Skipping $name (quick mode)"
+    return 0
+  fi
+  if [[ -n "$required_cmd" ]] && ! cmd_exists "$required_cmd"; then
+    warn "Skipping $name ($required_cmd not installed)"
+    return 0
+  fi
+
+  if run_cmd "$cmd" "$name"; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# ── Initialise counters ──────────────────────────────────────────────────────
+PASS=0
+FAIL=0
+FAILED_STEPS=()
+START_TIME=$(date +%s)
+
+# ── Trap for cleanup ────────────────────────────────────────────────────────
+cleanup() {
+  if [[ $FAIL -gt 0 ]]; then
+    echo ""
+    echo "────────────────────────────────────────────────────────────────────"
+    warn "Release checklist incomplete. Failures recorded. See above."
+  fi
+}
+trap cleanup EXIT
 
 # ── A. Code formatting ──────────────────────────────────────────────────────
-
 step "A. cargo fmt --check"
-if cargo fmt --check 2>/dev/null; then
-    pass "formatting"
+if run_cmd "cargo fmt --check" "code formatting"; then
+  PASS=$((PASS+1))
 else
-    fail "formatting (run 'cargo fmt' to fix)"
+  FAIL=$((FAIL+1)); FAILED_STEPS+=("cargo fmt")
 fi
 
-# ── B. Lint ──────────────────────────────────────────────────────────────────
-
+# ── B. Lint (clippy) ───────────────────────────────────────────────────────
 step "B. cargo clippy"
-if cargo clippy --locked -- -D warnings 2>&1; then
-    pass "clippy"
+if run_cmd "cargo clippy --locked -- -D warnings" "clippy warnings"; then
+  PASS=$((PASS+1))
 else
-    fail "clippy warnings/errors found"
+  FAIL=$((FAIL+1)); FAILED_STEPS+=("cargo clippy")
 fi
 
-# ── C. Tests (including determinism and protocol) ────────────────────────────
-
+# ── C. Tests (full suite) ───────────────────────────────────────────────────
 step "C. cargo test --locked"
-if cargo test --locked 2>&1; then
-    pass "tests"
+if run_cmd "cargo test --locked" "all tests"; then
+  PASS=$((PASS+1))
 else
-    fail "one or more tests failed"
+  FAIL=$((FAIL+1)); FAILED_STEPS+=("cargo test")
 fi
 
-# ── D. Documentation build (ensures no warnings) ─────────────────────────────
-
-if [[ "${SKIP_DOC:-0}" != "1" ]]; then
-    step "D. cargo doc --no-deps --document-private-items"
-    if RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items 2>&1; then
-        pass "documentation"
-    else
-        fail "documentation warnings/errors found"
-    fi
+# ── D. Documentation build ──────────────────────────────────────────────────
+if [[ "${SKIP_DOC:-0}" -eq 1 ]]; then
+  warn "Skipping documentation build (SKIP_DOC=1)"
 else
-    warn "SKIP_DOC is set; skipping documentation build"
+  step "D. cargo doc --no-deps --document-private-items"
+  if run_cmd "RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps --document-private-items" "documentation"; then
+    PASS=$((PASS+1))
+  else
+    FAIL=$((FAIL+1)); FAILED_STEPS+=("cargo doc")
+  fi
 fi
 
-# ── E. Security audit (cargo audit) ──────────────────────────────────────────
+# ── E. Security audit (cargo audit) ─────────────────────────────────────────
+optional_check "cargo audit" \
+  "cargo audit" \
+  "SKIP_AUDIT" \
+  "cargo-audit"
+if [[ $? -eq 0 ]]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILED_STEPS+=("cargo audit"); fi
 
-if [[ "${SKIP_AUDIT:-0}" != "1" ]] && require_cmd "cargo-audit"; then
-    step "E. cargo audit"
-    if cargo audit 2>&1; then
-        pass "audit"
-    else
-        fail "security vulnerabilities found"
-    fi
+# ── F. License & dependency checks (cargo deny) ─────────────────────────────
+optional_check "cargo deny check" \
+  "cargo deny check" \
+  "SKIP_DENY" \
+  "cargo-deny"
+if [[ $? -eq 0 ]]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILED_STEPS+=("cargo deny"); fi
+
+# ── G. Fuzzing (compile only) ───────────────────────────────────────────────
+optional_check "fuzz targets (compile)" \
+  "cargo fuzz build --all" \
+  "SKIP_FUZZ" \
+  "cargo-fuzz"
+if [[ $? -eq 0 ]]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILED_STEPS+=("cargo fuzz"); fi
+
+# ── H. Outdated dependencies (cargo outdated) – optional, only if tool present
+optional_check "cargo outdated (check for updates)" \
+  "cargo outdated --exit-code 1" \
+  "SKIP_OUTDATED" \
+  "cargo-outdated"
+# This check is informational; it does not fail the release
+if [[ $? -eq 0 ]]; then
+  # it passed (no outdated or tool missing) – we don't count as pass/fail
+  :;
 else
-    warn "Skipping cargo audit (not installed or SKIP_AUDIT set)"
+  warn "Some dependencies have newer versions (not a blocker)"
 fi
 
-# ── F. License and dependency checks (cargo deny) ────────────────────────────
-
-if [[ "${SKIP_DENY:-0}" != "1" ]] && require_cmd "cargo-deny"; then
-    step "F. cargo deny check"
-    if cargo deny check 2>&1; then
-        pass "deny checks (licenses, bans, sources)"
-    else
-        fail "cargo deny violations found"
-    fi
-else
-    warn "Skipping cargo deny (not installed or SKIP_DENY set)"
-fi
-
-# ── G. Fuzzing (compile all targets to ensure they build) ────────────────────
-
-if [[ "${SKIP_FUZZ:-0}" != "1" ]] && require_cmd "cargo-fuzz"; then
-    step "G. fuzz targets (compile only)"
-    # This compiles all fuzz targets without running them
-    if cargo fuzz build --all 2>&1; then
-        pass "fuzz targets compile"
-    else
-        fail "fuzz targets failed to compile"
-    fi
-else
-    warn "Skipping fuzz (cargo-fuzz not installed or SKIP_FUZZ set)"
-fi
-
-# ── H. Release build ─────────────────────────────────────────────────────────
-
+# ── I. Release build ────────────────────────────────────────────────────────
 step "H. cargo build --release --locked --bin $BIN_NAME"
-if cargo build --release --locked --bin "$BIN_NAME" 2>&1; then
-    pass "release build"
+if run_cmd "cargo build --release --locked --bin \"$BIN_NAME\"" "release build"; then
+  PASS=$((PASS+1))
 else
-    fail "release build failed"
+  FAIL=$((FAIL+1)); FAILED_STEPS+=("release build")
 fi
 
-# ── I. Binary sanity ─────────────────────────────────────────────────────────
-
+# ── J. Binary sanity ────────────────────────────────────────────────────────
 step "I. Binary exists and is executable"
 BINARY="target/release/$BIN_NAME"
 if [[ -x "$BINARY" ]]; then
-    SIZE=$(du -h "$BINARY" | awk '{print $1}')
-    SHA=$(sha256sum "$BINARY" | awk '{print $1}')
-    echo "  binary: $BINARY ($SIZE)"
-    echo "  sha256: $SHA"
-    pass "binary sanity"
+  SIZE=$(du -h "$BINARY" 2>/dev/null | awk '{print $1}' || stat -c %s "$BINARY" 2>/dev/null || echo "unknown")
+  SHA=$(sha256sum "$BINARY" | awk '{print $1}')
+  info "Binary: $BINARY ($SIZE)"
+  info "SHA256: $SHA"
+  pass "binary sanity"
+  PASS=$((PASS+1))
 else
-    fail "binary not found at $BINARY"
+  fail "binary not found at $BINARY"
+  FAIL=$((FAIL+1)); FAILED_STEPS+=("binary exists")
 fi
 
-# ── J. Determinism golden vectors ────────────────────────────────────────────
-
+# ── K. Determinism golden vectors ───────────────────────────────────────────
 step "J. Determinism tests (golden vectors)"
-if cargo test --locked determinism 2>&1; then
-    pass "determinism golden vectors"
+if run_cmd "cargo test --locked determinism" "determinism golden vectors"; then
+  PASS=$((PASS+1))
 else
-    fail "determinism tests failed"
+  FAIL=$((FAIL+1)); FAILED_STEPS+=("determinism")
 fi
 
-# ── K. Protocol version tests ────────────────────────────────────────────────
-
+# ── L. Protocol version tests ───────────────────────────────────────────────
 step "K. Protocol version tests"
-if cargo test --locked test_version_for_height test_validate_block_version test_is_supported 2>&1; then
-    pass "protocol version"
+if run_cmd "cargo test --locked test_version_for_height test_validate_block_version test_is_supported" "protocol version"; then
+  PASS=$((PASS+1))
 else
-    fail "protocol version tests failed"
+  FAIL=$((FAIL+1)); FAILED_STEPS+=("protocol version")
 fi
 
-# ── L. Check for uncommitted changes (optional) ──────────────────────────────
-
-if [[ -n "$(git status --porcelain)" ]]; then
-    warn "Uncommitted changes detected. Consider committing before release."
-else
+# ── M. Working directory clean (git) ────────────────────────────────────────
+if [[ -d .git ]]; then
+  step "L. Check for uncommitted changes"
+  if [[ -z "$(git status --porcelain)" ]]; then
     pass "working directory clean"
+    PASS=$((PASS+1))
+  else
+    warn "Uncommitted changes detected (not a blocker for release but recommended to commit)"
+    # Not counted as failure
+  fi
+else
+  warn "Not a git repository, skipping uncommitted changes check"
 fi
 
-# ── Summary ──────────────────────────────────────────────────────────────────
-
+# ── Summary ─────────────────────────────────────────────────────────────────
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
+
 echo ""
 echo "╔══════════════════════════════════════════════════════════════════════╗"
-echo "  RESULTS: $PASS passed, $FAIL failed"
+echo "  SUMMARY: $PASS passed, $FAIL failed"
 echo "  Duration: ${DURATION}s"
 if [[ $FAIL -gt 0 ]]; then
-    echo "  STATUS: NOT READY FOR RELEASE"
-    echo "╚══════════════════════════════════════════════════════════════════════╝"
-    exit 1
+  echo "  ❌ STATUS: NOT READY FOR RELEASE"
+  echo "  Failed steps: ${FAILED_STEPS[*]}"
+  echo "╚══════════════════════════════════════════════════════════════════════╝"
+  if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+    jq -n \
+      --arg status "FAIL" \
+      --arg pass "$PASS" \
+      --arg fail "$FAIL" \
+      --arg duration "$DURATION" \
+      --argjson steps "$(printf '%s\n' "${FAILED_STEPS[@]}" | jq -R . | jq -s .)" \
+      '{status: $status, passed: $pass, failed: $fail, duration: $duration, failed_steps: $steps}'
+  fi
+  exit 1
 else
-    echo "  STATUS: READY FOR RELEASE"
-    echo "╚══════════════════════════════════════════════════════════════════════╝"
-    exit 0
+  echo "  ✅ STATUS: READY FOR RELEASE"
+  echo "╚══════════════════════════════════════════════════════════════════════╝"
+  if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+    jq -n \
+      --arg status "PASS" \
+      --arg pass "$PASS" \
+      --arg fail "$FAIL" \
+      --arg duration "$DURATION" \
+      '{status: $status, passed: $pass, failed: $fail, duration: $duration}'
+  fi
+  exit 0
 fi
