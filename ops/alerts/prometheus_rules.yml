@@ -1,10 +1,18 @@
 # IONA Prometheus Alert Rules — v28.8.0
 # 10 production alerts with runbook links
+#
+# To use: include in Prometheus config under 'rule_files'
+#   rule_files:
+#     - "iona_alerts.yml"
+#
+# Runbook base URL: https://github.com/iona/iona/blob/main/ops/runbooks/
 
 groups:
+  # ==========================================================================
+  # Consensus health
+  # ==========================================================================
   - name: iona.consensus
     rules:
-
       - alert: IonaConsensusNoProgress
         expr: increase(iona_consensus_height[5m]) == 0
         for: 3m
@@ -37,9 +45,11 @@ groups:
           description: "Validator has signed conflicting messages. Immediate action required to prevent slashing."
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/validator_double_sign.md"
 
+  # ==========================================================================
+  # RPC layer
+  # ==========================================================================
   - name: iona.rpc
     rules:
-
       - alert: IonaRpcP99LatencyHigh
         expr: |
           histogram_quantile(0.99,
@@ -63,9 +73,11 @@ groups:
           summary: "RPC rate limiter firing on {{ $labels.instance }}: {{ $value }}/s rejected"
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/rpc_latency.md"
 
+  # ==========================================================================
+  # Network connectivity
+  # ==========================================================================
   - name: iona.network
     rules:
-
       - alert: IonaPeerCountLow
         expr: iona_p2p_peer_count < 3
         for: 5m
@@ -76,11 +88,13 @@ groups:
           summary: "Low peer count on {{ $labels.instance }}: {{ $value }} peers"
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/peer_drop.md"
 
+  # ==========================================================================
+  # Storage and memory pressure
+  # ==========================================================================
   - name: iona.storage
     rules:
-
       - alert: IonaDiskWalGrowthHigh
-        expr: rate(iona_wal_size_bytes[10m]) > 10485760
+        expr: rate(iona_wal_size_bytes[10m]) > 10485760  # 10 MiB/s
         for: 5m
         labels:
           severity: warning
@@ -99,11 +113,13 @@ groups:
           summary: "Mempool at {{ $value | humanizePercentage }} capacity on {{ $labels.instance }}"
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/mempool_pressure.md"
 
+  # ==========================================================================
+  # Security (TLS, audit, version skew)
+  # ==========================================================================
   - name: iona.security
     rules:
-
       - alert: IonaTLSCertExpiringSoon
-        expr: iona_tls_cert_expiry_seconds < 86400 * 30
+        expr: iona_tls_cert_expiry_seconds < 86400 * 30  # 30 days
         for: 1h
         labels:
           severity: warning
@@ -114,7 +130,7 @@ groups:
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/tls_cert_expiry.md"
 
       - alert: IonaTLSCertCritical
-        expr: iona_tls_cert_expiry_seconds < 86400 * 7
+        expr: iona_tls_cert_expiry_seconds < 86400 * 7  # 7 days
         for: 5m
         labels:
           severity: critical
