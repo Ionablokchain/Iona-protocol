@@ -11,113 +11,153 @@
 //! All failures are **fatal** — not warnings.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
 
-/// A fatal validation error that prevents node startup.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidationError {
-    pub field: String,
-    pub message: String,
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Minimum parts expected in a multiaddress (including empty first part).
+const MIN_MULTIADDR_PARTS: usize = 5;
+
+/// Supported protocol names for multiaddress.
+const PROTOCOL_IP4: &str = "ip4";
+const PROTOCOL_IP6: &str = "ip6";
+const PROTOCOL_DNS4: &str = "dns4";
+const PROTOCOL_DNS6: &str = "dns6";
+
+/// Protocol name for TCP.
+const PROTOCOL_TCP: &str = "tcp";
+
+/// Protocol name for P2P peer ID.
+const PROTOCOL_P2P: &str = "p2p";
+
+/// Default listen port for RPC (used in self‑bootstrap detection).
+const DEFAULT_RPC_PORT: u16 = 9001;
+
+// -----------------------------------------------------------------------------
+// Error types
+// -----------------------------------------------------------------------------
+
+/// Fatal validation error that prevents node startup.
+#[derive(Debug, Error)]
+pub enum BootstrapError {
+    #[error("invalid bootnode at index {index}: {reason}")]
+    InvalidBootnode { index: usize, reason: String },
+
+    #[error("duplicate bootnode entries")]
+    DuplicateBootnodes,
+
+    #[error("self‑bootstrap detected: node appears to bootstrap from its own address")]
+    SelfBootstrap,
+
+    #[error("chain ID mismatch: config={config}, genesis={genesis}")]
+    ChainIdMismatch { config: u64, genesis: u64 },
+
+    #[error("invalid stake_each: must be > 0, got {stake}")]
+    ZeroStake { stake: u64 },
+
+    #[error("simple_producer conflict: node seed {seed} is not in validator set {validators:?}")]
+    SimpleProducerConflict { seed: u64, validators: Vec<u64> },
+
+    #[error("empty RPC listen address")]
+    EmptyListenAddress,
+
+    #[error("genesis file error: {reason}")]
+    GenesisFile { reason: String },
+
+    #[error("genesis hash mismatch: expected {expected}, got {actual}")]
+    GenesisHashMismatch { expected: String, actual: String },
 }
 
-impl std::fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FATAL config error [{}]: {}", self.field, self.message)
-    }
-}
+pub type BootstrapResult<T> = Result<T, BootstrapError>;
 
-/// Result of config validation.
-#[derive(Debug, Clone)]
-pub struct ValidationResult {
-    pub errors: Vec<ValidationError>,
-}
-
-impl ValidationResult {
-    pub fn is_ok(&self) -> bool {
-        self.errors.is_empty()
-    }
-
-    pub fn into_result(self) -> Result<(), Vec<ValidationError>> {
-        if self.errors.is_empty() {
-            Ok(())
-        } else {
-            Err(self.errors)
-        }
-    }
-}
-
-impl std::fmt::Display for ValidationResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.is_ok() {
-            write!(f, "Config validation: PASS")
-        } else {
-            writeln!(f, "Config validation: FAIL ({} errors)", self.errors.len())?;
-            for e in &self.errors {
-                writeln!(f, "  {e}")?;
-            }
-            Ok(())
-        }
-    }
-}
+// -----------------------------------------------------------------------------
+// Validation functions
+// -----------------------------------------------------------------------------
 
 /// Validate a bootnode multiaddr string.
-/// Valid formats: /ip4/X.X.X.X/tcp/PORT or /ip4/X.X.X.X/tcp/PORT/p2p/PEERID
-/// or /dns4/HOST/tcp/PORT/p2p/PEERID
-fn validate_bootnode(addr: &str) -> Result<(), String> {
+/// Valid formats: `/ip4/X.X.X.X/tcp/PORT` or `/ip4/X.X.X.X/tcp/PORT/p2p/PEERID`
+/// or `/dns4/HOST/tcp/PORT/p2p/PEERID`
+fn validate_bootnode(addr: &str, index: usize) -> BootstrapResult<()> {
     if addr.is_empty() {
-        return Err("empty bootnode address".into());
+        return Err(BootstrapError::InvalidBootnode {
+            index,
+            reason: "empty bootnode address".into(),
+        });
     }
 
     let parts: Vec<&str> = addr.split('/').collect();
-    if parts.len() < 5 {
-        return Err(format!("malformed multiaddr (too few parts): {addr}"));
+    if parts.len() < MIN_MULTIADDR_PARTS {
+        return Err(BootstrapError::InvalidBootnode {
+            index,
+            reason: format!("malformed multiaddr (too few parts): {addr}"),
+        });
     }
 
     // First part should be empty (leading /).
     if !parts[0].is_empty() {
-        return Err(format!("multiaddr must start with /: {addr}"));
+        return Err(BootstrapError::InvalidBootnode {
+            index,
+            reason: format!("multiaddr must start with /: {addr}"),
+        });
     }
 
     // Check protocol prefix.
     match parts[1] {
-        "ip4" => {
-            // Validate IP.
+        PROTOCOL_IP4 => {
             let ip = parts[2];
             let octets: Vec<&str> = ip.split('.').collect();
             if octets.len() != 4 {
-                return Err(format!("invalid IPv4 address: {ip}"));
+                return Err(BootstrapError::InvalidBootnode {
+                    index,
+                    reason: format!("invalid IPv4 address: {ip}"),
+                });
             }
             for octet in &octets {
                 if octet.parse::<u8>().is_err() {
-                    return Err(format!("invalid IPv4 octet: {octet}"));
+                    return Err(BootstrapError::InvalidBootnode {
+                        index,
+                        reason: format!("invalid IPv4 octet: {octet}"),
+                    });
                 }
             }
         }
-        "dns4" | "dns6" => {
-            // DNS hostname — just check it's not empty.
+        PROTOCOL_DNS4 | PROTOCOL_DNS6 => {
             if parts[2].is_empty() {
-                return Err("empty DNS hostname".into());
+                return Err(BootstrapError::InvalidBootnode {
+                    index,
+                    reason: "empty DNS hostname".into(),
+                });
             }
         }
-        "ip6" => { /* Accept IPv6 */ }
+        PROTOCOL_IP6 => {
+            // IPv6 is accepted without detailed validation
+        }
         other => {
-            return Err(format!("unsupported multiaddr protocol: {other}"));
+            return Err(BootstrapError::InvalidBootnode {
+                index,
+                reason: format!("unsupported multiaddr protocol: {other}"),
+            });
         }
     }
 
     // Check for /tcp/PORT.
-    if parts.len() >= 5 && parts[3] == "tcp" {
-        if parts[4].parse::<u16>().is_err() {
-            return Err(format!("invalid TCP port: {}", parts[4]));
+    if parts.len() >= MIN_MULTIADDR_PARTS && parts[3] == PROTOCOL_TCP {
+        let port = parts[4];
+        if port.parse::<u16>().is_err() {
+            return Err(BootstrapError::InvalidBootnode {
+                index,
+                reason: format!("invalid TCP port: {port}"),
+            });
         }
     }
 
     Ok(())
 }
 
-/// Validate the full node configuration. Returns fatal errors.
-///
-/// This is called at boot: `config.validate() -> fatal if errors`.
+/// Validate the full node configuration. Returns `Ok(())` on success.
 pub fn validate_config(
     chain_id_config: u64,
     chain_id_genesis: Option<u64>,
@@ -127,22 +167,19 @@ pub fn validate_config(
     node_seed: u64,
     genesis_validator_seeds: &[u64],
     listen_addr: &str,
-) -> ValidationResult {
-    let mut errors = Vec::new();
-
+) -> BootstrapResult<()> {
     // 1. Validate bootnodes.
     for (i, bn) in bootnodes.iter().enumerate() {
-        if let Err(e) = validate_bootnode(bn) {
-            errors.push(ValidationError {
-                field: format!("network.bootnodes[{i}]"),
-                message: e,
-            });
-        }
+        validate_bootnode(bn, i)?;
     }
 
-    // 2. Check for self-bootstrap (node's own address in bootnodes).
-    // We can detect this if the bootnode points to the same listen address.
-    // (Simple heuristic: check if any bootnode contains the listen port)
+    // 2. Check for duplicate bootnodes.
+    let unique: BTreeSet<&str> = bootnodes.iter().map(|s| s.as_str()).collect();
+    if unique.len() < bootnodes.len() {
+        return Err(BootstrapError::DuplicateBootnodes);
+    }
+
+    // 3. Check for self‑bootstrap (node's own address in bootnodes).
     let listen_port = listen_addr
         .rsplit(':')
         .next()
@@ -150,71 +187,52 @@ pub fn validate_config(
         .chars()
         .filter(|c| c.is_ascii_digit())
         .collect::<String>();
+    let listen_port_u16 = listen_port.parse::<u16>().unwrap_or(DEFAULT_RPC_PORT);
     for bn in bootnodes {
-        if !listen_port.is_empty() && bn.contains("127.0.0.1") && bn.contains(&listen_port) {
-            errors.push(ValidationError {
-                field: "network.bootnodes".into(),
-                message: format!("node appears to bootstrap from itself: {bn}"),
-            });
+        if bn.contains("127.0.0.1") && bn.contains(&listen_port_u16.to_string()) {
+            return Err(BootstrapError::SelfBootstrap);
         }
     }
 
-    // 3. Chain ID mismatch.
+    // 4. Chain ID mismatch.
     if let Some(genesis_chain_id) = chain_id_genesis {
         if chain_id_config != genesis_chain_id {
-            errors.push(ValidationError {
-                field: "node.chain_id".into(),
-                message: format!(
-                    "config chain_id={chain_id_config} does not match genesis chain_id={genesis_chain_id}"
-                ),
+            return Err(BootstrapError::ChainIdMismatch {
+                config: chain_id_config,
+                genesis: genesis_chain_id,
             });
         }
     }
 
-    // 4. Stake config invalid.
+    // 5. Stake config invalid.
     if stake_each == 0 {
-        errors.push(ValidationError {
-            field: "consensus.stake_each".into(),
-            message: "stake_each must be > 0".into(),
-        });
+        return Err(BootstrapError::ZeroStake { stake: stake_each });
     }
 
-    // 5. simple_producer conflict: if node is not a validator, it shouldn't produce.
+    // 6. simple_producer conflict.
     if simple_producer && !genesis_validator_seeds.is_empty() {
         let is_validator = genesis_validator_seeds.contains(&node_seed);
         if !is_validator {
-            errors.push(ValidationError {
-                field: "consensus.simple_producer".into(),
-                message: format!(
-                    "simple_producer=true but node seed={node_seed} is not in validator set {:?}",
-                    genesis_validator_seeds
-                ),
+            return Err(BootstrapError::SimpleProducerConflict {
+                seed: node_seed,
+                validators: genesis_validator_seeds.to_vec(),
             });
         }
-    }
-
-    // 6. Duplicate bootnode check.
-    let unique: BTreeSet<&str> = bootnodes.iter().map(|s| s.as_str()).collect();
-    if unique.len() < bootnodes.len() {
-        errors.push(ValidationError {
-            field: "network.bootnodes".into(),
-            message: "duplicate bootnode entries detected".into(),
-        });
     }
 
     // 7. Listen address validation.
     if listen_addr.is_empty() {
-        errors.push(ValidationError {
-            field: "rpc.listen".into(),
-            message: "listen address cannot be empty".into(),
-        });
+        return Err(BootstrapError::EmptyListenAddress);
     }
 
-    ValidationResult { errors }
+    Ok(())
 }
 
-/// Compute a genesis hash for integrity checking.
-/// Uses SHA-256 of the canonical JSON representation.
+// -----------------------------------------------------------------------------
+// Genesis validation
+// -----------------------------------------------------------------------------
+
+/// Compute a genesis hash using SHA‑256 of the canonical JSON representation.
 pub fn genesis_hash(genesis_json: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -230,44 +248,49 @@ pub fn genesis_hash(genesis_json: &str) -> [u8; 32] {
 pub fn verify_genesis_integrity(
     genesis_path: impl AsRef<Path>,
     expected_hash: Option<&[u8; 32]>,
-) -> Result<[u8; 32], String> {
+) -> BootstrapResult<[u8; 32]> {
     let content = std::fs::read_to_string(genesis_path.as_ref())
-        .map_err(|e| format!("cannot read genesis: {e}"))?;
+        .map_err(|e| BootstrapError::GenesisFile {
+            reason: format!("cannot read genesis: {e}"),
+        })?;
 
     let hash = genesis_hash(&content);
 
     if let Some(expected) = expected_hash {
         if hash != *expected {
-            return Err(format!(
-                "genesis hash mismatch: expected 0x{}, got 0x{}",
-                hex::encode(expected),
-                hex::encode(hash),
-            ));
+            return Err(BootstrapError::GenesisHashMismatch {
+                expected: hex::encode(expected),
+                actual: hex::encode(hash),
+            });
         }
     }
 
     Ok(hash)
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_validate_bootnode_valid() {
-        assert!(validate_bootnode("/ip4/1.2.3.4/tcp/7001").is_ok());
-        assert!(validate_bootnode("/ip4/192.168.1.1/tcp/30333/p2p/12D3KooW").is_ok());
-        assert!(validate_bootnode("/dns4/node.example.com/tcp/7001").is_ok());
+        assert!(validate_bootnode("/ip4/1.2.3.4/tcp/7001", 0).is_ok());
+        assert!(validate_bootnode("/ip4/192.168.1.1/tcp/30333/p2p/12D3KooW", 0).is_ok());
+        assert!(validate_bootnode("/dns4/node.example.com/tcp/7001", 0).is_ok());
     }
 
     #[test]
     fn test_validate_bootnode_invalid() {
-        assert!(validate_bootnode("").is_err());
-        assert!(validate_bootnode("not-a-multiaddr").is_err());
-        assert!(validate_bootnode("/ip4/999.999.999.999/tcp/7001").is_err());
-        assert!(validate_bootnode("/ip4/1.2.3.4/tcp/99999").is_err());
+        assert!(validate_bootnode("", 0).is_err());
+        assert!(validate_bootnode("not-a-multiaddr", 0).is_err());
+        assert!(validate_bootnode("/ip4/999.999.999.999/tcp/7001", 0).is_err());
+        assert!(validate_bootnode("/ip4/1.2.3.4/tcp/99999", 0).is_err());
+        assert!(validate_bootnode("/ip4/1.2.3.4", 0).is_err());
     }
 
     #[test]
@@ -278,18 +301,18 @@ mod tests {
             &["/ip4/1.2.3.4/tcp/7001".into()],
             1000,
             true,
-            2, // Seed 2 is in validator set.
+            2,
             &[2, 3, 4],
             "0.0.0.0:9001",
         );
-        assert!(result.is_ok(), "{result}");
+        assert!(result.is_ok());
     }
 
     #[test]
     fn test_chain_id_mismatch() {
         let result = validate_config(
             6126151,
-            Some(9999), // Different!
+            Some(9999),
             &[],
             1000,
             false,
@@ -297,8 +320,10 @@ mod tests {
             &[],
             "0.0.0.0:9001",
         );
-        assert!(!result.is_ok());
-        assert!(result.errors.iter().any(|e| e.field == "node.chain_id"));
+        assert!(matches!(
+            result.unwrap_err(),
+            BootstrapError::ChainIdMismatch { config: 6126151, genesis: 9999 }
+        ));
     }
 
     #[test]
@@ -313,8 +338,10 @@ mod tests {
             &[],
             "0.0.0.0:9001",
         );
-        assert!(!result.is_ok());
-        assert!(result.errors.iter().any(|e| e.field.contains("bootnodes")));
+        assert!(matches!(
+            result.unwrap_err(),
+            BootstrapError::InvalidBootnode { index: 0, .. }
+        ));
     }
 
     #[test]
@@ -323,14 +350,13 @@ mod tests {
             6126151,
             None,
             &[],
-            0, // Invalid!
+            0,
             false,
             1,
             &[],
             "0.0.0.0:9001",
         );
-        assert!(!result.is_ok());
-        assert!(result.errors.iter().any(|e| e.field.contains("stake_each")));
+        assert!(matches!(result.unwrap_err(), BootstrapError::ZeroStake { stake: 0 }));
     }
 
     #[test]
@@ -340,16 +366,15 @@ mod tests {
             None,
             &[],
             1000,
-            true, // Producer enabled...
-            1,    // ...but seed 1 is NOT a validator.
+            true,
+            1,
             &[2, 3, 4],
             "0.0.0.0:9001",
         );
-        assert!(!result.is_ok());
-        assert!(result
-            .errors
-            .iter()
-            .any(|e| e.field.contains("simple_producer")));
+        assert!(matches!(
+            result.unwrap_err(),
+            BootstrapError::SimpleProducerConflict { seed: 1, .. }
+        ));
     }
 
     #[test]
@@ -359,7 +384,7 @@ mod tests {
             None,
             &[
                 "/ip4/1.2.3.4/tcp/7001".into(),
-                "/ip4/1.2.3.4/tcp/7001".into(), // Duplicate!
+                "/ip4/1.2.3.4/tcp/7001".into(),
             ],
             1000,
             false,
@@ -367,11 +392,7 @@ mod tests {
             &[],
             "0.0.0.0:9001",
         );
-        assert!(!result.is_ok());
-        assert!(result
-            .errors
-            .iter()
-            .any(|e| e.message.contains("duplicate")));
+        assert!(matches!(result.unwrap_err(), BootstrapError::DuplicateBootnodes));
     }
 
     #[test]
@@ -384,10 +405,9 @@ mod tests {
             false,
             1,
             &[],
-            "", // Empty!
+            "",
         );
-        assert!(!result.is_ok());
-        assert!(result.errors.iter().any(|e| e.field.contains("listen")));
+        assert!(matches!(result.unwrap_err(), BootstrapError::EmptyListenAddress));
     }
 
     #[test]
@@ -406,57 +426,22 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_genesis_integrity() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("genesis.json");
+    fn test_verify_genesis_integrity() -> BootstrapResult<()> {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
         let content = r#"{"chain_id":6126151,"validators":[]}"#;
-        std::fs::write(&path, content).unwrap();
+        std::fs::write(path, content).unwrap();
 
-        // Without expected hash — just compute.
-        let hash = verify_genesis_integrity(&path, None).unwrap();
+        let hash = verify_genesis_integrity(path, None)?;
         assert_ne!(hash, [0u8; 32]);
 
-        // With correct expected hash.
-        let result = verify_genesis_integrity(&path, Some(&hash));
-        assert!(result.is_ok());
+        // Correct hash
+        assert!(verify_genesis_integrity(path, Some(&hash)).is_ok());
 
-        // With wrong expected hash.
+        // Wrong hash
         let bad = [0xFFu8; 32];
-        let result = verify_genesis_integrity(&path, Some(&bad));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validation_result_display() {
-        let result = ValidationResult {
-            errors: vec![ValidationError {
-                field: "test".into(),
-                message: "bad".into(),
-            }],
-        };
-        let s = format!("{result}");
-        assert!(s.contains("FAIL"));
-        assert!(s.contains("1 errors"));
-    }
-
-    #[test]
-    fn test_validation_result_ok_display() {
-        let result = ValidationResult { errors: vec![] };
-        let s = format!("{result}");
-        assert!(s.contains("PASS"));
-    }
-
-    #[test]
-    fn test_validation_into_result() {
-        let ok = ValidationResult { errors: vec![] };
-        assert!(ok.into_result().is_ok());
-
-        let fail = ValidationResult {
-            errors: vec![ValidationError {
-                field: "x".into(),
-                message: "y".into(),
-            }],
-        };
-        assert!(fail.into_result().is_err());
+        let err = verify_genesis_integrity(path, Some(&bad)).unwrap_err();
+        assert!(matches!(err, BootstrapError::GenesisHashMismatch { .. }));
+        Ok(())
     }
 }
