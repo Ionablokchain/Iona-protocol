@@ -1,8 +1,12 @@
-# IONA v30.0.0 — Node 2 configuration
+# =============================================================================
+# IONA v30.0.0 — Node 2 Configuration (Validator)
+# =============================================================================
 # Chain: iona-testnet-local4 (chain_id = 6126151)
+# Node role: Validator (produces blocks)
 #
-# This is a production‑ready configuration for a validator node in a local testnet.
-# All values are explicitly set for clarity and reproducibility.
+# This configuration is production‑ready and includes all available options.
+# Security‑sensitive values should be set via environment variables, not hardcoded.
+# =============================================================================
 
 # -----------------------------------------------------------------------------
 # Node identity and basic settings
@@ -11,7 +15,8 @@
 # Base directory for node data (database, snapshots, quarantines, keys)
 data_dir = "/home/claude/iona_v30/testnet/local4/node2/data"
 
-# Deterministic key seed (change per node). WARNING: Keep secret in production.
+# Deterministic key seed (change per node). 
+# ⚠️ WARNING: Keep secret in production; use encrypted keystore instead.
 seed = 2
 
 # Unique chain identifier (must match genesis)
@@ -23,13 +28,15 @@ log_level = "info"
 # Path to genesis file (must exist and be valid)
 genesis_file = "/home/claude/iona_v30/testnet/local4/genesis.json"
 
-# Keystore mode: plain (insecure) | encrypted (recommended for production)
+# Keystore mode: "plain" (insecure, only for testing) 
+#                "encrypted" (recommended for production)
 keystore = "plain"
 
 # Password for encrypted keystore (fallback if env var not set)
+# DO NOT hardcode – use environment variable.
 keystore_password = ""
 
-# Environment variable name containing the keystore password (default)
+# Environment variable name containing the keystore password
 keystore_password_env = "IONA_KEYSTORE_PASSWORD"
 
 # -----------------------------------------------------------------------------
@@ -49,10 +56,10 @@ peers = [
 # Bootnodes for peer discovery (empty for local testnet)
 bootnodes = []
 
-# Enable mDNS for local network discovery (disabled for security)
+# Enable mDNS for local network discovery (disable in production)
 enable_mdns = false
 
-# Enable Kademlia DHT for peer discovery (optional)
+# Enable Kademlia DHT for peer discovery (recommended)
 enable_kad = true
 
 # Maximum number of connected peers (total inbound + outbound)
@@ -61,30 +68,32 @@ max_peers = 50
 # Reconnect interval to static peers (seconds)
 reconnect_interval_s = 30
 
-# Additional connection limits (recommended)
+# Additional connection limits (anti‑DoS)
 max_connections_per_ip = 8
 
-# Peer scoring and quarantine (defaults)
+# ── Request‑Response rate limits ──
 [network.rr_limits]
+# Per‑protocol limits (requests/sec)
 max_req_per_sec_block  = 15
 max_req_per_sec_status = 30
 max_req_per_sec_range  = 5
+# Per‑protocol bandwidth caps (bytes/sec)
 max_bytes_per_sec_block  = 2_000_000
 max_bytes_per_sec_status = 200_000
 max_bytes_per_sec_range  = 4_000_000
-
+# Global inbound/outbound caps (bytes/sec)
 global_in_bytes_per_sec  = 10_000_000
 global_out_bytes_per_sec = 10_000_000
-
-peer_strike_decay_s = 30
-peer_score_decay_s  = 60
-peer_quarantine_s   = 60
+# Peer scoring and quarantine
+peer_strike_decay_s          = 30
+peer_score_decay_s           = 60
+peer_quarantine_s            = 60
 rr_strikes_before_quarantine = 2
 rr_strikes_before_ban        = 3
 rr_quarantines_before_ban    = 2
 persist_quarantine = true
 
-# Eclipse attack protection
+# ── Eclipse attack protection ──
 [network.diversity]
 bucket_kind = "ip16"
 max_inbound_per_bucket = 4
@@ -92,16 +101,16 @@ max_outbound_per_bucket = 4
 eclipse_detection_min_buckets = 3
 reseed_cooldown_s = 60
 
-# Gossipsub limits
+# ── Gossipsub limits ──
 [network.gossipsub]
 allowed_topics = ["iona/tx", "iona/blocks", "iona/evidence"]
 deny_unknown_topics = true
-max_publish_msgs_per_sec = 50
-max_publish_bytes_per_sec = 5_242_880
-max_in_msgs_per_sec = 100
-max_in_bytes_per_sec = 10_485_760
+max_publish_msgs_per_sec  = 50
+max_publish_bytes_per_sec = 5_242_880   # 5 MiB
+max_in_msgs_per_sec       = 100
+max_in_bytes_per_sec      = 10_485_760  # 10 MiB
 
-# State sync security
+# ── State sync security ──
 [network.state_sync_security]
 bind_validator_set = true
 bind_epoch = true
@@ -109,15 +118,15 @@ attestation_epoch_s = 60
 require_attestation = false
 use_aggregated_signatures = false
 
-# P2P state sync
-enable_p2p_state_sync = true
-state_sync_chunk_bytes = 1_048_576
-state_sync_timeout_s = 15
+# P2P state sync (fast bootstrap)
+enable_p2p_state_sync    = true
+state_sync_chunk_bytes   = 1_048_576   # 1 MiB
+state_sync_timeout_s     = 15
 
-# Snapshot attestation
-enable_snapshot_attestation = true
-snapshot_attestation_threshold = 2
-snapshot_attestation_collect_s = 8
+# Snapshot attestation (for state sync security)
+enable_snapshot_attestation       = true
+snapshot_attestation_threshold    = 2
+snapshot_attestation_collect_s    = 8
 
 # -----------------------------------------------------------------------------
 # RPC server (local only for security)
@@ -138,10 +147,10 @@ allowed_origins = []
 
 # Rate limiting for RPC calls (requests per second, per IP)
 rate_limit_per_ip = 100
-rate_limit_burst = 200
+rate_limit_burst  = 200
 
 # Maximum request size (bytes)
-max_request_size = 10_485_760
+max_request_size = 10_485_760   # 10 MiB
 
 # Timeout for RPC calls (seconds)
 timeout_s = 30
@@ -156,6 +165,7 @@ max_json_depth = 32
 listen = "127.0.0.1:9002"
 
 # Optional API key for admin endpoints (empty = disabled)
+# Use environment variable for production.
 api_key = ""
 
 # -----------------------------------------------------------------------------
@@ -209,7 +219,7 @@ min_gas_price = 1
 max_gas_price = 1_000_000
 max_priority_fee_per_gas = 100
 
-# MEV protection
+# ── MEV protection ──
 [mev]
 enable_commit_reveal = true
 enable_threshold_encryption = true
@@ -238,9 +248,9 @@ snapshot_zstd_level = 3
 # Database cache size (MB)
 db_cache_size_mb = 512
 
-# WAL (Write-Ahead Log) configuration
+# ── WAL (Write-Ahead Log) configuration ──
 [storage.wal]
-max_segment_bytes = 67_108_864
+max_segment_bytes = 67_108_864   # 64 MiB
 keep_segments = 3
 fsync_every_write = true
 
@@ -276,7 +286,7 @@ remote_tls_server_name     = ""
 # -----------------------------------------------------------------------------
 [audit]
 log_path = "/home/claude/iona_v30/testnet/local4/node2/data/audit.jsonl"
-max_file_size_bytes = 104_857_600
+max_file_size_bytes = 104_857_600   # 100 MiB
 rotate_count = 5
 emit_to_tracing = true
 
@@ -286,19 +296,19 @@ emit_to_tracing = true
 [governance]
 min_deposit = 1_000_000
 voting_epochs = 100
-quorum_bps = 3340
-threshold_bps = 5000
+quorum_bps = 3340      # 33.4%
+threshold_bps = 5000   # 50%
 
 # -----------------------------------------------------------------------------
 # Economics (testnet defaults)
 # -----------------------------------------------------------------------------
 [economics]
-base_inflation_bps = 500
+base_inflation_bps = 500        # 5% annual
 min_stake = 10_000_000_000
-slash_double_sign_bps = 5000
-slash_downtime_bps = 100
+slash_double_sign_bps = 5000    # 50%
+slash_downtime_bps = 100        # 1%
 unbonding_epochs = 14
-treasury_bps = 500
+treasury_bps = 500              # 5%
 
 # -----------------------------------------------------------------------------
 # Backup (optional)
