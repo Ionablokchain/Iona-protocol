@@ -1,27 +1,95 @@
+# =============================================================================
+# IONA Multi-Node Docker Compose — Production‑Ready
+# =============================================================================
+# Starts 3 IONA nodes with persistent data volumes.
+# Each node uses its own configuration file (mounted as /data/config.toml).
+#
+# Usage:
+#   docker-compose up -d
+#   docker-compose down
+#   docker-compose logs -f iona1
+# =============================================================================
+
+version: '3.9'
+
+# -----------------------------------------------------------------------------
+# Common configuration (YAML anchors)
+# -----------------------------------------------------------------------------
+x-iona-base: &iona-base
+  build: .
+  networks:
+    - iona-net
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 30s
+  deploy:
+    resources:
+      limits:
+        cpus: '2'
+        memory: 4G
+      reservations:
+        cpus: '0.5'
+        memory: 1G
+
+# -----------------------------------------------------------------------------
+# Services
+# -----------------------------------------------------------------------------
 services:
   iona1:
-    build: .
-    command: ["--config", "/data/config.toml"]
+    <<: *iona-base
+    container_name: iona-node-1
     ports:
-      - "7001:7001"
-      - "9001:9001"
+      - "7001:7001"   # P2P
+      - "9001:9001"   # RPC
     volumes:
       - ./data/node1:/data
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    command: ["--config", "/data/config.toml"]
 
   iona2:
-    build: .
-    command: ["--config", "/data/config.toml"]
+    <<: *iona-base
+    container_name: iona-node-2
     ports:
       - "7002:7001"
       - "9002:9001"
     volumes:
       - ./data/node2:/data
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    command: ["--config", "/data/config.toml"]
+    depends_on:
+      - iona1
 
   iona3:
-    build: .
-    command: ["--config", "/data/config.toml"]
+    <<: *iona-base
+    container_name: iona-node-3
     ports:
       - "7003:7001"
       - "9003:9001"
     volumes:
       - ./data/node3:/data
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    command: ["--config", "/data/config.toml"]
+    depends_on:
+      - iona1
+
+# -----------------------------------------------------------------------------
+# Networks
+# -----------------------------------------------------------------------------
+networks:
+  iona-net:
+    name: iona-network
+    driver: bridge
+    # Uncomment to use a fixed subnet
+    # ipam:
+    #   config:
+    #     - subnet: 172.20.0.0/24
