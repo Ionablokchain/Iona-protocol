@@ -1,18 +1,20 @@
-# cargo-deny configuration for IONA.
-#
+# =============================================================================
+# cargo-deny configuration for IONA
+# =============================================================================
 # This file controls `cargo deny` checks for:
-# - license compliance
-# - security advisories
-# - duplicate dependencies
-# - crate sources
+#   - license compliance
+#   - security advisories
+#   - duplicate dependencies
+#   - crate sources
 #
 # Run: cargo deny check
+# =============================================================================
 
 # -----------------------------------------------------------------------------
-# Licenses
+# License compliance
 # -----------------------------------------------------------------------------
 [licenses]
-# List of allowed licenses. All crates must have one of these.
+# List of allowed licenses. All crates must have at least one license from this list.
 allow = [
     "MIT",
     "MIT-0",
@@ -41,25 +43,29 @@ deny = [
     "LGPL-3.0",
 ]
 
-# Require explicit license text in Cargo.toml.
+# Require explicit license text in Cargo.toml (prevents implicit fallback).
 require_explicit = true
 
-# If a crate has multiple licenses, require that all are allowed.
+# If a crate has multiple licenses, all must be allowed.
 allow_openssl = true
 
 # -----------------------------------------------------------------------------
-# Security Advisories
+# Security advisories
 # -----------------------------------------------------------------------------
 [advisories]
-# How to treat unmaintained crates.
-unmaintained = "workspace"   # warn at workspace level
+# How to treat unmaintained crates (warn at workspace level, not deny).
+unmaintained = "workspace"
 
 # How to treat unsound crates.
 unsound = "workspace"
 
-# Ignore specific advisories that have been reviewed and accepted.
+# Severity threshold for vulnerabilities (default: medium).
+# Uncomment to set a custom threshold.
+# severity-threshold = "medium"
+
+# Ignored advisories (reviewed and accepted as not exploitable or not applicable).
 ignore = [
-    # 2026 batch currently tolerated until upstreams are updated
+    # 2026 batch tolerated until upstreams are updated
     "RUSTSEC-2026-0002", # lru unsound
     "RUSTSEC-2026-0044",
     "RUSTSEC-2026-0045",
@@ -76,40 +82,36 @@ ignore = [
     "RUSTSEC-2025-0141", # bincode unmaintained
 ]
 
-# Vulnerability severity threshold (deny by default).
-# severity-threshold = "medium"
-
 # -----------------------------------------------------------------------------
-# Crate Bans (duplicate versions, wildcards)
+# Crate bans (duplicate versions, wildcard dependencies)
 # -----------------------------------------------------------------------------
 [bans]
-# Warn when multiple versions of the same crate are used.
+# Warn when multiple versions of the same crate are used (prevents bloat).
 multiple-versions = "warn"
 
 # Deny wildcard dependencies (e.g., `version = "*"`).
 wildcards = "deny"
 
-# Highlight all crates in duplicate reports.
+# Show all crates in duplicate reports, not just the first.
 highlight = "all"
 
-# Explicitly skip certain crates from duplicate detection (if needed).
+# Skip specific crates from duplicate detection (rarely needed).
 skip = []
 
-# Skip entire trees of crates (if needed).
+# Skip entire trees of crates (rarely needed).
 skip-tree = []
 
-# List of crates that are allowed to have multiple versions.
-# (Used when a conflict is unavoidable, e.g., two major versions of a crate.)
+# Explicitly allow certain wildcard paths (if unavoidable).
 # allow-wildcard-paths = []
 
 # -----------------------------------------------------------------------------
-# Sources (where crates are fetched from)
+# Sources (crate registries)
 # -----------------------------------------------------------------------------
 [sources]
-# Deny unknown registries (only crates.io allowed).
+# Deny unknown registries (only allow explicitly listed ones).
 unknown-registry = "deny"
 
-# Deny unknown git repositories (only explicit allowlist allowed).
+# Deny unknown git repositories.
 unknown-git = "deny"
 
 # Allow the official crates.io registry.
@@ -119,7 +121,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
 
 # -----------------------------------------------------------------------------
-# Bans for specific crates (optional)
+# Ban specific crates entirely (optional)
 # -----------------------------------------------------------------------------
 # [bans.deny]
-# crates = []   # list of crate names to deny entirely
+# crates = []   # list of crate names to deny (e.g., ["openssl-sys"])
