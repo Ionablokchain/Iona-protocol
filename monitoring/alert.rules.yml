@@ -1,18 +1,130 @@
+# =============================================================================
+# IONA Prometheus Alert Rules — Production‑Ready
+# =============================================================================
+# These alerts are designed for a validator or full node.
+# Adjust thresholds based on your environment (testnet / mainnet).
+#
+# Severity levels:
+#   - page   (critical, requires immediate action)
+#   - ticket (warning, investigate within business hours)
+#   - info   (informational, no immediate action)
+# =============================================================================
+
 groups:
-  - name: iona-alerts
+  # ---------------------------------------------------------------------------
+  # Node liveness and health
+  # ---------------------------------------------------------------------------
+  - name: iona.health
     rules:
       - alert: IonaNodeDown
         expr: up{job="iona-node"} == 0
         for: 30s
         labels:
           severity: page
+          team: ops
         annotations:
-          summary: "Iona node is down"
+          summary: "IONA node is down on {{ $labels.instance }}"
+          description: "The node has been unreachable for more than 30 seconds."
+          runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/node_down.md"
 
-      - alert: HighFinalityLag
+      - alert: IonaNodeHighCPU
+        expr: (100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)) > 90
+        for: 10m
+        labels:
+          severity: ticket
+          team: ops
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}: {{ $value }}%"
+          description: "CPU usage has exceeded 90% for 10 minutes."
+
+  # ---------------------------------------------------------------------------
+  # Consensus and finality
+  # ---------------------------------------------------------------------------
+  - name: iona.consensus
+    rules:
+      - alert: IonaHighFinalityLag
         expr: iona_finality_lag_seconds > 10
         for: 2m
         labels:
           severity: ticket
+          team: validators
         annotations:
-          summary: "Finality lag is high"
+          summary: "High finality lag on {{ $labels.instance }}: {{ $value }}s"
+          description: "Blocks are taking more than 10 seconds to finalise."
+          runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/finality_lag.md"
+
+      - alert: IonaNoBlocksFor5Minutes
+        expr: (time() - iona_block_timestamp_seconds) > 300
+        for: 0m
+        labels:
+          severity: page
+          team: validators
+        annotations:
+          summary: "No new blocks for 5+ minutes on {{ $labels.instance }}"
+          description: "Last block timestamp is more than 300 seconds old. Chain may be halted."
+
+  # ---------------------------------------------------------------------------
+  # Peer connectivity
+  # ---------------------------------------------------------------------------
+  - name: iona.network
+    rules:
+      - alert: IonaLowPeers
+        expr: iona_peer_count < 3
+        for: 5m
+        labels:
+          severity: ticket
+          team: ops
+        annotations:
+          summary: "Low peer count on {{ $labels.instance }}: {{ $value }}"
+          description: "Node has fewer than 3 connected peers for 5 minutes."
+
+  # ---------------------------------------------------------------------------
+  # Storage and memory pressure
+  # ---------------------------------------------------------------------------
+  - name: iona.storage
+    rules:
+      - alert: IonaHighDiskUsage
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 10
+        for: 5m
+        labels:
+          severity: page
+          team: ops
+        annotations:
+          summary: "Low disk space on {{ $labels.instance }}: {{ $value }}% available"
+          description: "Less than 10% disk space remaining."
+
+      - alert: IonaMempoolFull
+        expr: iona_mempool_size / iona_mempool_capacity > 0.95
+        for: 2m
+        labels:
+          severity: ticket
+          team: ops
+        annotations:
+          summary: "Mempool nearly full on {{ $labels.instance }}: {{ $value | humanizePercentage }}"
+          description: "Mempool capacity is >95% used. Consider increasing capacity or processing more transactions."
+
+  # ---------------------------------------------------------------------------
+  # Security and anomalies
+  # ---------------------------------------------------------------------------
+  - name: iona.security
+    rules:
+      - alert: IonaTooManyRateLimitHits
+        expr: rate(iona_rpc_rate_limited_total[1m]) > 10
+        for: 2m
+        labels:
+          severity: ticket
+          team: security
+        annotations:
+          summary: "High rate of RPC rate limiting on {{ $labels.instance }}"
+          description: "More than 10 requests per second are being rate‑limited. Possible abuse."
+
+      - alert: IonaAuditIntegrityFailure
+        expr: iona_audit_chain_integrity == 0
+        for: 1m
+        labels:
+          severity: page
+          team: security
+        annotations:
+          summary: "Audit chain integrity failure on {{ $labels.instance }}"
+          description: "The audit log tamper‑evident chain is broken. Run verification immediately."
+          runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/audit_chain_break.md"
