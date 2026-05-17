@@ -1,4 +1,4 @@
---------------------------- MODULE upgrade ---------------------------
+---------------------------- MODULE upgrade ----------------------------
 \* TLA+ model for IONA protocol upgrade activation + safety invariants.
 \*
 \* This model verifies that a rolling protocol upgrade preserves:
@@ -13,54 +13,61 @@
 \*   H = activation height (e.g. 5)
 \*   G = grace window (e.g. 2)
 \*   MaxHeight = simulation bound (e.g. 10)
+\*
+\* Usage: TLC model checker with temporal formulas.
 
 EXTENDS Integers, Sequences, FiniteSets, TLC
+
+-----------------------------------------------------------------------------
+\* Constants and assumptions
+-----------------------------------------------------------------------------
 
 CONSTANTS N, F, H, G, MaxHeight
 
 ASSUME N > 0
 ASSUME F >= 0
-ASSUME F * 3 < N
+ASSUME F * 3 < N   \* Byzantine fault tolerance: > 2/3 correct
 ASSUME H > 0
 ASSUME G >= 0
-ASSUME MaxHeight >= H + G
+ASSUME MaxHeight >= H + G   \* Enough height to observe after grace
 
-\* Validator IDs: 1..N
+-----------------------------------------------------------------------------
+\* Basic definitions
+-----------------------------------------------------------------------------
+
 Validators == 1..N
 
 \* Protocol versions
 PV_OLD == 1
 PV_NEW == 2
 
-\* ---------------------------------------------------------------------------
-\* Variables
-\* ---------------------------------------------------------------------------
-
-VARIABLES
-    height,           \* current chain height (global, simplified)
-    upgraded,         \* upgraded[v] = TRUE if validator v has upgraded binary
-    finalized,        \* finalized[h] = block_pv finalized at height h (or 0)
-    finalized_height, \* highest finalized height (monotonic)
-    produced_pv       \* produced_pv[h] = PV used to produce block at height h
-
-vars == <<height, upgraded, finalized, finalized_height, produced_pv>>
-
-\* ---------------------------------------------------------------------------
-\* PV function: deterministic from height + activation schedule
-\* ---------------------------------------------------------------------------
-
+\* PV function: deterministic based on height and activation schedule
 PV(h) == IF h < H THEN PV_OLD ELSE PV_NEW
 
-\* Accept predicate: is block_pv acceptable at height h?
+\* Accept predicate: a block with given PV is acceptable at height h
+\* During grace window, old PV blocks are still accepted.
 AcceptPV(block_pv, h) ==
     \/ block_pv = PV(h)
     \/ /\ h >= H
        /\ h < H + G
        /\ block_pv = PV_OLD
 
-\* ---------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+\* Variables
+-----------------------------------------------------------------------------
+
+VARIABLES
+    height,           \* current chain height (global, simplified)
+    upgraded,         \* upgraded[v] = TRUE if validator v has upgraded binary
+    finalized,        \* finalized[h] = PV of block finalized at height h (or 0)
+    finalized_height, \* highest finalized height (monotonic)
+    produced_pv       \* produced_pv[h] = PV used to produce block at height h
+
+vars == <<height, upgraded, finalized, finalized_height, produced_pv>>
+
+-----------------------------------------------------------------------------
 \* Initial state
-\* ---------------------------------------------------------------------------
+-----------------------------------------------------------------------------
 
 Init ==
     /\ height = 1
@@ -69,9 +76,9 @@ Init ==
     /\ finalized_height = 0
     /\ produced_pv = [h \in 1..MaxHeight |-> 0]
 
-\* ---------------------------------------------------------------------------
+-----------------------------------------------------------------------------
 \* Actions
-\* ---------------------------------------------------------------------------
+-----------------------------------------------------------------------------
 
 \* A validator upgrades its binary (rolling upgrade, one at a time)
 UpgradeValidator(v) ==
@@ -80,19 +87,19 @@ UpgradeValidator(v) ==
     /\ UNCHANGED <<height, finalized, finalized_height, produced_pv>>
 
 \* Produce and finalize a block at current height
-\* The proposer uses PV based on whether it has upgraded
+\* The proposer uses PV based on whether it has upgraded.
+\* A block is valid only if ≥ 2/3 of validators (byzantine‑aware) can validate it.
 ProduceBlock ==
     /\ height <= MaxHeight
     /\ \E proposer \in Validators:
         LET block_pv == IF upgraded[proposer] THEN PV(height) ELSE PV_OLD
         IN
-        \* Check if enough validators can validate this block
         LET supporters == {v \in Validators :
             \/ (upgraded[v] /\ block_pv \in {PV_OLD, PV_NEW})
             \/ (~upgraded[v] /\ block_pv = PV_OLD)
         }
         IN
-        /\ Cardinality(supporters) * 3 > N * 2  \* 2/3+ quorum
+        /\ Cardinality(supporters) * 3 > N * 2   \* > 2/3 quorum
         /\ AcceptPV(block_pv, height)
         /\ produced_pv' = [produced_pv EXCEPT ![height] = block_pv]
         /\ finalized' = [finalized EXCEPT ![height] = block_pv]
@@ -100,44 +107,47 @@ ProduceBlock ==
         /\ height' = height + 1
         /\ UNCHANGED upgraded
 
-\* ---------------------------------------------------------------------------
-\* Next state
-\* ---------------------------------------------------------------------------
-
+\* Next-state relation
 Next ==
     \/ \E v \in Validators: UpgradeValidator(v)
     \/ ProduceBlock
 
-\* ---------------------------------------------------------------------------
+-----------------------------------------------------------------------------
 \* Safety invariants
-\* ---------------------------------------------------------------------------
+-----------------------------------------------------------------------------
 
-\* S1: No split finality — at most one finalized block per height
-\* (trivially true in this model since finalized[h] is a single value)
+\* S1: No split finality – at most one finalized block per height.
+\* (In this simplified model, finalized[h] holds at most one value.)
 NoSplitFinality ==
     \A h \in 1..MaxHeight:
         finalized[h] # 0 => finalized[h] \in {PV_OLD, PV_NEW}
 
-\* S2: Finality monotonic — finalized_height never decreases
-\* (encoded in ProduceBlock: finalized_height' = height which is monotonically increasing)
+\* S2: Finality monotonic – finalized_height never decreases.
+\* (ProduceBlock sets it to current height, which increases.)
 FinalityMonotonic ==
     finalized_height >= 0
 
-\* S3: Deterministic PV — all correct nodes compute same PV(height)
-\* (PV is a pure function of height, so this is true by construction)
+\* S3: Deterministic PV – all correct nodes compute same PV(height).
+\* (PV is a pure function, so true by construction.)
 DeterministicPV ==
     \A h \in 1..MaxHeight:
         PV(h) \in {PV_OLD, PV_NEW}
 
-\* S4: After activation + grace, only PV_NEW blocks are finalized
+\* S4: After activation + grace window, only new‑PV blocks are finalized.
 AfterGraceOnlyNew ==
     \A h \in 1..MaxHeight:
         (h >= H + G /\ finalized[h] # 0) => finalized[h] = PV_NEW
 
-\* S5: Before activation, only PV_OLD blocks are finalized
+\* S5: Before activation, only old‑PV blocks are finalized.
 BeforeActivationOnlyOld ==
     \A h \in 1..MaxHeight:
         (h < H /\ finalized[h] # 0) => finalized[h] = PV_OLD
+
+\* S6: A block’s PV must be acceptable at its height (already enforced in ProduceBlock).
+\* This invariant is implied, but we state it for completeness.
+BlockPVAcceptable ==
+    \A h \in 1..MaxHeight:
+        produced_pv[h] # 0 => AcceptPV(produced_pv[h], h)
 
 \* Combined safety invariant
 Safety ==
@@ -146,21 +156,22 @@ Safety ==
     /\ DeterministicPV
     /\ AfterGraceOnlyNew
     /\ BeforeActivationOnlyOld
+    /\ BlockPVAcceptable
 
-\* ---------------------------------------------------------------------------
-\* Liveness (checked as temporal property, not invariant)
-\* ---------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+\* Liveness (temporal properties – not model‑checked by default)
+-----------------------------------------------------------------------------
 
-\* If all correct validators upgrade before H, the chain makes progress
-\* (not model-checked here, but stated for completeness)
+\* If all correct validators upgrade before H, the chain makes progress.
+\* (Illustrative – not used in TLC without temporal specification.)
+\* Liveness == <>(height > H)
 
-\* ---------------------------------------------------------------------------
-\* Spec
-\* ---------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+\* Specification and theorem
+-----------------------------------------------------------------------------
 
 Spec == Init /\ [][Next]_vars
 
-\* Check Safety as an invariant
 THEOREM Spec => []Safety
 
 =============================================================================
