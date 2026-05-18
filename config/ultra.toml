@@ -1,6 +1,15 @@
-# Ultra profile: aggressive safety defaults for open Internet.
+# =============================================================================
+# IONA Ultra Profile — Aggressive safety defaults for open Internet
+# =============================================================================
 # This configuration is intended for production nodes exposed to the public Internet.
 # All values are tuned for maximum security and resilience.
+#
+# Security notes:
+#   - DO NOT commit secrets (api_key_value, keystore_password) to version control.
+#   - Use environment variables (IONA_KEYSTORE_PASSWORD, IONA_API_KEY) instead.
+#   - Run behind a reverse proxy (nginx, caddy) with TLS and rate limiting.
+#   - Enable fail2ban or similar for SSH and RPC protection.
+# =============================================================================
 
 # -----------------------------------------------------------------------------
 # Node identity and basic settings
@@ -9,19 +18,20 @@
 # Base directory for node data (database, snapshots, quarantines, keys)
 data_dir = "./data/ultra-node"
 
-# Deterministic key seed (change per node). WARNING: Keep secret in production.
+# Deterministic key seed (change per node). 
+# ⚠️ WARNING: Keep secret in production. Use encrypted keystore instead.
 seed = 1
 
 # Unique chain identifier (must match genesis)
 chain_id = 6126151
 
 # Log level: trace | debug | info | warn | error
-log_level = "warn"
+log_level = "warn"   # Reduced log volume, more security
 
-# Keystore mode: plain (insecure) | encrypted (recommended)
+# Keystore mode: "encrypted" (MANDATORY for public nodes)
 keystore = "encrypted"
 
-# Password for encrypted keystore (fallback if env var not set)
+# Password for encrypted keystore – DO NOT hardcode. Use environment variable.
 keystore_password = ""
 
 # Environment variable name containing the keystore password
@@ -117,7 +127,7 @@ bootnodes = [
   # "/dns4/node.example/tcp/7001/p2p/12D3KooW...",
 ]
 
-# Enable mDNS for local network discovery (disables for security)
+# Enable mDNS for local network discovery (disabled for security)
 enable_mdns = false
 
 # Enable Kademlia DHT for peer discovery
@@ -139,7 +149,7 @@ max_bytes_per_sec_range  = 2_000_000
 global_in_bytes_per_sec  = 5_000_000
 global_out_bytes_per_sec = 5_000_000
 
-# Peer scoring
+# Peer scoring (aggressive quarantine)
 peer_strike_decay_s = 60
 peer_score_decay_s  = 120
 peer_quarantine_s   = 300
@@ -148,7 +158,7 @@ rr_strikes_before_ban        = 2
 rr_quarantines_before_ban    = 1
 persist_quarantine = true
 
-# Eclipse attack protection (diversity)
+# Eclipse attack protection (tight diversity)
 [network.diversity]
 bucket_kind = "ip16"
 max_inbound_per_bucket = 2
@@ -165,7 +175,7 @@ max_publish_bytes_per_sec = 2_000_000
 max_in_msgs_per_sec = 50
 max_in_bytes_per_sec = 5_000_000
 
-# State sync security
+# State sync security (require attestation)
 [network.state_sync_security]
 bind_validator_set = true
 bind_epoch = true
@@ -175,7 +185,7 @@ use_aggregated_signatures = false
 
 # P2P state sync
 enable_p2p_state_sync = true
-state_sync_chunk_bytes = 1_048_576
+state_sync_chunk_bytes = 1_048_576   # 1 MiB
 state_sync_timeout_s = 15
 
 # Snapshot attestation
@@ -210,7 +220,7 @@ max_pending_commits = 100_000
 bind = "127.0.0.1:8080"
 enable_api_key = true
 api_key_header = "x-api-key"
-api_key_value = ""                    # MUST be set via environment or config
+api_key_value = ""                    # MUST be set via environment variable
 cors_allowed_origins = ["http://localhost:3000"]
 max_body_bytes = 1_048_576
 rate_limit_enabled = true
@@ -230,7 +240,7 @@ db_cache_size_mb = 1024
 max_concurrent_tasks = 128
 
 [storage.wal]
-max_segment_bytes = 67_108_864
+max_segment_bytes = 67_108_864   # 64 MiB
 keep_segments = 3
 fsync_every_write = true
 
@@ -239,7 +249,7 @@ fsync_every_write = true
 # -----------------------------------------------------------------------------
 [audit]
 log_path = "./data/ultra-node/audit.jsonl"
-max_file_size_bytes = 104_857_600
+max_file_size_bytes = 104_857_600   # 100 MiB
 rotate_count = 10
 emit_to_tracing = true
 
@@ -257,8 +267,8 @@ service_name = "iona-ultra-node"
 [governance]
 min_deposit = 1_000_000
 voting_epochs = 100
-quorum_bps = 3340
-threshold_bps = 5000
+quorum_bps = 3340      # 33.4%
+threshold_bps = 5000   # 50%
 
 # -----------------------------------------------------------------------------
 # Economics (testnet defaults)
@@ -274,6 +284,6 @@ treasury_bps = 500
 # -----------------------------------------------------------------------------
 # Network emulation (for testing only – comment out in production)
 # -----------------------------------------------------------------------------
-[netem]
-delay = "200ms 50ms"
-loss = "5%"
+# [netem]
+# delay = "200ms 50ms"
+# loss = "5%"
