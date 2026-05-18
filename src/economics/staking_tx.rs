@@ -23,7 +23,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum StakingTxError {
     #[error("insufficient balance: have {have}, need {need}")]
-    InsufficientBalance { have: u128, need: u128 },
+    InsufficientBalance { have: u64, need: u64 },
     #[error("delegation amount must be > 0, got {0}")]
     ZeroDelegation(u128),
     #[error("undelegation amount must be > 0, got {0}")]
@@ -52,6 +52,8 @@ pub enum StakingTxError {
     UnknownAction(String),
     #[error("staking state error: {0}")]
     StakingError(#[from] StakingError),
+    #[error("arithmetic overflow")]
+    Overflow,
 }
 
 pub type StakingTxResult<T> = Result<T, StakingTxError>;
@@ -85,14 +87,17 @@ pub fn try_apply_staking_tx(
     }
 
     let parts: Vec<&str> = payload.split_whitespace().collect();
-    let action = parts.get(1).copied().unwrap_or("");
+    if parts.len() < 2 {
+        return Some(StakingTxOutcome::failure("missing action after 'stake'"));
+    }
 
+    let action = parts[1];
     let result = match action {
         "delegate" => apply_delegate(&parts, from, kv, staking, params),
         "undelegate" => apply_undelegate(&parts, from, kv, staking, params, epoch),
         "withdraw" => apply_withdraw(&parts, from, kv, staking, epoch),
         "register" => apply_register(&parts, from, kv, staking, params),
-        "deregister" => apply_deregister(from, kv, staking),
+        "deregister" => apply_deregister(from, kv, staking, epoch),
         _ => Err(StakingTxError::UnknownAction(action.to_string())),
     };
 
@@ -105,13 +110,49 @@ pub fn try_apply_staking_tx(
         Err(e) => StakingTxOutcome {
             success: false,
             error: Some(e.to_string()),
-            gas_used: 21_000,
+            gas_used: 21_000, // base gas even on failure
         },
     })
 }
 
+impl StakingTxOutcome {
+    fn failure(msg: &str) -> Self {
+        Self {
+            success: false,
+            error: Some(msg.to_string()),
+            gas_used: 21_000,
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Helpers
+// -----------------------------------------------------------------------------
+
+/// Safely deduct `amount` from a KV balance, returning the new balance or error.
+fn deduct_balance(kv: &mut KvState, address: &str, amount: u64) -> StakingTxResult<u64> {
+    let bal = *kv.balances.get(address).unwrap_or(&0);
+    if bal < amount {
+        return Err(StakingTxError::InsufficientBalance {
+            have: bal,
+            need: amount,
+        });
+    }
+    let new_bal = bal.checked_sub(amount).ok_or(StakingTxError::Overflow)?;
+    kv.balances.insert(address.to_string(), new_bal);
+    Ok(new_bal)
+}
+
+/// Safely add `amount` to a KV balance, returning the new balance or error.
+fn add_balance(kv: &mut KvState, address: &str, amount: u64) -> StakingTxResult<u64> {
+    let current = *kv.balances.get(address).unwrap_or(&0);
+    let new_bal = current.checked_add(amount).ok_or(StakingTxError::Overflow)?;
+    kv.balances.insert(address.to_string(), new_bal);
+    Ok(new_bal)
+}
+
+// -----------------------------------------------------------------------------
+// Action handlers
 // -----------------------------------------------------------------------------
 
 /// stake delegate <validator_addr> <amount>
@@ -122,48 +163,34 @@ fn apply_delegate(
     staking: &mut StakingState,
     params: &EconomicsParams,
 ) -> StakingTxResult<u64> {
-    let val_addr = parts
-        .get(2)
-        .ok_or(StakingTxError::MissingArgument("validator address"))?;
-    let amount_str = parts
-        .get(3)
-        .ok_or(StakingTxError::MissingArgument("amount"))?;
-    let amount: u128 = amount_str
+    if parts.len() != 4 {
+        return Err(StakingTxError::MissingArgument("validator address and amount"));
+    }
+    let val_addr = parts[2];
+    let amount_str = parts[3];
+    let amount: u64 = amount_str
         .parse()
         .map_err(|_| StakingTxError::InvalidAmount(amount_str.to_string()))?;
 
     if amount == 0 {
-        return Err(StakingTxError::ZeroDelegation(amount));
+        return Err(StakingTxError::ZeroDelegation(amount as u128));
     }
 
     // Validator must exist and not be jailed
     let val = staking
-        .validators
-        .get(*val_addr)
+        .get_validator(val_addr)
         .ok_or_else(|| StakingTxError::ValidatorNotFound(val_addr.to_string()))?;
     if val.jailed {
         return Err(StakingTxError::ValidatorJailed(val_addr.to_string()));
     }
 
     // Deduct from sender's balance
-    let bal = *kv.balances.get(from).unwrap_or(&0) as u128;
-    if bal < amount {
-        return Err(StakingTxError::InsufficientBalance {
-            have: bal,
-            need: amount,
-        });
-    }
-    *kv.balances.entry(from.to_string()).or_insert(0) = (bal - amount) as u64;
+    deduct_balance(kv, from, amount)?;
 
-    // Record delegation (uses staking.delegate which now returns Result)
+    // Record delegation (staking uses u128 internally)
     staking
-        .delegate(from.to_string(), val_addr.to_string(), amount)
+        .delegate(from.to_string(), val_addr.to_string(), amount as u128)
         .map_err(StakingTxError::StakingError)?;
-
-    // Increase validator total stake
-    if let Some(v) = staking.validators.get_mut(*val_addr) {
-        v.stake = v.stake.saturating_add(amount);
-    }
 
     Ok(21_000 + 5_000) // delegate costs slightly more gas
 }
@@ -177,26 +204,25 @@ fn apply_undelegate(
     params: &EconomicsParams,
     epoch: u64,
 ) -> StakingTxResult<u64> {
-    let val_addr = parts
-        .get(2)
-        .ok_or(StakingTxError::MissingArgument("validator address"))?;
-    let amount_str = parts
-        .get(3)
-        .ok_or(StakingTxError::MissingArgument("amount"))?;
-    let amount: u128 = amount_str
+    if parts.len() != 4 {
+        return Err(StakingTxError::MissingArgument("validator address and amount"));
+    }
+    let val_addr = parts[2];
+    let amount_str = parts[3];
+    let amount: u64 = amount_str
         .parse()
         .map_err(|_| StakingTxError::InvalidAmount(amount_str.to_string()))?;
 
     if amount == 0 {
-        return Err(StakingTxError::ZeroUndelegation(amount));
+        return Err(StakingTxError::ZeroUndelegation(amount as u128));
     }
 
     let key = (from.to_string(), val_addr.to_string());
-    let delegated = *staking.delegations.get(&key).unwrap_or(&0);
-    if delegated < amount {
+    let delegated = staking.get_delegation(from, val_addr);
+    if delegated < amount as u128 {
         return Err(StakingTxError::InsufficientDelegation {
             have: delegated,
-            need: amount,
+            need: amount as u128,
         });
     }
 
@@ -204,16 +230,14 @@ fn apply_undelegate(
         .undelegate(
             from.to_string(),
             val_addr.to_string(),
-            amount,
+            amount as u128,
             epoch,
             params.unbonding_epochs,
         )
         .map_err(StakingTxError::StakingError)?;
 
-    // Decrease validator total stake
-    if let Some(v) = staking.validators.get_mut(*val_addr) {
-        v.stake = v.stake.saturating_sub(amount);
-    }
+    // No need to manually adjust validator stake; StakingState tracks delegations correctly.
+    // Validator total bond is computed on the fly from self_stake + delegations.
 
     Ok(21_000 + 5_000)
 }
@@ -226,18 +250,21 @@ fn apply_withdraw(
     staking: &mut StakingState,
     epoch: u64,
 ) -> StakingTxResult<u64> {
-    let val_addr = parts
-        .get(2)
-        .ok_or(StakingTxError::MissingArgument("validator address"))?;
+    if parts.len() != 3 {
+        return Err(StakingTxError::MissingArgument("validator address"));
+    }
+    let val_addr = parts[2];
 
     let withdrawn = staking.withdraw(from.to_string(), val_addr.to_string(), epoch);
     if withdrawn == 0 {
         return Err(StakingTxError::NothingToWithdraw);
     }
 
-    let current_bal = *kv.balances.get(from).unwrap_or(&0) as u128;
-    *kv.balances.entry(from.to_string()).or_insert(0) =
-        current_bal.saturating_add(withdrawn) as u64;
+    // Convert to u64 safely; unstaking amount shouldn't exceed u64 range under normal balances.
+    let amount: u64 = withdrawn
+        .try_into()
+        .map_err(|_| StakingTxError::Overflow)?;
+    add_balance(kv, from, amount)?;
 
     Ok(21_000)
 }
@@ -250,9 +277,10 @@ fn apply_register(
     staking: &mut StakingState,
     params: &EconomicsParams,
 ) -> StakingTxResult<u64> {
-    let commission_str = parts
-        .get(2)
-        .ok_or(StakingTxError::MissingArgument("commission_bps"))?;
+    if parts.len() != 3 {
+        return Err(StakingTxError::MissingArgument("commission_bps"));
+    }
+    let commission_str = parts[2];
     let commission_bps: u64 = commission_str
         .parse()
         .map_err(|_| StakingTxError::InvalidAmount(commission_str.to_string()))?;
@@ -261,27 +289,21 @@ fn apply_register(
         return Err(StakingTxError::InvalidCommissionBps(commission_bps));
     }
 
-    if staking.validators.contains_key(from) {
+    if staking.get_validator(from).is_some() {
         return Err(StakingTxError::AlreadyRegistered);
     }
 
-    let bal = *kv.balances.get(from).unwrap_or(&0) as u128;
-    if bal < params.min_stake {
-        return Err(StakingTxError::InsufficientBalance {
-            have: bal,
-            need: params.min_stake,
-        });
-    }
+    let min_stake = params.min_stake as u64;
+    deduct_balance(kv, from, min_stake)?;
 
-    // Lock min_stake as self-delegation
-    *kv.balances.entry(from.to_string()).or_insert(0) = (bal - params.min_stake) as u64;
-
-    let validator = EconValidator::new(from.to_string(), params.min_stake, commission_bps)
+    let validator = EconValidator::new(from.to_string(), min_stake as u128, commission_bps)
         .map_err(StakingTxError::StakingError)?;
-    staking.validators.insert(from.to_string(), validator);
     staking
-        .delegate(from.to_string(), from.to_string(), params.min_stake)
+        .add_validator(validator)
         .map_err(StakingTxError::StakingError)?;
+
+    // The self_stake is already recorded in the validator.
+    // No separate delegation entry is needed; self_stake represents the validator's own bond.
 
     Ok(21_000 + 10_000) // register costs more gas
 }
@@ -291,12 +313,13 @@ fn apply_deregister(
     from: &str,
     kv: &mut KvState,
     staking: &mut StakingState,
+    epoch: u64,
 ) -> StakingTxResult<u64> {
-    if !staking.validators.contains_key(from) {
-        return Err(StakingTxError::NotRegistered);
-    }
+    let v = staking
+        .get_validator(from)
+        .ok_or(StakingTxError::NotRegistered)?;
 
-    // Check no external delegators
+    // Check for external delegations
     let external_delegations: u128 = staking
         .delegations
         .iter()
@@ -310,14 +333,18 @@ fn apply_deregister(
         });
     }
 
-    // Return self-bond to balance
-    let self_stake = staking.validators.get(from).map(|v| v.stake).unwrap_or(0);
-    let current_bal = *kv.balances.get(from).unwrap_or(&0) as u128;
-    *kv.balances.entry(from.to_string()).or_insert(0) =
-        current_bal.saturating_add(self_stake) as u64;
+    let self_stake = v.self_stake;
 
-    staking.validators.remove(from);
-    staking.delegations.retain(|(_, v), _| v != from);
+    // Remove validator and any remaining delegation entries (should be none except maybe self-delegation if present)
+    staking
+        .remove_validator(from, epoch)
+        .map_err(StakingTxError::StakingError)?;
+
+    // Return self_stake to balance
+    let amount: u64 = self_stake
+        .try_into()
+        .map_err(|_| StakingTxError::Overflow)?;
+    add_balance(kv, from, amount)?;
 
     Ok(21_000)
 }
@@ -330,7 +357,7 @@ fn apply_deregister(
 mod tests {
     use super::*;
     use crate::economics::params::EconomicsParams;
-    use crate::economics::staking::{StakingState, Validator as EconValidator};
+    use crate::economics::staking::StakingState;
     use crate::execution::KvState;
 
     fn setup() -> (KvState, StakingState, EconomicsParams) {
@@ -338,17 +365,19 @@ mod tests {
         let mut staking = StakingState::default();
         let params = EconomicsParams::default();
 
-        // Pre-register alice as validator with some stake
-        staking.validators.insert(
-            "alice".into(),
-            EconValidator::new("alice".into(), 1_000_000, 500).unwrap(),
-        );
+        // Pre-register alice as validator with self_stake
+        let v = EconValidator::new("alice".into(), 1_000_000, 500).unwrap();
+        staking.add_validator(v).unwrap();
 
-        // Give bob some balance to delegate
+        // Give bob some balance
         kv.balances.insert("bob".into(), 500_000);
 
         (kv, staking, params)
     }
+
+    // -----------------------------------------------------------------------------
+    // Delegate tests
+    // -----------------------------------------------------------------------------
 
     #[test]
     fn test_delegate_success() {
@@ -364,13 +393,7 @@ mod tests {
         .unwrap();
         assert!(res.success, "{:?}", res.error);
         assert_eq!(*kv.balances.get("bob").unwrap(), 400_000);
-        assert_eq!(
-            *staking
-                .delegations
-                .get(&("bob".into(), "alice".into()))
-                .unwrap(),
-            100_000
-        );
+        assert_eq!(staking.get_delegation("bob", "alice"), 100_000);
     }
 
     #[test]
@@ -388,6 +411,59 @@ mod tests {
         assert!(!res.success);
         assert!(res.error.unwrap().contains("insufficient balance"));
     }
+
+    #[test]
+    fn test_delegate_zero_amount() {
+        let (mut kv, mut staking, params) = setup();
+        let res = try_apply_staking_tx(
+            "stake delegate alice 0",
+            "bob",
+            &mut kv,
+            &mut staking,
+            &params,
+            0,
+        )
+        .unwrap();
+        assert!(!res.success);
+        assert!(res.error.unwrap().contains("amount must be > 0"));
+    }
+
+    #[test]
+    fn test_delegate_to_nonexistent() {
+        let (mut kv, mut staking, params) = setup();
+        let res = try_apply_staking_tx(
+            "stake delegate nobody 100",
+            "bob",
+            &mut kv,
+            &mut staking,
+            &params,
+            0,
+        )
+        .unwrap();
+        assert!(!res.success);
+        assert!(res.error.unwrap().contains("not found"));
+    }
+
+    #[test]
+    fn test_delegate_to_jailed_validator() {
+        let (mut kv, mut staking, params) = setup();
+        staking.validators.get_mut("alice").unwrap().jailed = true;
+        let res = try_apply_staking_tx(
+            "stake delegate alice 100",
+            "bob",
+            &mut kv,
+            &mut staking,
+            &params,
+            0,
+        )
+        .unwrap();
+        assert!(!res.success);
+        assert!(res.error.unwrap().contains("jailed"));
+    }
+
+    // -----------------------------------------------------------------------------
+    // Undelegate & withdraw tests
+    // -----------------------------------------------------------------------------
 
     #[test]
     fn test_undelegate_and_withdraw() {
@@ -416,7 +492,7 @@ mod tests {
         .unwrap();
         assert!(res.success, "{:?}", res.error);
 
-        // Cannot withdraw yet (unbonding_epochs = 14)
+        // Withdraw too early
         let res = try_apply_staking_tx(
             "stake withdraw alice",
             "bob",
@@ -428,14 +504,17 @@ mod tests {
         .unwrap();
         assert!(!res.success, "Should not be withdrawable before unbonding");
 
-        // Advance past unbonding period
+        // Withdraw after unbonding period (5 + 14 = 19, so epoch 19 is still not unlocked; need >= 19? 
+        // In StakingState::undelegate unlock_epoch = current_epoch + unbonding_epochs. 
+        // Here current=5, unbonding=14 -> unlock=19. So epoch=18 is not unlocked, epoch=19 is.
+        // Let's use 19.)
         let res = try_apply_staking_tx(
             "stake withdraw alice",
             "bob",
             &mut kv,
             &mut staking,
             &params,
-            20,
+            19,
         )
         .unwrap();
         assert!(res.success, "{:?}", res.error);
@@ -445,6 +524,51 @@ mod tests {
             "Full balance restored"
         );
     }
+
+    #[test]
+    fn test_undelegate_insufficient() {
+        let (mut kv, mut staking, params) = setup();
+        try_apply_staking_tx(
+            "stake delegate alice 5000",
+            "bob",
+            &mut kv,
+            &mut staking,
+            &params,
+            0,
+        )
+        .unwrap();
+        let res = try_apply_staking_tx(
+            "stake undelegate alice 10000",
+            "bob",
+            &mut kv,
+            &mut staking,
+            &params,
+            0,
+        )
+        .unwrap();
+        assert!(!res.success);
+        assert!(res.error.unwrap().contains("insufficient delegated amount"));
+    }
+
+    #[test]
+    fn test_withdraw_nothing() {
+        let (mut kv, mut staking, params) = setup();
+        let res = try_apply_staking_tx(
+            "stake withdraw alice",
+            "bob",
+            &mut kv,
+            &mut staking,
+            &params,
+            0,
+        )
+        .unwrap();
+        assert!(!res.success);
+        assert!(res.error.unwrap().contains("nothing to withdraw"));
+    }
+
+    // -----------------------------------------------------------------------------
+    // Register & deregister tests
+    // -----------------------------------------------------------------------------
 
     #[test]
     fn test_register_validator() {
@@ -467,8 +591,14 @@ mod tests {
         )
         .unwrap();
         assert!(res.success, "{:?}", res.error);
-        assert!(staking.validators.contains_key("charlie"));
-        assert_eq!(staking.validators["charlie"].commission_bps, 500);
+        assert!(staking.get_validator("charlie").is_some());
+        assert_eq!(staking.get_validator("charlie").unwrap().commission_bps, 500);
+        assert_eq!(
+            staking.get_validator("charlie").unwrap().self_stake,
+            1_000
+        );
+        // Balance reduced by min_stake
+        assert_eq!(*kv.balances.get("charlie").unwrap(), 99_000);
     }
 
     #[test]
@@ -495,7 +625,24 @@ mod tests {
     }
 
     #[test]
-    fn test_deregister() {
+    fn test_register_already_validator() {
+        let (mut kv, mut staking, params) = setup();
+        // alice already registered
+        let res = try_apply_staking_tx(
+            "stake register 1000",
+            "alice",
+            &mut kv,
+            &mut staking,
+            &params,
+            0,
+        )
+        .unwrap();
+        assert!(!res.success);
+        assert!(res.error.unwrap().contains("already registered"));
+    }
+
+    #[test]
+    fn test_deregister_without_delegators() {
         let mut kv = KvState::default();
         let mut staking = StakingState::default();
         let params = EconomicsParams {
@@ -525,10 +672,40 @@ mod tests {
         )
         .unwrap();
         assert!(res.success);
-        assert!(!staking.validators.contains_key("charlie"));
-        // Self-bond should be returned
-        assert!(kv.balances.get("charlie").unwrap() >= &100_000);
+        assert!(staking.get_validator("charlie").is_none());
+        // Balance should be restored (100_000 - 1_000 + 1_000 = 100_000)
+        assert_eq!(*kv.balances.get("charlie").unwrap(), 100_000);
     }
+
+    #[test]
+    fn test_deregister_with_external_delegations_fails() {
+        let (mut kv, mut staking, params) = setup();
+        // alice is a validator, bob delegated to her
+        try_apply_staking_tx(
+            "stake delegate alice 50000",
+            "bob",
+            &mut kv,
+            &mut staking,
+            &params,
+            0,
+        )
+        .unwrap();
+        let res = try_apply_staking_tx(
+            "stake deregister",
+            "alice",
+            &mut kv,
+            &mut staking,
+            &params,
+            0,
+        )
+        .unwrap();
+        assert!(!res.success);
+        assert!(res.error.unwrap().contains("delegators still active"));
+    }
+
+    // -----------------------------------------------------------------------------
+    // Parsing tests
+    // -----------------------------------------------------------------------------
 
     #[test]
     fn test_non_staking_payload_returns_none() {
@@ -544,5 +721,149 @@ mod tests {
             0,
         );
         assert!(res.is_none(), "Non-staking payload should return None");
+    }
+
+    #[test]
+    fn test_unknown_action() {
+        let (mut kv, mut staking, params) = setup();
+        let res = try_apply_staking_tx(
+            "stake unknown_action",
+            "alice",
+            &mut kv,
+            &mut staking,
+            &params,
+            0,
+        )
+        .unwrap();
+        assert!(!res.success);
+        assert!(res.error.unwrap().contains("unknown"));
+    }
+
+    #[test]
+    fn test_missing_arguments() {
+        let (mut kv, mut staking, params) = setup();
+        // Delegate without amount
+        let res = try_apply_staking_tx(
+            "stake delegate alice",
+            "bob",
+            &mut kv,
+            &mut staking,
+            &params,
+            0,
+        )
+        .unwrap();
+        assert!(!res.success);
+        assert!(res.error.unwrap().contains("missing argument"));
+    }
+
+    #[test]
+    fn test_invalid_amount_format() {
+        let (mut kv, mut staking, params) = setup();
+        let res = try_apply_staking_tx(
+            "stake delegate alice abc",
+            "bob",
+            &mut kv,
+            &mut staking,
+            &params,
+            0,
+        )
+        .unwrap();
+        assert!(!res.success);
+        assert!(res.error.unwrap().contains("invalid amount"));
+    }
+
+    // -----------------------------------------------------------------------------
+    // Edge cases & security
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn test_delegate_exact_balance() {
+        let (mut kv, mut staking, params) = setup();
+        kv.balances.insert("bob".into(), 500_000);
+        let res = try_apply_staking_tx(
+            "stake delegate alice 500000",
+            "bob",
+            &mut kv,
+            &mut staking,
+            &params,
+            0,
+        )
+        .unwrap();
+        assert!(res.success);
+        assert_eq!(*kv.balances.get("bob").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_overflow_protection_balance() {
+        let mut kv = KvState::default();
+        let mut staking = StakingState::default();
+        let params = EconomicsParams::default();
+        kv.balances.insert("bob".into(), u64::MAX);
+        staking.add_validator(EconValidator::new("alice".into(), 1, 0).unwrap()).unwrap();
+
+        // Delegate a large amount that would overflow if added to balance after withdrawal? Not directly tested here.
+        // But we test that adding to balance doesn't overflow
+        // We'll just ensure deduct_balance works near max
+        let res = try_apply_staking_tx(
+            "stake delegate alice 500000",
+            "bob",
+            &mut kv,
+            &mut staking,
+            &params,
+            0,
+        )
+        .unwrap();
+        assert!(res.success);
+        assert_eq!(
+            *kv.balances.get("bob").unwrap(),
+            u64::MAX - 500_000
+        );
+    }
+
+    #[test]
+    fn test_withdraw_overflow_balance() {
+        let mut kv = KvState::default();
+        let mut staking = StakingState::default();
+        let params = EconomicsParams {
+            unbonding_epochs: 0,
+            ..Default::default()
+        };
+        kv.balances.insert("bob".into(), u64::MAX - 1000);
+        staking.add_validator(EconValidator::new("alice".into(), 1, 0).unwrap()).unwrap();
+
+        // Delegate some amount
+        try_apply_staking_tx(
+            "stake delegate alice 500",
+            "bob",
+            &mut kv,
+            &mut staking,
+            &params,
+            0,
+        )
+        .unwrap();
+
+        // Undelegate and then withdraw immediately (unbonding_epochs = 0)
+        try_apply_staking_tx(
+            "stake undelegate alice 500",
+            "bob",
+            &mut kv,
+            &mut staking,
+            &params,
+            10,
+        )
+        .unwrap();
+
+        let res = try_apply_staking_tx(
+            "stake withdraw alice",
+            "bob",
+            &mut kv,
+            &mut staking,
+            &params,
+            10,
+        )
+        .unwrap();
+        assert!(res.success);
+        // Balance should now be u64::MAX - 1000 + 500 = u64::MAX - 500, no overflow
+        assert_eq!(*kv.balances.get("bob").unwrap(), u64::MAX - 500);
     }
 }
