@@ -1,4 +1,39 @@
-[toolchain]
+# =============================================================================
+# IONA Rust Toolchain Configuration
+# =============================================================================
+# This file pins the Rust compiler version and components for reproducible builds.
+# It also enables the WASM target (optional) and sets the profile to minimal.
+#
+# Usage:
+#   The toolchain specified here will be used by cargo and rustup automatically.
+#   To override locally: rustup override set <version>
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Toolchain channel (stable, beta, nightly, or a specific date)
+# -----------------------------------------------------------------------------
 channel = "stable"
-components = ["rustfmt", "clippy"]
+
+# -----------------------------------------------------------------------------
+# Additional components to install with the toolchain
+# -----------------------------------------------------------------------------
+components = [
+    "rustfmt",      # Code formatting (enforces style)
+    "clippy",       # Linter (catches common mistakes)
+    "rust-analyzer",# IDE support (optional but recommended)
+]
+
+# -----------------------------------------------------------------------------
+# Installation profile (minimal saves disk space by omitting docs)
+# -----------------------------------------------------------------------------
 profile = "minimal"
+
+# -----------------------------------------------------------------------------
+# Targets (uncomment if you need WASM or other architectures)
+# -----------------------------------------------------------------------------
+# targets = ["wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"]
+
+# -----------------------------------------------------------------------------
+# Optional: Pin to a specific nightly date (for features not yet stable)
+# -----------------------------------------------------------------------------
+# channel = "nightly-2025-01-01"
