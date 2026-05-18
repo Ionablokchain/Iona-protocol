@@ -66,6 +66,17 @@ VARIABLES
 vars == <<height, upgraded, finalized, finalized_height, produced_pv>>
 
 -----------------------------------------------------------------------------
+\* Type invariant (for TLC to check variable domains)
+-----------------------------------------------------------------------------
+
+TypeOK ==
+    /\ height \in 1..MaxHeight+1
+    /\ upgraded \in [Validators -> BOOLEAN]
+    /\ finalized \in [1..MaxHeight -> 0..PV_NEW]
+    /\ finalized_height \in 0..MaxHeight
+    /\ produced_pv \in [1..MaxHeight -> 0..PV_NEW]
+
+-----------------------------------------------------------------------------
 \* Initial state
 -----------------------------------------------------------------------------
 
@@ -149,14 +160,27 @@ BlockPVAcceptable ==
     \A h \in 1..MaxHeight:
         produced_pv[h] # 0 => AcceptPV(produced_pv[h], h)
 
+\* S7: finalized_height must never exceed the current height.
+FinalizedHeightBound ==
+    finalized_height <= height - 1
+
+\* S8: A height can be finalized at most once (already covered by NoSplitFinality).
+\* S9: Once finalized, the PV for that height never changes.
+FinalizedImmutable ==
+    \A h \in 1..MaxHeight:
+        finalized[h] # 0 => finalized'[h] = finalized[h]
+
 \* Combined safety invariant
 Safety ==
+    /\ TypeOK
     /\ NoSplitFinality
     /\ FinalityMonotonic
     /\ DeterministicPV
     /\ AfterGraceOnlyNew
     /\ BeforeActivationOnlyOld
     /\ BlockPVAcceptable
+    /\ FinalizedHeightBound
+    /\ FinalizedImmutable
 
 -----------------------------------------------------------------------------
 \* Liveness (temporal properties – not model‑checked by default)
