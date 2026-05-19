@@ -1,308 +1,276 @@
-#!/bin/bash
-
-#############################################################################
+#!/usr/bin/env bash
+# =============================================================================
 # IONA Cosmos Adapter: Key Import Script
-# 
-# Converts a CometBFT priv_validator_key.json to IONA encrypted format
-# 
-# Usage: ./key_import.sh priv_validator_key.json
-# 
-# This script:
-# 1. Validates the input file format
-# 2. Extracts the ed25519 private key (base64)
-# 3. Converts base64 to hex representation
-# 4. Displays the public key for verification
-# 5. Provides instructions for IONA encryption
 #
-#############################################################################
+# Converts a CometBFT priv_validator_key.json to IONA-compatible hex format.
+# Supports both raw ed25519 private keys (32 bytes) and expanded keys (64 bytes).
+#
+# Usage:
+#   ./key_import.sh [OPTIONS] <priv_validator_key.json>
+#
+# Options:
+#   --output FILE   Write hex-encoded private key to FILE instead of stdout
+#   --help          Show this help
+#
+# Exit codes:
+#   0   Success
+#   1   Usage or input error
+#   2   Dependency missing
+#   3   Cryptographic error (invalid length, encoding)
+# =============================================================================
 
 set -euo pipefail
 
-# Color output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# -----------------------------------------------------------------------------
+# Colours (only when stdout is a terminal)
+# -----------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; NC=''
+fi
 
-# Configuration
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+print_error()   { echo -e "${RED}✗ ERROR${NC}: $*" >&2; }
+print_success() { echo -e "${GREEN}✓${NC} $*"; }
+print_info()    { echo -e "${BLUE}[*]${NC} $*"; }
+print_warn()    { echo -e "${YELLOW}⚠${NC} $*"; }
+
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
 SUPPORTED_KEY_TYPE="ed25519"
+# ed25519 private key is 32 bytes → 44 chars base64 (without padding).
+# Some CometBFT keys are 64 bytes (seed + pub) → 88 chars base64.
+VALID_B64_LENGTHS=(44 88)
 
-#############################################################################
-# Functions
-#############################################################################
-
-print_error() {
-    echo -e "${RED}✗ ERROR${NC}: $1" >&2
+# -----------------------------------------------------------------------------
+# Help
+# -----------------------------------------------------------------------------
+usage() {
+    sed -n '2,/^$/p' "$0" | sed 's/^# //'
+    exit 0
 }
 
-print_success() {
-    echo -e "${GREEN}✓${NC} $1"
+# -----------------------------------------------------------------------------
+# Dependency checks
+# -----------------------------------------------------------------------------
+check_deps() {
+    local missing=0
+    for cmd in jq openssl; do
+        if ! command -v "$cmd" &>/dev/null; then
+            print_error "Required command not found: $cmd"
+            missing=1
+        fi
+    done
+    if [[ $missing -ne 0 ]]; then
+        exit 2
+    fi
 }
 
-print_info() {
-    echo -e "${BLUE}[*]${NC} $1"
-}
-
-print_warning() {
-    echo -e "${YELLOW}⚠${NC} $1"
-}
-
-print_header() {
-    echo ""
-    echo "=========================================="
-    echo "  IONA Cosmos Adapter: Key Import"
-    echo "=========================================="
-    echo ""
-}
-
-# Check if command exists
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-# Convert base64 to hex
+# -----------------------------------------------------------------------------
+# Base64 → hex conversion (strict, using openssl)
+# -----------------------------------------------------------------------------
 base64_to_hex() {
     local b64="$1"
-    if command_exists openssl; then
-        echo -n "$b64" | openssl enc -d -base64 -A | od -An -tx1 | tr -d ' \n'
-    else
-        # Fallback using printf (less reliable for all inputs)
-        echo -n "$b64" | base64 -d 2>/dev/null | xxd -p | tr -d '\n'
-    fi
-}
-
-# Validate JSON
-validate_json() {
-    local file="$1"
-    if ! jq empty "$file" 2>/dev/null; then
+    # Remove any whitespace or newlines
+    b64="${b64//[$' \t\n\r']/}"
+    if [[ -z "$b64" ]]; then
         return 1
     fi
-    return 0
+    openssl enc -d -base64 -A <<< "$b64" 2>/dev/null | od -An -tx1 | tr -d ' \n'
 }
 
-# Extract key type
-get_key_type() {
-    local file="$1"
-    jq -r '.type // empty' "$file" 2>/dev/null || echo ""
+# -----------------------------------------------------------------------------
+# Validate base64 length
+# -----------------------------------------------------------------------------
+validate_b64_length() {
+    local b64="$1" context="$2"
+    local len=${#b64}
+    for valid in "${VALID_B64_LENGTHS[@]}"; do
+        if [[ $len -eq $valid ]]; then
+            return 0
+        fi
+    done
+    print_error "$context length is $len chars; expected one of ${VALID_B64_LENGTHS[*]}"
+    return 1
 }
 
-# Extract private key (base64)
-get_private_key_b64() {
-    local file="$1"
-    jq -r '.priv_key.value // .priv_key // empty' "$file" 2>/dev/null || echo ""
+# -----------------------------------------------------------------------------
+# Argument parsing
+# -----------------------------------------------------------------------------
+OUTPUT_FILE=""
+KEYFILE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --output)
+            OUTPUT_FILE="$2"; shift 2 ;;
+        --help)
+            usage ;;
+        -*)
+            print_error "Unknown option: $1"
+            echo "Try '$0 --help'" >&2
+            exit 1 ;;
+        *)
+            if [[ -z "$KEYFILE" ]]; then
+                KEYFILE="$1"
+            else
+                print_error "Unexpected argument: $1"
+                exit 1
+            fi
+            shift ;;
+    esac
+done
+
+if [[ -z "$KEYFILE" ]]; then
+    print_error "Missing required argument: priv_validator_key.json"
+    echo "Usage: $0 [--output FILE] <priv_validator_key.json>" >&2
+    exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Input file validation
+# -----------------------------------------------------------------------------
+if [[ ! -f "$KEYFILE" ]]; then
+    print_error "File not found: $KEYFILE"
+    exit 1
+fi
+if [[ ! -r "$KEYFILE" ]]; then
+    print_error "File not readable: $KEYFILE"
+    exit 1
+fi
+
+check_deps
+
+# -----------------------------------------------------------------------------
+# JSON validation
+# -----------------------------------------------------------------------------
+if ! jq empty "$KEYFILE" 2>/dev/null; then
+    print_error "Invalid JSON in $KEYFILE"
+    exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Key type check
+# -----------------------------------------------------------------------------
+key_type=$(jq -r '.type // empty' "$KEYFILE" 2>/dev/null || true)
+if [[ -z "$key_type" ]]; then
+    print_warn "Key type field missing; assuming $SUPPORTED_KEY_TYPE"
+    key_type="$SUPPORTED_KEY_TYPE"
+fi
+if [[ "$key_type" != "$SUPPORTED_KEY_TYPE" ]]; then
+    print_error "Unsupported key type '$key_type' (expected '$SUPPORTED_KEY_TYPE')"
+    exit 1
+fi
+print_success "Key type verified: $key_type"
+
+# -----------------------------------------------------------------------------
+# Extract private key
+# -----------------------------------------------------------------------------
+priv_key_b64=$(jq -r '.priv_key.value // .priv_key // empty' "$KEYFILE" 2>/dev/null || true)
+if [[ -z "$priv_key_b64" ]]; then
+    print_error "Could not extract private key from $KEYFILE"
+    echo "Expected JSON structure:"
+    echo '  {"type": "ed25519", "priv_key": {"value": "<base64>"}}'
+    exit 1
+fi
+
+validate_b64_length "$priv_key_b64" "Private key" || exit 3
+print_success "Private key extracted (${#priv_key_b64} chars base64)"
+
+# -----------------------------------------------------------------------------
+# Convert to hex
+# -----------------------------------------------------------------------------
+priv_key_hex=$(base64_to_hex "$priv_key_b64") || {
+    print_error "Failed to decode base64 private key"
+    exit 3
 }
 
-# Derive public key from private key
-derive_public_key() {
-    local priv_key_b64="$1"
-    # Note: This is a simplified version showing the expected format
-    # Full key derivation requires the IONA binary or a crypto library
-    # For now, we just show the structure
-    echo "$priv_key_b64"
-}
+hex_len=${#priv_key_hex}
+# Ed25519: 32 bytes → 64 hex chars; 64 bytes → 128 hex chars
+if [[ $hex_len -ne 64 && $hex_len -ne 128 ]]; then
+    print_error "Unexpected hex length $hex_len (expected 64 or 128)"
+    exit 3
+fi
+print_success "Hex conversion successful (${hex_len} chars)"
 
-# Main function
-main() {
-    print_header
-    
-    # Check arguments
-    if [[ $# -lt 1 ]]; then
-        print_error "Missing argument"
-        echo "Usage: $0 <priv_validator_key.json>"
-        echo ""
-        echo "Example:"
-        echo "  $0 priv_validator_key.json"
-        exit 1
+# -----------------------------------------------------------------------------
+# Extract public key (if present)
+# -----------------------------------------------------------------------------
+pub_key_b64=$(jq -r '.pub_key.value // .pub_key // empty' "$KEYFILE" 2>/dev/null || true)
+if [[ -n "$pub_key_b64" ]]; then
+    if validate_b64_length "$pub_key_b64" "Public key"; then
+        pub_key_hex=$(base64_to_hex "$pub_key_b64") || true
+        if [[ ${#pub_key_hex} -eq 64 ]]; then
+            print_success "Public key extracted and verified"
+        else
+            print_warn "Public key hex length is ${#pub_key_hex} (expected 64)"
+        fi
     fi
-    
-    local keyfile="$1"
-    
-    # Validate input file
-    print_info "Checking input file..."
-    
-    if [[ ! -f "$keyfile" ]]; then
-        print_error "File not found: $keyfile"
-        exit 1
-    fi
-    print_success "File exists: $keyfile"
-    
-    if [[ ! -r "$keyfile" ]]; then
-        print_error "File is not readable: $keyfile"
-        exit 1
-    fi
-    print_success "File is readable"
-    
-    # Check for required tools
-    print_info "Checking dependencies..."
-    
-    if ! command_exists jq; then
-        print_error "jq is required but not installed"
-        echo "  Install with: apt-get install jq (Debian/Ubuntu) or brew install jq (macOS)"
-        exit 1
-    fi
-    print_success "jq is installed"
-    
-    if ! command_exists openssl; then
-        print_warning "openssl not found; using fallback base64 converter (less reliable)"
-    else
-        print_success "openssl is installed"
-    fi
-    
-    # Validate JSON
-    print_info "Validating JSON format..."
-    
-    if ! validate_json "$keyfile"; then
-        print_error "Invalid JSON in $keyfile"
-        exit 1
-    fi
-    print_success "JSON is valid"
-    
-    # Extract and validate key type
-    print_info "Checking key type..."
-    
-    local key_type
-    key_type=$(get_key_type "$keyfile")
-    
-    if [[ -z "$key_type" ]]; then
-        print_warning "Key type field missing; assuming ed25519"
-        key_type="ed25519"
-    fi
-    
-    if [[ "$key_type" != "$SUPPORTED_KEY_TYPE" ]]; then
-        print_error "Unsupported key type: $key_type (expected: $SUPPORTED_KEY_TYPE)"
-        exit 1
-    fi
-    print_success "Key type is $SUPPORTED_KEY_TYPE"
-    
-    # Extract private key
-    print_info "Extracting private key..."
-    
-    local priv_key_b64
-    priv_key_b64=$(get_private_key_b64 "$keyfile")
-    
-    if [[ -z "$priv_key_b64" ]]; then
-        print_error "Could not extract private key from $keyfile"
-        echo "Expected JSON format:"
-        echo '  {"type": "ed25519", "priv_key": {"type": "...", "value": "..."}}'
-        exit 1
-    fi
-    
-    # Validate base64 length (ed25519 is 64 bytes = 88 chars base64)
-    local b64_len=${#priv_key_b64}
-    if [[ $b64_len -lt 80 ]] || [[ $b64_len -gt 95 ]]; then
-        print_warning "Private key length seems off: $b64_len chars (expected ~88)"
-    fi
-    print_success "Private key extracted (${b64_len} chars base64)"
-    
-    # Convert to hex
-    print_info "Converting to hex format..."
-    
-    local priv_key_hex
-    priv_key_hex=$(base64_to_hex "$priv_key_b64")
-    
-    if [[ -z "$priv_key_hex" ]]; then
-        print_error "Failed to convert private key to hex"
-        exit 1
-    fi
-    
-    local hex_len=${#priv_key_hex}
-    if [[ $hex_len -ne 128 ]]; then
-        print_warning "Hex key length is $hex_len (expected 128 for ed25519)"
-    fi
-    print_success "Hex conversion complete"
-    
-    # Display conversion results
+fi
+
+# -----------------------------------------------------------------------------
+# Output
+# -----------------------------------------------------------------------------
+if [[ -n "$OUTPUT_FILE" ]]; then
+    # Write only the hex private key to the output file
+    echo -n "$priv_key_hex" > "$OUTPUT_FILE"
+    chmod 600 "$OUTPUT_FILE"
+    print_success "Private key written to $OUTPUT_FILE"
+else
+    # Display full report
     echo ""
     echo "=========================================="
     echo "  Conversion Results"
     echo "=========================================="
     echo ""
-    
     echo -e "${BLUE}Private Key (base64):${NC}"
     echo "  $priv_key_b64"
     echo ""
-    
     echo -e "${BLUE}Private Key (hex):${NC}"
     echo "  $priv_key_hex"
     echo ""
-    
-    # Extract public key if available
-    local pub_key_b64
-    pub_key_b64=$(jq -r '.pub_key.value // .pub_key // empty' "$keyfile" 2>/dev/null || echo "")
-    
-    if [[ -n "$pub_key_b64" ]]; then
-        print_success "Public key found in JSON"
+
+    if [[ -n "${pub_key_b64:-}" ]]; then
         echo -e "${BLUE}Public Key (base64):${NC}"
         echo "  $pub_key_b64"
         echo ""
-        
-        # Convert public key to hex
-        local pub_key_hex
-        pub_key_hex=$(base64_to_hex "$pub_key_b64")
-        if [[ -n "$pub_key_hex" ]]; then
+        if [[ -n "${pub_key_hex:-}" ]]; then
             echo -e "${BLUE}Public Key (hex):${NC}"
             echo "  $pub_key_hex"
             echo ""
         fi
     fi
-    
-    # Next steps
+
     echo "=========================================="
     echo "  Next Steps"
     echo "=========================================="
     echo ""
-    
     echo "1. Verify the keys above match your expectations"
     echo ""
-    
-    echo "2. Encrypt the key with IONA:"
+    echo "2. Encrypt with IONA:"
     echo ""
-    echo "   ${YELLOW}iona keys import $keyfile --output keys.enc${NC}"
+    echo "   ${YELLOW}iona keys import $KEYFILE --output keys.enc${NC}"
     echo ""
-    echo "   You will be prompted for a passphrase."
-    echo "   Choose a strong passphrase (20+ characters)."
-    echo ""
-    
-    echo "3. Verify the encryption succeeded:"
+    echo "3. Verify encryption:"
     echo ""
     echo "   ${YELLOW}iona keys check keys.enc${NC}"
     echo ""
-    
-    echo "4. Display your public key in IONA format:"
+    echo "4. Display public key:"
     echo ""
     echo "   ${YELLOW}iona keys show keys.enc --public-only${NC}"
     echo ""
-    
-    echo "5. For full migration instructions, see:"
-    echo "   ${YELLOW}migrate_validator.md${NC}"
-    echo ""
-    
-    # Security warnings
+
     echo "=========================================="
     echo "  Security Warnings"
     echo "=========================================="
     echo ""
-    
-    print_warning "This script displays your private key in base64 and hex formats"
-    print_warning "Do not share these values with anyone"
-    print_warning "Do not commit this script output to version control"
-    print_warning "Do not email or slack these keys to yourself or others"
+    print_warn "Private key data was displayed on screen."
+    print_warn "Do NOT share, commit, email, or store these values in plaintext."
+    print_warn "After encrypting with IONA, securely delete the original JSON file:"
     echo ""
-    
-    print_warning "After encryption with IONA:"
-    print_warning "Delete the plaintext key files"
+    echo "   ${YELLOW}shred -vfz -n 10 $KEYFILE${NC}"
     echo ""
-    echo "   ${YELLOW}shred -vfz -n 10 $keyfile${NC}  (secure delete)"
-    echo "   ${YELLOW}rm -f $keyfile${NC}            (insecure, but okay if encrypted)"
-    echo ""
-    
-    print_success "Key import script completed successfully"
-}
+fi
 
-#############################################################################
-# Entry Point
-#############################################################################
-
-main "$@"
+print_success "Key import script completed successfully"
