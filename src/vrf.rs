@@ -1,4 +1,4 @@
-//! IONA v33 — On-chain Verifiable Random Function (VRF).
+//! IONA— On-chain Verifiable Random Function (VRF).
 //!
 //! Implements **ECVRF-EDWARDS25519-SHA512-TAI** (try-and-increment hash-to-curve)
 //! per RFC 9381 Section 5.4.1. This is the same VRF construction used by
