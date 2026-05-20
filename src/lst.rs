@@ -1,4 +1,4 @@
-//! IONA v36 — Liquid Staking Tokens (stIONA).
+//! IONA — Liquid Staking Tokens (stIONA).
 //!
 //! Allows stakers to maintain liquidity while earning staking rewards.
 //! 1 stIONA = proportional claim on the staking pool (price appreciation model).
