@@ -1,4 +1,4 @@
-//! IONA v34 — ICS-020 Fungible Token Transfer.
+//! IONA  — ICS-020 Fungible Token Transfer.
 //!
 //! Implements cross-chain token transfers over IBC.
 //! Built on the ICS-002 light client from v33.
