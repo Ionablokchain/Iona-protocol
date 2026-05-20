@@ -1,4 +1,4 @@
-//! IONA v33 — IBC Light Client (ICS-002 minimal implementation).
+//! IONA— IBC Light Client (ICS-002 minimal implementation).
 //!
 //! Implements the core IBC light client state machine that allows IONA to
 //! verify headers from other Tendermint/CometBFT chains.
