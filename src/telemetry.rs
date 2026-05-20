@@ -1,4 +1,4 @@
-//! IONA v35 — OpenTelemetry distributed tracing.
+//! IONA— OpenTelemetry distributed tracing.
 //!
 //! Initializes OTLP tracing export to Jaeger, Tempo, or any
 //! OpenTelemetry-compatible collector. Enables end-to-end request
