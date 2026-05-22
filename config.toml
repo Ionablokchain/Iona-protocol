@@ -1,12 +1,13 @@
-# IONA v30.0.0 node configuration — SECURITY-FIRST DEFAULTS
-# All values shown are production-safe defaults.
+# IONA v30.0.0 node configuration — HARDENED PRODUCTION TEMPLATE
+# All values shown are secure defaults. Replace placeholders before use.
 #
 # ┌─────────────────────────────────────────────────────────────────┐
-# │  SECURITY DEFAULTS — DO NOT CHANGE WITHOUT READING BELOW       │
+# │  SECURITY DEFAULTS — DO NOT CHANGE WITHOUT UNDERSTANDING       │
 # │                                                                 │
-# │  rpc.listen    = "127.0.0.1:9001"  ← loopback only            │
-# │  admin.listen  = "127.0.0.1:9099"  ← loopback only            │
-# │  cors_allow_all = false             ← restrictive CORS         │
+# │  rpc.listen        = "127.0.0.1:9001"   ← loopback only       │
+# │  admin.listen      = "127.0.0.1:9099"   ← loopback only       │
+# │  cors_allow_all    = false              ← restrictive CORS    │
+# │  require_attestation = true             ← state sync security │
 # │                                                                 │
 # │  To expose RPC publicly (e.g. for a public API node):          │
 # │    1. Set listen = "0.0.0.0:9001"                              │
@@ -19,8 +20,21 @@
 # Base directory for node data (database, snapshots, quarantines, keys)
 data_dir = "./data/node1"
 
-# Deterministic key seed (change per node). WARNING: Keep secret in production.
-seed = 1
+# --- PRIVATE KEY MANAGEMENT -------------------------------------------------
+# NEVER hardcode a seed. Use one of the following methods:
+#   1. Private key file (recommended for validators)
+#   2. Environment variable (for containers)
+#   3. External signer (see [signing] section)
+#
+# Option A: Path to Ed25519 private key file (hex or raw)
+# private_key_path = "./secrets/validator.key"
+#
+# Option B: Environment variable containing the private key (hex)
+# private_key_env = "IONA_NODE_PRIVATE_KEY"
+#
+# WARNING: The "seed" field below is INSECURE. It exists only for
+#          testnets and development. Remove in production.
+seed = 1   # [DEV ONLY] remove for mainnet
 
 # Unique chain identifier (must match genesis)
 chain_id = 6126151
@@ -28,8 +42,8 @@ chain_id = 6126151
 # Log level: trace | debug | info | warn | error
 log_level = "info"
 
-# Keystore mode: plain (insecure) | encrypted (recommended)
-keystore = "plain"
+# Keystore mode: encrypted (recommended) | plain (insecure)
+keystore = "encrypted"
 
 # Password for encrypted keystore (fallback if env var not set)
 keystore_password = ""
@@ -105,6 +119,9 @@ reconnect_s = 30
 max_connections_total = 200
 max_connections_per_peer = 8
 
+# Do not dial private IP addresses (prevents routing attacks)
+allow_private_addresses = false
+
 # Request-response protocol limits (per-peer, per-protocol)
 [network.rr_limits]
 max_req_per_sec_block  = 15
@@ -157,7 +174,7 @@ max_in_bytes_per_sec = 10_485_760
 bind_validator_set = true
 bind_epoch = true
 attestation_epoch_s = 60
-require_attestation = false
+require_attestation = true          # CHANGED: now true for security
 use_aggregated_signatures = false
 
 # P2P state sync
@@ -184,6 +201,9 @@ max_gas_price = 1_000_000
 # Maximum priority fee per gas
 max_priority_fee_per_gas = 100
 
+# Replace-by-fee ratio (new fee must be at least this times old fee)
+replace_by_fee_ratio = 1.1
+
 # MEV protection (commit-reveal, threshold encryption, fair ordering)
 [mev]
 enable_commit_reveal = true
@@ -193,6 +213,12 @@ ordering_jitter_ms = 50
 commit_ttl_blocks = 20
 backrun_delay_blocks = 1
 max_pending_commits = 100_000
+
+[admin]
+# Admin API – separate from public RPC, loopback only.
+listen = "127.0.0.1:9099"
+enable_profiling = false
+enable_debug_api = false
 
 [rpc]
 # SECURITY: bind to loopback by default.
@@ -221,6 +247,13 @@ timeout_s = 30
 # Maximum JSON nesting depth (prevents DoS via deep structures)
 max_json_depth = 32
 
+# WebSocket subscription limits
+max_subscriptions_per_client = 100
+
+# Optional: whitelist of allowed RPC methods (empty = allow all)
+# method_whitelist = ["eth_blockNumber", "eth_getBalance", "eth_call", "eth_sendRawTransaction"]
+method_whitelist = []
+
 [storage]
 # Enable snapshot generation
 enable_snapshots = true
@@ -240,6 +273,13 @@ db_cache_size_mb = 512
 # Maximum number of concurrent I/O tasks
 max_concurrent_tasks = 256
 
+# Pruning configuration (keep recent state)
+[storage.pruning]
+enabled = true
+keep_recent_blocks = 100_000
+keep_recent_states = 10_000
+interval_blocks = 1000
+
 # WAL (Write-Ahead Log) configuration
 [storage.wal]
 max_segment_bytes = 67_108_864              # 64 MiB
@@ -256,11 +296,12 @@ otel_endpoint = "http://127.0.0.1:4317"
 # Service name for traces/metrics
 service_name = "iona-node"
 
-# Metrics export (Prometheus) – if enabled, expose /metrics on this address
-# metrics_listen = "127.0.0.1:9100"
+# Metrics export (Prometheus) – exposed on loopback by default
+enable_metrics = true
+metrics_listen = "127.0.0.1:9100"
 
 [signing]
-# Signing mode: local (use seed) | remote (external signer)
+# Signing mode: local (use private key) | remote (external signer)
 mode = "local"
 
 # Remote signer URL (only if mode = "remote")
