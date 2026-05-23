@@ -1,18 +1,22 @@
 //! Remote signer client.
 //!
-//! This is intentionally small and "boring": it uses `reqwest::blocking` so it can implement the
-//! synchronous `crate::crypto::Signer` trait without changing consensus code.
+//! This module provides a client for a remote signing service (e.g., a hardware security module
+//! or a separate signing process). The client implements the synchronous `Signer` trait so it can
+//! be used directly by consensus code without changes to the asynchronous runtime.
 //!
-//! Expected remote signer API (HTTP JSON):
-//! - `GET /pubkey`  → `{ "pubkey_base64": "..." }`
-//! - `POST /sign`   → `{ "msg_base64": "..." }`  → `{ "sig_base64": "..." }`
-//! - `GET /health`  → `200 OK` (optional, but recommended)
+//! # Expected Remote Signer API
+//!
+//! The remote signer must expose the following HTTP JSON endpoints:
+//!
+//! - `GET /pubkey` → `{ "pubkey_base64": "..." }`
+//! - `POST /sign`  → request `{ "msg_base64": "..." }`, response `{ "sig_base64": "..." }`
+//! - `GET /health` → `200 OK` (optional, but recommended)
 //!
 //! # Features
 //!
-//! - Optional mTLS (client certificate + private key) and custom CA root.
-//! - Optional server name override (SNI) for strict TLS.
-//! - Health check and error logging.
+//! - Optional **mTLS**: client certificate + private key and a custom CA root.
+//! - Optional **server name override** (SNI) for strict TLS validation.
+//! - Health check and comprehensive error logging.
 //!
 //! # Example
 //!
@@ -37,42 +41,69 @@ use tracing::{debug, error, info, warn};
 // -----------------------------------------------------------------------------
 
 /// Client for a remote signing service.
+///
+/// Implements the `Signer` trait by forwarding signing requests over HTTP.
+/// The client is cloneable and internally uses a `reqwest::blocking::Client`.
 #[derive(Clone)]
 pub struct RemoteSigner {
+    /// Base URL of the remote signer (e.g., `http://localhost:9100`).
     base_url: String,
+    /// HTTP client configured with timeouts and optional mTLS.
     client: Client,
+    /// Public key fetched from the remote signer at connection time.
     pubkey: PublicKeyBytes,
+    /// Request timeout for all operations.
     timeout: Duration,
 }
 
+/// Response from `GET /pubkey`.
 #[derive(Debug, Deserialize)]
 struct PubkeyResp {
+    /// Base64‑encoded public key (e.g., 32 bytes for Ed25519).
     pubkey_base64: String,
 }
 
+/// Request body for `POST /sign`.
 #[derive(Debug, Serialize)]
 struct SignReq {
+    /// Base64‑encoded message to sign.
     msg_base64: String,
 }
 
+/// Response from `POST /sign`.
 #[derive(Debug, Deserialize)]
 struct SignResp {
+    /// Base64‑encoded signature.
     sig_base64: String,
 }
 
 impl RemoteSigner {
-    /// Build a `RemoteSigner` and fetch the public key from `/pubkey`.
+    /// Connect to a remote signer using plain HTTP/HTTPS (no mTLS).
+    ///
+    /// # Arguments
+    /// * `base_url` – Base URL of the signer (e.g., `http://localhost:9100`).
+    /// * `timeout` – Request timeout for all operations.
+    ///
+    /// # Errors
+    /// Returns an error if the public key cannot be fetched or if the connection fails.
     #[must_use]
     pub fn connect(base_url: String, timeout: Duration) -> anyhow::Result<Self> {
         Self::connect_mtls(base_url, timeout, None)
     }
 
-    /// Same as `connect`, but optionally enables mTLS.
+    /// Connect to a remote signer with optional mTLS.
     ///
-    /// Provide a tuple of `(client_identity_pem, ca_cert_pem, server_name_override)`:
-    /// - `client_identity_pem` should contain **both** certificate and private key in PEM.
-    /// - `ca_cert_pem` is used as a custom root (useful for private PKI).
-    /// - `server_name_override` is used for strict SNI validation when the URL host is an IP.
+    /// # Arguments
+    /// * `base_url` – Base URL of the signer.
+    /// * `timeout` – Request timeout for all operations.
+    /// * `mtls` – Optional mTLS configuration tuple:
+    ///     - `identity_pem`: PEM containing both client certificate and private key.
+    ///     - `ca_pem`: PEM for a custom CA root (optional, can be empty).
+    ///     - `server_name_override`: SNI override (useful when the URL uses an IP address).
+    ///
+    /// # Errors
+    /// Returns an error if the public key cannot be fetched, TLS configuration fails,
+    /// or the connection cannot be established.
     #[must_use]
     pub fn connect_mtls(
         base_url: String,
@@ -86,10 +117,9 @@ impl RemoteSigner {
             let ca = Certificate::from_pem(&ca_pem)?;
             builder = builder.identity(id).add_root_certificate(ca);
             if let Some(name) = server_name {
-                // NOTE: reqwest does not offer an explicit per-request SNI override;
-                // the best practice is to use a DNS name in the URL. This field is kept for config
-                // compatibility and documentation.
-                debug!(server_name = %name, "mTLS server name override set");
+                // Note: `reqwest` does not expose a per-request SNI override;
+                // using a DNS name in the URL is the recommended practice.
+                debug!(server_name = %name, "mTLS server name override set (for configuration only)");
             }
         }
 
@@ -120,7 +150,10 @@ impl RemoteSigner {
         &self.base_url
     }
 
-    /// Check if the remote signer is healthy by calling `/health` (or falling back to `/pubkey`).
+    /// Check if the remote signer is healthy.
+    ///
+    /// Tries `GET /health` first; if that fails (404, timeout, or non‑2xx), falls back to
+    /// `GET /pubkey` as a minimal liveness probe.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
         let url = format!("{}/health", self.base_url.trim_end_matches('/'));
@@ -137,8 +170,10 @@ impl RemoteSigner {
         }
     }
 
-    /// Attempt to sign a message, returning `Some(SignatureBytes)` on success, `None` on failure.
-    /// This method is useful for callers that can handle transient errors.
+    /// Attempt to sign a message, returning `Some(SignatureBytes)` on success.
+    ///
+    /// This method logs errors but does not propagate them; the caller can decide
+    /// whether to retry or fall back. The `Signer` trait uses this internally.
     #[must_use]
     pub fn try_sign(&self, msg: &[u8]) -> Option<SignatureBytes> {
         let url = format!("{}/sign", self.base_url.trim_end_matches('/'));
@@ -172,7 +207,16 @@ impl RemoteSigner {
         }
     }
 
-    /// Helper: build mTLS materials from PEM files.
+    /// Helper to load mTLS materials from PEM files.
+    ///
+    /// # Arguments
+    /// * `client_identity_pem_path` – Path to a PEM file containing the client certificate
+    ///   and private key (concatenated).
+    /// * `ca_cert_pem_path` – Path to a PEM file containing the CA certificate.
+    /// * `server_name_override` – Optional SNI override.
+    ///
+    /// # Errors
+    /// Returns an error if file reading fails.
     #[must_use]
     pub fn mtls_from_files(
         client_identity_pem_path: &str,
@@ -190,10 +234,15 @@ impl RemoteSigner {
 // -----------------------------------------------------------------------------
 
 impl Signer for RemoteSigner {
+    /// Returns the public key fetched during connection.
     fn public_key(&self) -> PublicKeyBytes {
         self.pubkey.clone()
     }
 
+    /// Signs a message using the remote signer.
+    ///
+    /// If signing fails, logs a warning and returns an empty signature.
+    /// The consensus engine must handle invalid signatures appropriately.
     fn sign(&self, msg: &[u8]) -> SignatureBytes {
         match self.try_sign(msg) {
             Some(sig) => sig,
