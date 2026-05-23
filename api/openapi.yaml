@@ -5,12 +5,20 @@ info:
     Complete API documentation for the IONA blockchain node.
     
     The node exposes two main interfaces:
-    - **JSON-RPC** (Ethereum-compatible): Standard eth_* methods via POST /rpc
+    - **JSON-RPC** (Ethereum-compatible): Standard `eth_*` methods via `POST /rpc`
     - **REST endpoints**: Health, status, metrics, VM operations
     
     ## Rate Limiting
     Built-in rate limiting applies to P2P connections. RPC rate limiting should be
-    configured via reverse proxy (nginx/caddy).
+    configured via a reverse proxy (nginx/caddy).
+    
+    ## Error Codes
+    Standard JSON-RPC error codes are used:
+    - `-32700`: Parse error
+    - `-32600`: Invalid request
+    - `-32601`: Method not found
+    - `-32602`: Invalid params
+    - `-32000` to `-32099`: Server errors (e.g., execution reverted)
   version: 27.0.0
   license:
     name: MIT
@@ -19,6 +27,8 @@ info:
 servers:
   - url: http://127.0.0.1:8080
     description: Local node (default)
+  - url: https://your-node.example.com
+    description: Remote node (example)
 
 tags:
   - name: JSON-RPC
@@ -38,29 +48,35 @@ paths:
       description: |
         Standard Ethereum JSON-RPC endpoint supporting:
         
-        **Chain State:** eth_chainId, eth_blockNumber, eth_getBalance, eth_getCode,
-        eth_getStorageAt, eth_getTransactionCount
+        **Chain State:**
+        `eth_chainId`, `eth_blockNumber`, `eth_getBalance`, `eth_getCode`,
+        `eth_getStorageAt`, `eth_getTransactionCount`, `eth_getProof`
         
-        **Transactions:** eth_sendRawTransaction, eth_getTransactionByHash,
-        eth_getTransactionReceipt, eth_call, eth_estimateGas
+        **Transactions:**
+        `eth_sendRawTransaction`, `eth_getTransactionByHash`,
+        `eth_getTransactionReceipt`, `eth_call`, `eth_estimateGas`
         
-        **Blocks:** eth_getBlockByNumber, eth_getBlockByHash,
-        eth_getBlockTransactionCountByNumber, eth_getBlockTransactionCountByHash,
-        eth_getTransactionByBlockHashAndIndex, eth_getTransactionByBlockNumberAndIndex
+        **Blocks:**
+        `eth_getBlockByNumber`, `eth_getBlockByHash`,
+        `eth_getBlockTransactionCountByNumber`, `eth_getBlockTransactionCountByHash`,
+        `eth_getTransactionByBlockHashAndIndex`, `eth_getTransactionByBlockNumberAndIndex`
         
-        **Logs & Filters:** eth_getLogs, eth_newFilter, eth_newBlockFilter,
-        eth_newPendingTransactionFilter, eth_getFilterChanges, eth_uninstallFilter
+        **Logs & Filters:**
+        `eth_getLogs`, `eth_newFilter`, `eth_newBlockFilter`,
+        `eth_newPendingTransactionFilter`, `eth_getFilterChanges`, `eth_uninstallFilter`
         
-        **Network:** net_version, net_listening, net_peerCount, web3_clientVersion
+        **Network:**
+        `net_version`, `net_listening`, `net_peerCount`, `web3_clientVersion`
         
-        **Gas:** eth_gasPrice, eth_maxPriorityFeePerGas
+        **Gas:**
+        `eth_gasPrice`, `eth_maxPriorityFeePerGas`
         
-        **Proof:** eth_getProof (Merkle proof for account state)
+        **IONA-specific:**
+        `iona_mine` (mine pending transactions in dev mode)
         
-        **IONA-specific:** iona_mine (mine pending transactions in dev mode)
-        
-        **Misc:** eth_syncing, eth_mining, eth_accounts, eth_protocolVersion,
-        eth_hashrate, eth_getUncleCountByBlockHash, eth_getUncleCountByBlockNumber
+        **Misc:**
+        `eth_syncing`, `eth_mining`, `eth_accounts`, `eth_protocolVersion`,
+        `eth_hashrate`, `eth_getUncleCountByBlockHash`, `eth_getUncleCountByBlockNumber`
       requestBody:
         required: true
         content:
@@ -90,7 +106,7 @@ paths:
                   params: ["0xf86c...signed_tx_hex"]
                   id: 1
               eth_call:
-                summary: Execute call (read-only)
+                summary: Execute read‑only call
                 value:
                   jsonrpc: "2.0"
                   method: "eth_call"
@@ -370,6 +386,9 @@ components:
         message:
           type: string
           example: "Method not found"
+        data:
+          description: Optional additional data (e.g., revert reason)
+          type: object
 
     NodeStatus:
       type: object
@@ -416,10 +435,13 @@ components:
           example: 1700000000
         state_root:
           type: string
+          example: "0x..."
         transactions_root:
           type: string
+          example: "0x..."
         receipts_root:
           type: string
+          example: "0x..."
         gas_used:
           type: integer
           example: 210000
