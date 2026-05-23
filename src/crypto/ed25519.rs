@@ -1,4 +1,21 @@
 //! Ed25519 signing and verification for IONA.
+//!
+//! This module provides an implementation of the `Signer` and `Verifier` traits
+//! using the Ed25519 signature scheme (Edwards-curve Digital Signature Algorithm).
+//! The implementation is based on the `ed25519_dalek` crate.
+//!
+//! # Example
+//!
+//! ```
+//! use iona::crypto::ed25519::{Ed25519Signer, Ed25519Verifier};
+//! use iona::crypto::{Signer, Verifier};
+//!
+//! let signer = Ed25519Signer::random();
+//! let msg = b"hello world";
+//! let sig = signer.sign(msg);
+//! let pk = signer.public_key();
+//! assert!(Ed25519Verifier::verify(&pk, msg, &sig).is_ok());
+//! ```
 
 use crate::crypto::{CryptoError, PublicKeyBytes, SignatureBytes, Signer, Verifier};
 use ed25519_dalek::{Signature, Signer as EdSigner, SigningKey, Verifier as EdVerifier, VerifyingKey};
@@ -6,16 +23,34 @@ use rand::rngs::OsRng;
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
+// -----------------------------------------------------------------------------
+// Ed25519Signer
+// -----------------------------------------------------------------------------
+
 /// Ed25519 signer that holds a signing key.
+///
+/// The signing key is stored in an `Arc` to allow cheap cloning.
+/// The seed is zeroized on drop via `Zeroizing` (though the `SigningKey`
+/// itself does not implement zeroize; we rely on the caller to manage
+/// memory sensitivity).
 #[derive(Clone)]
 pub struct Ed25519Signer {
+    /// The secret signing key (wrapped in `Arc` for cheap cloning).
     signing_key: Arc<SigningKey>,
+    /// The corresponding verifying key (for fast access).
     verifying_key: VerifyingKey,
+    /// Public key bytes (cached for efficient access).
     public_key_bytes: PublicKeyBytes,
 }
 
 impl Ed25519Signer {
-    /// Create a new signer from a seed (32 bytes).
+    /// Create a new signer from a 32‑byte seed.
+    ///
+    /// # Arguments
+    /// * `seed` – A 32‑byte secret seed (should be kept confidential).
+    ///
+    /// # Returns
+    /// An `Ed25519Signer` instance.
     pub fn from_seed(seed: [u8; 32]) -> Self {
         let signing_key = SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
@@ -27,7 +62,7 @@ impl Ed25519Signer {
         }
     }
 
-    /// Generate a random signing key.
+    /// Generate a random signing key using the operating system's random number generator.
     pub fn random() -> Self {
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
@@ -39,12 +74,18 @@ impl Ed25519Signer {
         }
     }
 
-    /// Export the seed (32 bytes) for persistence (careful!).
+    /// Export the seed (32 bytes) for persistence.
+    ///
+    /// # Warning
+    /// This exposes the private key material. Use with extreme care.
     pub fn to_seed(&self) -> [u8; 32] {
         self.signing_key.to_bytes()
     }
 
-    /// Try to create a signer from a byte slice (must be 32 bytes).
+    /// Attempt to create a signer from a byte slice (must be exactly 32 bytes).
+    ///
+    /// # Errors
+    /// Returns `CryptoError::Key` if the slice length is not 32.
     pub fn try_from_slice(slice: &[u8]) -> Result<Self, CryptoError> {
         if slice.len() != 32 {
             return Err(CryptoError::Key("seed must be 32 bytes".into()));
@@ -54,7 +95,7 @@ impl Ed25519Signer {
         Ok(Self::from_seed(seed))
     }
 
-    /// Access the verifying key (for verification).
+    /// Access the verifying key (for verification outside the trait).
     pub fn verifying_key(&self) -> &VerifyingKey {
         &self.verifying_key
     }
@@ -71,10 +112,28 @@ impl Signer for Ed25519Signer {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Ed25519Verifier
+// -----------------------------------------------------------------------------
+
 /// Ed25519 verifier (stateless).
+///
+/// This type implements the `Verifier` trait and provides a single static
+/// method for verifying Ed25519 signatures.
 pub struct Ed25519Verifier;
 
 impl Verifier for Ed25519Verifier {
+    /// Verify an Ed25519 signature.
+    ///
+    /// # Arguments
+    /// * `pk` – The public key (must be exactly 32 bytes).
+    /// * `msg` – The message that was signed.
+    /// * `sig` – The signature (must be exactly 64 bytes).
+    ///
+    /// # Returns
+    /// `Ok(())` if the signature is valid, `Err(CryptoError::InvalidSignature)`
+    /// if the signature is invalid, or `Err(CryptoError::Key)` if the public key
+    /// or signature length is incorrect.
     fn verify(pk: &PublicKeyBytes, msg: &[u8], sig: &SignatureBytes) -> Result<(), CryptoError> {
         if pk.0.len() != 32 {
             return Err(CryptoError::Key("public key must be 32 bytes".into()));
@@ -95,6 +154,10 @@ impl Verifier for Ed25519Verifier {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,7 +176,7 @@ mod tests {
         let signer = Ed25519Signer::random();
         let msg = b"hello world";
         let mut sig = signer.sign(msg);
-        // Corrupt signature
+        // Corrupt the signature by flipping one bit.
         if let Some(byte) = sig.0.get_mut(0) {
             *byte ^= 1;
         }
