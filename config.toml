@@ -106,7 +106,7 @@ bootnodes = [
   # "/dns4/node.example/tcp/7001/p2p/12D3KooW...",
 ]
 
-# Enable mDNS for local network discovery (disables for security)
+# Enable mDNS for local network discovery (disabled for security)
 enable_mdns = false
 
 # Enable Kademlia DHT for peer discovery
@@ -174,7 +174,7 @@ max_in_bytes_per_sec = 10_485_760
 bind_validator_set = true
 bind_epoch = true
 attestation_epoch_s = 60
-require_attestation = true          # CHANGED: now true for security
+require_attestation = true          # Now true for security
 use_aggregated_signatures = false
 
 # P2P state sync
