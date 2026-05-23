@@ -1,19 +1,42 @@
+//! Cryptographic primitives for IONA.
+//!
+//! This module provides:
+//! - Public key and signature type wrappers with hex serialisation.
+//! - Traits `Signer` and `Verifier` for pluggable signing backends.
+//! - Ed25519 implementation (ed25519 module).
+//! - Transaction signing utilities (tx module).
+//! - Encrypted keystore (keystore module).
+//! - Remote signer client (remote_signer module).
+//! - HSM support (hsm module, optional).
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+// -----------------------------------------------------------------------------
+// Error types
+// -----------------------------------------------------------------------------
+
+/// Cryptographic errors that can occur during signature verification or key handling.
 #[derive(Debug, Error)]
 pub enum CryptoError {
+    /// Signature verification failed (invalid signature for the given message and public key).
     #[error("invalid signature")]
     InvalidSignature,
+
+    /// Key‑related error (e.g., invalid key format, unsupported algorithm).
     #[error("key error: {0}")]
     Key(String),
 }
 
-/// Public key bytes — serializes as hex string for JSON compatibility.
+// -----------------------------------------------------------------------------
+// PublicKeyBytes
+// -----------------------------------------------------------------------------
+
+/// Public key bytes wrapper with hex serialisation.
 ///
-/// JSON map keys must be strings, so we serialize as hex instead of byte arrays.
-/// This fixes "stakes.json encode: key must be a string" when `BTreeMap<PublicKeyBytes, _>`
-/// is serialized to JSON.
+/// JSON map keys must be strings, so this wrapper serialises as a hex string
+/// instead of a byte array. This fixes encoding issues when used as keys in
+/// `BTreeMap` or `HashMap` (e.g., `stakes.json`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PublicKeyBytes(pub Vec<u8>);
 
@@ -45,24 +68,55 @@ impl<'de> Deserialize<'de> for PublicKeyBytes {
     }
 }
 
+// -----------------------------------------------------------------------------
+// SignatureBytes
+// -----------------------------------------------------------------------------
+
+/// Signature bytes wrapper (usually 64 bytes for Ed25519).
+/// Unlike `PublicKeyBytes`, this type is serialised as a byte array (via `serde` derive)
+/// because signatures are never used as map keys.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SignatureBytes(pub Vec<u8>);
 
+// -----------------------------------------------------------------------------
+// Signer trait
+// -----------------------------------------------------------------------------
+
+/// A signer that can produce signatures for arbitrary messages.
+///
+/// Implementations must be thread‑safe (`Send + Sync`) and can be backed
+/// by local keys, remote signing services, or hardware security modules.
 pub trait Signer: Send + Sync {
+    /// Return the public key corresponding to this signer.
     fn public_key(&self) -> PublicKeyBytes;
+
+    /// Sign the given message and return the signature.
+    ///
+    /// # Panics
+    /// Implementations should avoid panicking; instead they may return an empty
+    /// signature if signing fails (the caller must handle that case).
     fn sign(&self, msg: &[u8]) -> SignatureBytes;
 }
 
+// -----------------------------------------------------------------------------
+// Verifier trait
+// -----------------------------------------------------------------------------
+
+/// A stateless verifier that can validate signatures against public keys.
 pub trait Verifier: Send + Sync {
+    /// Verify that `sig` is a valid signature for `msg` under `pk`.
+    ///
+    /// # Returns
+    /// `Ok(())` if the signature is valid, `Err(CryptoError::InvalidSignature)` otherwise.
     fn verify(pk: &PublicKeyBytes, msg: &[u8], sig: &SignatureBytes) -> Result<(), CryptoError>;
 }
 
+// -----------------------------------------------------------------------------
+// Submodules
+// -----------------------------------------------------------------------------
+
 pub mod ed25519;
-
 pub mod tx;
-
 pub mod keystore;
-
 pub mod remote_signer;
-
 pub mod hsm;
