@@ -4,6 +4,20 @@
 //! and for producing the canonical byte representation that is signed over a
 //! transaction.
 //!
+//! # Address derivation
+//!
+//! Iona addresses are derived as the first 20 bytes of the Blake3 hash of the
+//! public key, encoded as a 40‑character hex string (without `0x` prefix).
+//!
+//! # Signing payload
+//!
+//! The canonical signing payload is a deterministic JSON array:
+//! `["iona-tx-v1", chain_id, pubkey, nonce, max_fee_per_gas,
+//!   max_priority_fee_per_gas, gas_limit, payload]`
+//!
+//! This format is stable across serialisation library versions and does not
+//! include the signature itself.
+//!
 //! # Example
 //!
 //! ```
@@ -30,9 +44,9 @@ use tracing::debug;
 
 /// Derive an Iona address (20‑byte hex string) from a public key.
 ///
-/// The address is computed as the first 20 bytes of the Blake3 hash of the public key.
-/// This produces a human‑readable hex string (40 characters) suitable for use as
-/// an account identifier.
+/// The address is computed as the first 20 bytes of the Blake3 hash of the
+/// public key. This produces a human‑readable hex string (40 characters)
+/// suitable for use as an account identifier.
 ///
 /// # Arguments
 /// * `pubkey` – The public key bytes (e.g., 32 bytes for Ed25519).
@@ -102,9 +116,12 @@ pub fn tx_sign_bytes(tx: &Tx) -> Vec<u8> {
 
 /// Sign a transaction using an Ed25519 signer.
 ///
+/// This function computes the signing payload, signs it with the provided
+/// Ed25519 keypair, and updates the transaction's `signature` and `from` fields.
+///
 /// # Arguments
 /// * `tx` – The transaction to sign (will be modified in place).
-/// * `signer` – The Ed25519 signer.
+/// * `signer` – The Ed25519 signer (keypair).
 ///
 /// # Example
 /// ```
@@ -125,6 +142,9 @@ pub fn sign_tx(tx: &mut Tx, signer: &crate::crypto::ed25519::Ed25519Keypair) {
 }
 
 /// Verify a transaction's signature.
+///
+/// Re‑computes the signing payload and checks the signature against the
+/// transaction's public key.
 ///
 /// # Arguments
 /// * `tx` – The transaction to verify.
