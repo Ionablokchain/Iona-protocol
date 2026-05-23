@@ -61,7 +61,8 @@ use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::signal;
-use tracing::{error, info, warn};
+use tokio::sync::watch;
+use tracing::{error, info, warn, debug};
 
 // -----------------------------------------------------------------------------
 // Node Error
@@ -87,6 +88,9 @@ pub enum NodeError {
 
     #[error("upgrade error: {0}")]
     Upgrade(String),
+
+    #[error("initialisation failed: {0}")]
+    Init(String),
 }
 
 /// Alias for `Result<T, NodeError>`.
@@ -99,9 +103,12 @@ pub type NodeResult<T> = Result<T, NodeError>;
 /// Main node handle. Holds all components and manages the node lifecycle.
 pub struct Node {
     config: Config,
-    // Components will be initialised in `new` and stored here.
-    // For brevity, we only keep the config; real implementation would hold
-    // storage, mempool, consensus engine, network, etc.
+    /// Shutdown signal sender (used to stop all background tasks).
+    shutdown_tx: watch::Sender<()>,
+    /// Shutdown signal receiver.
+    shutdown_rx: watch::Receiver<()>,
+    // Component handles (would be stored here in real implementation).
+    // For this example, we only keep the configuration.
 }
 
 impl Node {
@@ -133,31 +140,81 @@ impl Node {
             }
         }
 
-        // TODO: Initialise storage, mempool, network, consensus, RPC, etc.
+        // Create shutdown channel
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
 
-        Ok(Self { config })
+        // TODO: Initialise storage, mempool, network, consensus, RPC, etc.
+        // The following stubs show how the components would be integrated.
+
+        Ok(Self {
+            config,
+            shutdown_tx,
+            shutdown_rx,
+        })
     }
 
     /// Run the node main loop.
     ///
-    /// Starts consensus, networking, RPC servers, and blocks until shutdown.
+    /// Starts all background services (consensus, networking, RPC) and
+    /// blocks until a shutdown signal is received.
     pub async fn run(&self) -> NodeResult<()> {
         info!("Starting IONA node");
 
         // Start RPC server (if configured)
-        if !self.config.rpc.listen.is_empty() {
+        let rpc_handle = if !self.config.rpc.listen.is_empty() {
             info!("Starting RPC server on {}", self.config.rpc.listen);
-            // spawn RPC task
-        }
+            let listen_addr = self.config.rpc.listen.parse()
+                .map_err(|e| NodeError::Init(format!("invalid RPC listen address: {}", e)))?;
+            let shutdown_rx = self.shutdown_rx.clone();
+            let rpc_config = self.config.rpc.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = rpc::router::serve(listen_addr, rpc_config, shutdown_rx).await {
+                    error!("RPC server error: {}", e);
+                }
+            }))
+        } else {
+            debug!("RPC server disabled (no listen address)");
+            None
+        };
 
-        // Start consensus engine and network
-        info!("Consensus engine started");
+        // Start metrics server (if enabled)
+        let metrics_handle = if self.config.observability.enable_metrics {
+            let metrics_addr = self.config.observability.metrics_listen.parse()
+                .map_err(|e| NodeError::Init(format!("invalid metrics address: {}", e)))?;
+            let shutdown_rx = self.shutdown_rx.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = metrics::serve(metrics_addr, shutdown_rx).await {
+                    error!("Metrics server error: {}", e);
+                }
+            }))
+        } else {
+            None
+        };
+
+        // Start networking and consensus components
+        // (In a real node, these would be spawned and awaited.)
+
+        info!("Node started successfully");
 
         // Wait for shutdown signal
-        wait_for_shutdown().await;
+        wait_for_shutdown(self.shutdown_rx.clone()).await;
+        info!("Shutdown signal received, stopping components");
 
-        info!("Shutting down IONA node");
+        // Cancel all background tasks (they will exit when shutdown_rx changes)
+        if let Some(handle) = rpc_handle {
+            handle.abort();
+        }
+        if let Some(handle) = metrics_handle {
+            handle.abort();
+        }
+
+        info!("Node shutdown complete");
         Ok(())
+    }
+
+    /// Trigger a graceful shutdown from within the node (e.g., after receiving a signal).
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(());
     }
 }
 
@@ -176,23 +233,41 @@ fn init_tracing(config: &Config) {
         .with_target(true)
         .with_thread_ids(true);
 
-    if cfg!(feature = "otel") {
-        // OpenTelemetry integration (requires feature flag)
-        let otel_layer = opentelemetry::global::tracer_provider()
-            .tracer("iona-node")
-            .into();
-        builder.with(otel_layer).init();
-    } else {
-        builder.init();
+    #[cfg(feature = "otel")]
+    {
+        use opentelemetry::global;
+        use opentelemetry_otlp::WithExportConfig;
+        use opentelemetry_sdk::trace::{self, TracerProvider};
+
+        if config.observability.enable_otel {
+            let endpoint = config.observability.otel_endpoint.clone();
+            let service_name = config.observability.service_name.clone();
+            let exporter = opentelemetry_otlp::new_exporter()
+                .tonic()
+                .with_endpoint(endpoint);
+            let provider = TracerProvider::builder()
+                .with_simple_exporter(exporter)
+                .with_config(trace::config().with_resource(
+                    opentelemetry_sdk::Resource::new(vec![
+                        opentelemetry::KeyValue::new("service.name", service_name),
+                    ])
+                ))
+                .build();
+            global::set_tracer_provider(provider);
+            let otel_layer = tracing_opentelemetry::layer().with_tracer(global::tracer("iona-node"));
+            builder.with(otel_layer).init();
+            return;
+        }
     }
+    builder.init();
 }
 
-async fn wait_for_shutdown() {
+async fn wait_for_shutdown(mut shutdown_rx: watch::Receiver<()>) {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
             .expect("failed to install Ctrl+C handler");
-        info!("Received Ctrl+C, shutting down");
+        info!("Received Ctrl+C");
     };
 
     #[cfg(unix)]
@@ -201,7 +276,7 @@ async fn wait_for_shutdown() {
             .expect("failed to install SIGTERM handler")
             .recv()
             .await;
-        info!("Received SIGTERM, shutting down");
+        info!("Received SIGTERM");
     };
 
     #[cfg(not(unix))]
@@ -210,6 +285,9 @@ async fn wait_for_shutdown() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+        _ = shutdown_rx.changed() => {
+            info!("Internal shutdown signal");
+        },
     }
 }
 
