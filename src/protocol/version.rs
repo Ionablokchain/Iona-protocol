@@ -1,19 +1,19 @@
 //! Protocol versioning for IONA.
 //!
-//! Every block header carries a `protocol_version` field.  Nodes use this to:
+//! Every block header carries a `protocol_version` field. Nodes use this to:
 //!   - Decide which validation / execution rules to apply.
 //!   - Reject blocks produced under an unsupported protocol.
-//!   - Coordinate hard-fork upgrades via an **activation height**.
+//!   - Coordinate hard‑fork upgrades via an **activation height**.
 //!
 //! # Upgrade flow
 //!
 //! 1. **Minor (rolling):** `protocol_version` stays the same; only storage
-//!    schema or RPC fields change.  Nodes upgrade one-by-one with no halt.
+//!    schema or RPC fields change. Nodes upgrade one‑by‑one with no halt.
 //!
 //! 2. **Major (coordinated):** A new `protocol_version` is introduced.
-//!    - Pre-activation: nodes support *both* old and new versions.
-//!    - At `activation_height`: nodes start producing new-version blocks.
-//!    - After a grace window: old-version blocks are rejected.
+//!    - Pre‑activation: nodes support *both* old and new versions.
+//!    - At `activation_height`: nodes start producing new‑version blocks.
+//!    - After a grace window: old‑version blocks are rejected.
 //!
 //! # Example
 //!
@@ -27,7 +27,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -45,13 +45,13 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[1];
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
 // -----------------------------------------------------------------------------
-// Activation config
+// Activation configuration
 // -----------------------------------------------------------------------------
 
-/// Per-version activation rule.
+/// Per‑version activation rule.
 ///
 /// When the chain reaches `activation_height`, the node switches to producing
-/// blocks with `protocol_version`.  Before that height, it continues to
+/// blocks with `protocol_version`. Before that height, it continues to
 /// produce blocks with the previous version.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtocolActivation {
@@ -67,11 +67,12 @@ pub struct ProtocolActivation {
     pub grace_blocks: u64,
 }
 
+/// Default grace blocks value (1000 blocks).
 fn default_grace_blocks() -> u64 {
     1000
 }
 
-/// Default activation schedule: v1 active from genesis.
+/// Returns the default activation schedule: protocol version 1 active from genesis.
 #[must_use]
 pub fn default_activations() -> Vec<ProtocolActivation> {
     vec![ProtocolActivation {
@@ -90,13 +91,13 @@ pub fn default_activations() -> Vec<ProtocolActivation> {
 #[must_use]
 pub fn version_for_height(height: u64, activations: &[ProtocolActivation]) -> u32 {
     let mut active_version = 1u32;
-    for a in activations {
-        match a.activation_height {
+    for activation in activations {
+        match activation.activation_height {
             None => {
-                active_version = active_version.max(a.protocol_version);
+                active_version = active_version.max(activation.protocol_version);
             }
             Some(h) if height >= h => {
-                active_version = active_version.max(a.protocol_version);
+                active_version = active_version.max(activation.protocol_version);
             }
             _ => {}
         }
@@ -106,7 +107,7 @@ pub fn version_for_height(height: u64, activations: &[ProtocolActivation]) -> u3
 }
 
 /// Check whether a given `protocol_version` is acceptable for a block at
-/// `height`.  Returns `Ok(())` or an error string.
+/// `height`. Returns `Ok(())` or an error string.
 #[must_use]
 pub fn validate_block_version(
     block_version: u32,
@@ -123,10 +124,11 @@ pub fn validate_block_version(
 
     let expected = version_for_height(height, activations);
     if block_version < expected {
-        let in_grace = activations.iter().any(|a| {
-            a.protocol_version == expected
-                && a.activation_height
-                    .map(|ah| height < ah + a.grace_blocks)
+        let in_grace = activations.iter().any(|activation| {
+            activation.protocol_version == expected
+                && activation
+                    .activation_height
+                    .map(|ah| height < ah + activation.grace_blocks)
                     .unwrap_or(false)
         });
         if !in_grace {
@@ -158,7 +160,7 @@ pub fn is_supported(version: u32) -> bool {
 // Convenience helpers
 // -----------------------------------------------------------------------------
 
-/// Human-readable version string for logs / RPC.
+/// Human‑readable version string for logs / RPC.
 #[must_use]
 pub fn version_string() -> String {
     format!(
