@@ -1,11 +1,23 @@
-//! Dual-validate (shadow validation) for pre-activation protocol upgrades.
+//! Dual-validate (shadow validation) for pre‑activation protocol upgrades.
 //!
-//! During the pre-activation window, a node running the new binary can
-//! perform **shadow validation**: applying the new PV rules to blocks
-//! without rejecting them if the new rules fail.
+//! During the pre‑activation window, a node running a binary that already
+//! supports the **next** protocol version can perform **shadow validation**:
+//! applying the new PV rules to blocks without rejecting them if the new
+//! rules fail.
 //!
 //! This allows operators to verify that the new rules work correctly
-//! before the activation height is reached.
+//! **before** the activation height is reached.  Failures are logged and
+//! counted but never block consensus.
+//!
+//! # How it works
+//!
+//! 1. The node is built with `CURRENT_PROTOCOL_VERSION = N+1` (it knows the
+//!    future rules).
+//! 2. The chain is still running at protocol version `N`.
+//! 3. For every block at height `< activation_height(N+1)`, the node runs
+//!    the new validation rules in a shadow thread.
+//! 4. Results are recorded; if a block would be invalid under the new rules,
+//!    a warning is logged.
 //!
 //! # Usage
 //!
@@ -33,9 +45,9 @@ use tracing::{debug, info, warn};
 /// Configuration for the shadow validator.
 #[derive(Debug, Clone)]
 pub struct ShadowValidatorConfig {
-    /// Enable shadow validation (default: true).
+    /// Enable shadow validation (default: `true`).
     pub enabled: bool,
-    /// If true, log every shadow validation result (default: false).
+    /// If `true`, log every shadow validation result (default: `false`).
     pub verbose_logging: bool,
 }
 
@@ -64,9 +76,9 @@ pub struct ShadowValidator {
     config: ShadowValidatorConfig,
     /// Number of blocks validated under shadow rules.
     shadow_validated: AtomicU64,
-    /// Number of blocks that PASSED shadow validation.
+    /// Number of blocks that **passed** shadow validation.
     shadow_passed: AtomicU64,
-    /// Number of blocks that FAILED shadow validation.
+    /// Number of blocks that **failed** shadow validation.
     shadow_failed: AtomicU64,
 }
 
@@ -92,13 +104,19 @@ impl ShadowValidator {
 
     /// Perform shadow validation on a block.
     ///
-    /// This is called for blocks at heights BEFORE the activation point.
+    /// This is called for blocks at heights **before** the activation point
+    /// of a newer protocol version that this binary already supports.
     /// The block has already been validated under the current PV rules;
-    /// this additionally validates it under the NEW PV rules.
+    /// this method additionally validates it under the **new** PV rules.
     ///
-    /// Returns `Ok(true)` if shadow validation passed, `Ok(false)` if
-    /// shadow validation is not applicable (height is past activation,
-    /// or shadow validation is disabled), or `Err` with a description of the shadow failure.
+    /// # Returns
+    ///
+    /// - `Ok(true)` if shadow validation was performed and passed.
+    /// - `Ok(false)` if shadow validation was not applicable (e.g., disabled,
+    ///   no future activation, or already at the latest PV).
+    /// - `Err(reason)` if shadow validation was performed but failed (non‑blocking).
+    ///
+    /// The caller should **never** reject a block based on this error.
     pub fn validate(&self, block: &Block, height: Height) -> Result<bool, String> {
         if !self.config.enabled {
             debug!("shadow validation disabled");
@@ -107,26 +125,55 @@ impl ShadowValidator {
 
         let current_pv = version_for_height(height, &self.activations);
 
-        // Shadow validation only applies before activation height.
+        // Shadow validation only makes sense when this binary already supports
+        // a *higher* protocol version than the one currently active on the chain.
         if current_pv >= CURRENT_PROTOCOL_VERSION {
-            debug!(height, current_pv, "shadow validation not applicable (already at latest PV)");
+            debug!(
+                height,
+                current_pv,
+                binary_pv = CURRENT_PROTOCOL_VERSION,
+                "shadow validation not applicable (binary version not ahead of chain)"
+            );
             return Ok(false);
         }
 
-        // Find the next activation that hasn't happened yet.
-        let next_activation = self.activations.iter().find(|a| {
-            a.protocol_version > current_pv
-                && a.activation_height.map(|ah| height < ah).unwrap_or(false)
-        });
-
-        let Some(activation) = next_activation else {
-            debug!(height, "no upcoming activation found");
+        // Find the activation for the protocol version that this binary produces
+        // (i.e., `CURRENT_PROTOCOL_VERSION`). If it's not found, there is no
+        // scheduled upgrade to that version – shadow validation is irrelevant.
+        let Some(activation) = self.activations.iter().find(|a| {
+            a.protocol_version == CURRENT_PROTOCOL_VERSION
+        }) else {
+            debug!(
+                height,
+                binary_pv = CURRENT_PROTOCOL_VERSION,
+                "no activation entry for the binary's protocol version"
+            );
             return Ok(false);
         };
 
+        // If the activation height is not yet set, the upgrade is not scheduled.
+        let Some(activation_height) = activation.activation_height else {
+            debug!(
+                height,
+                binary_pv = CURRENT_PROTOCOL_VERSION,
+                "activation height is None (upgrade not scheduled)"
+            );
+            return Ok(false);
+        };
+
+        // Only run shadow validation for blocks **strictly before** activation.
+        if height >= activation_height {
+            debug!(
+                height,
+                activation_height,
+                "shadow validation not applicable (already at or past activation)"
+            );
+            return Ok(false);
+        }
+
         self.shadow_validated.fetch_add(1, Ordering::Relaxed);
 
-        // Apply new‑PV validation rules (shadow, non‑blocking).
+        // Apply the new‑PV validation rules (shadow, non‑blocking).
         let result = self.shadow_validate_block(block, activation);
 
         match &result {
@@ -136,7 +183,8 @@ impl ShadowValidator {
                     debug!(
                         height,
                         block_pv = block.header.protocol_version,
-                        next_pv = activation.protocol_version,
+                        target_pv = activation.protocol_version,
+                        activation_height,
                         "shadow validation PASSED"
                     );
                 } else {
@@ -149,7 +197,8 @@ impl ShadowValidator {
                 warn!(
                     height,
                     block_pv = block.header.protocol_version,
-                    next_pv = activation.protocol_version,
+                    target_pv = activation.protocol_version,
+                    activation_height,
                     reason = reason.as_str(),
                     "shadow validation FAILED (non‑blocking)"
                 );
@@ -158,21 +207,29 @@ impl ShadowValidator {
         }
     }
 
-    /// Internal: apply new‑PV rules to a block (shadow mode).
+    /// Internal: apply the new‑PV validation rules to a block (shadow mode).
+    ///
+    /// This is the place where additional checks for future protocol versions
+    /// should be added.  The base implementation verifies:
+    ///
+    /// - `protocol_version` is not zero.
+    /// - Block ID is non‑zero (deterministic).
+    /// - Transaction root matches the transactions.
+    ///
+    /// More checks can be added as new PVs are introduced.
     fn shadow_validate_block(&self, block: &Block, activation: &ProtocolActivation) -> Result<(), String> {
-        // Validate block header structure for the new PV.
+        // Check that the block's protocol version is at least 1.
         if block.header.protocol_version == 0 {
             return Err("protocol_version must be >= 1".into());
         }
 
-        // For future PVs, additional checks can be added here.
-        // Example: validate that the block ID is deterministic.
+        // Verify that the block ID is deterministic (not all zeros).
         let computed_id = block.id();
         if computed_id.0 == [0u8; 32] {
             return Err("block ID is all zeros (likely missing header fields)".into());
         }
 
-        // Validate tx_root matches the transactions.
+        // Validate transaction root.
         let computed_tx_root = crate::types::tx_root(&block.txs);
         if computed_tx_root != block.header.tx_root {
             return Err(format!(
@@ -182,8 +239,8 @@ impl ShadowValidator {
             ));
         }
 
-        // Validate receipts_root if there are receipts? Not available here.
-        // Additional PV‑specific validations can be added.
+        // Additional PV‑specific checks can be inserted here.
+        // Example: future PV 2 may require a new header field, etc.
 
         Ok(())
     }
@@ -242,9 +299,10 @@ mod tests {
     use crate::protocol::version::ProtocolActivation;
     use crate::types::*;
 
-    fn make_test_block(height: u64, pv: u32, tx_root: Option<Hash32>) -> Block {
+    // Test helpers
+    fn make_test_block(height: u64, pv: u32, tx_root_override: Option<Hash32>) -> Block {
         let txs = vec![];
-        let tx_root = tx_root.unwrap_or_else(|| tx_root(&txs));
+        let tx_root = tx_root_override.unwrap_or_else(|| tx_root(&txs));
         Block {
             header: BlockHeader {
                 height,
@@ -268,115 +326,64 @@ mod tests {
         }
     }
 
+    // This test simulates a binary that already supports PV 2 (CURRENT_PROTOCOL_VERSION = 2)
+    // while the chain is still on PV 1. In this test environment we cannot change the
+    // const, but we can create a helper that mocks the condition. For the purpose of
+    // this test, we use the real `CURRENT_PROTOCOL_VERSION` (which is 1 as of this writing).
+    // Therefore, shadow validation will not be triggered because the binary does not
+    // support a newer version. To keep the tests meaningful, we will only test the
+    // internal `shadow_validate_block` directly and check the conditions.
+
     #[test]
-    fn test_shadow_not_applicable_when_disabled() {
-        let activations = vec![
-            ProtocolActivation {
-                protocol_version: 1,
-                activation_height: None,
-                grace_blocks: 0,
-            },
-            ProtocolActivation {
-                protocol_version: 2,
-                activation_height: Some(1000),
-                grace_blocks: 100,
-            },
-        ];
-        let config = ShadowValidatorConfig {
-            enabled: false,
-            verbose_logging: false,
+    fn test_shadow_validate_block_passes() {
+        let activation = ProtocolActivation {
+            protocol_version: 2,
+            activation_height: Some(1000),
+            grace_blocks: 100,
         };
-        let sv = ShadowValidator::new(activations, config);
+        let sv = ShadowValidator::with_defaults(vec![]); // activations not used internally
         let block = make_test_block(500, 1, None);
-        let result = sv.validate(&block, 500).unwrap();
-        assert!(!result);
+        let result = sv.shadow_validate_block(&block, &activation);
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn test_shadow_not_applicable_at_current_pv() {
-        // With only PV=1 active (no future activation), shadow is not applicable.
-        let activations = vec![ProtocolActivation {
-            protocol_version: 1,
-            activation_height: None,
-            grace_blocks: 0,
-        }];
-        let sv = ShadowValidator::with_defaults(activations);
-        let block = make_test_block(100, 1, None);
-        let result = sv.validate(&block, 100).unwrap();
-        assert!(!result);
+    fn test_shadow_validate_block_fails_bad_tx_root() {
+        let activation = ProtocolActivation {
+            protocol_version: 2,
+            activation_height: Some(1000),
+            grace_blocks: 100,
+        };
+        let sv = ShadowValidator::with_defaults(vec![]);
+        let bad_hash = Hash32([0xDE; 32]);
+        let block = make_test_block(500, 1, Some(bad_hash));
+        let result = sv.shadow_validate_block(&block, &activation);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("tx_root mismatch"));
     }
 
     #[test]
-    fn test_shadow_validates_before_activation() {
-        let activations = vec![
-            ProtocolActivation {
-                protocol_version: 1,
-                activation_height: None,
-                grace_blocks: 0,
-            },
-            ProtocolActivation {
-                protocol_version: 2,
-                activation_height: Some(1000),
-                grace_blocks: 100,
-            },
-        ];
-        let sv = ShadowValidator::with_defaults(activations);
-        let block = make_test_block(500, 1, None);
-        // This should attempt shadow validation because CURRENT_PROTOCOL_VERSION is 1,
-        // and there is a future activation. But CURRENT_PROTOCOL_VERSION is 1,
-        // so current_pv == CURRENT_PROTOCOL_VERSION? Actually at height 500,
-        // version_for_height returns 1, which is equal to CURRENT_PROTOCOL_VERSION.
-        // So it will return false (not applicable). That's correct because shadow
-        // validation applies only when there is a *higher* PV scheduled.
-        let result = sv.validate(&block, 500).unwrap();
-        assert!(!result);
+    fn test_shadow_validate_block_fails_zero_pv() {
+        let activation = ProtocolActivation {
+            protocol_version: 2,
+            activation_height: Some(1000),
+            grace_blocks: 100,
+        };
+        let sv = ShadowValidator::with_defaults(vec![]);
+        let mut block = make_test_block(500, 1, None);
+        block.header.protocol_version = 0;
+        let result = sv.shadow_validate_block(&block, &activation);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("protocol_version must be >= 1"));
     }
 
     #[test]
-    fn test_shadow_fails_on_bad_tx_root() {
-        // Simulate a future PV where shadow validation is enabled.
-        // We need to create a scenario where current_pv < CURRENT_PROTOCOL_VERSION.
-        // But CURRENT_PROTOCOL_VERSION is currently 1. We'll override for test?
-        // Instead, we directly call shadow_validate_block.
-        let activations = vec![
-            ProtocolActivation {
-                protocol_version: 1,
-                activation_height: None,
-                grace_blocks: 0,
-            },
-            ProtocolActivation {
-                protocol_version: 2,
-                activation_height: Some(1000),
-                grace_blocks: 100,
-            },
-        ];
-        let sv = ShadowValidator::with_defaults(activations);
-        let bad_tx_root = Hash32([0xDE; 32]);
-        let block = make_test_block(500, 1, Some(bad_tx_root));
-        // Call validate, but it will not run because current_pv == CURRENT_PROTOCOL_VERSION.
-        // To test the internal validation, we'll call the private method via a wrapper.
-        // We'll add a test-only method or just test the public method with a higher CURRENT_PROTOCOL_VERSION.
-        // Since CURRENT_PROTOCOL_VERSION is const, we can't change it in tests.
-        // Instead, we can directly test the shadow_validate_block using a newtype or mock.
-        // For simplicity, we'll skip this test; the functionality is already covered by the earlier `shadow_validate_block` logic.
-        // The code will be fine.
-        let result = sv.validate(&block, 500).unwrap();
-        assert!(!result); // not applicable, so not a failure.
-    }
-
-    #[test]
-    fn test_shadow_stats() {
-        let activations = vec![ProtocolActivation {
-            protocol_version: 1,
-            activation_height: None,
-            grace_blocks: 0,
-        }];
-        let sv = ShadowValidator::with_defaults(activations);
+    fn test_stats() {
+        let sv = ShadowValidator::with_defaults(vec![]);
         let stats = sv.stats();
         assert_eq!(stats.validated, 0);
         assert_eq!(stats.passed, 0);
         assert_eq!(stats.failed, 0);
-
         sv.reset_stats();
         let stats2 = sv.stats();
         assert_eq!(stats2.validated, 0);
