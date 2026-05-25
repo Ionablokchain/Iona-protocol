@@ -1,4 +1,4 @@
-//! ProtocolVersion activation guarantees.
+//! Protocol version activation guarantees.
 //!
 //! This module formalises the guarantees that the activation mechanism provides to
 //! operators, developers, and the consensus layer. Each guarantee is expressed as
@@ -53,7 +53,8 @@ pub fn check_deterministic_activation(
     let pv2 = version_for_height(height, activations);
     if pv1 != pv2 {
         let err = format!(
-            "AG-1 VIOLATION: PV({height}) returned {pv1} then {pv2}"
+            "AG-1 VIOLATION: PV({}) returned {} then {}",
+            height, pv1, pv2
         );
         warn!("{}", err);
         return Err(err);
@@ -91,7 +92,8 @@ pub fn check_pv_monotonic(
         let pv = version_for_height(h, activations);
         if pv < prev_pv {
             let err = format!(
-                "AG-2 VIOLATION: PV decreased from {prev_pv} to {pv} at height {h}"
+                "AG-2 VIOLATION: PV decreased from {} to {} at height {}",
+                prev_pv, pv, h
             );
             warn!("{}", err);
             return Err(err);
@@ -157,9 +159,9 @@ pub fn check_signal_distance(
                 let distance = ah - current_height;
                 if distance < min_lead_blocks {
                     let err = format!(
-                        "AG-4 WARNING: PV={} activates in {distance} blocks \
-                         (minimum lead time: {min_lead_blocks})",
-                        a.protocol_version
+                        "AG-4 WARNING: PV={} activates in {} blocks \
+                         (minimum lead time: {})",
+                        a.protocol_version, distance, min_lead_blocks
                     );
                     warn!("{}", err);
                     return Err(err);
@@ -184,8 +186,8 @@ pub fn check_grace_bounded(activations: &[ProtocolActivation]) -> Result<(), Str
     for a in activations {
         if a.grace_blocks > MAX_GRACE_BLOCKS {
             let err = format!(
-                "AG-5 VIOLATION: PV={} has grace_blocks={} > max={MAX_GRACE_BLOCKS}",
-                a.protocol_version, a.grace_blocks
+                "AG-5 VIOLATION: PV={} has grace_blocks={} > max={}",
+                a.protocol_version, a.grace_blocks, MAX_GRACE_BLOCKS
             );
             warn!("{}", err);
             return Err(err);
@@ -208,7 +210,7 @@ pub fn check_post_activation_mandatory(
 ) -> Result<(), String> {
     let expected_pv = version_for_height(height, activations);
     if block_pv < expected_pv {
-        // Check if we're still in a grace window.
+        // Check if we are still in a grace window.
         let in_grace = activations.iter().any(|a| {
             a.protocol_version == expected_pv
                 && a.activation_height
@@ -217,8 +219,9 @@ pub fn check_post_activation_mandatory(
         });
         if !in_grace {
             let err = format!(
-                "AG-6 VIOLATION: block PV={block_pv} at height {height}, \
-                 but PV={expected_pv} is mandatory (grace expired)"
+                "AG-6 VIOLATION: block PV={} at height {}, \
+                 but PV={} is mandatory (grace expired)",
+                block_pv, height, expected_pv
             );
             warn!("{}", err);
             return Err(err);
@@ -246,7 +249,7 @@ pub fn check_activation_immutable(
                     let err = format!(
                         "AG-7 VIOLATION: PV={} has different activation heights: \
                          {:?} vs {:?}",
-                        a.protocol_version, a.activation_height, b.activation_height,
+                        a.protocol_version, a.activation_height, b.activation_height
                     );
                     warn!("{}", err);
                     return Err(err);
@@ -284,7 +287,7 @@ pub fn check_rollback_safe(
     let activation = activations
         .iter()
         .find(|a| a.protocol_version == target_pv)
-        .ok_or_else(|| format!("AG-8: no activation found for PV={target_pv}"))?;
+        .ok_or_else(|| format!("AG-8: no activation found for PV={}", target_pv))?;
 
     match rollback_window(activation, current_height) {
         Some(safe_until) => {
@@ -293,8 +296,9 @@ pub fn check_rollback_safe(
         }
         None => {
             let err = format!(
-                "AG-8 VIOLATION: rollback unsafe for PV={target_pv} at height {current_height} \
-                 (activation already passed)"
+                "AG-8 VIOLATION: rollback unsafe for PV={} at height {} \
+                 (activation already passed)",
+                target_pv, current_height
             );
             warn!("{}", err);
             Err(err)
@@ -335,7 +339,7 @@ impl std::fmt::Display for ActivationReport {
         )?;
         for c in &self.checks {
             let mark = if c.passed { "OK" } else { "FAIL" };
-            writeln!(f, "  [{mark}] {}: {} — {}", c.id, c.name, c.detail)?;
+            writeln!(f, "  [{}] {}: {} — {}", mark, c.id, c.name, c.detail)?;
         }
         Ok(())
     }
@@ -349,7 +353,7 @@ pub fn check_all_guarantees(
 ) -> ActivationReport {
     let mut checks = Vec::new();
 
-    // AG-1: Deterministic.
+    // AG-1: Deterministic activation.
     let r = check_deterministic_range(
         current_height.saturating_sub(10),
         current_height + 10,
@@ -364,7 +368,7 @@ pub fn check_all_guarantees(
             .unwrap_or_else(|| "PV deterministic across height range".into()),
     });
 
-    // AG-2: Monotonic.
+    // AG-2: Monotonic PV.
     let heights: Vec<u64> = (0..=current_height + 100).step_by(10).collect();
     let r = check_pv_monotonic(&heights, activations);
     checks.push(ActivationCheck {
@@ -376,7 +380,7 @@ pub fn check_all_guarantees(
             .unwrap_or_else(|| "PV non‑decreasing across heights".into()),
     });
 
-    // AG-3: Exactly-once.
+    // AG-3: Exactly‑once activation.
     let r = check_exactly_once(activations);
     checks.push(ActivationCheck {
         id: "AG-3".into(),
@@ -387,7 +391,7 @@ pub fn check_all_guarantees(
             .unwrap_or_else(|| format!("{} unique PVs in schedule", activations.len())),
     });
 
-    // AG-5: Grace bounded.
+    // AG-5: Grace window bounded.
     let r = check_grace_bounded(activations);
     checks.push(ActivationCheck {
         id: "AG-5".into(),
@@ -398,7 +402,7 @@ pub fn check_all_guarantees(
             .unwrap_or_else(|| "all grace windows within bounds".into()),
     });
 
-    // AG-4 and AG-6, AG-7, AG-8 are not fully covered here because they require
+    // AG-4, AG-6, AG-7, AG-8 are not fully covered here because they require
     // additional context (e.g., actual block PV, second schedule, etc.).
     // They can be added as needed.
 
@@ -586,21 +590,21 @@ mod tests {
     fn test_all_guarantees_default() {
         let a = default_activations();
         let report = check_all_guarantees(&a, 100);
-        assert!(report.all_passed, "report: {report}");
+        assert!(report.all_passed, "report: {}", report);
     }
 
     #[test]
     fn test_all_guarantees_with_upgrade() {
         let a = test_activations();
         let report = check_all_guarantees(&a, 500);
-        assert!(report.all_passed, "report: {report}");
+        assert!(report.all_passed, "report: {}", report);
     }
 
     #[test]
     fn test_report_display() {
         let a = default_activations();
         let report = check_all_guarantees(&a, 100);
-        let s = format!("{report}");
+        let s = format!("{}", report);
         assert!(s.contains("Activation Guarantees"));
     }
 }
