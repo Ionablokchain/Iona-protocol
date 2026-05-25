@@ -1,12 +1,12 @@
 //! P2P wire compatibility and capability negotiation.
 //!
-//! Defines the `Hello` handshake message exchanged when two nodes connect,
-//! and the rules for determining whether two nodes are compatible.
+//! This module defines the `Hello` handshake message exchanged when two nodes connect,
+//! and the rules for determining whether two nodes are compatible to peer.
 //!
 //! # Wire Compatibility Rules
 //!
-//! 1. New fields in messages use `#[serde(default)]` for backward compat.
-//! 2. Unknown message `type_id` values are silently ignored (forward compat).
+//! 1. New fields in messages must use `#[serde(default)]` for backward compatibility.
+//! 2. Unknown message `type_id` values are silently ignored (forward compatibility).
 //! 3. Two nodes connect iff `intersection(supported_pv) != {}`.
 //! 4. Session PV = `min(max(local.supported_pv), max(remote.supported_pv))`.
 //!
@@ -24,7 +24,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use super::version::{CURRENT_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS};
 use crate::storage::CURRENT_SCHEMA_VERSION;
@@ -44,7 +44,7 @@ pub struct Hello {
     pub supported_pv: Vec<u32>,
     /// Schema versions this node can read (informational; not used for gating).
     pub supported_sv: Vec<u32>,
-    /// Semver of the binary (informational, not protocol-significant).
+    /// Semver of the binary (informational, not protocol‑significant).
     pub software_version: String,
     /// Chain identifier — must match for connection.
     pub chain_id: u64,
@@ -57,7 +57,15 @@ pub struct Hello {
 }
 
 impl Hello {
-    /// Build a `Hello` for the local node.
+    /// Build a `Hello` handshake message for the local node.
+    ///
+    /// # Arguments
+    /// * `chain_id` – The chain ID (must match genesis).
+    /// * `genesis_hash` – The hash of the genesis block.
+    /// * `head_height` – The current height of the local chain.
+    ///
+    /// # Returns
+    /// A `Hello` message populated with local capabilities.
     #[must_use]
     pub fn local(chain_id: u64, genesis_hash: Hash32, head_height: u64) -> Self {
         debug!(
@@ -87,20 +95,20 @@ impl Hello {
 pub struct CompatResult {
     /// Whether the two nodes are compatible (can peer).
     pub compatible: bool,
-    /// Negotiated session PV (only valid if `compatible == true`).
+    /// Negotiated session protocol version (only valid if `compatible` is `true`).
     pub session_pv: u32,
     /// Human‑readable reason for incompatibility (empty if compatible).
     pub reason: String,
 }
 
 impl CompatResult {
-    /// Returns `true` if compatible, `false` otherwise.
+    /// Returns `true` if the nodes are compatible, `false` otherwise.
     #[must_use]
     pub fn is_compatible(&self) -> bool {
         self.compatible
     }
 
-    /// Returns the reason as a string (empty if compatible).
+    /// Returns the reason as a string (empty string if compatible).
     #[must_use]
     pub fn reason(&self) -> &str {
         &self.reason
@@ -121,6 +129,9 @@ impl CompatResult {
 ///     AND local.genesis_hash == remote.genesis_hash
 ///     AND intersection(local.supported_pv, remote.supported_pv) != {}
 /// ```
+///
+/// # Returns
+/// A `CompatResult` with the negotiation outcome.
 #[must_use]
 pub fn check_hello_compat(local: &Hello, remote: &Hello) -> CompatResult {
     // Chain ID must match.
@@ -148,7 +159,7 @@ pub fn check_hello_compat(local: &Hello, remote: &Hello) -> CompatResult {
         };
     }
 
-    // PV intersection must be non‑empty.
+    // Protocol version intersection must be non‑empty.
     let intersection: Vec<u32> = local
         .supported_pv
         .iter()
@@ -169,7 +180,7 @@ pub fn check_hello_compat(local: &Hello, remote: &Hello) -> CompatResult {
         };
     }
 
-    // Session PV = min(max(local), max(remote)).
+    // Session PV = min(max(local.supported_pv), max(remote.supported_pv)).
     let local_max = local.supported_pv.iter().copied().max().unwrap_or(1);
     let remote_max = remote.supported_pv.iter().copied().max().unwrap_or(1);
     let session_pv = local_max.min(remote_max);
@@ -197,12 +208,19 @@ pub fn check_hello_compat(local: &Hello, remote: &Hello) -> CompatResult {
 ///
 /// Unknown IDs are silently ignored by receivers (forward compatibility).
 pub mod msg_type {
+    /// Proposal message type.
     pub const PROPOSAL: u8 = 0;
+    /// Vote message type.
     pub const VOTE: u8 = 1;
+    /// Evidence message type.
     pub const EVIDENCE: u8 = 2;
+    /// Block request message type.
     pub const BLOCK_REQUEST: u8 = 3;
+    /// Block response message type.
     pub const BLOCK_RESPONSE: u8 = 4;
+    /// Hello handshake message type.
     pub const HELLO: u8 = 5;
+    /// Status message type.
     pub const STATUS: u8 = 6;
 }
 
@@ -290,5 +308,16 @@ mod tests {
         assert_eq!(h.chain_id, 6126151);
         assert_eq!(h.head_height, 42);
         assert!(h.supported_pv.contains(&CURRENT_PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn test_msg_type_constants() {
+        assert_eq!(msg_type::PROPOSAL, 0);
+        assert_eq!(msg_type::VOTE, 1);
+        assert_eq!(msg_type::EVIDENCE, 2);
+        assert_eq!(msg_type::BLOCK_REQUEST, 3);
+        assert_eq!(msg_type::BLOCK_RESPONSE, 4);
+        assert_eq!(msg_type::HELLO, 5);
+        assert_eq!(msg_type::STATUS, 6);
     }
 }
