@@ -8,6 +8,7 @@
 //! - **Backward compatibility**: rules for wire, state, RPC, and consensus changes.
 //! - **Dual‑validation**: shadow validation of new PV rules before activation.
 //! - **Safety invariants**: consensus safety properties (S1‑S5).
+//! - **State invariants**: storage format constraints.
 //! - **Upgrade constraints**: bounds checks for activation heights and grace windows.
 //! - **Wire compatibility**: version negotiation and handshake logic.
 //!
@@ -45,7 +46,7 @@ pub use version::{
     default_activations, is_supported,
 };
 
-// Activation guarantees
+// Activation guarantees (formal properties AG‑1 to AG‑8)
 pub use activation_guarantees::{
     check_all_guarantees, check_deterministic_activation, check_deterministic_range,
     check_exactly_once, check_grace_bounded, check_monotonic, check_post_activation_mandatory,
@@ -59,40 +60,40 @@ pub use compat::{
     build_compat_matrix, check_version_compat,
 };
 
-// Dual‑validation (shadow validation)
+// Dual‑validation (shadow validation for new protocol versions)
 pub use dual_validate::{
     ShadowValidator, ShadowValidatorConfig, ShadowStats,
 };
 
-// Rolling upgrade utilities
+// Rolling upgrade utilities (no‑downtime upgrades)
 pub use rolling::{
     RollingUpgrade, RollingUpgradeStatus, RollingUpgradeConfig,
 };
 
-// Safety invariants (consensus safety)
+// Safety invariants (consensus safety properties S1–S5)
 pub use safety::{
     check_no_split_finality, check_finality_monotonic, check_deterministic_pv,
     check_state_compat, check_value_conservation, check_root_equivalence,
     SafetyReport, SafetyCheck,
 };
 
-// State invariants (storage format)
+// State invariants (storage format validation)
 pub use state_invariants::{
     check_state_invariants, StateInvariantReport, StateInvariant,
 };
 
-// Transition validation
+// Transition validation (between protocol versions)
 pub use transitions::{
     validate_transition, TransitionValidation, TransitionResult,
 };
 
-// Upgrade constraints
+// Upgrade constraints (bounds checks)
 pub use upgrade_constraints::{
     check_activation_bounds, check_grace_bounds, check_upgrade_sequence,
     UpgradeConstraintReport, UpgradeConstraint,
 };
 
-// Wire compatibility helpers
+// Wire compatibility helpers (handshake)
 pub use wire::{
     Hello, handshake, HandshakeError, HandshakeResult,
 };
