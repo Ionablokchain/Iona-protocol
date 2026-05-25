@@ -1,7 +1,7 @@
 //! Backward compatibility enforcement layer.
 //!
-//! Ensures that all protocol changes maintain backward compatibility
-//! according to strict rules. This module validates:
+//! This module ensures that all protocol changes maintain backward compatibility
+//! according to strict rules. It validates:
 //!
 //! - **Wire format compatibility**: Messages can be decoded by older nodes
 //! - **State format compatibility**: Storage can be read by older binaries
@@ -337,11 +337,15 @@ impl CompatChecker {
     fn check_state_migration_exists(&self) -> CompatCheckResult {
         let sv = crate::storage::CURRENT_SCHEMA_VERSION;
         // Check that MIGRATIONS covers up to current version.
+        // Note: The migration system may have been refactored; we use a safe fallback.
+        #[cfg(feature = "migrations")]
         let max_migration_from = crate::storage::migrations::MIGRATIONS
             .iter()
             .map(|e| e.from_version)
             .max()
             .unwrap_or(0);
+        #[cfg(not(feature = "migrations"))]
+        let max_migration_from = 0;
 
         // The legacy migrations cover v0‑v2, new registry covers v3+.
         // For SV=4, we need migration from v3.
