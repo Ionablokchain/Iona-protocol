@@ -1,7 +1,7 @@
 //! STEP 1 — Deterministic replay tool.
 //!
 //! Provides the `iona replay --from 1 --to N --verify-root` CLI logic.
-//! Replays blocks from stored chain data, re-executes each block,
+//! Replays blocks from stored chain data, re‑executes each block,
 //! verifies state roots, and reports any divergence.
 //!
 //! This is the primary tool for:
@@ -34,12 +34,19 @@ use thiserror::Error;
 /// Errors that can occur during replay.
 #[derive(Debug, Error)]
 pub enum ReplayError {
+    /// The `from` height is greater than the `to` height.
     #[error("invalid height range: from={from} > to={to}")]
     InvalidHeightRange { from: Height, to: Height },
+
+    /// The determinism check count must be greater than 0.
     #[error("determinism check count must be > 0, got {0}")]
     InvalidDeterminismCount(usize),
+
+    /// The base fee per gas must be greater than 0.
     #[error("base fee per gas must be > 0, got {0}")]
     InvalidBaseFee(u64),
+
+    /// Block execution failed at a specific height.
     #[error("block execution failed at height {height}: {reason}")]
     ExecutionFailed { height: Height, reason: String },
 }
@@ -53,11 +60,17 @@ pub type ReplayResult<T> = Result<T, ReplayError>;
 /// Options for the replay command.
 #[derive(Debug, Clone)]
 pub struct ReplayOpts {
+    /// Starting block height (inclusive).
     pub from: Height,
+    /// Ending block height (inclusive).
     pub to: Height,
+    /// Whether to verify state roots against block headers.
     pub verify_root: bool,
+    /// Whether to log state roots to console.
     pub log_roots: bool,
+    /// Number of additional executions to check determinism (0 = skip).
     pub determinism_check: usize,
+    /// Base fee per gas for all executed blocks (simplified).
     pub base_fee_per_gas: u64,
 }
 
@@ -75,7 +88,7 @@ impl Default for ReplayOpts {
 }
 
 impl ReplayOpts {
-    /// Validate options.
+    /// Validate the options (range, base fee, determinism count).
     pub fn validate(&self) -> ReplayResult<()> {
         if self.from > self.to {
             return Err(ReplayError::InvalidHeightRange {
@@ -94,14 +107,20 @@ impl ReplayOpts {
 // Result types
 // -----------------------------------------------------------------------------
 
-/// Per-block replay result with state root logging (STEP 5).
+/// Per‑block replay result with state root logging (STEP 5).
 #[derive(Debug, Clone)]
 pub struct BlockReplayEntry {
+    /// Block height.
     pub height: Height,
+    /// State root computed by the node.
     pub state_root: Hash32,
+    /// State root from the block header.
     pub expected_root: Hash32,
+    /// Whether the computed root matches the header root.
     pub root_match: bool,
+    /// Gas used during execution.
     pub gas_used: u64,
+    /// Whether multiple executions produced the same result.
     pub deterministic: bool,
 }
 
@@ -129,11 +148,17 @@ impl std::fmt::Display for BlockReplayEntry {
 /// Full replay result.
 #[derive(Debug, Clone)]
 pub struct ReplayResult {
+    /// Per‑block entries.
     pub entries: Vec<BlockReplayEntry>,
+    /// Whether all blocks passed verification (roots match and deterministic).
     pub success: bool,
+    /// Total number of blocks replayed.
     pub total_blocks: usize,
+    /// Total gas consumed across all blocks.
     pub total_gas: u64,
+    /// First height where a state root mismatch occurred.
     pub first_mismatch: Option<Height>,
+    /// First height where nondeterminism was detected.
     pub first_nondeterministic: Option<Height>,
 }
 
@@ -165,6 +190,12 @@ impl std::fmt::Display for ReplayResult {
 /// Execute the replay tool on a set of blocks.
 ///
 /// This is the core of `iona replay --from <from> --to <to> --verify-root`.
+///
+/// # Arguments
+/// * `blocks` – Slice of blocks in ascending height order.
+/// * `initial_state` – Starting state (genesis or checkpoint).
+/// * `opts` – Replay options (range, verification, determinism checks).
+/// * `nd_logger` – Optional nondeterminism logger (for auditing).
 pub fn replay(
     blocks: &[Block],
     initial_state: &KvState,
@@ -185,7 +216,7 @@ pub fn replay(
             continue;
         }
 
-        // Log height for nondeterminism tracking.
+        // Log the current height for nondeterminism tracking.
         if let Some(logger) = nd_logger {
             logger.set_height(h);
         }
@@ -196,7 +227,7 @@ pub fn replay(
             crate::crypto::tx::derive_address(&block.header.proposer_pk)
         };
 
-        // Execute block.
+        // Execute the block.
         let (new_state, gas_used, _receipts) =
             execute_block(&state, &block.txs, opts.base_fee_per_gas, &proposer_addr);
 
@@ -208,7 +239,7 @@ pub fn replay(
             true
         };
 
-        // Determinism check: run N more times and compare roots.
+        // Determinism check: run the same block multiple times and compare roots.
         let mut deterministic = true;
         if opts.determinism_check > 0 {
             for _ in 0..opts.determinism_check {
@@ -255,10 +286,10 @@ pub fn replay(
 }
 
 // -----------------------------------------------------------------------------
-// Cross-node comparison (STEP 6)
+// Cross‑node comparison (STEP 6)
 // -----------------------------------------------------------------------------
 
-/// Root mismatch between two nodes.
+/// A state root mismatch between two nodes at a given height.
 #[derive(Debug, Clone)]
 pub struct RootMismatch {
     pub height: Height,
@@ -266,15 +297,22 @@ pub struct RootMismatch {
     pub root_b: Hash32,
 }
 
-/// Result of cross-node comparison.
+/// Result of cross‑node comparison.
 #[derive(Debug, Clone)]
 pub struct CompareResult {
+    /// Identifier of the first node.
     pub node_a: String,
+    /// Identifier of the second node.
     pub node_b: String,
+    /// Number of heights present in both snapshots.
     pub common_heights: usize,
+    /// List of mismatches (different roots at the same height).
     pub mismatches: Vec<RootMismatch>,
+    /// Heights present only in node A's snapshot.
     pub only_in_a: Vec<Height>,
+    /// Heights present only in node B's snapshot.
     pub only_in_b: Vec<Height>,
+    /// Whether the two snapshots agree completely.
     pub agree: bool,
 }
 
@@ -307,6 +345,13 @@ impl std::fmt::Display for CompareResult {
 }
 
 /// Compare state roots from two nodes to find divergence.
+///
+/// # Arguments
+/// * `node_a_id` – Identifier for the first node (e.g., "validator1").
+/// * `node_a_roots` – Map from height to state root from the first node.
+/// * `node_b_id` – Identifier for the second node.
+/// * `node_b_roots` – Map from height to state root from the second node.
+#[must_use]
 pub fn compare_nodes(
     node_a_id: &str,
     node_a_roots: &BTreeMap<Height, Hash32>,
