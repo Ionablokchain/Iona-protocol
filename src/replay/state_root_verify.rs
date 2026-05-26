@@ -11,8 +11,8 @@
 //! # Approach
 //!
 //! 1. Execute the same block N times and verify identical roots
-//! 2. Compare roots against golden vectors (known-good values)
-//! 3. Detect platform-specific nondeterminism (float ops, hashmap order)
+//! 2. Compare roots against golden vectors (known‑good values)
+//! 3. Detect platform‑specific nondeterminism (float ops, hashmap order)
 //!
 //! # Example
 //!
@@ -34,12 +34,15 @@ use thiserror::Error;
 /// Errors that can occur during state root verification.
 #[derive(Debug, Error)]
 pub enum VerificationError {
+    /// Number of iterations must be at least 1.
     #[error("iterations must be >= 1, got {0}")]
     InvalidIterations(usize),
 
+    /// Base fee per gas must be greater than 0.
     #[error("base fee per gas must be > 0, got {0}")]
     InvalidBaseFee(u64),
 
+    /// Computed root differs from the provided golden vector.
     #[error("golden vector mismatch at height {height}: expected {expected}, got {actual}")]
     GoldenMismatch {
         height: Height,
@@ -47,6 +50,7 @@ pub enum VerificationError {
         actual: String,
     },
 
+    /// State root inconsistency across multiple executions of the same block.
     #[error("state root inconsistency: iteration {iteration}: first={first}, current={current}")]
     Inconsistency {
         iteration: usize,
@@ -64,21 +68,32 @@ pub type VerificationResult<T> = Result<T, VerificationError>;
 /// Result of a reproducibility check for a single block.
 #[derive(Debug, Clone)]
 pub struct ReproducibilityResult {
+    /// Block height.
     pub height: Height,
+    /// Number of iterations executed.
     pub iterations: usize,
+    /// Whether all iterations produced the same root.
     pub all_match: bool,
+    /// The root from the first execution (canonical).
     pub canonical_root: Hash32,
+    /// The first iteration index where divergence occurred (if any).
     pub diverged_at: Option<usize>,
+    /// All state roots collected during each iteration.
     pub roots: Vec<Hash32>,
 }
 
 /// Result of verifying reproducibility across multiple blocks.
 #[derive(Debug, Clone)]
 pub struct BatchReproducibilityResult {
+    /// Total number of blocks processed.
     pub total_blocks: usize,
+    /// Number of iterations performed per block.
     pub total_iterations: usize,
+    /// Whether all blocks were reproducible (all_match == true).
     pub all_reproducible: bool,
+    /// Per‑block reproducibility results.
     pub results: Vec<ReproducibilityResult>,
+    /// First height where reproducibility failed (if any).
     pub first_failure: Option<Height>,
 }
 
@@ -110,6 +125,12 @@ impl std::fmt::Display for BatchReproducibilityResult {
 // -----------------------------------------------------------------------------
 
 /// Verify that executing a block N times produces the same state root.
+///
+/// # Arguments
+/// * `block` – The block to execute.
+/// * `initial_state` – The state before executing the block.
+/// * `base_fee_per_gas` – The base fee for gas calculations.
+/// * `iterations` – Number of times to execute the block (must be ≥ 1).
 pub fn verify_block_reproducibility(
     block: &Block,
     initial_state: &KvState,
@@ -131,6 +152,7 @@ pub fn verify_block_reproducibility(
 
     let mut roots = Vec::with_capacity(iterations);
 
+    // Execute the block the requested number of times.
     for _ in 0..iterations {
         let (new_state, _gas, _receipts) =
             execute_block(initial_state, &block.txs, base_fee_per_gas, &proposer_addr);
@@ -154,7 +176,13 @@ pub fn verify_block_reproducibility(
     })
 }
 
-/// Verify reproducibility for a chain of blocks.
+/// Verify reproducibility for a chain of blocks (sequential execution).
+///
+/// # Arguments
+/// * `blocks` – Slice of blocks in ascending height order.
+/// * `initial_state` – Starting state (genesis or checkpoint).
+/// * `base_fee_per_gas` – Base fee for all blocks.
+/// * `iterations_per_block` – Number of times to execute each block (must be ≥ 1).
 pub fn verify_chain_reproducibility(
     blocks: &[Block],
     initial_state: &KvState,
@@ -173,13 +201,14 @@ pub fn verify_chain_reproducibility(
     let mut state = initial_state.clone();
 
     for block in blocks {
+        // Check reproducibility for this block using the current state.
         let result = verify_block_reproducibility(block, &state, base_fee_per_gas, iterations_per_block)?;
 
         if !result.all_match && first_failure.is_none() {
             first_failure = Some(block.header.height);
         }
 
-        // Advance state using the canonical execution (first run).
+        // Advance the state using the canonical (first) execution.
         let proposer_addr = if block.header.proposer_pk.is_empty() {
             "0000000000000000000000000000000000000000".to_string()
         } else {
@@ -201,7 +230,16 @@ pub fn verify_chain_reproducibility(
     })
 }
 
-/// Compare a computed state root against a golden vector.
+/// Compare a computed state root against a golden vector (known‑good value).
+///
+/// # Arguments
+/// * `block` – The block to execute.
+/// * `initial_state` – The state before executing the block.
+/// * `base_fee_per_gas` – Base fee for gas calculations.
+/// * `golden_root` – The expected state root.
+///
+/// # Returns
+/// The computed state root if it matches the golden vector.
 pub fn verify_against_golden(
     block: &Block,
     initial_state: &KvState,
@@ -233,6 +271,12 @@ pub fn verify_against_golden(
 }
 
 /// Verify that `KvState::root()` is deterministic (no hashmap ordering issues).
+///
+/// Computes the state root multiple times and ensures all results are identical.
+///
+/// # Arguments
+/// * `state` – The state to test.
+/// * `iterations` – Number of times to compute the root (must be ≥ 1).
 pub fn verify_state_root_consistency(state: &KvState, iterations: usize) -> VerificationResult<Hash32> {
     if iterations == 0 {
         return Err(VerificationError::InvalidIterations(iterations));
