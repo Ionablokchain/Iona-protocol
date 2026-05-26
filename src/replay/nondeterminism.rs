@@ -1,24 +1,24 @@
 //! Nondeterministic input logging.
 //!
 //! Tracks and logs every source of nondeterminism that could cause state
-//! divergence between nodes.  In a deterministic blockchain, the *only*
+//! divergence between nodes. In a deterministic blockchain, the *only*
 //! valid source of nondeterminism is the block itself (proposer choice,
-//! tx ordering).  Everything else must be either:
+//! transaction ordering). Everything else must be either:
 //!
-//! - Derived deterministically from the block/state
+//! - Derived deterministically from the block or state
 //! - Logged and auditable
 //!
 //! # Nondeterminism Sources
 //!
 //! | Source         | Risk  | Mitigation                              |
 //! |----------------|-------|-----------------------------------------|
-//! | System clock   | HIGH  | Use block.timestamp, never wall clock    |
+//! | System clock   | HIGH  | Use `block.timestamp`, never wall clock  |
 //! | RNG            | HIGH  | Use deterministic seed from block hash   |
-//! | HashMap order  | HIGH  | Use BTreeMap exclusively                 |
+//! | HashMap order  | HIGH  | Use `BTreeMap` exclusively               |
 //! | Float ops      | MED   | Avoid floats; use integer arithmetic     |
-//! | Thread sched   | MED   | Single-threaded state transitions        |
+//! | Thread sched   | MED   | Single‑threaded state transitions        |
 //! | External I/O   | LOW   | No external calls during execution       |
-//! | Compiler opts  | LOW   | Pinned toolchain + --locked              |
+//! | Compiler opts  | LOW   | Pinned toolchain + `--locked`            |
 //!
 //! # Usage
 //!
@@ -47,17 +47,20 @@ use thiserror::Error;
 /// Errors that can occur during nondeterminism logging.
 #[derive(Debug, Error)]
 pub enum NdLoggerError {
+    /// Failed to open the log file for writing.
     #[error("failed to open log file {path}: {source}")]
     OpenFile {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+    /// Failed to write an event to the log file.
     #[error("failed to write to log file: {source}")]
     WriteFile {
         #[source]
         source: std::io::Error,
     },
+    /// Failed to serialise an event to JSON.
     #[error("serialization error: {source}")]
     Serialization {
         #[source]
@@ -75,13 +78,21 @@ pub type NdLoggerResult<T> = Result<T, NdLoggerError>;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum NdSource {
+    /// System wall‑clock time.
     Timestamp,
+    /// Random number generator.
     Rng,
+    /// Unordered iteration over a hash map or hash set.
     HashMapOrder,
+    /// Floating‑point arithmetic.
     FloatOp,
+    /// Thread scheduling (e.g., sleeping, yielding).
     ThreadSchedule,
+    /// External I/O (file, network).
     ExternalIo,
+    /// Behaviour that varies by CPU, OS, or compiler.
     PlatformSpecific,
+    /// Any other user‑defined source.
     Other(String),
 }
 
@@ -104,8 +115,11 @@ impl std::fmt::Display for NdSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum NdSeverity {
+    /// Informational – not a direct cause of divergence but worth noting.
     Info,
+    /// Warning – could cause divergence under certain conditions.
     Warning,
+    /// Critical – definitely causes divergence in production.
     Critical,
 }
 
@@ -122,12 +136,19 @@ impl std::fmt::Display for NdSeverity {
 /// A single logged nondeterminism event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NdEvent {
+    /// The source of nondeterminism.
     pub source: NdSource,
+    /// Severity level.
     pub severity: NdSeverity,
+    /// Block height at which this event occurred.
     pub height: u64,
+    /// Human‑readable description.
     pub description: String,
+    /// The observed nondeterministic value.
     pub observed_value: String,
+    /// Suggested deterministic alternative (if known).
     pub deterministic_alternative: Option<String>,
+    /// Timestamp when the event was logged (nanoseconds since boot, placeholder).
     pub logged_at_ns: u64,
 }
 
@@ -149,16 +170,23 @@ impl std::fmt::Display for NdEvent {
 // Logger with optional file output
 // -----------------------------------------------------------------------------
 
-/// Thread-safe nondeterminism logger.
+/// Thread‑safe nondeterminism logger.
+///
+/// Events are stored in memory and optionally written to a JSON‑lines file.
 pub struct NdLogger {
+    /// In‑memory event buffer.
     events: Mutex<Vec<NdEvent>>,
+    /// Current block height (set before execution).
     current_height: Mutex<u64>,
+    /// Whether logging is enabled.
     enabled: bool,
+    /// Optional file writer for persistent logging.
     file_writer: Mutex<Option<BufWriter<std::fs::File>>>,
 }
 
 impl NdLogger {
     /// Create a new logger without file output.
+    #[must_use]
     pub fn new(enabled: bool) -> Self {
         Self {
             events: Mutex::new(Vec::new()),
@@ -187,14 +215,14 @@ impl NdLogger {
         })
     }
 
-    /// Set the current block height (called at start of block execution).
+    /// Set the current block height (call at the start of block execution).
     pub fn set_height(&self, height: u64) {
         if let Ok(mut h) = self.current_height.lock() {
             *h = height;
         }
     }
 
-    /// Internal log method.
+    /// Internal helper to log an event.
     fn log_internal(
         &self,
         source: NdSource,
@@ -214,15 +242,15 @@ impl NdLogger {
             description,
             observed_value: observed,
             deterministic_alternative: alternative,
-            logged_at_ns: 0,
+            logged_at_ns: 0, // Placeholder; could be filled with a real timestamp.
         };
 
-        // Store in memory
+        // Store in memory.
         if let Ok(mut events) = self.events.lock() {
             events.push(event.clone());
         }
 
-        // Write to file if configured
+        // Write to file if configured.
         if let Ok(mut writer) = self.file_writer.lock() {
             if let Some(w) = writer.as_mut() {
                 if let Ok(json) = serde_json::to_string(&event) {
@@ -233,7 +261,7 @@ impl NdLogger {
         }
     }
 
-    /// Log a timestamp usage.
+    /// Log a timestamp usage (wall clock vs block timestamp).
     pub fn log_timestamp(&self, wall_clock_ms: u64, block_timestamp: u64) {
         self.log_internal(
             NdSource::Timestamp,
@@ -255,7 +283,7 @@ impl NdLogger {
         );
     }
 
-    /// Log HashMap iteration.
+    /// Log HashMap/HashSet iteration.
     pub fn log_hashmap_usage(&self, location: &str) {
         self.log_internal(
             NdSource::HashMapOrder,
@@ -277,18 +305,18 @@ impl NdLogger {
         );
     }
 
-    /// Log floating-point operation.
+    /// Log floating‑point operation.
     pub fn log_float_op(&self, location: &str, value: &str) {
         self.log_internal(
             NdSource::FloatOp,
             NdSeverity::Warning,
             format!("float operation at {location}"),
             value.to_string(),
-            Some("use integer/fixed-point arithmetic".to_string()),
+            Some("use integer/fixed‑point arithmetic".to_string()),
         );
     }
 
-    /// Log platform-specific behaviour.
+    /// Log platform‑specific behaviour (e.g., CPU‑dependent results).
     pub fn log_platform(&self, description: &str, observed: &str) {
         self.log_internal(
             NdSource::PlatformSpecific,
@@ -300,11 +328,13 @@ impl NdLogger {
     }
 
     /// Get all logged events.
+    #[must_use]
     pub fn events(&self) -> Vec<NdEvent> {
         self.events.lock().map(|e| e.clone()).unwrap_or_default()
     }
 
-    /// Get events filtered by severity.
+    /// Get events filtered by minimum severity.
+    #[must_use]
     pub fn events_by_severity(&self, min_severity: NdSeverity) -> Vec<NdEvent> {
         self.events()
             .into_iter()
@@ -313,6 +343,7 @@ impl NdLogger {
     }
 
     /// Get events filtered by source.
+    #[must_use]
     pub fn events_by_source(&self, source: &NdSource) -> Vec<NdEvent> {
         self.events()
             .into_iter()
@@ -320,14 +351,15 @@ impl NdLogger {
             .collect()
     }
 
-    /// Check if any critical nondeterminism was detected.
+    /// Check if any critical nondeterminism events were logged.
+    #[must_use]
     pub fn has_critical(&self) -> bool {
         self.events()
             .iter()
             .any(|e| e.severity == NdSeverity::Critical)
     }
 
-    /// Clear all events (memory only, file not truncated).
+    /// Clear all events (in‑memory only; file is not truncated).
     pub fn clear(&self) {
         if let Ok(mut events) = self.events.lock() {
             events.clear();
@@ -335,6 +367,7 @@ impl NdLogger {
     }
 
     /// Generate a summary report.
+    #[must_use]
     pub fn report(&self) -> NdReport {
         let events = self.events();
         let critical_count = events
@@ -373,6 +406,8 @@ pub struct NdLoggerBuilder {
 }
 
 impl NdLoggerBuilder {
+    /// Create a new builder with default settings (enabled = true, no file).
+    #[must_use]
     pub fn new() -> Self {
         Self {
             enabled: true,
@@ -380,16 +415,21 @@ impl NdLoggerBuilder {
         }
     }
 
+    /// Set whether logging is enabled.
+    #[must_use]
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
     }
 
+    /// Enable file output to the given path.
+    #[must_use]
     pub fn with_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.file_path = Some(path.into());
         self
     }
 
+    /// Build the logger.
     pub fn build(self) -> NdLoggerResult<NdLogger> {
         match self.file_path {
             Some(path) => NdLogger::with_file(self.enabled, path),
@@ -402,6 +442,7 @@ impl NdLoggerBuilder {
 // Summary report
 // -----------------------------------------------------------------------------
 
+/// Report summarising all logged nondeterminism events.
 #[derive(Debug, Clone)]
 pub struct NdReport {
     pub total_events: usize,
@@ -435,6 +476,7 @@ impl std::fmt::Display for NdReport {
 // Static analysis helpers
 // -----------------------------------------------------------------------------
 
+/// Patterns that are safe (deterministic).
 pub const SAFE_PATTERNS: &[&str] = &[
     "BTreeMap",
     "BTreeSet",
@@ -444,6 +486,7 @@ pub const SAFE_PATTERNS: &[&str] = &[
     "block.hash",
 ];
 
+/// Patterns that are dangerous (nondeterministic) and should be avoided.
 pub const DANGEROUS_PATTERNS: &[&str] = &[
     "HashMap",
     "HashSet",
@@ -456,6 +499,10 @@ pub const DANGEROUS_PATTERNS: &[&str] = &[
     "f64",
 ];
 
+/// Statically check a code snippet for dangerous patterns.
+///
+/// Returns a list of `(pattern, severity)` for each dangerous pattern found.
+#[must_use]
 pub fn check_code_snippet(code: &str) -> Vec<(String, NdSeverity)> {
     let mut findings = Vec::new();
     for &pattern in DANGEROUS_PATTERNS {
