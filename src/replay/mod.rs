@@ -21,10 +21,10 @@
 //! # Quick Start
 //!
 //! ```rust,ignore
-//! use iona::replay::{replay_chain, ReplayError};
+//! use iona::replay::{verify_chain, ReplayError};
 //!
 //! fn main() -> Result<(), ReplayError> {
-//!     let result = replay_chain(&blocks, &genesis_state, base_fee)?;
+//!     let result = verify_chain(&blocks, &genesis_state, base_fee)?;
 //!     if !result.success {
 //!         eprintln!("Replay failed at height {:?}", result.failed_at);
 //!     }
@@ -44,7 +44,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 // -----------------------------------------------------------------------------
-// Re-export core types from submodules
+// Re‑export core types from submodules
 // -----------------------------------------------------------------------------
 
 pub use divergence::{
@@ -63,18 +63,23 @@ pub use state_root_verify::{verify_roots, VerifyResult};
 /// Errors that can occur during replay or verification operations.
 #[derive(Debug, Error)]
 pub enum ReplayError {
+    /// Error from the historical replay subsystem.
     #[error("historical replay error: {0}")]
     Historical(#[from] historical::HistoricalError),
 
+    /// Error from state root verification.
     #[error("state root verification error: {0}")]
     StateRootVerify(#[from] state_root_verify::VerifyError),
 
+    /// Error from divergence detection.
     #[error("divergence detection error: {0}")]
     Divergence(#[from] divergence::DivergenceError),
 
+    /// Error from nondeterminism logging.
     #[error("nondeterminism logging error: {0}")]
     Nondeterminism(String),
 
+    /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -83,13 +88,21 @@ pub enum ReplayError {
 pub type ReplayResult<T> = Result<T, ReplayError>;
 
 // -----------------------------------------------------------------------------
-// High-level convenience API
+// High‑level convenience API
 // -----------------------------------------------------------------------------
 
 /// Replay a chain of blocks and verify state roots against block headers.
 ///
 /// This is the main entry point for block replay. It wraps
 /// [`historical::replay_chain`] and returns a [`ChainReplayResult`].
+///
+/// # Arguments
+/// * `blocks` – Slice of blocks in ascending height order.
+/// * `initial_state` – Starting state (e.g., genesis state).
+/// * `base_fee_per_gas` – Base fee to use for all blocks (simplified).
+///
+/// # Returns
+/// A `ChainReplayResult` indicating success or failure.
 pub fn verify_chain(
     blocks: &[Block],
     initial_state: &KvState,
@@ -101,6 +114,15 @@ pub fn verify_chain(
 /// Verify state roots against an external map of expected roots.
 ///
 /// Wraps [`state_root_verify::verify_roots`].
+///
+/// # Arguments
+/// * `blocks` – Slice of blocks in ascending height order.
+/// * `initial_state` – Starting state.
+/// * `base_fee_per_gas` – Base fee for all blocks.
+/// * `expected_roots` – Map from height to expected state root.
+///
+/// # Returns
+/// A `VerifyResult` indicating pass/fail and mismatch details.
 pub fn verify_state_roots(
     blocks: &[Block],
     initial_state: &KvState,
@@ -113,6 +135,12 @@ pub fn verify_state_roots(
 /// Compare two sets of node snapshots and return a divergence report.
 ///
 /// Wraps [`divergence::detect_divergence_range`].
+///
+/// # Arguments
+/// * `node_snapshots` – A map from node identifier to a vector of snapshots.
+///
+/// # Returns
+/// A `DivergenceReport` detailing any divergence between nodes.
 pub fn compare_environments(
     node_snapshots: &BTreeMap<String, Vec<NodeSnapshot>>,
 ) -> ReplayResult<DivergenceReport> {
@@ -120,6 +148,12 @@ pub fn compare_environments(
 }
 
 /// Create a new nondeterminism logger that writes to the given file.
+///
+/// # Arguments
+/// * `path` – File path for the log output.
+///
+/// # Returns
+/// An `NdLogger` instance.
 pub fn create_nd_logger(path: impl AsRef<std::path::Path>) -> ReplayResult<NdLogger> {
     NdLogger::new(path).map_err(|e| ReplayError::Nondeterminism(e.to_string()))
 }
@@ -131,8 +165,8 @@ pub fn create_nd_logger(path: impl AsRef<std::path::Path>) -> ReplayResult<NdLog
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Block, BlockHeader};
     use crate::execution::KvState;
+    use crate::types::{Block, BlockHeader};
 
     fn empty_block(height: Height, state_root: Hash32) -> Block {
         Block {
