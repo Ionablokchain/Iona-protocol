@@ -6,7 +6,7 @@
 //! rules fail.
 //!
 //! This allows operators to verify that the new rules work correctly
-//! **before** the activation height is reached.  Failures are logged and
+//! **before** the activation height is reached. Failures are logged and
 //! counted but never block consensus.
 //!
 //! # How it works
@@ -34,9 +34,11 @@
 //! ```
 
 use crate::protocol::version::{version_for_height, ProtocolActivation, CURRENT_PROTOCOL_VERSION};
-use crate::types::{Block, Height};
+use crate::types::{Block, Height, Hash32};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, info, warn};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn, error};
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -49,6 +51,10 @@ pub struct ShadowValidatorConfig {
     pub enabled: bool,
     /// If `true`, log every shadow validation result (default: `false`).
     pub verbose_logging: bool,
+    /// If `true`, collect detailed timing metrics (default: `false`).
+    pub collect_timing: bool,
+    /// Maximum number of shadow validation failures to log (default: 100).
+    pub max_failures_logged: usize,
 }
 
 impl Default for ShadowValidatorConfig {
@@ -56,6 +62,8 @@ impl Default for ShadowValidatorConfig {
         Self {
             enabled: true,
             verbose_logging: false,
+            collect_timing: false,
+            max_failures_logged: 100,
         }
     }
 }
@@ -80,19 +88,30 @@ pub struct ShadowValidator {
     shadow_passed: AtomicU64,
     /// Number of blocks that **failed** shadow validation.
     shadow_failed: AtomicU64,
+    /// Number of failures logged (to avoid flooding logs).
+    failures_logged: AtomicU64,
+    /// Total time spent in shadow validation (nanoseconds).
+    total_time_ns: AtomicU64,
 }
 
 impl ShadowValidator {
     /// Create a new shadow validator with the given activation schedule and configuration.
     #[must_use]
     pub fn new(activations: Vec<ProtocolActivation>, config: ShadowValidatorConfig) -> Self {
-        info!(enabled = config.enabled, "shadow validator created");
+        info!(
+            enabled = config.enabled,
+            verbose = config.verbose_logging,
+            collect_timing = config.collect_timing,
+            "shadow validator created"
+        );
         Self {
             activations,
             config,
             shadow_validated: AtomicU64::new(0),
             shadow_passed: AtomicU64::new(0),
             shadow_failed: AtomicU64::new(0),
+            failures_logged: AtomicU64::new(0),
+            total_time_ns: AtomicU64::new(0),
         }
     }
 
@@ -173,8 +192,12 @@ impl ShadowValidator {
 
         self.shadow_validated.fetch_add(1, Ordering::Relaxed);
 
-        // Apply the new‑PV validation rules (shadow, non‑blocking).
+        let start = if self.config.collect_timing { Some(Instant::now()) } else { None };
         let result = self.shadow_validate_block(block, activation);
+        if let Some(start_time) = start {
+            let elapsed = start_time.elapsed().as_nanos() as u64;
+            self.total_time_ns.fetch_add(elapsed, Ordering::Relaxed);
+        }
 
         match &result {
             Ok(()) => {
@@ -194,14 +217,22 @@ impl ShadowValidator {
             }
             Err(reason) => {
                 self.shadow_failed.fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    height,
-                    block_pv = block.header.protocol_version,
-                    target_pv = activation.protocol_version,
-                    activation_height,
-                    reason = reason.as_str(),
-                    "shadow validation FAILED (non‑blocking)"
-                );
+                let failures = self.failures_logged.fetch_add(1, Ordering::Relaxed);
+                if failures < self.config.max_failures_logged {
+                    warn!(
+                        height,
+                        block_pv = block.header.protocol_version,
+                        target_pv = activation.protocol_version,
+                        activation_height,
+                        reason = reason.as_str(),
+                        "shadow validation FAILED (non‑blocking)"
+                    );
+                } else if failures == self.config.max_failures_logged {
+                    warn!(
+                        "shadow validation failures exceeded limit ({}), suppressing further logs",
+                        self.config.max_failures_logged
+                    );
+                }
                 Err(reason.clone())
             }
         }
@@ -210,11 +241,12 @@ impl ShadowValidator {
     /// Internal: apply the new‑PV validation rules to a block (shadow mode).
     ///
     /// This is the place where additional checks for future protocol versions
-    /// should be added.  The base implementation verifies:
+    /// should be added. The base implementation verifies:
     ///
     /// - `protocol_version` is not zero.
     /// - Block ID is non‑zero (deterministic).
     /// - Transaction root matches the transactions.
+    /// - Receipts root matches (if receipts are available).
     ///
     /// More checks can be added as new PVs are introduced.
     fn shadow_validate_block(&self, block: &Block, activation: &ProtocolActivation) -> Result<(), String> {
@@ -239,8 +271,43 @@ impl ShadowValidator {
             ));
         }
 
+        // Validate receipts root (if receipts are available in the block).
+        // For blocks without receipts, this check is skipped.
+        if !block.receipts.is_empty() {
+            let computed_receipts_root = crate::types::receipts_root(&block.receipts);
+            if computed_receipts_root != block.header.receipts_root {
+                return Err(format!(
+                    "receipts_root mismatch: header={}, computed={}",
+                    hex::encode(block.header.receipts_root.0),
+                    hex::encode(computed_receipts_root.0),
+                ));
+            }
+        }
+
+        // Validate state root (basic sanity – non-zero).
+        if block.header.state_root.0 == [0u8; 32] {
+            return Err("state_root is all zeros".into());
+        }
+
         // Additional PV‑specific checks can be inserted here.
-        // Example: future PV 2 may require a new header field, etc.
+        // Example: future PV 2 may require a new header field.
+        if activation.protocol_version >= 2 {
+            // PV2: validate that block height is within reasonable bounds
+            if block.header.height == 0 {
+                return Err("PV2: block height cannot be zero".into());
+            }
+        }
+
+        if activation.protocol_version >= 3 {
+            // PV3: validate that timestamp is reasonable (not in the far future)
+            let now = crate::arch::x86_64::timer::uptime_ms() / 1000;
+            if block.header.timestamp > now + 3600 {
+                return Err(format!(
+                    "PV3: block timestamp too far in the future: {} > {} + 3600",
+                    block.header.timestamp, now
+                ));
+            }
+        }
 
         Ok(())
     }
@@ -252,6 +319,12 @@ impl ShadowValidator {
             validated: self.shadow_validated.load(Ordering::Relaxed),
             passed: self.shadow_passed.load(Ordering::Relaxed),
             failed: self.shadow_failed.load(Ordering::Relaxed),
+            total_time_ns: self.total_time_ns.load(Ordering::Relaxed),
+            avg_time_ns: if self.shadow_validated.load(Ordering::Relaxed) > 0 {
+                self.total_time_ns.load(Ordering::Relaxed) / self.shadow_validated.load(Ordering::Relaxed)
+            } else {
+                0
+            },
         }
     }
 
@@ -260,7 +333,33 @@ impl ShadowValidator {
         self.shadow_validated.store(0, Ordering::Relaxed);
         self.shadow_passed.store(0, Ordering::Relaxed);
         self.shadow_failed.store(0, Ordering::Relaxed);
+        self.failures_logged.store(0, Ordering::Relaxed);
+        self.total_time_ns.store(0, Ordering::Relaxed);
         debug!("shadow validation stats reset");
+    }
+
+    /// Get the current failure rate (failed / validated).
+    #[must_use]
+    pub fn failure_rate(&self) -> f64 {
+        let validated = self.shadow_validated.load(Ordering::Relaxed);
+        let failed = self.shadow_failed.load(Ordering::Relaxed);
+        if validated == 0 {
+            0.0
+        } else {
+            failed as f64 / validated as f64
+        }
+    }
+
+    /// Get the current pass rate (passed / validated).
+    #[must_use]
+    pub fn pass_rate(&self) -> f64 {
+        let validated = self.shadow_validated.load(Ordering::Relaxed);
+        let passed = self.shadow_passed.load(Ordering::Relaxed);
+        if validated == 0 {
+            0.0
+        } else {
+            passed as f64 / validated as f64
+        }
     }
 }
 
@@ -277,14 +376,28 @@ pub struct ShadowStats {
     pub passed: u64,
     /// Blocks that failed shadow validation (non‑blocking).
     pub failed: u64,
+    /// Total time spent in shadow validation (nanoseconds).
+    pub total_time_ns: u64,
+    /// Average time per validation (nanoseconds).
+    pub avg_time_ns: u64,
 }
 
 impl std::fmt::Display for ShadowStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pass_rate = if self.validated > 0 {
+            (self.passed as f64 / self.validated as f64) * 100.0
+        } else {
+            0.0
+        };
+        let fail_rate = if self.validated > 0 {
+            (self.failed as f64 / self.validated as f64) * 100.0
+        } else {
+            0.0
+        };
         write!(
             f,
-            "shadow_validation: {} validated, {} passed, {} failed",
-            self.validated, self.passed, self.failed
+            "shadow_validation: {} validated, {} passed ({:.1}%), {} failed ({:.1}%), avg={}ns",
+            self.validated, self.passed, pass_rate, self.failed, fail_rate, self.avg_time_ns
         )
     }
 }
@@ -319,20 +432,13 @@ mod tests {
                 vm_gas_used: 0,
                 evm_gas_used: 0,
                 chain_id: 6126151,
-                timestamp: 0,
+                timestamp: height * 1000,
                 protocol_version: pv,
             },
             txs,
+            receipts: vec![],
         }
     }
-
-    // This test simulates a binary that already supports PV 2 (CURRENT_PROTOCOL_VERSION = 2)
-    // while the chain is still on PV 1. In this test environment we cannot change the
-    // const, but we can create a helper that mocks the condition. For the purpose of
-    // this test, we use the real `CURRENT_PROTOCOL_VERSION` (which is 1 as of this writing).
-    // Therefore, shadow validation will not be triggered because the binary does not
-    // support a newer version. To keep the tests meaningful, we will only test the
-    // internal `shadow_validate_block` directly and check the conditions.
 
     #[test]
     fn test_shadow_validate_block_passes() {
@@ -341,7 +447,7 @@ mod tests {
             activation_height: Some(1000),
             grace_blocks: 100,
         };
-        let sv = ShadowValidator::with_defaults(vec![]); // activations not used internally
+        let sv = ShadowValidator::with_defaults(vec![]);
         let block = make_test_block(500, 1, None);
         let result = sv.shadow_validate_block(&block, &activation);
         assert!(result.is_ok());
@@ -378,6 +484,21 @@ mod tests {
     }
 
     #[test]
+    fn test_shadow_validate_block_fails_zero_state_root() {
+        let activation = ProtocolActivation {
+            protocol_version: 2,
+            activation_height: Some(1000),
+            grace_blocks: 100,
+        };
+        let sv = ShadowValidator::with_defaults(vec![]);
+        let mut block = make_test_block(500, 1, None);
+        block.header.state_root = Hash32([0u8; 32]);
+        let result = sv.shadow_validate_block(&block, &activation);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("state_root is all zeros"));
+    }
+
+    #[test]
     fn test_stats() {
         let sv = ShadowValidator::with_defaults(vec![]);
         let stats = sv.stats();
@@ -387,5 +508,21 @@ mod tests {
         sv.reset_stats();
         let stats2 = sv.stats();
         assert_eq!(stats2.validated, 0);
+    }
+
+    #[test]
+    fn test_failure_rate() {
+        // We need to actually validate blocks to see failure rate.
+        // This test just checks the method exists and returns a value.
+        let sv = ShadowValidator::with_defaults(vec![]);
+        let rate = sv.failure_rate();
+        assert_eq!(rate, 0.0);
+    }
+
+    #[test]
+    fn test_pass_rate() {
+        let sv = ShadowValidator::with_defaults(vec![]);
+        let rate = sv.pass_rate();
+        assert_eq!(rate, 0.0);
     }
 }
