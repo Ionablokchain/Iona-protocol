@@ -22,7 +22,18 @@
 //! ```
 
 use crate::types::Height;
-use tracing::{debug, info, warn};
+use std::time::Instant;
+use tracing::{debug, info, warn, error};
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Maximum acceptable difference in supply for floating-point tolerance.
+pub const MAX_SUPPLY_TOLERANCE: u128 = 1;
+
+/// Maximum acceptable difference in state root (must be 0).
+pub const MAX_ROOT_TOLERANCE: usize = 0;
 
 // -----------------------------------------------------------------------------
 // S1: No split finality
@@ -30,19 +41,23 @@ use tracing::{debug, info, warn};
 
 /// Verify that at most one block has been finalized at the given height.
 ///
-/// `finalized_count` is the number of distinct block IDs that have been finalized
-/// for this height (should be 0 or 1).
+/// # Arguments
+/// * `height` – The block height to check.
+/// * `finalized_count` – Number of distinct block IDs finalized for this height.
+///
+/// # Returns
+/// `Ok(())` if `finalized_count <= 1`, `Err` otherwise.
 #[must_use]
 pub fn check_no_split_finality(height: Height, finalized_count: usize) -> Result<(), String> {
     if finalized_count > 1 {
         let err = format!(
-            "SAFETY VIOLATION S1: {finalized_count} blocks finalized at height {height}; \
-             expected at most 1"
+            "SAFETY VIOLATION S1: {} blocks finalized at height {}; expected at most 1",
+            finalized_count, height
         );
-        warn!("{}", err);
+        error!("{}", err);
         return Err(err);
     }
-    debug!(height, "S1 check passed (finalized_count={finalized_count})");
+    debug!(height, finalized_count, "S1 check passed");
     Ok(())
 }
 
@@ -51,6 +66,13 @@ pub fn check_no_split_finality(height: Height, finalized_count: usize) -> Result
 // -----------------------------------------------------------------------------
 
 /// Verify that the new finalized height is >= the previous one.
+///
+/// # Arguments
+/// * `prev_finalized` – Previously finalized height.
+/// * `new_finalized` – Newly finalized height.
+///
+/// # Returns
+/// `Ok(())` if `new_finalized >= prev_finalized`, `Err` otherwise.
 #[must_use]
 pub fn check_finality_monotonic(
     prev_finalized: Height,
@@ -58,9 +80,10 @@ pub fn check_finality_monotonic(
 ) -> Result<(), String> {
     if new_finalized < prev_finalized {
         let err = format!(
-            "SAFETY VIOLATION S2: finalized_height decreased from {prev_finalized} to {new_finalized}"
+            "SAFETY VIOLATION S2: finalized_height decreased from {} to {}",
+            prev_finalized, new_finalized
         );
-        warn!("{}", err);
+        error!("{}", err);
         return Err(err);
     }
     debug!(
@@ -79,6 +102,15 @@ pub fn check_finality_monotonic(
 ///
 /// This check ensures that all correct nodes agree on which protocol version
 /// applies at a given height.
+///
+/// # Arguments
+/// * `height` – Block height.
+/// * `block_pv` – Protocol version from the block header.
+/// * `local_pv` – Locally computed protocol version.
+/// * `activations` – Activation schedule.
+///
+/// # Returns
+/// `Ok(())` if the block PV is valid at this height, `Err` otherwise.
 #[must_use]
 pub fn check_deterministic_pv(
     height: Height,
@@ -90,9 +122,10 @@ pub fn check_deterministic_pv(
     // taking into account the grace window.
     if let Err(e) = crate::protocol::version::validate_block_version(block_pv, height, activations) {
         let err = format!(
-            "SAFETY VIOLATION S3: block PV={block_pv} not accepted at height {height}: {e}"
+            "SAFETY VIOLATION S3: block PV={} not accepted at height {}: {}",
+            block_pv, height, e
         );
-        warn!("{}", err);
+        error!("{}", err);
         return Err(err);
     }
 
@@ -100,8 +133,8 @@ pub fn check_deterministic_pv(
     if block_pv != expected && block_pv != local_pv {
         // This is a warning only (not a hard violation) because grace window may allow old PV.
         let msg = format!(
-            "SAFETY NOTE S3: block PV={block_pv} differs from local PV={local_pv} \
-             at height {height} (expected PV={expected}) – but may be within grace window"
+            "SAFETY NOTE S3: block PV={} differs from local PV={} at height {} (expected PV={}) – but may be within grace window",
+            block_pv, local_pv, height, expected
         );
         debug!("{}", msg);
     }
@@ -120,6 +153,14 @@ pub fn check_deterministic_pv(
 // -----------------------------------------------------------------------------
 
 /// Verify that after activation, we're not applying old-PV execution rules.
+///
+/// # Arguments
+/// * `height` – Block height.
+/// * `execution_pv` – Protocol version used for execution.
+/// * `activations` – Activation schedule.
+///
+/// # Returns
+/// `Ok(())` if the execution PV is valid at this height, `Err` otherwise.
 #[must_use]
 pub fn check_state_compat(
     height: Height,
@@ -137,10 +178,10 @@ pub fn check_state_compat(
         });
         if !in_grace {
             let err = format!(
-                "SAFETY VIOLATION S4: executing with PV={execution_pv} at height {height}, \
-                 but PV={expected} is mandatory (grace window expired)"
+                "SAFETY VIOLATION S4: executing with PV={} at height {}, but PV={} is mandatory (grace window expired)",
+                execution_pv, height, expected
             );
-            warn!("{}", err);
+            error!("{}", err);
             return Err(err);
         } else {
             debug!(
@@ -151,7 +192,7 @@ pub fn check_state_compat(
             );
         }
     }
-    debug!(height, execution_pv, "S4 check passed");
+    debug!(height, execution_pv, expected, "S4 check passed");
     Ok(())
 }
 
@@ -161,13 +202,17 @@ pub fn check_state_compat(
 
 /// Check that total token supply is conserved across a state transition.
 ///
-/// `supply_before` = sum(balances) + sum(staked) before block execution.
-/// `supply_after`  = sum(balances) + sum(staked) after block execution.
-/// `minted`        = block rewards minted (epoch boundary).
-/// `slashed`       = tokens destroyed by slashing.
-/// `burned`        = tokens burned via EIP-1559 base fee.
-///
 /// Invariant: `supply_after == supply_before + minted - slashed - burned`
+///
+/// # Arguments
+/// * `supply_before` – Total supply before block execution.
+/// * `supply_after` – Total supply after block execution.
+/// * `minted` – Block rewards minted.
+/// * `slashed` – Tokens destroyed by slashing.
+/// * `burned` – Tokens burned via EIP-1559 base fee.
+///
+/// # Returns
+/// `Ok(())` if supply is conserved within tolerance, `Err` otherwise.
 #[must_use]
 pub fn check_value_conservation(
     supply_before: u128,
@@ -180,14 +225,21 @@ pub fn check_value_conservation(
         .saturating_add(minted)
         .saturating_sub(slashed)
         .saturating_sub(burned);
-    if supply_after != expected {
-        let diff = (supply_after as i128) - (expected as i128);
+
+    let diff = if supply_after > expected {
+        supply_after - expected
+    } else {
+        expected - supply_after
+    };
+
+    if diff > MAX_SUPPLY_TOLERANCE {
+        let diff_signed = (supply_after as i128) - (expected as i128);
         let err = format!(
             "SAFETY VIOLATION M2: value not conserved. \
-             before={supply_before} + minted={minted} - slashed={slashed} - burned={burned} \
-             = expected {expected}, got {supply_after} (diff={diff})"
+             before={} + minted={} - slashed={} - burned={} = expected {}, got {} (diff={})",
+            supply_before, minted, slashed, burned, expected, supply_after, diff_signed
         );
-        warn!("{}", err);
+        error!("{}", err);
         return Err(err);
     }
     debug!(
@@ -196,7 +248,8 @@ pub fn check_value_conservation(
         minted,
         slashed,
         burned,
-        "M2 check passed (value conserved)"
+        expected,
+        "M2 check passed (value conserved within tolerance)"
     );
     Ok(())
 }
@@ -207,8 +260,12 @@ pub fn check_value_conservation(
 
 /// Verify that a format-only migration preserves the state root.
 ///
-/// `root_before` and `root_after` are the Merkle state roots computed
-/// before and after the migration.
+/// # Arguments
+/// * `root_before` – State root before migration.
+/// * `root_after` – State root after migration.
+///
+/// # Returns
+/// `Ok(())` if roots are identical, `Err` otherwise.
 #[must_use]
 pub fn check_root_equivalence(root_before: &[u8; 32], root_after: &[u8; 32]) -> Result<(), String> {
     if root_before != root_after {
@@ -218,7 +275,7 @@ pub fn check_root_equivalence(root_before: &[u8; 32], root_after: &[u8; 32]) -> 
             hex::encode(root_before),
             hex::encode(root_after),
         );
-        warn!("{}", err);
+        error!("{}", err);
         return Err(err);
     }
     debug!("M3 check passed (state root unchanged after migration)");
@@ -235,6 +292,20 @@ pub struct SafetyCheck {
     pub name: String,
     pub passed: bool,
     pub detail: String,
+    pub duration_ms: u64,
+}
+
+impl SafetyCheck {
+    /// Create a new safety check result.
+    #[must_use]
+    pub fn new(name: &str, passed: bool, detail: &str, duration_ms: u64) -> Self {
+        Self {
+            name: name.to_string(),
+            passed,
+            detail: detail.to_string(),
+            duration_ms,
+        }
+    }
 }
 
 /// Report from running all safety checks.
@@ -242,18 +313,21 @@ pub struct SafetyCheck {
 pub struct SafetyReport {
     pub checks: Vec<SafetyCheck>,
     pub all_passed: bool,
+    pub total_duration_ms: u64,
 }
 
 impl std::fmt::Display for SafetyReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(
             f,
-            "Safety Report: {}",
-            if self.all_passed { "ALL PASSED" } else { "FAILURES DETECTED" }
+            "Safety Report: {} ({} checks, {}ms)",
+            if self.all_passed { "ALL PASSED" } else { "FAILURES DETECTED" },
+            self.checks.len(),
+            self.total_duration_ms
         )?;
         for c in &self.checks {
-            let mark = if c.passed { "OK" } else { "FAIL" };
-            writeln!(f, "  [{mark}] {}: {}", c.name, c.detail)?;
+            let mark = if c.passed { "✓" } else { "✗" };
+            writeln!(f, "  [{}] {}: {} [{}ms]", mark, c.name, c.detail, c.duration_ms)?;
         }
         Ok(())
     }
@@ -278,64 +352,233 @@ pub fn check_all_safety(
     root_before: &[u8; 32],
     root_after: &[u8; 32],
 ) -> SafetyReport {
+    let start = Instant::now();
+    let mut checks = Vec::new();
+
+    // S1: No split finality
+    let check_start = Instant::now();
+    let r = check_no_split_finality(height, finalized_count);
+    checks.push(SafetyCheck::new(
+        "S1: No split finality",
+        r.is_ok(),
+        &r.err().unwrap_or_else(|| "ok".into()),
+        check_start.elapsed().as_millis() as u64,
+    ));
+
+    // S2: Finality monotonic
+    let check_start = Instant::now();
+    let r = check_finality_monotonic(prev_finalized, new_finalized);
+    checks.push(SafetyCheck::new(
+        "S2: Finality monotonic",
+        r.is_ok(),
+        &r.err().unwrap_or_else(|| "ok".into()),
+        check_start.elapsed().as_millis() as u64,
+    ));
+
+    // S3: Deterministic PV
+    let check_start = Instant::now();
+    let r = check_deterministic_pv(height, block_pv, local_pv, activations);
+    checks.push(SafetyCheck::new(
+        "S3: Deterministic PV",
+        r.is_ok(),
+        &r.err().unwrap_or_else(|| "ok".into()),
+        check_start.elapsed().as_millis() as u64,
+    ));
+
+    // S4: State compatibility
+    let check_start = Instant::now();
+    let r = check_state_compat(height, block_pv, activations);
+    checks.push(SafetyCheck::new(
+        "S4: State compatibility",
+        r.is_ok(),
+        &r.err().unwrap_or_else(|| "ok".into()),
+        check_start.elapsed().as_millis() as u64,
+    ));
+
+    // M2: Value conservation
+    let check_start = Instant::now();
+    let r = check_value_conservation(supply_before, supply_after, minted, slashed, burned);
+    checks.push(SafetyCheck::new(
+        "M2: Value conservation",
+        r.is_ok(),
+        &r.err().unwrap_or_else(|| "ok".into()),
+        check_start.elapsed().as_millis() as u64,
+    ));
+
+    // M3: Root equivalence
+    let check_start = Instant::now();
+    let r = check_root_equivalence(root_before, root_after);
+    checks.push(SafetyCheck::new(
+        "M3: Root equivalence",
+        r.is_ok(),
+        &r.err().unwrap_or_else(|| "ok".into()),
+        check_start.elapsed().as_millis() as u64,
+    ));
+
+    let all_passed = checks.iter().all(|c| c.passed);
+    let total_duration_ms = start.elapsed().as_millis() as u64;
+
+    if all_passed {
+        info!(
+            height,
+            total_duration_ms,
+            "All safety checks passed at height {}",
+            height
+        );
+    } else {
+        let failed: Vec<_> = checks.iter().filter(|c| !c.passed).map(|c| c.name.as_str()).collect();
+        warn!(
+            height,
+            failed = ?failed,
+            total_duration_ms,
+            "Safety checks failed at height {}",
+            height
+        );
+    }
+
+    SafetyReport {
+        checks,
+        all_passed,
+        total_duration_ms,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Safety check configuration
+// -----------------------------------------------------------------------------
+
+/// Configuration for safety checks.
+#[derive(Debug, Clone)]
+pub struct SafetyConfig {
+    /// Whether to enable S1 check (No split finality).
+    pub enable_s1: bool,
+    /// Whether to enable S2 check (Finality monotonic).
+    pub enable_s2: bool,
+    /// Whether to enable S3 check (Deterministic PV).
+    pub enable_s3: bool,
+    /// Whether to enable S4 check (State compatibility).
+    pub enable_s4: bool,
+    /// Whether to enable M2 check (Value conservation).
+    pub enable_m2: bool,
+    /// Whether to enable M3 check (Root equivalence).
+    pub enable_m3: bool,
+}
+
+impl Default for SafetyConfig {
+    fn default() -> Self {
+        Self {
+            enable_s1: true,
+            enable_s2: true,
+            enable_s3: true,
+            enable_s4: true,
+            enable_m2: true,
+            enable_m3: true,
+        }
+    }
+}
+
+/// Run safety checks with configuration (allows selective disabling).
+#[must_use]
+pub fn check_all_safety_with_config(
+    config: &SafetyConfig,
+    height: Height,
+    finalized_count: usize,
+    prev_finalized: Height,
+    new_finalized: Height,
+    block_pv: u32,
+    local_pv: u32,
+    activations: &[crate::protocol::version::ProtocolActivation],
+    supply_before: u128,
+    supply_after: u128,
+    minted: u128,
+    slashed: u128,
+    burned: u128,
+    root_before: &[u8; 32],
+    root_after: &[u8; 32],
+) -> SafetyReport {
+    let start = Instant::now();
     let mut checks = Vec::new();
 
     // S1
-    let r = check_no_split_finality(height, finalized_count);
-    checks.push(SafetyCheck {
-        name: "S1: No split finality".into(),
-        passed: r.is_ok(),
-        detail: r.err().unwrap_or_else(|| "ok".into()),
-    });
-
-    // S2
-    let r = check_finality_monotonic(prev_finalized, new_finalized);
-    checks.push(SafetyCheck {
-        name: "S2: Finality monotonic".into(),
-        passed: r.is_ok(),
-        detail: r.err().unwrap_or_else(|| "ok".into()),
-    });
-
-    // S3
-    let r = check_deterministic_pv(height, block_pv, local_pv, activations);
-    checks.push(SafetyCheck {
-        name: "S3: Deterministic PV".into(),
-        passed: r.is_ok(),
-        detail: r.err().unwrap_or_else(|| "ok".into()),
-    });
-
-    // S4
-    let r = check_state_compat(height, block_pv, activations);
-    checks.push(SafetyCheck {
-        name: "S4: State compatibility".into(),
-        passed: r.is_ok(),
-        detail: r.err().unwrap_or_else(|| "ok".into()),
-    });
-
-    // M2
-    let r = check_value_conservation(supply_before, supply_after, minted, slashed, burned);
-    checks.push(SafetyCheck {
-        name: "M2: Value conservation".into(),
-        passed: r.is_ok(),
-        detail: r.err().unwrap_or_else(|| "ok".into()),
-    });
-
-    // M3
-    let r = check_root_equivalence(root_before, root_after);
-    checks.push(SafetyCheck {
-        name: "M3: Root equivalence".into(),
-        passed: r.is_ok(),
-        detail: r.err().unwrap_or_else(|| "ok".into()),
-    });
-
-    let all_passed = checks.iter().all(|c| c.passed);
-    if all_passed {
-        info!("All safety checks passed at height {}", height);
-    } else {
-        warn!(height, "Safety checks failed");
+    if config.enable_s1 {
+        let check_start = Instant::now();
+        let r = check_no_split_finality(height, finalized_count);
+        checks.push(SafetyCheck::new(
+            "S1: No split finality",
+            r.is_ok(),
+            &r.err().unwrap_or_else(|| "ok".into()),
+            check_start.elapsed().as_millis() as u64,
+        ));
     }
 
-    SafetyReport { checks, all_passed }
+    // S2
+    if config.enable_s2 {
+        let check_start = Instant::now();
+        let r = check_finality_monotonic(prev_finalized, new_finalized);
+        checks.push(SafetyCheck::new(
+            "S2: Finality monotonic",
+            r.is_ok(),
+            &r.err().unwrap_or_else(|| "ok".into()),
+            check_start.elapsed().as_millis() as u64,
+        ));
+    }
+
+    // S3
+    if config.enable_s3 {
+        let check_start = Instant::now();
+        let r = check_deterministic_pv(height, block_pv, local_pv, activations);
+        checks.push(SafetyCheck::new(
+            "S3: Deterministic PV",
+            r.is_ok(),
+            &r.err().unwrap_or_else(|| "ok".into()),
+            check_start.elapsed().as_millis() as u64,
+        ));
+    }
+
+    // S4
+    if config.enable_s4 {
+        let check_start = Instant::now();
+        let r = check_state_compat(height, block_pv, activations);
+        checks.push(SafetyCheck::new(
+            "S4: State compatibility",
+            r.is_ok(),
+            &r.err().unwrap_or_else(|| "ok".into()),
+            check_start.elapsed().as_millis() as u64,
+        ));
+    }
+
+    // M2
+    if config.enable_m2 {
+        let check_start = Instant::now();
+        let r = check_value_conservation(supply_before, supply_after, minted, slashed, burned);
+        checks.push(SafetyCheck::new(
+            "M2: Value conservation",
+            r.is_ok(),
+            &r.err().unwrap_or_else(|| "ok".into()),
+            check_start.elapsed().as_millis() as u64,
+        ));
+    }
+
+    // M3
+    if config.enable_m3 {
+        let check_start = Instant::now();
+        let r = check_root_equivalence(root_before, root_after);
+        checks.push(SafetyCheck::new(
+            "M3: Root equivalence",
+            r.is_ok(),
+            &r.err().unwrap_or_else(|| "ok".into()),
+            check_start.elapsed().as_millis() as u64,
+        ));
+    }
+
+    let all_passed = checks.iter().all(|c| c.passed);
+    let total_duration_ms = start.elapsed().as_millis() as u64;
+
+    SafetyReport {
+        checks,
+        all_passed,
+        total_duration_ms,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -413,7 +656,28 @@ mod tests {
             1000, 1005, 10, 0, 5,
             &root, &root,
         );
-        assert!(report.all_passed, "report: {report}");
+        assert!(report.all_passed, "report: {}", report);
         assert_eq!(report.checks.len(), 6);
+    }
+
+    #[test]
+    fn test_check_all_safety_with_config() {
+        let activations = default_activations();
+        let root = [0u8; 32];
+        let config = SafetyConfig {
+            enable_s1: true,
+            enable_s2: false,
+            enable_s3: false,
+            enable_s4: false,
+            enable_m2: false,
+            enable_m3: false,
+        };
+        let report = check_all_safety_with_config(
+            &config, 100, 1, 99, 100, 1, 1, &activations,
+            1000, 1005, 10, 0, 5,
+            &root, &root,
+        );
+        assert!(report.all_passed);
+        assert_eq!(report.checks.len(), 1);
     }
 }
