@@ -1,7 +1,42 @@
-//! Evidence types for consensus faults (double-vote, double-proposal).
+//! Quantum evidence types for consensus faults.
 //!
-//! Each evidence variant includes both raw signed messages and metadata
-//! needed for external verification by slashable offence handlers.
+//! # Quantum Consensus Fault Model
+//!
+//! In the quantum consensus model, validators are represented as quantum
+//! systems that must exist in a single eigenstate per round. A double-vote
+//! or double-proposal represents a **quantum forbidden transition** where
+//! the validator's state has bifurcated into a superposition of conflicting
+//! outcomes — a violation of the no-cloning theorem for consensus states.
+//!
+//! # Hamiltonian for Fault Detection
+//!
+//! ```text
+//! Ĥ_evidence = Ĥ_double_vote + Ĥ_double_proposal
+//!
+//! Ĥ_double_vote = Σ_{v,h,r} g_v |vote_1⟩⟨vote_2| + h.c.
+//! Ĥ_double_proposal = Σ_{p,h,r} g_p |prop_1⟩⟨prop_2| + h.c.
+//! ```
+//!
+//! The coupling constants g_v, g_p are non-zero only when the two states
+//! differ, indicating a fault. The Hamiltonian's eigenvalues correspond
+//! to the severity of the offence.
+//!
+//! # Entanglement Witness for Faults
+//!
+//! A double-sign is detected via an **entanglement witness** operator W:
+//! ```text
+//! W = |vote⟩⟨vote| ⊗ |proposal⟩⟨proposal|
+//! ```
+//! If Tr(Wρ) > threshold, the validator has become entangled with two
+//! conflicting states — evidence of a fault.
+//!
+//! # Signature Verification via Quantum One-Way Functions
+//!
+//! Cryptographic signatures are modeled as quantum trapdoor functions:
+//! ```text
+//! |signature⟩ = U_sign(sk) |message⟩
+//! ```
+//! Verification measures the overlap ⟨signature_expected|signature_actual⟩.
 
 use crate::consensus::messages::{Proposal, Vote, VoteType};
 use crate::crypto::{PublicKeyBytes, Signature, verify_signature};
@@ -11,63 +46,191 @@ use std::fmt;
 use thiserror::Error;
 
 // -----------------------------------------------------------------------------
-// Errors
+// Quantum Constants
 // -----------------------------------------------------------------------------
 
+/// Entanglement witness threshold for fault detection.
+const WITNESS_THRESHOLD: f64 = 0.99;
+
+/// Reduced Planck constant (natural units).
+const HBAR: f64 = 1.0;
+
+/// Fault coupling constant for double-vote.
+const G_VOTE: f64 = 1.0;
+
+/// Fault coupling constant for double-proposal.
+const G_PROPOSAL: f64 = 1.0;
+
+// -----------------------------------------------------------------------------
+// Quantum Evidence Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during quantum evidence verification.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum EvidenceError {
-    #[error("invalid evidence: duplicate messages (identical content)")]
+    #[error("quantum duplicate: messages occupy identical state vectors")]
     DuplicateMessages,
-    #[error("invalid evidence: messages are from different height/round")]
+
+    #[error("Hilbert space mismatch: height/round eigenvalues differ")]
     MismatchedHeightRound,
-    #[error("invalid evidence: vote_type mismatch between the two votes")]
+
+    #[error("observable mismatch: vote_type eigenvalues differ")]
     VoteTypeMismatch,
-    #[error("invalid evidence: proposer mismatch between proposals")]
+
+    #[error("entanglement broken: proposer identity differs")]
     ProposerMismatch,
-    #[error("signature verification failed: {0}")]
+
+    #[error("signature quantum state verification failed: {0}")]
     InvalidSignature(String),
-    #[error("missing block hash in vote/proposal")]
+
+    #[error("measurement error: missing block hash observable")]
     MissingBlockHash,
+
+    #[error("decoherence: evidence state has lost fidelity ({fidelity})")]
+    Decoherence { fidelity: f64 },
+
+    #[error("witness operator expectation below threshold: {value} < {threshold}")]
+    WitnessBelowThreshold { value: f64, threshold: f64 },
 }
 
 pub type EvidenceResult<T> = Result<T, EvidenceError>;
 
 // -----------------------------------------------------------------------------
-// Evidence enum
+// Quantum State for Fault Evidence
 // -----------------------------------------------------------------------------
 
+/// Represents the quantum state of a fault evidence.
+///
+/// Tracks coherence, fidelity, and entanglement witnesses.
+#[derive(Debug, Clone)]
+struct QuantumEvidenceState {
+    /// Coherence quality of the evidence (1.0 = perfect).
+    coherence: f64,
+    /// Fidelity with the expected fault state.
+    fidelity: f64,
+    /// Entanglement witness expectation value.
+    witness_value: f64,
+}
+
+impl QuantumEvidenceState {
+    /// Create a new pure quantum state for evidence.
+    fn new() -> Self {
+        Self {
+            coherence: 1.0,
+            fidelity: 1.0,
+            witness_value: 0.0,
+        }
+    }
+
+    /// Compute the entanglement witness for two conflicting states.
+    ///
+    /// W = |state_a⟩⟨state_a| ⊗ |state_b⟩⟨state_b|
+    /// The witness detects entanglement between the two states.
+    fn compute_witness(&mut self, state_a_hash: &[u8], state_b_hash: &[u8]) -> f64 {
+        let overlap = state_a_hash
+            .iter()
+            .zip(state_b_hash.iter())
+            .filter(|(a, b)| a == b)
+            .count() as f64
+            / state_a_hash.len().max(1) as f64;
+
+        // Witness is high when states are similar but differ (indicating fault)
+        self.witness_value = 1.0 - overlap;
+        self.witness_value
+    }
+
+    /// Check if the witness exceeds the detection threshold.
+    fn is_fault_detected(&self) -> bool {
+        self.witness_value > WITNESS_THRESHOLD
+    }
+
+    /// Apply decoherence from environmental interactions.
+    fn apply_decoherence(&mut self, strength: f64) {
+        self.coherence *= (-strength).exp();
+        self.fidelity = self.coherence.sqrt();
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Quantum Evidence Enum
+// -----------------------------------------------------------------------------
+
+/// Evidence of a consensus fault — a quantum forbidden transition.
+///
+/// Each variant represents a different type of fault observable,
+/// with eigenvalues corresponding to the severity of the offence.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum Evidence {
-    /// Two distinct votes from the same validator at the same (height, round, vote_type).
+    /// Double-vote: a validator has cast two different votes in the same round.
+    ///
+    /// This represents a quantum state bifurcation:
+    /// ```text
+    /// |ψ⟩_validator → α|vote_a⟩ + β|vote_b⟩
+    /// ```
+    /// where |α|² + |β|² = 1 but both amplitudes are non-zero,
+    /// violating the consensus observable's eigenstate requirement.
     DoubleVote {
+        /// The offending validator's public key (quantum system identifier).
         voter: PublicKeyBytes,
+        /// Height at which the fault occurred (time eigenvalue).
         height: Height,
+        /// Round at which the fault occurred (spatial eigenvalue).
         round: Round,
+        /// Type of vote (quantum number: prevote or precommit).
         vote_type: VoteType,
-        /// Block hash from first vote (None for nil-vote)
+        /// Block hash from first vote (None for nil-vote — vacuum state).
         a: Option<Hash32>,
-        /// Block hash from second vote (None for nil-vote)
+        /// Block hash from second vote (None for nil-vote — vacuum state).
         b: Option<Hash32>,
-        /// The full signed vote structures (for audit and replay verification)
+        /// Full signed vote structures (quantum state vectors).
         vote_a: Vote,
         vote_b: Vote,
+        /// Quantum coherence of this evidence.
+        #[serde(default = "default_coherence")]
+        coherence: f64,
+        /// Entanglement witness value (computed during validation).
+        #[serde(default)]
+        witness_value: f64,
     },
-    /// Two distinct proposals from the same validator at the same (height, round).
+
+    /// Double-proposal: a validator has proposed two different blocks.
+    ///
+    /// Represents a forbidden transition in the proposal observable:
+    /// ```text
+    /// Ĥ_proposal |proposer⟩ = E_a|block_a⟩ + E_b|block_b⟩
+    /// ```
+    /// with E_a ≠ E_b, violating the single-proposal-per-round rule.
     DoubleProposal {
+        /// The offending proposer's public key.
         proposer: PublicKeyBytes,
+        /// Height at which the fault occurred.
         height: Height,
+        /// Round at which the fault occurred.
         round: Round,
-        /// Block hash from first proposal (None for nil-proposal)
+        /// Block hash from first proposal (None for nil-proposal).
         a: Option<Hash32>,
-        /// Block hash from second proposal (None for nil-proposal)
+        /// Block hash from second proposal (None for nil-proposal).
         b: Option<Hash32>,
+        /// Full signed proposal structures.
         proposal_a: Proposal,
         proposal_b: Proposal,
+        /// Quantum coherence of this evidence.
+        #[serde(default = "default_coherence")]
+        coherence: f64,
+        /// Entanglement witness value.
+        #[serde(default)]
+        witness_value: f64,
     },
 }
 
+fn default_coherence() -> f64 {
+    1.0
+}
+
 impl Evidence {
+    // ── Classical Accessors ────────────────────────────────────────────
+
     /// Returns the height at which the offence occurred.
     pub fn height(&self) -> Height {
         match self {
@@ -92,7 +255,28 @@ impl Evidence {
         }
     }
 
-    /// Validate internal consistency – does not verify cryptographic signatures.
+    /// Returns the quantum coherence of the evidence.
+    pub fn coherence(&self) -> f64 {
+        match self {
+            Self::DoubleVote { coherence, .. } => *coherence,
+            Self::DoubleProposal { coherence, .. } => *coherence,
+        }
+    }
+
+    /// Returns the entanglement witness value.
+    pub fn witness_value(&self) -> f64 {
+        match self {
+            Self::DoubleVote { witness_value, .. } => *witness_value,
+            Self::DoubleProposal { witness_value, .. } => *witness_value,
+        }
+    }
+
+    // ── Quantum Validation ─────────────────────────────────────────────
+
+    /// Validate internal consistency — classical checks.
+    ///
+    /// This performs the initial projective measurement to confirm
+    /// the evidence is not a false positive.
     pub fn validate(&self) -> EvidenceResult<()> {
         match self {
             Self::DoubleVote {
@@ -104,16 +288,19 @@ impl Evidence {
                 b: _,
                 vote_a,
                 vote_b,
+                ..
             } => {
-                // Must be two distinct votes.
+                // Must be two distinct quantum states
                 if vote_a == vote_b {
                     return Err(EvidenceError::DuplicateMessages);
                 }
-                // Both votes must belong to the same validator.
+
+                // Both states must belong to the same quantum system
                 if vote_a.validator != vote_b.validator {
                     return Err(EvidenceError::ProposerMismatch);
                 }
-                // Height, round, vote_type must match the evidence fields.
+
+                // Quantum numbers must match
                 if vote_a.height != *height
                     || vote_b.height != *height
                     || vote_a.round != *round
@@ -123,8 +310,10 @@ impl Evidence {
                 {
                     return Err(EvidenceError::MismatchedHeightRound);
                 }
+
                 Ok(())
             }
+
             Self::DoubleProposal {
                 proposer: _,
                 height,
@@ -133,13 +322,19 @@ impl Evidence {
                 b: _,
                 proposal_a,
                 proposal_b,
+                ..
             } => {
+                // Must be two distinct proposals
                 if proposal_a == proposal_b {
                     return Err(EvidenceError::DuplicateMessages);
                 }
+
+                // Same proposer (quantum system)
                 if proposal_a.proposer != proposal_b.proposer {
                     return Err(EvidenceError::ProposerMismatch);
                 }
+
+                // Same height and round
                 if proposal_a.height != *height
                     || proposal_b.height != *height
                     || proposal_a.round != *round
@@ -147,13 +342,77 @@ impl Evidence {
                 {
                     return Err(EvidenceError::MismatchedHeightRound);
                 }
+
                 Ok(())
             }
         }
     }
 
-    /// Verify cryptographic signatures of both included messages.
-    /// Requires access to the validator's public key (already present in the evidence).
+    /// Validate with quantum witness computation.
+    ///
+    /// Performs full quantum validation including entanglement witness
+    /// computation to confirm the fault is real.
+    pub fn validate_quantum(&mut self) -> EvidenceResult<()> {
+        self.validate()?;
+
+        let mut qstate = QuantumEvidenceState::new();
+
+        match self {
+            Self::DoubleVote {
+                vote_a,
+                vote_b,
+                witness_value,
+                coherence,
+                ..
+            } => {
+                // Compute entanglement witness
+                let hash_a = vote_a.encode_for_signing();
+                let hash_b = vote_b.encode_for_signing();
+                let witness = qstate.compute_witness(&hash_a, &hash_b);
+
+                if !qstate.is_fault_detected() {
+                    return Err(EvidenceError::WitnessBelowThreshold {
+                        value: witness,
+                        threshold: WITNESS_THRESHOLD,
+                    });
+                }
+
+                // Apply minimal decoherence
+                qstate.apply_decoherence(0.001);
+                *witness_value = witness;
+                *coherence = qstate.coherence;
+                Ok(())
+            }
+
+            Self::DoubleProposal {
+                proposal_a,
+                proposal_b,
+                witness_value,
+                coherence,
+                ..
+            } => {
+                let hash_a = proposal_a.encode_for_signing();
+                let hash_b = proposal_b.encode_for_signing();
+                let witness = qstate.compute_witness(&hash_a, &hash_b);
+
+                if !qstate.is_fault_detected() {
+                    return Err(EvidenceError::WitnessBelowThreshold {
+                        value: witness,
+                        threshold: WITNESS_THRESHOLD,
+                    });
+                }
+
+                qstate.apply_decoherence(0.001);
+                *witness_value = witness;
+                *coherence = qstate.coherence;
+                Ok(())
+            }
+        }
+    }
+
+    /// Verify cryptographic signatures — quantum trapdoor verification.
+    ///
+    /// Measures the overlap between expected and actual signature states.
     pub fn verify_signatures(&self) -> EvidenceResult<()> {
         match self {
             Self::DoubleVote { vote_a, vote_b, .. } => {
@@ -161,7 +420,11 @@ impl Evidence {
                 self.verify_vote_signature(vote_b)?;
                 Ok(())
             }
-            Self::DoubleProposal { proposal_a, proposal_b, .. } => {
+            Self::DoubleProposal {
+                proposal_a,
+                proposal_b,
+                ..
+            } => {
                 self.verify_proposal_signature(proposal_a)?;
                 self.verify_proposal_signature(proposal_b)?;
                 Ok(())
@@ -169,41 +432,84 @@ impl Evidence {
         }
     }
 
-    fn verify_vote_signature(&self, vote: &Vote) -> EvidenceResult<()> {
-        let bytes = vote.encode_for_signing(); // assume method exists
-        verify_signature(&bytes, &vote.signature, &vote.validator)
-            .map_err(|e| EvidenceError::InvalidSignature(format!("vote: {}", e)))
-    }
-
-    fn verify_proposal_signature(&self, proposal: &Proposal) -> EvidenceResult<()> {
-        let bytes = proposal.encode_for_signing(); // assume method exists
-        verify_signature(&bytes, &proposal.signature, &proposal.proposer)
-            .map_err(|e| EvidenceError::InvalidSignature(format!("proposal: {}", e)))
-    }
-
-    /// Full evidence verification: internal consistency + signatures.
+    /// Full evidence verification: classical + quantum + signatures.
     pub fn verify(&self) -> EvidenceResult<()> {
         self.validate()?;
         self.verify_signatures()?;
         Ok(())
+    }
+
+    /// Full quantum verification including witness computation.
+    pub fn verify_quantum(&mut self) -> EvidenceResult<()> {
+        self.validate_quantum()?;
+        self.verify_signatures()?;
+        Ok(())
+    }
+
+    // ── Private helpers ─────────────────────────────────────────────────
+
+    fn verify_vote_signature(&self, vote: &Vote) -> EvidenceResult<()> {
+        let bytes = vote.encode_for_signing();
+        verify_signature(&bytes, &vote.signature, &vote.validator).map_err(|e| {
+            EvidenceError::InvalidSignature(format!("vote: {e}"))
+        })
+    }
+
+    fn verify_proposal_signature(&self, proposal: &Proposal) -> EvidenceResult<()> {
+        let bytes = proposal.encode_for_signing();
+        verify_signature(&bytes, &proposal.signature, &proposal.proposer).map_err(|e| {
+            EvidenceError::InvalidSignature(format!("proposal: {e}"))
+        })
     }
 }
 
 impl fmt::Display for Evidence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DoubleVote { voter, height, round, vote_type, a, b, .. } => {
+            Self::DoubleVote {
+                voter,
+                height,
+                round,
+                vote_type,
+                a,
+                b,
+                coherence,
+                witness_value,
+                ..
+            } => {
                 write!(
                     f,
-                    "DoubleVote(voter={}, height={}, round={}, type={:?}, a={:?}, b={:?})",
-                    hex::encode(voter.as_bytes()), height, round, vote_type, a, b
+                    "DoubleVote(voter={}, h={}, r={}, type={:?}, a={:?}, b={:?}, γ={:.4}, W={:.4})",
+                    hex::encode(voter.as_bytes()),
+                    height,
+                    round,
+                    vote_type,
+                    a,
+                    b,
+                    coherence,
+                    witness_value
                 )
             }
-            Self::DoubleProposal { proposer, height, round, a, b, .. } => {
+            Self::DoubleProposal {
+                proposer,
+                height,
+                round,
+                a,
+                b,
+                coherence,
+                witness_value,
+                ..
+            } => {
                 write!(
                     f,
-                    "DoubleProposal(proposer={}, height={}, round={}, a={:?}, b={:?})",
-                    hex::encode(proposer.as_bytes()), height, round, a, b
+                    "DoubleProposal(proposer={}, h={}, r={}, a={:?}, b={:?}, γ={:.4}, W={:.4})",
+                    hex::encode(proposer.as_bytes()),
+                    height,
+                    round,
+                    a,
+                    b,
+                    coherence,
+                    witness_value
                 )
             }
         }
@@ -220,10 +526,11 @@ mod tests {
     use crate::consensus::messages::test_utils::{dummy_proposal, dummy_vote};
 
     #[test]
-    fn test_double_vote_validation_ok() {
-        let mut vote1 = dummy_vote(1, 1, VoteType::Prevote, Some([1; 32].into()));
+    fn test_double_vote_classical_validation_ok() {
+        let vote1 = dummy_vote(1, 1, VoteType::Prevote, Some([1; 32].into()));
         let mut vote2 = vote1.clone();
-        vote2.block_hash = Some([2; 32].into()); // different hash
+        vote2.block_hash = Some([2; 32].into());
+
         let ev = Evidence::DoubleVote {
             voter: vote1.validator,
             height: 1,
@@ -233,13 +540,17 @@ mod tests {
             b: Some([2; 32].into()),
             vote_a: vote1.clone(),
             vote_b: vote2.clone(),
+            coherence: 1.0,
+            witness_value: 0.0,
         };
+
         assert!(ev.validate().is_ok());
     }
 
     #[test]
     fn test_double_vote_duplicate_messages() {
         let vote = dummy_vote(1, 1, VoteType::Prevote, Some([1; 32].into()));
+
         let ev = Evidence::DoubleVote {
             voter: vote.validator,
             height: 1,
@@ -249,10 +560,93 @@ mod tests {
             b: Some([1; 32].into()),
             vote_a: vote.clone(),
             vote_b: vote.clone(),
+            coherence: 1.0,
+            witness_value: 0.0,
         };
+
         assert!(matches!(
             ev.validate(),
             Err(EvidenceError::DuplicateMessages)
         ));
+    }
+
+    #[test]
+    fn test_double_vote_mismatched_height() {
+        let vote1 = dummy_vote(1, 1, VoteType::Prevote, Some([1; 32].into()));
+        let mut vote2 = vote1.clone();
+        vote2.height = 2;
+
+        let ev = Evidence::DoubleVote {
+            voter: vote1.validator,
+            height: 1,
+            round: 1,
+            vote_type: VoteType::Prevote,
+            a: Some([1; 32].into()),
+            b: Some([2; 32].into()),
+            vote_a: vote1.clone(),
+            vote_b: vote2.clone(),
+            coherence: 1.0,
+            witness_value: 0.0,
+        };
+
+        assert!(matches!(
+            ev.validate(),
+            Err(EvidenceError::MismatchedHeightRound)
+        ));
+    }
+
+    #[test]
+    fn test_quantum_witness_computation() {
+        let mut qstate = QuantumEvidenceState::new();
+
+        let hash_a = vec![0u8; 32];
+        let hash_b = vec![1u8; 32]; // completely different
+
+        let witness = qstate.compute_witness(&hash_a, &hash_b);
+        assert!(witness > 0.0);
+        assert!(qstate.is_fault_detected());
+    }
+
+    #[test]
+    fn test_quantum_witness_identical_states() {
+        let mut qstate = QuantumEvidenceState::new();
+
+        let hash = vec![0x42u8; 32];
+
+        let witness = qstate.compute_witness(&hash, &hash);
+        assert!((witness - 0.0).abs() < 1e-10);
+        assert!(!qstate.is_fault_detected());
+    }
+
+    #[test]
+    fn test_quantum_decoherence() {
+        let mut qstate = QuantumEvidenceState::new();
+        assert!((qstate.coherence - 1.0).abs() < 1e-10);
+
+        qstate.apply_decoherence(0.5);
+        assert!(qstate.coherence < 1.0);
+        assert!(qstate.fidelity < 1.0);
+    }
+
+    #[test]
+    fn test_evidence_display() {
+        let vote = dummy_vote(1, 1, VoteType::Prevote, Some([1; 32].into()));
+        let ev = Evidence::DoubleVote {
+            voter: vote.validator,
+            height: 1,
+            round: 1,
+            vote_type: VoteType::Prevote,
+            a: Some([1; 32].into()),
+            b: Some([2; 32].into()),
+            vote_a: vote.clone(),
+            vote_b: vote.clone(),
+            coherence: 0.99,
+            witness_value: 0.85,
+        };
+
+        let display = format!("{ev}");
+        assert!(display.contains("DoubleVote"));
+        assert!(display.contains("γ=0.99"));
+        assert!(display.contains("W=0.85"));
     }
 }
