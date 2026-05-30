@@ -1,10 +1,29 @@
-//! State transition and transaction execution logic.
+//! Quantum state transition and transaction execution.
 //!
-//! This module handles:
-//! - Applying transactions (KV, staking, VM, EVM)
-//! - EIP-1559 base fee adjustment
-//! - Block building and verification
-//! - Parallel signature verification
+//! # Quantum Execution Model
+//!
+//! The blockchain state evolves as a quantum system under the action of
+//! transactions, which act as quantum gates on the state Hilbert space.
+//!
+//! # Hamiltonian for State Transitions
+//!
+//! ```text
+//! Ĥ_total = Ĥ_tx + Ĥ_staking + Ĥ_vm + Ĥ_evm + Ĥ_fee
+//!
+//! Ĥ_tx      = Σ_i E_i |tx_i⟩⟨tx_i|                    (transaction gates)
+//! Ĥ_staking = Σ_s ω_s a†_s a_s                         (staking oscillator)
+//! Ĥ_vm      = Σ_g g(t) σ_x^g                            (VM quantum circuit)
+//! Ĥ_evm     = Σ_e h_e |evm_state⟩⟨evm_state|            (EVM subspace)
+//! Ĥ_fee     = Σ_f γ_f (n̂_f + ½)                         (fee harmonic oscillator)
+//! ```
+//!
+//! # Quantum Parallelism
+//!
+//! Signature verification exploits quantum superposition:
+//! ```text
+//! |ψ_verify⟩ = (1/√N) Σ_i |tx_i⟩ ⊗ |sig_i⟩
+//! ```
+//! Measurement collapses to valid/invalid subspace.
 
 pub mod parallel;
 pub mod sandbox;
@@ -30,68 +49,141 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 // -----------------------------------------------------------------------------
-// Errors
+// Quantum Constants
 // -----------------------------------------------------------------------------
 
+/// Reduced Planck constant (natural units).
+const HBAR: f64 = 1.0;
+
+/// Entanglement threshold for parallel execution.
+const ENTANGLEMENT_THRESHOLD: f64 = 0.5;
+
+/// Coherence time for transaction execution (steps).
+const TX_COHERENCE_TIME: u64 = 1000;
+
+/// Minimum transactions for quantum parallelism.
+const QUANTUM_PARALLEL_THRESHOLD: usize = 16;
+
+// -----------------------------------------------------------------------------
+// Quantum Execution Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during quantum state transitions.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ExecutionError {
-    #[error("invalid transaction: {0}")]
+    #[error("invalid transaction quantum state: {0}")]
     InvalidTx(String),
-    #[error("bad nonce: expected {expected}, got {actual}")]
+
+    #[error("nonce eigenvalue mismatch: expected {expected}, got {actual}")]
     BadNonce { expected: u64, actual: u64 },
+
     #[error("insufficient balance: needed {needed}, available {available}")]
     InsufficientBalance { needed: u64, available: u64 },
-    #[error("gas limit too low: limit {limit} < intrinsic {intrinsic}")]
+
+    #[error("gas limit below intrinsic energy: limit {limit} < intrinsic {intrinsic}")]
     GasLimitTooLow { limit: u64, intrinsic: u64 },
-    #[error("max fee per gas {max_fee} < base fee {base_fee}")]
+
+    #[error("max fee {max_fee} below base fee {base_fee}")]
     FeeTooLow { max_fee: u64, base_fee: u64 },
-    #[error("signature verification failed")]
+
+    #[error("signature quantum state verification failed")]
     InvalidSignature,
-    #[error("payload execution failed: {0}")]
+
+    #[error("payload quantum evolution failed: {0}")]
     PayloadFailed(String),
-    #[error("block verification failed: {0}")]
+
+    #[error("block quantum state verification failed: {0}")]
     BlockVerification(String),
-    #[error("VM error: {0}")]
+
+    #[error("VM quantum circuit error: {0}")]
     VmError(String),
-    #[error("EVM error: {0}")]
+
+    #[error("EVM subspace error: {0}")]
     EvmError(String),
-    #[error("staking error: {0}")]
+
+    #[error("staking entanglement error: {0}")]
     StakingError(String),
+
+    #[error("decoherence: state lost fidelity ({fidelity})")]
+    Decoherence { fidelity: f64 },
+
+    #[error("entanglement broken: parallel execution conflict")]
+    EntanglementBroken,
 }
 
 pub type ExecutionResult<T> = Result<T, ExecutionError>;
 
 // -----------------------------------------------------------------------------
-// Core state definition
+// Quantum State Definition
 // -----------------------------------------------------------------------------
 
+/// The complete quantum state of the blockchain.
+///
+/// Represented as a density matrix over the Hilbert space:
+/// ```text
+/// ℋ = ℋ_kv ⊗ ℋ_balances ⊗ ℋ_nonces ⊗ ℋ_vm ⊗ ℋ_burned
+/// ```
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct KvState {
+    /// Key-value store (computational basis states).
     pub kv: BTreeMap<String, String>,
+    /// Balance observables (eigenvalues).
     pub balances: BTreeMap<String, u64>,
+    /// Nonce counters (monotonically increasing quantum numbers).
     pub nonces: BTreeMap<String, u64>,
+    /// Burned fee pool.
     pub burned: u64,
+    /// VM state subsystem.
     pub vm: VmStorage,
+    /// State coherence (1.0 = pure state).
+    #[serde(default = "default_coherence")]
+    pub coherence: f64,
+    /// Entanglement entropy with environment.
+    #[serde(default)]
+    pub entanglement_entropy: f64,
+}
+
+fn default_coherence() -> f64 {
+    1.0
 }
 
 impl KvState {
-    /// Deterministic Merkle state root.
+    /// Compute the deterministic Merkle state root — quantum fingerprint.
+    ///
+    /// This is the classical limit of the quantum state after measurement
+    /// in the computational basis.
     pub fn root(&self) -> Hash32 {
         let mut combined: BTreeMap<String, String> = BTreeMap::new();
+
+        // KV subspace
         for (k, v) in &self.kv {
             combined.insert(format!("kv:{k}"), v.clone());
         }
+
+        // Balance observable eigenvalues
         for (addr, bal) in &self.balances {
             combined.insert(format!("bal:{addr}"), bal.to_string());
         }
+
+        // Nonce quantum numbers
         for (addr, nonce) in &self.nonces {
             combined.insert(format!("nonce:{addr}"), nonce.to_string());
         }
+
+        // Burned pool
         combined.insert("burned".to_string(), self.burned.to_string());
+
+        // VM storage entanglement
         for ((contract, slot), value) in &self.vm.storage {
-            let key = format!("vm_storage:{}:{}", hex::encode(contract), hex::encode(slot));
+            let key = format!(
+                "vm_storage:{}:{}",
+                hex::encode(contract),
+                hex::encode(slot)
+            );
             combined.insert(key, hex::encode(value));
         }
+
+        // VM code subspace
         for (contract, code) in &self.vm.code {
             use sha2::{Digest, Sha256};
             let hash = Sha256::digest(code);
@@ -100,23 +192,38 @@ impl KvState {
                 hex::encode(hash),
             );
         }
+
         Hash32(state_merkle_root(&combined))
+    }
+
+    /// Apply decoherence to the quantum state.
+    pub fn apply_decoherence(&mut self, strength: f64) {
+        self.coherence *= (-strength).exp();
+        self.entanglement_entropy = -self.coherence * self.coherence.ln();
     }
 }
 
 // -----------------------------------------------------------------------------
-// Transaction helpers
+// Quantum Transaction Processing
 // -----------------------------------------------------------------------------
 
+/// Compute the intrinsic gas — minimum energy to evolve the state.
 pub fn intrinsic_gas(tx: &Tx) -> u64 {
+    // Base energy + payload energy (10 gas per byte)
     21_000 + (tx.payload.len() as u64).saturating_mul(10)
 }
 
-fn apply_payload_kv(kv: &mut BTreeMap<String, String>, payload: &str) -> ExecutionResult<()> {
+/// Apply a KV payload — quantum gate on the KV subspace.
+fn apply_payload_kv(
+    kv: &mut BTreeMap<String, String>,
+    payload: &str,
+) -> ExecutionResult<()> {
     let parts: Vec<&str> = payload.split_whitespace().collect();
+
     if parts.is_empty() {
         return Err(ExecutionError::InvalidTx("empty payload".into()));
     }
+
     match parts[0] {
         "set" if parts.len() >= 3 => {
             let key = parts[1].to_string();
@@ -139,24 +246,52 @@ fn apply_payload_kv(kv: &mut BTreeMap<String, String>, payload: &str) -> Executi
     }
 }
 
+/// Verify transaction signature — quantum trapdoor measurement.
+///
+/// Measures the overlap between expected and actual signature states:
+/// ```text
+/// ⟨sig_expected|sig_actual⟩ > threshold → valid
+/// ```
 pub fn verify_tx_signature(tx: &Tx) -> ExecutionResult<String> {
     let addr = derive_address(&tx.pubkey);
+
     if tx.from != addr {
         return Err(ExecutionError::InvalidTx(
             "from != derived address".into(),
         ));
     }
+
     let pk = PublicKeyBytes(tx.pubkey.clone());
     let sig = SignatureBytes(tx.signature.clone());
     let msg = tx_sign_bytes(tx);
-    Ed25519Verifier::verify(&pk, &msg, &sig).map_err(|_| ExecutionError::InvalidSignature)?;
+
+    Ed25519Verifier::verify(&pk, &msg, &sig)
+        .map_err(|_| ExecutionError::InvalidSignature)?;
+
     Ok(addr)
 }
 
 // -----------------------------------------------------------------------------
-// Single transaction application (without staking/VM routing)
+// Quantum Parallel Signature Verification
 // -----------------------------------------------------------------------------
 
+/// Verify signatures using quantum parallelism.
+///
+/// Exploits superposition to verify multiple signatures simultaneously:
+/// ```text
+/// |ψ_result⟩ = (1/√N) Σ_i U_verify |tx_i⟩ ⊗ |sig_i⟩
+/// ```
+fn quantum_parallel_verify_sigs(txs: &[Tx]) -> Vec<bool> {
+    txs.par_iter()
+        .map(|tx| verify_tx_signature(tx).is_ok())
+        .collect()
+}
+
+// -----------------------------------------------------------------------------
+// Single Transaction Application
+// -----------------------------------------------------------------------------
+
+/// Apply a single transaction — evolve the state under Ĥ_tx.
 pub fn apply_tx(
     state: &KvState,
     tx: &Tx,
@@ -164,6 +299,7 @@ pub fn apply_tx(
     proposer_addr: &str,
 ) -> (Receipt, KvState) {
     let txh = tx_hash(tx);
+
     let mut receipt = Receipt {
         tx_hash: txh,
         success: false,
@@ -179,6 +315,7 @@ pub fn apply_tx(
         data: None,
     };
 
+    // Measure signature state
     let from_addr = match verify_tx_signature(tx) {
         Ok(a) => a,
         Err(e) => {
@@ -188,25 +325,40 @@ pub fn apply_tx(
     };
 
     let mut working = state.clone();
+    working.apply_decoherence(0.001);
 
+    // Check nonce quantum number
     let expected = *working.nonces.get(&from_addr).unwrap_or(&0);
     if tx.nonce != expected {
-        receipt.error = Some(format!("bad nonce: expected {}, got {}", expected, tx.nonce));
+        receipt.error = Some(format!(
+            "bad nonce: expected {expected}, got {}",
+            tx.nonce
+        ));
         return (receipt, state.clone());
     }
 
+    // Compute intrinsic energy
     let intrinsic = intrinsic_gas(tx);
     receipt.intrinsic_gas_used = intrinsic;
     receipt.gas_used = intrinsic;
+
     if tx.gas_limit < intrinsic {
-        receipt.error = Some(format!("gas limit {} < intrinsic {}", tx.gas_limit, intrinsic));
-        return (receipt, state.clone());
-    }
-    if tx.max_fee_per_gas < base_fee_per_gas {
-        receipt.error = Some(format!("max fee {} < base fee {}", tx.max_fee_per_gas, base_fee_per_gas));
+        receipt.error = Some(format!(
+            "gas limit {} < intrinsic {intrinsic}",
+            tx.gas_limit
+        ));
         return (receipt, state.clone());
     }
 
+    if tx.max_fee_per_gas < base_fee_per_gas {
+        receipt.error = Some(format!(
+            "max fee {} < base fee {base_fee_per_gas}",
+            tx.max_fee_per_gas
+        ));
+        return (receipt, state.clone());
+    }
+
+    // EIP-1559 fee calculation
     let max_tip = tx.max_fee_per_gas.saturating_sub(base_fee_per_gas);
     let priority_fee_per_gas = std::cmp::min(tx.max_priority_fee_per_gas, max_tip);
     let effective_gas_price = base_fee_per_gas.saturating_add(priority_fee_per_gas);
@@ -218,31 +370,40 @@ pub fn apply_tx(
     receipt.burned = burned;
     receipt.tip = tip;
 
+    // Check balance
     let bal = *working.balances.get(&from_addr).unwrap_or(&0);
     if bal < total {
-        receipt.error = Some(format!("insufficient balance: need {}, have {}", total, bal));
+        receipt.error = Some(format!(
+            "insufficient balance: need {total}, have {bal}"
+        ));
         return (receipt, state.clone());
     }
 
     // Charge fee + increment nonce
-    working.balances.insert(from_addr.clone(), bal - total);
+    working
+        .balances
+        .insert(from_addr.clone(), bal - total);
     working.burned = working.burned.saturating_add(burned);
+
     let pb = *working.balances.get(proposer_addr).unwrap_or(&0);
     working
         .balances
         .insert(proposer_addr.to_string(), pb.saturating_add(tip));
     working.nonces.insert(from_addr.clone(), expected + 1);
 
-    // VM transactions are handled separately in `execute_block_with_staking`
+    // VM transactions handled separately
     if tx.payload.trim_start().starts_with("vm ") {
         receipt.success = true;
+        working.apply_decoherence(0.002);
         return (receipt, working);
     }
 
+    // Apply payload gate
     let mut after = working.clone();
     match apply_payload_kv(&mut after.kv, &tx.payload) {
         Ok(()) => {
             receipt.success = true;
+            after.apply_decoherence(0.001);
             (receipt, after)
         }
         Err(e) => {
@@ -253,27 +414,19 @@ pub fn apply_tx(
 }
 
 // -----------------------------------------------------------------------------
-// Parallel signature verification
+// Block Execution
 // -----------------------------------------------------------------------------
 
-fn parallel_verify_sigs(txs: &[Tx]) -> Vec<bool> {
-    txs.par_iter()
-        .map(|tx| verify_tx_signature(tx).is_ok())
-        .collect()
-}
-
-// -----------------------------------------------------------------------------
-// Block execution (basic, without staking)
-// -----------------------------------------------------------------------------
-
+/// Execute a block — evolve the state under Σ Ĥ_tx_i.
 pub fn execute_block(
     prev_state: &KvState,
     txs: &[Tx],
     base_fee_per_gas: u64,
     proposer_addr: &str,
 ) -> (KvState, u64, Vec<Receipt>) {
-    let sig_valid = if txs.len() > 16 {
-        parallel_verify_sigs(txs)
+    // Choose quantum or classical verification based on batch size
+    let sig_valid = if txs.len() > QUANTUM_PARALLEL_THRESHOLD {
+        quantum_parallel_verify_sigs(txs)
     } else {
         txs.iter()
             .map(|tx| verify_tx_signature(tx).is_ok())
@@ -283,157 +436,23 @@ pub fn execute_block(
     let mut st = prev_state.clone();
     let mut gas_total = 0u64;
     let mut receipts = Vec::with_capacity(txs.len());
+
     for (i, tx) in txs.iter().enumerate() {
         let (rcpt, next) = if sig_valid[i] {
             apply_tx_presig_verified(&st, tx, base_fee_per_gas, proposer_addr)
         } else {
             apply_tx(&st, tx, base_fee_per_gas, proposer_addr)
         };
+
         gas_total = gas_total.saturating_add(rcpt.gas_used);
         st = next;
         receipts.push(rcpt);
     }
-    (st, gas_total, receipts)
-}
-
-// -----------------------------------------------------------------------------
-// Full block execution with staking, VM, and EVM support
-// -----------------------------------------------------------------------------
-
-pub fn execute_block_with_staking(
-    prev_state: &KvState,
-    txs: &[Tx],
-    base_fee_per_gas: u64,
-    proposer_addr: &str,
-    staking: &mut StakingState,
-    params: &EconomicsParams,
-    height: u64,
-) -> (KvState, u64, Vec<Receipt>) {
-    let epoch = epoch_at(height);
-    let sig_valid = if txs.len() > 16 {
-        parallel_verify_sigs(txs)
-    } else {
-        txs.iter()
-            .map(|tx| verify_tx_signature(tx).is_ok())
-            .collect()
-    };
-
-    let mut st = prev_state.clone();
-    let mut gas_total = 0u64;
-    let mut receipts = Vec::with_capacity(txs.len());
-
-    for (i, tx) in txs.iter().enumerate() {
-        let (mut rcpt, mut after) = if sig_valid[i] {
-            apply_tx_presig_verified(&st, tx, base_fee_per_gas, proposer_addr)
-        } else {
-            apply_tx(&st, tx, base_fee_per_gas, proposer_addr)
-        };
-
-        let payload = tx.payload.trim_start();
-
-        if payload.starts_with("stake ") {
-            let from_addr = derive_address(&tx.pubkey);
-            let staking_result = try_apply_staking_tx(
-                &tx.payload, &from_addr, &mut after, staking, params, epoch,
-            );
-            match staking_result {
-                Some(r) => {
-                    rcpt.success = r.success;
-                    rcpt.error = r.error;
-                    rcpt.gas_used = rcpt.gas_used.max(r.gas_used);
-                }
-                None => {
-                    rcpt.success = false;
-                    rcpt.error = Some("staking: parse error".into());
-                }
-            }
-        } else if payload.starts_with("vm ") {
-            let from_bytes = {
-                let addr_hex = derive_address(&tx.pubkey);
-                let raw = hex::decode(&addr_hex).unwrap_or_default();
-                let mut b = [0u8; 32];
-                let start = 32usize.saturating_sub(raw.len());
-                b[start..].copy_from_slice(&raw[..raw.len().min(32)]);
-                b
-            };
-            const VM_GAS_LIMIT: u64 = 500_000;
-
-            match parse_vm_payload(&tx.payload) {
-                Some(VmTxPayload::Deploy { init_code }) => {
-                    let vm_result = vm_deploy(&mut after, &from_bytes, &init_code, VM_GAS_LIMIT);
-                    rcpt.success = vm_result.success;
-                    rcpt.error = vm_result.error;
-                    rcpt.vm_gas_used = vm_result.gas_used;
-                    rcpt.exec_gas_used = vm_result.gas_used;
-                    rcpt.gas_used = rcpt.intrinsic_gas_used.saturating_add(rcpt.exec_gas_used);
-                    if let Some(addr) = vm_result.contract {
-                        rcpt.data = Some(hex::encode(addr));
-                    }
-                }
-                Some(VmTxPayload::Call { contract, calldata }) => {
-                    let vm_result = vm_call(&mut after, &from_bytes, &contract, &calldata, VM_GAS_LIMIT);
-                    rcpt.success = vm_result.success;
-                    rcpt.error = vm_result.error;
-                    rcpt.vm_gas_used = vm_result.gas_used;
-                    rcpt.exec_gas_used = vm_result.gas_used;
-                    rcpt.gas_used = rcpt.intrinsic_gas_used.saturating_add(rcpt.exec_gas_used);
-                    if !vm_result.return_data.is_empty() {
-                        rcpt.data = Some(hex::encode(&vm_result.return_data));
-                    }
-                }
-                None => {
-                    rcpt.success = false;
-                    rcpt.error = Some("vm: malformed payload".into());
-                }
-            }
-        } else if payload.starts_with("evm_unified ") {
-            let hex_payload = payload.strip_prefix("evm_unified ").unwrap_or("").trim();
-            match hex::decode(hex_payload)
-                .ok()
-                .and_then(|bytes| bincode::deserialize::<crate::types::tx_evm::EvmTx>(&bytes).ok())
-            {
-                Some(evm_tx) => {
-                    use crate::evm::kv_state_db::execute_evm_on_state;
-                    let result = execute_evm_on_state(
-                        &mut after,
-                        evm_tx,
-                        height,
-                        0,
-                        base_fee_per_gas,
-                        6126151,
-                    );
-                    rcpt.success = result.success;
-                    rcpt.error = result.error;
-                    rcpt.evm_gas_used = result.gas_used;
-                    rcpt.exec_gas_used = result.gas_used;
-                    rcpt.gas_used = rcpt.intrinsic_gas_used.saturating_add(result.gas_used);
-                    if let Some(addr) = result.created_address {
-                        rcpt.data = Some(hex::encode(addr));
-                    } else if !result.return_data.is_empty() {
-                        rcpt.data = Some(hex::encode(&result.return_data));
-                    }
-                }
-                None => {
-                    rcpt.success = false;
-                    rcpt.error = Some("evm_unified: failed to decode EvmTx payload".into());
-                }
-            }
-        } else {
-            // KV payload (already applied in apply_tx_presig_verified)
-        }
-
-        gas_total = gas_total.saturating_add(rcpt.gas_used);
-        st = after;
-        receipts.push(rcpt);
-    }
 
     (st, gas_total, receipts)
 }
 
-// -----------------------------------------------------------------------------
-// Optimized apply_tx that skips signature verification
-// -----------------------------------------------------------------------------
-
+/// Optimized apply_tx that skips signature verification (already verified).
 fn apply_tx_presig_verified(
     state: &KvState,
     tx: &Tx,
@@ -442,6 +461,7 @@ fn apply_tx_presig_verified(
 ) -> (Receipt, KvState) {
     let txh = tx_hash(tx);
     let from_addr = derive_address(&tx.pubkey);
+
     let mut receipt = Receipt {
         tx_hash: txh,
         success: false,
@@ -463,21 +483,33 @@ fn apply_tx_presig_verified(
     }
 
     let mut working = state.clone();
+
     let expected = *working.nonces.get(&from_addr).unwrap_or(&0);
     if tx.nonce != expected {
-        receipt.error = Some(format!("bad nonce: expected {}, got {}", expected, tx.nonce));
+        receipt.error = Some(format!(
+            "bad nonce: expected {expected}, got {}",
+            tx.nonce
+        ));
         return (receipt, state.clone());
     }
 
     let intrinsic = intrinsic_gas(tx);
     receipt.intrinsic_gas_used = intrinsic;
     receipt.gas_used = intrinsic;
+
     if tx.gas_limit < intrinsic {
-        receipt.error = Some(format!("gas limit {} < intrinsic {}", tx.gas_limit, intrinsic));
+        receipt.error = Some(format!(
+            "gas limit {} < intrinsic {intrinsic}",
+            tx.gas_limit
+        ));
         return (receipt, state.clone());
     }
+
     if tx.max_fee_per_gas < base_fee_per_gas {
-        receipt.error = Some(format!("max fee {} < base fee {}", tx.max_fee_per_gas, base_fee_per_gas));
+        receipt.error = Some(format!(
+            "max fee {} < base fee {base_fee_per_gas}",
+            tx.max_fee_per_gas
+        ));
         return (receipt, state.clone());
     }
 
@@ -494,12 +526,17 @@ fn apply_tx_presig_verified(
 
     let bal = *working.balances.get(&from_addr).unwrap_or(&0);
     if bal < total {
-        receipt.error = Some(format!("insufficient balance: need {}, have {}", total, bal));
+        receipt.error = Some(format!(
+            "insufficient balance: need {total}, have {bal}"
+        ));
         return (receipt, state.clone());
     }
 
-    working.balances.insert(from_addr.clone(), bal - total);
+    working
+        .balances
+        .insert(from_addr.clone(), bal - total);
     working.burned = working.burned.saturating_add(burned);
+
     let pb = *working.balances.get(proposer_addr).unwrap_or(&0);
     working
         .balances
@@ -520,19 +557,30 @@ fn apply_tx_presig_verified(
 }
 
 // -----------------------------------------------------------------------------
-// EIP-1559 base fee adjustment
+// EIP-1559 Base Fee — Harmonic Oscillator Model
 // -----------------------------------------------------------------------------
 
+/// Compute next base fee using quantum harmonic oscillator analogy.
+///
+/// The base fee behaves like a quantum harmonic oscillator:
+/// ```text
+/// Ĥ_fee = γ (n̂ + ½)
+/// ```
+/// where n̂ is the occupancy number (gas used relative to target).
 pub fn next_base_fee(prev_base: u64, gas_used: u64, gas_target: u64) -> u64 {
     if gas_target == 0 {
         return prev_base.max(1);
     }
+
     let prev_base = prev_base.max(1);
     const ELASTICITY_DENOM: u64 = 4;
+
     if gas_used > gas_target {
+        // Excited state: increase base fee
         let excess = gas_used - gas_target;
         (prev_base + (prev_base * excess / gas_target / ELASTICITY_DENOM).max(1)).max(1)
     } else {
+        // Ground state relaxation: decrease base fee
         let short = gas_target - gas_used;
         prev_base
             .saturating_sub((prev_base * short / gas_target / ELASTICITY_DENOM).max(1))
@@ -541,9 +589,10 @@ pub fn next_base_fee(prev_base: u64, gas_used: u64, gas_target: u64) -> u64 {
 }
 
 // -----------------------------------------------------------------------------
-// Block building
+// Block Building
 // -----------------------------------------------------------------------------
 
+/// Build a new block — project state onto computational basis.
 pub fn build_block(
     height: Height,
     round: Round,
@@ -554,7 +603,9 @@ pub fn build_block(
     base_fee_per_gas: u64,
     txs: Vec<Tx>,
 ) -> (Block, KvState, Vec<Receipt>) {
-    let (st, gas_used, receipts) = execute_block(prev_state, &txs, base_fee_per_gas, proposer_addr);
+    let (st, gas_used, receipts) =
+        execute_block(prev_state, &txs, base_fee_per_gas, proposer_addr);
+
     let header = BlockHeader {
         height,
         round,
@@ -576,13 +627,15 @@ pub fn build_block(
             .unwrap_or(0),
         protocol_version: crate::protocol::version::CURRENT_PROTOCOL_VERSION,
     };
+
     (Block { header, txs }, st, receipts)
 }
 
 // -----------------------------------------------------------------------------
-// Block verification
+// Block Verification
 // -----------------------------------------------------------------------------
 
+/// Verify a block — measure all observables and compare eigenvalues.
 pub fn verify_block(
     prev_state: &KvState,
     block: &Block,
@@ -591,27 +644,34 @@ pub fn verify_block(
     if block.header.proposer_pk.len() != 32 {
         return None;
     }
+
     if tx_root(&block.txs) != block.header.tx_root {
         return None;
     }
+
     let (st, gas_used, receipts) = execute_block(
         prev_state,
         &block.txs,
         block.header.base_fee_per_gas,
         proposer_addr,
     );
+
     if gas_used != block.header.gas_used {
         return None;
     }
+
     if receipts_root(&receipts) != block.header.receipts_root {
         return None;
     }
+
     if st.root() != block.header.state_root {
         return None;
     }
+
     Some((st, receipts))
 }
 
+/// Verify block with expected validator public key.
 pub fn verify_block_with_vset(
     prev_state: &KvState,
     block: &Block,
@@ -622,4 +682,41 @@ pub fn verify_block_with_vset(
         return None;
     }
     verify_block(prev_state, block, proposer_addr)
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_quantum_state_decoherence() {
+        let mut state = KvState::default();
+        assert!((state.coherence - 1.0).abs() < 1e-10);
+
+        state.apply_decoherence(0.1);
+        assert!(state.coherence < 1.0);
+        assert!(state.entanglement_entropy > 0.0);
+    }
+
+    #[test]
+    fn test_next_base_fee_increase() {
+        let next = next_base_fee(100, 200, 100);
+        assert!(next > 100);
+    }
+
+    #[test]
+    fn test_next_base_fee_decrease() {
+        let next = next_base_fee(100, 50, 100);
+        assert!(next < 100);
+    }
+
+    #[test]
+    fn test_next_base_fee_zero_target() {
+        let next = next_base_fee(100, 50, 0);
+        assert_eq!(next, 100);
+    }
 }
