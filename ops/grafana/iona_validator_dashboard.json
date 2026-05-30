@@ -1,5 +1,5 @@
 {
-  "__comment": "IONA Validator Dashboard v1 — Grafana 8.0+",
+  "__comment": "IONA Validator Dashboard v2 — Production-Grade (Grafana 8.0+)",
   "annotations": {
     "list": [
       {
@@ -13,14 +13,50 @@
       }
     ]
   },
+  "description": "Production dashboard for IONA validator operators. Requires Prometheus datasource with IONA metrics.",
   "editable": true,
   "gnetId": null,
-  "graphTooltip": 0,
+  "graphTooltip": 1,
   "id": null,
-  "links": [],
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "doc",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": ["iona"],
+      "targetBlank": true,
+      "title": "IONA Runbooks",
+      "tooltip": "Troubleshooting guides",
+      "type": "link",
+      "url": "https://github.com/iona/iona/blob/main/ops/runbooks/"
+    },
+    {
+      "asDropdown": false,
+      "icon": "dashboard",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": ["iona", "slo"],
+      "targetBlank": true,
+      "title": "SLO Dashboard",
+      "tooltip": "Service Level Objectives",
+      "type": "link",
+      "url": "/d/iona-slos"
+    }
+  ],
   "panels": [
     {
-      "__comment": "Connected Peers (Stat Panel)",
+      "__comment": "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+      "collapsed": false,
+      "datasource": null,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "panels": [],
+      "title": "Validator Health Overview",
+      "type": "row"
+    },
+    {
+      "__comment": "Connected Peers (Stat)",
       "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
@@ -29,15 +65,16 @@
             "mode": "absolute",
             "steps": [
               { "color": "red", "value": null },
-              { "color": "yellow", "value": 5 },
-              { "color": "green", "value": 10 }
+              { "color": "orange", "value": 3 },
+              { "color": "yellow", "value": 10 },
+              { "color": "green", "value": 25 }
             ]
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
       "id": 1,
       "options": {
         "colorMode": "background",
@@ -58,7 +95,7 @@
           "expr": "iona_peer_count{instance=\"$instance\"}",
           "format": "time_series",
           "intervalFactor": 2,
-          "legendFormat": "Peer Count",
+          "legendFormat": "Peers",
           "refId": "A"
         }
       ],
@@ -66,7 +103,7 @@
       "type": "stat"
     },
     {
-      "__comment": "Consensus Height Lag (Stat Panel)",
+      "__comment": "Consensus Height Lag (Stat)",
       "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
@@ -83,7 +120,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
       "id": 2,
       "options": {
         "colorMode": "background",
@@ -121,15 +158,15 @@
             "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
-              { "color": "yellow", "value": 50 },
-              { "color": "red", "value": 100 }
+              { "color": "yellow", "value": 0.7 },
+              { "color": "red", "value": 0.9 }
             ]
           },
           "unit": "percentunit"
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
       "id": 3,
       "options": {
         "colorMode": "background",
@@ -159,7 +196,111 @@
       "type": "stat"
     },
     {
-      "__comment": "RPC Request Rate (5m average) — Time Series",
+      "__comment": "Blocks Signed (Stat — last 24h)",
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 100 },
+              { "color": "green", "value": 500 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "id": 7,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "text": {},
+        "textMode": "auto"
+      },
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "increase(iona_blocks_signed_total{instance=\"$instance\"}[24h])",
+          "format": "time_series",
+          "intervalFactor": 2,
+          "legendFormat": "Blocks Signed (24h)",
+          "refId": "A"
+        }
+      ],
+      "title": "Blocks Signed (24h)",
+      "type": "stat"
+    },
+    {
+      "__comment": "Validator Status (Text Panel)",
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "value": "1", "text": "✅ Active" },
+            { "type": "value", "value": "0", "text": "❌ Inactive" }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "unit": "string"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "id": 8,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "text": {},
+        "textMode": "auto"
+      },
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "iona_validator_active{instance=\"$instance\"}",
+          "format": "time_series",
+          "intervalFactor": 2,
+          "legendFormat": "Status",
+          "refId": "A"
+        }
+      ],
+      "title": "Validator Status",
+      "type": "stat"
+    },
+    {
+      "__comment": "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+      "collapsed": false,
+      "datasource": null,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "id": 101,
+      "panels": [],
+      "title": "RPC & Network Performance",
+      "type": "row"
+    },
+    {
+      "__comment": "RPC Request Rate (5m) — Timeseries",
       "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
@@ -167,15 +308,8 @@
           "custom": {
             "axisLabel": "Requests/sec",
             "axisPlacement": "auto",
-            "barAlignment": 0,
             "drawStyle": "line",
             "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "tooltip": false,
-              "viz": false,
-              "legend": false
-            },
             "lineInterpolation": "linear",
             "lineWidth": 1,
             "pointSize": 5,
@@ -186,17 +320,18 @@
             "thresholdsStyle": { "mode": "off" }
           },
           "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
       "id": 4,
       "options": {
         "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom"
+          "calcs": ["mean", "max"],
+          "displayMode": "table",
+          "placement": "right"
         },
         "tooltip": { "mode": "single" }
       },
@@ -210,27 +345,20 @@
           "refId": "A"
         }
       ],
-      "title": "RPC Request Rate (5m average)",
+      "title": "RPC Request Rate (5m avg)",
       "type": "timeseries"
     },
     {
-      "__comment": "RPC P99 Latency — Time Series with thresholds",
+      "__comment": "RPC P99 Latency — Timeseries",
       "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
           "custom": {
-            "axisLabel": "Latency (ms)",
+            "axisLabel": "Milliseconds",
             "axisPlacement": "auto",
-            "barAlignment": 0,
             "drawStyle": "line",
             "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "tooltip": false,
-              "viz": false,
-              "legend": false
-            },
             "lineInterpolation": "linear",
             "lineWidth": 1,
             "pointSize": 5,
@@ -238,7 +366,7 @@
             "showPoints": "auto",
             "spanNulls": true,
             "stacking": { "group": "A", "mode": "none" },
-            "thresholdsStyle": { "mode": "off" }
+            "thresholdsStyle": { "mode": "line" }
           },
           "mappings": [],
           "thresholds": {
@@ -253,11 +381,11 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
       "id": 5,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
+          "calcs": ["mean", "max", "lastNotNull"],
           "displayMode": "table",
           "placement": "right"
         },
@@ -277,7 +405,17 @@
       "type": "timeseries"
     },
     {
-      "__comment": "WAL Growth Rate (10m average) — Time Series",
+      "__comment": "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+      "collapsed": false,
+      "datasource": null,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "id": 102,
+      "panels": [],
+      "title": "Storage & System",
+      "type": "row"
+    },
+    {
+      "__comment": "WAL Growth Rate (10m) — Timeseries",
       "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
@@ -285,15 +423,8 @@
           "custom": {
             "axisLabel": "Bytes/sec",
             "axisPlacement": "auto",
-            "barAlignment": 0,
             "drawStyle": "line",
             "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "tooltip": false,
-              "viz": false,
-              "legend": false
-            },
             "lineInterpolation": "linear",
             "lineWidth": 1,
             "pointSize": 5,
@@ -301,15 +432,21 @@
             "showPoints": "auto",
             "spanNulls": true,
             "stacking": { "group": "A", "mode": "none" },
-            "thresholdsStyle": { "mode": "off" }
+            "thresholdsStyle": { "mode": "line" }
           },
           "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 10485760 }
+            ]
+          },
           "unit": "Bps"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
       "id": 6,
       "options": {
         "legend": {
@@ -329,29 +466,121 @@
           "refId": "A"
         }
       ],
-      "title": "WAL Growth Rate (10m average)",
+      "title": "WAL Growth Rate (10m avg)",
       "type": "timeseries"
+    },
+    {
+      "__comment": "Disk Usage (Stat — requires node_exporter)",
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 70 },
+              { "color": "red", "value": 90 }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 15 },
+      "id": 9,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "text": {},
+        "textMode": "auto"
+      },
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "100 - (node_filesystem_avail_bytes{mountpoint=\"/\",instance=\"$instance\"} / node_filesystem_size_bytes{mountpoint=\"/\",instance=\"$instance\"} * 100)",
+          "format": "time_series",
+          "intervalFactor": 2,
+          "legendFormat": "Disk Usage %",
+          "refId": "A"
+        }
+      ],
+      "title": "Disk Usage (Root)",
+      "type": "stat"
+    },
+    {
+      "__comment": "Memory Usage (Stat — requires node_exporter)",
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 70 },
+              { "color": "red", "value": 90 }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 15 },
+      "id": 10,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "text": {},
+        "textMode": "auto"
+      },
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "(1 - (node_memory_MemAvailable_bytes{instance=\"$instance\"} / node_memory_MemTotal_bytes{instance=\"$instance\"})) * 100",
+          "format": "time_series",
+          "intervalFactor": 2,
+          "legendFormat": "Memory Usage %",
+          "refId": "A"
+        }
+      ],
+      "title": "Memory Usage",
+      "type": "stat"
     }
   ],
   "refresh": "30s",
   "schemaVersion": 16,
   "style": "dark",
-  "tags": ["iona", "validator", "blockchain"],
+  "tags": ["iona", "validator", "blockchain", "production"],
   "templating": {
     "list": [
       {
         "allValue": null,
         "current": {
-          "selected": false,
-          "text": "localhost:9090",
-          "value": "localhost:9090"
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
         },
         "datasource": "Prometheus",
         "definition": "label_values(iona_peer_count, instance)",
-        "description": null,
+        "description": "Select the IONA validator instance to monitor",
         "error": null,
         "hide": 0,
-        "includeAll": false,
+        "includeAll": true,
         "label": "Instance",
         "multi": false,
         "name": "instance",
@@ -363,7 +592,7 @@
         "refresh": 1,
         "regex": "",
         "skipUrlSync": false,
-        "sort": 0,
+        "sort": 1,
         "tagValuesQuery": "",
         "tags": [],
         "tagsQuery": "",
@@ -376,9 +605,11 @@
     "from": "now-1h",
     "to": "now"
   },
-  "timepicker": {},
-  "timezone": "",
+  "timepicker": {
+    "refresh_intervals": ["10s", "30s", "1m", "5m", "15m", "30m", "1h"]
+  },
+  "timezone": "utc",
   "title": "IONA Validator Dashboard",
-  "uid": "iona-validator-v1",
-  "version": 1
+  "uid": "iona-validator-v2",
+  "version": 2
 }
