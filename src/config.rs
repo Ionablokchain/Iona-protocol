@@ -1,18 +1,32 @@
-//! TOML configuration file support for IONA v24.
+//! Quantum configuration system for IONA v28.
 //!
-//! Config file is loaded from --config path (default: ./config.toml).
-//! CLI flags override config file values.
-//! Environment variables (IONA_*) override both.
-
-pub mod validation;
-
-use serde::{Deserialize, Serialize};
-use std::path::Path;
-//! TOML configuration file support for IONA v24.
+//! # Quantum Configuration Architecture
 //!
-//! Config file is loaded from --config path (default: ./config.toml).
-//! CLI flags override config file values.
-//! Environment variables (IONA_*) override both.
+//! The configuration is treated as a quantum observable Ô_config whose
+//! eigenvalues correspond to valid configuration states. Each section
+//! exists in a superposition of possible values until measured (loaded
+//! from file, CLI, or environment).
+//!
+//! # Hamiltonian for Configuration
+//!
+//! ```text
+//! Ĥ_config = Ĥ_node + Ĥ_consensus + Ĥ_network + Ĥ_mempool + Ĥ_rpc + Ĥ_admin + Ĥ_signing + Ĥ_storage + Ĥ_observability
+//!
+//! Each section Hamiltonian:
+//! Ĥ_section = Σ_i E_i |valid_i⟩⟨valid_i| + Σ_j ∞ |invalid_j⟩⟨invalid_j|
+//! ```
+//!
+//! Invalid configurations have infinite energy, making them unobservable
+//! (the system cannot exist in those states).
+//!
+//! # Measurement Order (Priority)
+//!
+//! 1. Default values (ground state)
+//! 2. Config file (first projective measurement)
+//! 3. CLI flags (second projective measurement)
+//! 4. Environment variables IONA_* (final projective measurement)
+//!
+//! The last measurement collapses the wavefunction to the final configuration.
 
 pub mod validation;
 
@@ -21,70 +35,99 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 // -----------------------------------------------------------------------------
-// Configuration errors
+// Quantum Configuration Errors
 // -----------------------------------------------------------------------------
 
+/// Errors that can occur during quantum configuration measurement.
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("I/O error reading config file {path}: {source}")]
+    #[error("I/O decoherence reading config file {path}: {source}")]
     Io {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("TOML parse error in {path}: {source}")]
+
+    #[error("TOML wavefunction collapse error in {path}: {source}")]
     Toml {
         path: PathBuf,
         #[source]
         source: toml::de::Error,
     },
+
     #[error("Configuration validation failed: {0}")]
     Validation(String),
+
+    #[error("Quantum coherence lost: conflicting configuration eigenvalues")]
+    CoherenceLost,
 }
 
 pub type ConfigResult<T> = Result<T, ConfigError>;
 
 // -----------------------------------------------------------------------------
-// Main configuration structure
+// Main Configuration Observable
 // -----------------------------------------------------------------------------
 
+/// The complete node configuration — a quantum observable.
+///
+/// When measured (loaded), it collapses to a single valid eigenstate.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NodeConfig {
     #[serde(default)]
     pub node: NodeSection,
+
     #[serde(default)]
     pub consensus: ConsensusSection,
+
     #[serde(default)]
     pub network: NetworkSection,
+
     #[serde(default)]
     pub mempool: MempoolSection,
+
     #[serde(default)]
     pub rpc: RpcSection,
+
     #[serde(default)]
     pub admin: AdminSection,
+
     #[serde(default)]
     pub signing: SigningSection,
+
     #[serde(default)]
     pub storage: StorageSection,
+
     #[serde(default)]
     pub observability: ObservabilitySection,
 }
 
 impl NodeConfig {
-    /// Load configuration from a TOML file. Returns default config if file does not exist.
+    /// Measure configuration from a TOML file.
+    ///
+    /// If the file does not exist, returns the ground state (default).
     pub fn load(path: impl AsRef<Path>) -> ConfigResult<Self> {
         let path = path.as_ref();
+
         if !path.exists() {
             return Ok(Self::default());
         }
-        let contents = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::Io { path: path.into(), source: e })?;
-        let cfg: Self = toml::from_str(&contents)
-            .map_err(|e| ConfigError::Toml { path: path.into(), source: e })?;
+
+        let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
+            path: path.into(),
+            source: e,
+        })?;
+
+        let cfg: Self = toml::from_str(&contents).map_err(|e| ConfigError::Toml {
+            path: path.into(),
+            source: e,
+        })?;
+
         Ok(cfg)
     }
 
-    /// Validate the entire configuration, returning an error if any constraint is violated.
+    /// Validate the entire configuration — measure all observables.
+    ///
+    /// Returns `Ok(())` if all sections are in valid eigenstates.
     pub fn validate(&self) -> ConfigResult<()> {
         self.node.validate()?;
         self.consensus.validate()?;
@@ -98,97 +141,38 @@ impl NodeConfig {
         Ok(())
     }
 
+    /// Example configuration string (classical representation).
     pub fn example_toml() -> &'static str {
-        r#"# IONA v24+ node configuration
-# All values shown are defaults.
-
-[node]
-data_dir  = "./data/node1"
-seed      = 1             # deterministic key seed (change per node)
-chain_id  = 6126151
-log_level = "info"        # trace | debug | info | warn | error
-keystore  = "plain"       # plain | encrypted
-keystore_password     = ""  # password for encrypted keystore (fallback if env not set)
-keystore_password_env = "IONA_KEYSTORE_PASSWORD"
-
-[consensus]
-propose_timeout_ms   = 300
-prevote_timeout_ms   = 200
-precommit_timeout_ms = 200
-max_txs_per_block    = 4096
-gas_target           = 43000000
-fast_quorum          = true
-initial_base_fee     = 1
-stake_each           = 1000
-simple_producer      = true
-validator_seeds      = [2, 3, 4]
-
-[network]
-listen = "/ip4/0.0.0.0/tcp/7001"
-peers  = []
-bootnodes = []
-enable_mdns = false
-enable_kad  = true
-reconnect_s = 30
-
-[mempool]
-capacity = 200000
-
-[rpc]
-listen        = "127.0.0.1:9001"
-enable_faucet = false
-cors_allow_all = false
-
-[admin]
-listen = "127.0.0.1:9002"
-rbac_path = "./rbac.toml"
-require_mtls = true
-tls_cert_pem = "./deploy/tls/admin-server.crt.pem"
-tls_key_pem = "./deploy/tls/admin-server.key.pem"
-tls_ca_cert_pem = "./deploy/tls/ca.crt.pem"
-audit_log_path = "./data/audit.log"
-
-[signing]
-mode = "local"
-remote_url = "http://127.0.0.1:9100"
-remote_timeout_s = 10
-remote_tls_client_cert_pem = ""
-remote_tls_client_key_pem = ""
-remote_tls_ca_cert_pem = ""
-remote_tls_server_name = ""
-
-[storage]
-enable_snapshots = true
-snapshot_every_n_blocks = 500
-snapshot_keep = 10
-snapshot_zstd_level = 3
-max_concurrent_tasks = 256
-
-[observability]
-enable_otel = false
-otel_endpoint = "http://127.0.0.1:4317"
-service_name = "iona-node"
-"#
+        include_str!("config_example.toml")
     }
 
+    /// Write example configuration to a file.
     pub fn write_example(path: impl AsRef<Path>) -> std::io::Result<()> {
         std::fs::write(path, Self::example_toml())
     }
 }
 
 // -----------------------------------------------------------------------------
-// Section definitions with validation
+// Node Section
 // -----------------------------------------------------------------------------
 
+/// Node identity and key management configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSection {
+    /// Data directory path.
     pub data_dir: String,
+    /// Deterministic key seed.
     pub seed: u64,
+    /// Chain identifier.
     pub chain_id: u64,
+    /// Log level: trace | debug | info | warn | error
     pub log_level: String,
+    /// Key storage mode: "plain" | "encrypted"
     pub keystore: String,
+    /// Keystore password fallback.
     #[serde(default)]
     pub keystore_password: String,
+    /// Environment variable for keystore password.
     pub keystore_password_env: String,
 }
 
@@ -213,13 +197,49 @@ impl NodeSection {
                 "node.keystore must be 'plain' or 'encrypted'".into(),
             ));
         }
-        if self.keystore == "encrypted" && self.keystore_password.is_empty() && self.keystore_password_env.is_empty() {
+        if self.keystore == "encrypted"
+            && self.keystore_password.is_empty()
+            && self.keystore_password_env.is_empty()
+        {
             return Err(ConfigError::Validation(
-                "encrypted keystore requires either keystore_password or keystore_password_env".into(),
+                "encrypted keystore requires keystore_password or keystore_password_env".into(),
             ));
         }
         Ok(())
     }
+}
+
+// -----------------------------------------------------------------------------
+// Consensus Section
+// -----------------------------------------------------------------------------
+
+/// Consensus protocol configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsensusSection {
+    /// Propose timeout in milliseconds.
+    pub propose_timeout_ms: u64,
+    /// Prevote timeout in milliseconds.
+    pub prevote_timeout_ms: u64,
+    /// Precommit timeout in milliseconds.
+    pub precommit_timeout_ms: u64,
+    /// Maximum transactions per block.
+    pub max_txs_per_block: usize,
+    /// EIP-1559 gas target per block.
+    pub gas_target: u64,
+    /// Fast quorum: advance immediately when 2/3+ votes received.
+    pub fast_quorum: bool,
+    /// Initial base fee for EIP-1559.
+    pub initial_base_fee: u64,
+    /// Stake assigned to each validator.
+    pub stake_each: u64,
+    /// Enable Simple PoS block producer.
+    pub simple_producer: bool,
+    /// Validator seeds (must match across all nodes).
+    #[serde(default = "default_validator_seeds")]
+    pub validator_seeds: Vec<u64>,
+    /// Protocol upgrade activation schedule.
+    #[serde(default = "default_activations")]
+    pub protocol_activations: Vec<crate::protocol::version::ProtocolActivation>,
 }
 
 fn default_validator_seeds() -> Vec<u64> {
@@ -228,23 +248,6 @@ fn default_validator_seeds() -> Vec<u64> {
 
 fn default_activations() -> Vec<crate::protocol::version::ProtocolActivation> {
     crate::protocol::version::default_activations()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConsensusSection {
-    pub propose_timeout_ms: u64,
-    pub prevote_timeout_ms: u64,
-    pub precommit_timeout_ms: u64,
-    pub max_txs_per_block: usize,
-    pub gas_target: u64,
-    pub fast_quorum: bool,
-    pub initial_base_fee: u64,
-    pub stake_each: u64,
-    pub simple_producer: bool,
-    #[serde(default = "default_validator_seeds")]
-    pub validator_seeds: Vec<u64>,
-    #[serde(default = "default_activations")]
-    pub protocol_activations: Vec<crate::protocol::version::ProtocolActivation>,
 }
 
 impl Default for ConsensusSection {
@@ -267,36 +270,62 @@ impl Default for ConsensusSection {
 
 impl ConsensusSection {
     fn validate(&self) -> ConfigResult<()> {
-        if self.propose_timeout_ms == 0 {
-            return Err(ConfigError::Validation("consensus.propose_timeout_ms must be > 0".into()));
+        let validators = [
+            ("propose_timeout_ms", self.propose_timeout_ms),
+            ("prevote_timeout_ms", self.prevote_timeout_ms),
+            ("precommit_timeout_ms", self.precommit_timeout_ms),
+        ];
+
+        for (name, value) in &validators {
+            if *value == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "consensus.{name} must be > 0"
+                )));
+            }
         }
-        if self.prevote_timeout_ms == 0 {
-            return Err(ConfigError::Validation("consensus.prevote_timeout_ms must be > 0".into()));
-        }
-        if self.precommit_timeout_ms == 0 {
-            return Err(ConfigError::Validation("consensus.precommit_timeout_ms must be > 0".into()));
-        }
+
         if self.max_txs_per_block == 0 {
-            return Err(ConfigError::Validation("consensus.max_txs_per_block must be > 0".into()));
+            return Err(ConfigError::Validation(
+                "consensus.max_txs_per_block must be > 0".into(),
+            ));
         }
+
         if self.validator_seeds.is_empty() {
-            return Err(ConfigError::Validation("consensus.validator_seeds cannot be empty".into()));
+            return Err(ConfigError::Validation(
+                "consensus.validator_seeds cannot be empty".into(),
+            ));
         }
+
         Ok(())
     }
 }
 
+// -----------------------------------------------------------------------------
+// Network Section
+// -----------------------------------------------------------------------------
+
+/// Network and P2P configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NetworkSection {
+    /// Listen multiaddress.
     pub listen: String,
+    /// Static peer multiaddresses.
     pub peers: Vec<String>,
+    /// Bootstrap peer multiaddresses.
     pub bootnodes: Vec<String>,
+    /// Enable mDNS discovery.
     pub enable_mdns: bool,
+    /// Enable Kademlia DHT.
     pub enable_kad: bool,
+    /// Reconnect interval in seconds.
     pub reconnect_s: u64,
+
+    // Connection limits
     pub max_connections_total: usize,
     pub max_connections_per_peer: usize,
+
+    // Rate limits
     pub rr_max_req_per_sec: u32,
     pub rr_strikes_before_ban: u32,
     pub rr_max_req_per_sec_block: u32,
@@ -309,21 +338,35 @@ pub struct NetworkSection {
     pub rr_max_bytes_per_sec_state: u32,
     pub rr_global_in_bytes_per_sec: u32,
     pub rr_global_out_bytes_per_sec: u32,
+
+    // Peer scoring
     pub peer_strike_decay_s: u64,
     pub peer_score_decay_s: u64,
     pub peer_quarantine_s: u64,
     pub rr_strikes_before_quarantine: u32,
     pub rr_quarantines_before_ban: u32,
     pub persist_quarantine: bool,
+
+    // Gossipsub
     pub gossipsub: GossipsubSection,
+
+    // Diversity
     pub diversity: DiversitySection,
+
+    /// Eclipse protection profile: "mainnet" | "testnet"
     pub eclipse_profile: String,
+
+    // State sync
     pub enable_p2p_state_sync: bool,
     pub state_sync_chunk_bytes: u32,
     pub state_sync_timeout_s: u64,
+
+    // Snapshot attestation
     pub enable_snapshot_attestation: bool,
     pub snapshot_attestation_threshold: u32,
     pub snapshot_attestation_collect_s: u64,
+
+    // State sync security
     pub state_sync_security: StateSyncSecuritySection,
 }
 
@@ -373,17 +416,27 @@ impl Default for NetworkSection {
 impl NetworkSection {
     fn validate(&self) -> ConfigResult<()> {
         if !self.listen.contains("/tcp/") && !self.listen.contains("/ws/") {
-            return Err(ConfigError::Validation("network.listen must be a valid multiaddress with /tcp/ or /ws/".into()));
+            return Err(ConfigError::Validation(
+                "network.listen must be a valid multiaddress with /tcp/ or /ws/".into(),
+            ));
         }
         if self.max_connections_total == 0 {
-            return Err(ConfigError::Validation("network.max_connections_total must be > 0".into()));
+            return Err(ConfigError::Validation(
+                "network.max_connections_total must be > 0".into(),
+            ));
         }
         if self.rr_max_req_per_sec == 0 {
-            return Err(ConfigError::Validation("network.rr_max_req_per_sec must be > 0".into()));
+            return Err(ConfigError::Validation(
+                "network.rr_max_req_per_sec must be > 0".into(),
+            ));
         }
         Ok(())
     }
 }
+
+// -----------------------------------------------------------------------------
+// Sub-sections
+// -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -467,6 +520,10 @@ impl Default for StateSyncSecuritySection {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Remaining sections
+// -----------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MempoolSection {
     pub capacity: usize,
@@ -481,7 +538,9 @@ impl Default for MempoolSection {
 impl MempoolSection {
     fn validate(&self) -> ConfigResult<()> {
         if self.capacity == 0 {
-            return Err(ConfigError::Validation("mempool.capacity must be > 0".into()));
+            return Err(ConfigError::Validation(
+                "mempool.capacity must be > 0".into(),
+            ));
         }
         Ok(())
     }
@@ -508,7 +567,9 @@ impl Default for RpcSection {
 impl RpcSection {
     fn validate(&self) -> ConfigResult<()> {
         if !self.listen.contains(':') {
-            return Err(ConfigError::Validation("rpc.listen must be in format 'host:port'".into()));
+            return Err(ConfigError::Validation(
+                "rpc.listen must be in format 'host:port'".into(),
+            ));
         }
         Ok(())
     }
@@ -542,12 +603,15 @@ impl Default for AdminSection {
 
 impl AdminSection {
     fn validate(&self) -> ConfigResult<()> {
-        if self.require_mtls {
-            if self.tls_cert_pem.is_empty() || self.tls_key_pem.is_empty() || self.tls_ca_cert_pem.is_empty() {
-                return Err(ConfigError::Validation(
-                    "admin.require_mtls=true requires tls_cert_pem, tls_key_pem, and tls_ca_cert_pem to be set".into(),
-                ));
-            }
+        if self.require_mtls
+            && (self.tls_cert_pem.is_empty()
+                || self.tls_key_pem.is_empty()
+                || self.tls_ca_cert_pem.is_empty())
+        {
+            return Err(ConfigError::Validation(
+                "admin.require_mtls=true requires tls_cert_pem, tls_key_pem, and tls_ca_cert_pem"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -571,10 +635,10 @@ impl Default for SigningSection {
             mode: "local".into(),
             remote_url: "http://127.0.0.1:9100".into(),
             remote_timeout_s: 10,
-            remote_tls_client_cert_pem: "".into(),
-            remote_tls_client_key_pem: "".into(),
-            remote_tls_ca_cert_pem: "".into(),
-            remote_tls_server_name: "".into(),
+            remote_tls_client_cert_pem: String::new(),
+            remote_tls_client_key_pem: String::new(),
+            remote_tls_ca_cert_pem: String::new(),
+            remote_tls_server_name: String::new(),
         }
     }
 }
@@ -582,10 +646,14 @@ impl Default for SigningSection {
 impl SigningSection {
     fn validate(&self) -> ConfigResult<()> {
         if !["local", "remote"].contains(&self.mode.as_str()) {
-            return Err(ConfigError::Validation("signing.mode must be 'local' or 'remote'".into()));
+            return Err(ConfigError::Validation(
+                "signing.mode must be 'local' or 'remote'".into(),
+            ));
         }
         if self.mode == "remote" && self.remote_url.is_empty() {
-            return Err(ConfigError::Validation("signing.remote_url must be set when mode=remote".into()));
+            return Err(ConfigError::Validation(
+                "signing.remote_url must be set when mode=remote".into(),
+            ));
         }
         Ok(())
     }
@@ -652,565 +720,68 @@ impl ObservabilitySection {
         Ok(())
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct NodeConfig {
-    #[serde(default)]
-    pub node: NodeSection,
-    #[serde(default)]
-    pub consensus: ConsensusSection,
-    #[serde(default)]
-    pub network: NetworkSection,
-    #[serde(default)]
-    pub mempool: MempoolSection,
-    #[serde(default)]
-    pub rpc: RpcSection,
-    #[serde(default)]
-    pub admin: AdminSection,
-    #[serde(default)]
-    pub signing: SigningSection,
-    #[serde(default)]
-    pub storage: StorageSection,
-    #[serde(default)]
-    pub observability: ObservabilitySection,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeSection {
-    pub data_dir: String,
-    pub seed: u64,
-    pub chain_id: u64,
-    pub log_level: String,
-    /// Key storage mode: "plain" (keys.json) or "encrypted" (keys.enc)
-    pub keystore: String,
-    /// Keystore password (plaintext in config). Used as fallback when env var is not set.
-    #[serde(default)]
-    pub keystore_password: String,
-    /// Environment variable name holding the keystore password when keystore=encrypted.
-    /// If the env var is set, it takes precedence over `keystore_password`.
-    pub keystore_password_env: String,
-}
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
-impl Default for NodeSection {
-    fn default() -> Self {
-        Self {
-            data_dir: "./data/node".into(),
-            seed: 1,
-            chain_id: 1,
-            log_level: "info".into(),
-            keystore: "plain".into(),
-            keystore_password: String::new(),
-            keystore_password_env: "IONA_KEYSTORE_PASSWORD".into(),
-        }
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn default_validator_seeds() -> Vec<u64> {
-    vec![2, 3, 4]
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConsensusSection {
-    pub propose_timeout_ms: u64,
-    pub prevote_timeout_ms: u64,
-    pub precommit_timeout_ms: u64,
-    pub max_txs_per_block: usize,
-    pub gas_target: u64,
-    pub fast_quorum: bool,
-    pub initial_base_fee: u64,
-    pub stake_each: u64,
-    /// Enable the Simple PoS block producer (round-robin propose + sign + broadcast)
-    pub simple_producer: bool,
-    /// Seeds of the validators that participate in consensus.
-    /// Must match across all nodes for consensus to work.
-    /// Default: [2, 3, 4] (the three producers in the standard topology).
-    #[serde(default = "default_validator_seeds")]
-    pub validator_seeds: Vec<u64>,
-    /// Protocol upgrade activation schedule.
-    /// Each entry specifies a protocol version and the height at which it activates.
-    /// Used for coordinated hard-fork upgrades.
-    #[serde(default = "default_activations")]
-    pub protocol_activations: Vec<crate::protocol::version::ProtocolActivation>,
-}
-
-fn default_activations() -> Vec<crate::protocol::version::ProtocolActivation> {
-    crate::protocol::version::default_activations()
-}
-
-fn default_eclipse_profile() -> String {
-    "testnet".into()
-}
-
-impl Default for ConsensusSection {
-    fn default() -> Self {
-        Self {
-            propose_timeout_ms: 300,
-            prevote_timeout_ms: 200,
-            precommit_timeout_ms: 200,
-            max_txs_per_block: 4096,
-            gas_target: 43_000_000,
-            fast_quorum: true,
-            initial_base_fee: 1,
-            stake_each: 1000,
-            simple_producer: true,
-            validator_seeds: default_validator_seeds(),
-            protocol_activations: default_activations(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct NetworkSection {
-    pub listen: String,
-    /// Static peer multiaddresses (e.g. ["/ip4/1.2.3.4/tcp/7001"])
-    pub peers: Vec<String>,
-    /// Optional bootstrap peers (may include /p2p/<peerid> for Kademlia)
-    pub bootnodes: Vec<String>,
-    /// Enable LAN peer discovery via mDNS
-    pub enable_mdns: bool,
-    /// Enable Kademlia DHT (optional)
-    pub enable_kad: bool,
-    pub reconnect_s: u64,
-
-    /// Connection limits (anti-DoS)
-    pub max_connections_total: usize,
-    pub max_connections_per_peer: usize,
-
-    /// Request-response rate limits (global and per-protocol)
-    pub rr_max_req_per_sec: u32,
-    pub rr_strikes_before_ban: u32,
-
-    /// Per-protocol request rate limits (requests/sec)
-    pub rr_max_req_per_sec_block: u32,
-    pub rr_max_req_per_sec_status: u32,
-    pub rr_max_req_per_sec_range: u32,
-    pub rr_max_req_per_sec_state: u32,
-
-    /// Per-protocol inbound bandwidth caps (bytes/sec) for request-response messages
-    pub rr_max_bytes_per_sec_block: u32,
-    pub rr_max_bytes_per_sec_status: u32,
-    pub rr_max_bytes_per_sec_range: u32,
-    pub rr_max_bytes_per_sec_state: u32,
-
-    /// Global inbound/outbound bandwidth caps (bytes/sec) for request-response
-    pub rr_global_in_bytes_per_sec: u32,
-    pub rr_global_out_bytes_per_sec: u32,
-
-    /// Strike/score decay + quarantine thresholds
-    pub peer_strike_decay_s: u64,
-    /// Peer score decay interval (seconds). Moves score toward 0 over time.
-    pub peer_score_decay_s: u64,
-    pub peer_quarantine_s: u64,
-    pub rr_strikes_before_quarantine: u32,
-    pub rr_quarantines_before_ban: u32,
-
-    /// Persist quarantine list to disk so it survives restarts
-    pub persist_quarantine: bool,
-
-    /// Gossipsub limits + ACL
-    pub gossipsub: GossipsubSection,
-
-    /// Peer diversity / eclipse resistance
-    pub diversity: DiversitySection,
-
-    /// Eclipse protection profile: "prod" (strict) or "testnet" (relaxed).
-    /// Overrides diversity defaults when set.
-    #[serde(default = "default_eclipse_profile")]
-    pub eclipse_profile: String,
-
-    /// State sync knobs
-    pub enable_p2p_state_sync: bool,
-    /// Chunk size for P2P state sync transfers (bytes)
-    pub state_sync_chunk_bytes: u32,
-    /// Timeout for a single state-sync request (seconds)
-    pub state_sync_timeout_s: u64,
-
-    /// Snapshot attestation collection/serving.
-    pub enable_snapshot_attestation: bool,
-    /// Required signatures for an aggregated attestation (threshold).
-    pub snapshot_attestation_threshold: u32,
-    /// How long (seconds) to collect attestations after creating a snapshot.
-    pub snapshot_attestation_collect_s: u64,
-
-    /// State-sync security bindings (validator-set/epoch/nonce)
-    pub state_sync_security: StateSyncSecuritySection,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct DiversitySection {
-    pub bucket_kind: String, // ip16 | ip24 | asn (asn is scaffold only)
-    pub max_inbound_per_bucket: usize,
-    pub max_outbound_per_bucket: usize,
-    pub eclipse_detection_min_buckets: usize,
-    pub reseed_cooldown_s: u64,
-}
-
-impl Default for DiversitySection {
-    fn default() -> Self {
-        Self {
-            bucket_kind: "ip16".into(),
-            max_inbound_per_bucket: 4,
-            max_outbound_per_bucket: 4,
-            eclipse_detection_min_buckets: 3,
-            reseed_cooldown_s: 60,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct TopicLimit {
-    pub topic: String,
-    pub max_in_msgs_per_sec: u32,
-    pub max_in_bytes_per_sec: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GossipsubSection {
-    pub allowed_topics: Vec<String>,
-    pub deny_unknown_topics: bool,
-
-    /// local publish caps
-    pub max_publish_msgs_per_sec: u32,
-    pub max_publish_bytes_per_sec: u32,
-
-    /// inbound per-peer caps
-    pub max_in_msgs_per_sec: u32,
-    pub max_in_bytes_per_sec: u32,
-
-    /// optional per-topic overrides
-    pub topic_limits: Vec<TopicLimit>,
-}
-
-impl Default for GossipsubSection {
-    fn default() -> Self {
-        Self {
-            allowed_topics: vec![
-                "iona/tx".into(),
-                "iona/blocks".into(),
-                "iona/evidence".into(),
-            ],
-            deny_unknown_topics: true,
-            max_publish_msgs_per_sec: 30,
-            max_publish_bytes_per_sec: 2_000_000,
-            max_in_msgs_per_sec: 60,
-            max_in_bytes_per_sec: 4_000_000,
-            topic_limits: vec![],
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct StateSyncSecuritySection {
-    pub bind_validator_set: bool,
-    pub bind_epoch: bool,
-    pub attestation_epoch_s: u64,
-    pub require_attestation: bool,
-    pub use_aggregated_signatures: bool,
-}
-
-impl Default for StateSyncSecuritySection {
-    fn default() -> Self {
-        Self {
-            bind_validator_set: true,
-            bind_epoch: true,
-            attestation_epoch_s: 60,
-            require_attestation: false,
-            use_aggregated_signatures: false,
-        }
-    }
-}
-
-impl Default for NetworkSection {
-    fn default() -> Self {
-        Self {
-            listen: "/ip4/0.0.0.0/tcp/7001".into(),
-            peers: vec![],
-            bootnodes: vec![],
-            enable_mdns: false,
-            enable_kad: true,
-            reconnect_s: 30,
-
-            max_connections_total: 200,
-            max_connections_per_peer: 8,
-
-            rr_max_req_per_sec: 25,
-            rr_strikes_before_ban: 3,
-
-            rr_max_req_per_sec_block: 15,
-            rr_max_req_per_sec_status: 30,
-            rr_max_req_per_sec_range: 5,
-            rr_max_req_per_sec_state: 10,
-
-            rr_max_bytes_per_sec_block: 2_000_000,
-            rr_max_bytes_per_sec_status: 200_000,
-            rr_max_bytes_per_sec_range: 4_000_000,
-            rr_max_bytes_per_sec_state: 8_000_000,
-
-            rr_global_in_bytes_per_sec: 10_000_000,
-            rr_global_out_bytes_per_sec: 10_000_000,
-
-            peer_strike_decay_s: 30,
-            peer_score_decay_s: 60,
-            peer_quarantine_s: 60,
-            rr_strikes_before_quarantine: 2,
-            rr_quarantines_before_ban: 2,
-
-            persist_quarantine: true,
-
-            gossipsub: GossipsubSection::default(),
-            diversity: DiversitySection::default(),
-
-            eclipse_profile: default_eclipse_profile(),
-
-            enable_p2p_state_sync: true,
-            state_sync_chunk_bytes: 1_048_576, // 1 MiB
-            state_sync_timeout_s: 10,
-
-            enable_snapshot_attestation: true,
-            snapshot_attestation_threshold: 2,
-            snapshot_attestation_collect_s: 8,
-
-            state_sync_security: StateSyncSecuritySection::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MempoolSection {
-    pub capacity: usize,
-}
-
-impl Default for MempoolSection {
-    fn default() -> Self {
-        Self { capacity: 200_000 }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RpcSection {
-    /// Socket address the RPC server binds to.
-    /// Default: 127.0.0.1:9001 (loopback-only, secure).
-    /// To expose publicly you MUST also pass --unsafe-rpc-public at startup.
-    pub listen: String,
-    /// Enable the /faucet endpoint. TESTNET ONLY.
-    pub enable_faucet: bool,
-    /// Allow cross-origin requests (CORS permissive mode).
-    /// false = restrictive (default, production-safe).
-    /// true  = allow-all (dev/testnet UI only).
-    pub cors_allow_all: bool,
-}
-
-impl Default for RpcSection {
-    fn default() -> Self {
-        Self {
-            listen: "127.0.0.1:9001".into(),
-            enable_faucet: false,
-            cors_allow_all: false,
-        }
-    }
-}
-
-/// Admin server configuration — mTLS + RBAC.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AdminSection {
-    /// Admin server bind address. Loopback-only by default.
-    /// Use a Unix socket or localhost:port; never bind to 0.0.0.0 in production.
-    pub listen: String,
-    /// Path to the RBAC policy file (rbac.toml).
-    pub rbac_path: String,
-    /// If true, require mTLS client certificates for all admin requests.
-    /// Set to false ONLY for dev/test environments.
-    pub require_mtls: bool,
-    /// TLS server cert PEM for the admin socket (mTLS server side).
-    pub tls_cert_pem: String,
-    /// TLS server key PEM for the admin socket.
-    pub tls_key_pem: String,
-    /// CA cert PEM used to verify client certificates.
-    pub tls_ca_cert_pem: String,
-    /// Path for the append-only tamper-evident audit log.
-    pub audit_log_path: String,
-}
-
-impl Default for AdminSection {
-    fn default() -> Self {
-        Self {
-            listen: "127.0.0.1:9002".into(),
-            rbac_path: "./rbac.toml".into(),
-            require_mtls: true,
-            tls_cert_pem: "./deploy/tls/admin-server.crt.pem".into(),
-            tls_key_pem: "./deploy/tls/admin-server.key.pem".into(),
-            tls_ca_cert_pem: "./deploy/tls/ca.crt.pem".into(),
-            audit_log_path: "./data/audit.log".into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SigningSection {
-    /// Signing mode used by helper tools / RPC features that need to sign locally.
-    /// - "local"  : use node keystore
-    /// - "remote" : use remote signer HTTP service
-    pub mode: String,
-    /// Remote signer base URL, e.g. http://127.0.0.1:9100
-    pub remote_url: String,
-    /// Remote signer request timeout (seconds)
-    pub remote_timeout_s: u64,
-    /// Remote signer mTLS: client certificate PEM path (optional)
-    pub remote_tls_client_cert_pem: String,
-    /// Remote signer mTLS: client private key PEM path (optional)
-    pub remote_tls_client_key_pem: String,
-    /// Remote signer mTLS: CA certificate PEM path (optional)
-    pub remote_tls_ca_cert_pem: String,
-    /// Remote signer mTLS: expected server name for TLS (SNI), optional
-    pub remote_tls_server_name: String,
-}
-
-impl Default for SigningSection {
-    fn default() -> Self {
-        Self {
-            mode: "local".into(),
-            remote_url: "http://127.0.0.1:9100".into(),
-            remote_timeout_s: 10,
-            remote_tls_client_cert_pem: "".into(),
-            remote_tls_client_key_pem: "".into(),
-            remote_tls_ca_cert_pem: "".into(),
-            remote_tls_server_name: "".into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct StorageSection {
-    /// Enable periodic local snapshots of state to data_dir/snapshots/
-    pub enable_snapshots: bool,
-    /// Snapshot every N blocks (0 disables interval)
-    pub snapshot_every_n_blocks: u64,
-    /// How many snapshots to keep (oldest pruned)
-    pub snapshot_keep: usize,
-    /// zstd compression level (1-22)
-    pub snapshot_zstd_level: i32,
-    /// Max concurrent background tasks (0 = auto)
-    pub max_concurrent_tasks: usize,
-}
-
-impl Default for StorageSection {
-    fn default() -> Self {
-        Self {
-            enable_snapshots: true,
-            snapshot_every_n_blocks: 500,
-            snapshot_keep: 10,
-            snapshot_zstd_level: 3,
-            max_concurrent_tasks: 256,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ObservabilitySection {
-    /// Enable OpenTelemetry export (requires --features otel)
-    pub enable_otel: bool,
-    /// OTLP endpoint (e.g. http://localhost:4317)
-    pub otel_endpoint: String,
-    pub service_name: String,
-}
-
-impl Default for ObservabilitySection {
-    fn default() -> Self {
-        Self {
-            enable_otel: false,
-            otel_endpoint: "http://127.0.0.1:4317".into(),
-            service_name: "iona-node".into(),
-        }
-    }
-}
-
-impl NodeConfig {
-    pub fn load(path: &str) -> anyhow::Result<Self> {
-        if !Path::new(path).exists() {
-            return Ok(Self::default());
-        }
-        let s = std::fs::read_to_string(path)?;
-        let cfg: NodeConfig = toml::from_str(&s)?;
-        Ok(cfg)
+    #[test]
+    fn test_default_config_is_valid() {
+        let cfg = NodeConfig::default();
+        assert!(cfg.validate().is_ok());
     }
 
-    pub fn example_toml() -> &'static str {
-        r#"# IONA v24+ node configuration
-# All values shown are defaults.
-
-[node]
-data_dir  = "./data/node1"
-seed      = 1             # deterministic key seed (change per node)
-chain_id  = 6126151
-log_level = "info"        # trace | debug | info | warn | error
-keystore  = "plain"       # plain | encrypted
-keystore_password     = ""  # password for encrypted keystore (fallback if env not set)
-keystore_password_env = "IONA_KEYSTORE_PASSWORD"
-
-[consensus]
-propose_timeout_ms   = 300   # ms to wait for proposal before nil-voting
-prevote_timeout_ms   = 200   # ms timeout for prevote phase (fallback)
-precommit_timeout_ms = 200   # ms timeout for precommit phase (fallback)
-max_txs_per_block    = 4096  # max transactions per block
-gas_target           = 43000000  # EIP-1559 target gas per block
-fast_quorum          = true  # advance immediately when 2/3+ votes received
-initial_base_fee     = 1
-stake_each           = 1000  # stake assigned to each demo validator
-
-[network]
-listen = "/ip4/0.0.0.0/tcp/7001"
-peers  = [
-  # "/ip4/1.2.3.4/tcp/7001",  # static peer 1
-  # "/ip4/1.2.3.5/tcp/7002",  # static peer 2
-]
-bootnodes = [
-  # "/dns4/node.example/tcp/7001/p2p/12D3KooW...",
-]
-enable_mdns = false
-enable_kad  = true
-reconnect_s = 30  # seconds between reconnect attempts to static peers
-
-# P2P state sync (download latest snapshot from peers when state_full.json is missing)
-enable_p2p_state_sync = true
-state_sync_chunk_bytes = 1048576
-state_sync_timeout_s = 15
-
-[mempool]
-capacity = 200000
-
-[rpc]
-listen        = "0.0.0.0:9001"
-enable_faucet = false  # set true ONLY for testnets
-
-[signing]
-mode = "local"              # local | remote
-remote_url = "http://127.0.0.1:9100"
-remote_timeout_s = 10
-
-[storage]
-enable_snapshots = true
-snapshot_every_n_blocks = 500
-snapshot_keep = 10
-snapshot_zstd_level = 3
-max_concurrent_tasks = 256
-
-[observability]
-enable_otel = false
-otel_endpoint = "http://127.0.0.1:4317"
-service_name = "iona-node"
-"#
+    #[test]
+    fn test_consensus_validation() {
+        let mut cfg = NodeConfig::default();
+        cfg.consensus.propose_timeout_ms = 0;
+        assert!(cfg.validate().is_err());
     }
 
-    pub fn write_example(path: &str) -> std::io::Result<()> {
-        std::fs::write(path, Self::example_toml())
+    #[test]
+    fn test_network_validation() {
+        let mut cfg = NodeConfig::default();
+        cfg.network.listen = "invalid".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_mempool_validation() {
+        let mut cfg = NodeConfig::default();
+        cfg.mempool.capacity = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_rpc_validation() {
+        let mut cfg = NodeConfig::default();
+        cfg.rpc.listen = "invalid".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_admin_mtls_validation() {
+        let mut cfg = NodeConfig::default();
+        cfg.admin.require_mtls = true;
+        cfg.admin.tls_cert_pem = String::new();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_signing_validation() {
+        let mut cfg = NodeConfig::default();
+        cfg.signing.mode = "invalid".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_storage_validation() {
+        let mut cfg = NodeConfig::default();
+        cfg.storage.snapshot_zstd_level = 0;
+        assert!(cfg.validate().is_err());
     }
 }
