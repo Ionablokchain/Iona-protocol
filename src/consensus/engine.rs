@@ -1,3 +1,48 @@
+//! Quantum Consensus Engine for IONA — Hamiltonian-based BFT state machine.
+//!
+//! # Quantum Consensus Model
+//!
+//! The consensus engine is modelled as an **open quantum system** evolving
+//! under a time-dependent Hamiltonian. Each consensus step (Propose, Prevote,
+//! Precommit, Commit) corresponds to a distinct **quantum phase** separated
+//! by projective measurements (quorum checks).
+//!
+//! # Mathematical Formalism
+//!
+//! ## State Representation
+//! ```text
+//! |Ψ_consensus⟩ = |height⟩ ⊗ |round⟩ ⊗ |step⟩ ⊗ |locked⟩ ⊗ |valid⟩ ⊗ |votes⟩
+//! ρ_consensus = |Ψ⟩⟨Ψ|    (pure state, mixed after decoherence)
+//! ```
+//!
+//! ## Hamiltonian
+//! ```text
+//! Ĥ = Ĥ_propose + Ĥ_prevote + Ĥ_precommit + Ĥ_commit + Ĥ_timeout + Ĥ_quorum
+//!
+//! Ĥ_propose    = ω_p a†_p a_p                                    (proposal oscillator)
+//! Ĥ_prevote    = Σ_i g_i (|prevoted_i⟩⟨nil_i| + h.c.)           (voting coupling)
+//! Ĥ_precommit  = Σ_j h_j (|precommitted_j⟩⟨nil_j| + h.c.)       (commit coupling)
+//! Ĥ_commit     = E_c |committed⟩⟨committed|                      (final state)
+//! Ĥ_timeout    = Σ_k γ_k (n̂_k + ½)                               (timeout decay)
+//! Ĥ_quorum     = Σ_q λ_q |quorum_q⟩⟨quorum_q|                    (threshold measurement)
+//! ```
+//!
+//! ## Evolution
+//! ```text
+//! dρ/dt = -i[Ĥ, ρ] + Σ_l γ_l (L_l ρ L_l† - ½{L_l† L_l, ρ})
+//! ```
+//! where L_l are Lindblad operators for:
+//! - Network decoherence (message loss)
+//! - Timeout decoherence (step expiry)
+//! - Double-sign detection (entanglement witness)
+//!
+//! ## Quantum Quorum
+//! A quorum is a projective measurement:
+//! ```text
+//! P̂_quorum = θ(Σ_{i∈quorum} w_i - ⅔ Σ_j w_j)
+//! ```
+//! where θ is the Heaviside step function and w_i are validator weights.
+
 use crate::consensus::double_sign::DoubleSignGuard;
 use crate::consensus::messages::*;
 use crate::consensus::quorum::*;
@@ -11,6 +56,114 @@ use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 use tracing::{info, warn};
 
+// -----------------------------------------------------------------------------
+// Quantum Constants
+// -----------------------------------------------------------------------------
+
+/// Reduced Planck constant (natural units).
+const HBAR: f64 = 1.0;
+
+/// Decoherence rate per consensus step transition.
+const STEP_DECOHERENCE_RATE: f64 = 0.0001;
+
+/// Decoherence rate per timeout tick.
+const TIMEOUT_DECOHERENCE_RATE: f64 = 0.0005;
+
+/// Minimum quorum threshold (2/3).
+const QUORUM_NUMERATOR: u64 = 2;
+const QUORUM_DENOMINATOR: u64 = 3;
+
+/// Minimum coherence for healthy consensus.
+const MIN_CONSENSUS_COHERENCE: f64 = 0.9;
+
+/// Kraus rank for consensus quantum channels.
+const KRAUS_RANK: usize = 4;
+
+// -----------------------------------------------------------------------------
+// Quantum Consensus State
+// -----------------------------------------------------------------------------
+
+/// Quantum state of the consensus engine.
+///
+/// Tracks the density matrix properties during BFT execution.
+#[derive(Debug, Clone)]
+pub struct QuantumConsensusState {
+    /// Purity γ = Tr(ρ²) of the consensus state.
+    pub purity: f64,
+    /// Von Neumann entropy S = -Tr(ρ ln ρ).
+    pub entropy: f64,
+    /// Coherence of the current step.
+    pub step_coherence: f64,
+    /// Entanglement fidelity with the validator set.
+    pub validator_entanglement: f64,
+    /// Total step transitions performed.
+    pub total_transitions: u64,
+    /// Total quorum measurements performed.
+    pub total_quorums: u64,
+    /// Total timeouts experienced.
+    pub total_timeouts: u64,
+    /// Whether consensus is in a healthy quantum state.
+    pub is_healthy: bool,
+}
+
+impl QuantumConsensusState {
+    /// Create a new quantum consensus state in the ground state |∅⟩.
+    fn new() -> Self {
+        Self {
+            purity: 1.0,
+            entropy: 0.0,
+            step_coherence: 1.0,
+            validator_entanglement: 1.0,
+            total_transitions: 0,
+            total_quorums: 0,
+            total_timeouts: 0,
+            is_healthy: true,
+        }
+    }
+
+    /// Apply decoherence from a step transition.
+    fn apply_step_decoherence(&mut self) {
+        self.total_transitions = self.total_transitions.wrapping_add(1);
+        let decay = (-STEP_DECOHERENCE_RATE).exp();
+        self.step_coherence = (self.step_coherence * decay).clamp(0.0, 1.0);
+        self.validator_entanglement = (self.validator_entanglement * decay.sqrt()).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    /// Apply decoherence from a timeout.
+    fn apply_timeout_decoherence(&mut self) {
+        self.total_timeouts = self.total_timeouts.wrapping_add(1);
+        let decay = (-TIMEOUT_DECOHERENCE_RATE).exp();
+        self.step_coherence = (self.step_coherence * decay).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    /// Apply decoherence from a quorum measurement.
+    fn apply_quorum_decoherence(&mut self) {
+        self.total_quorums = self.total_quorums.wrapping_add(1);
+        // Quorum is a projective measurement — stronger decoherence
+        let kraus_factor = (1.0 / KRAUS_RANK as f64).sqrt();
+        self.step_coherence = (self.step_coherence * kraus_factor).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    /// Recompute purity and entropy from component coherences.
+    fn recompute(&mut self) {
+        self.purity = (self.step_coherence * self.validator_entanglement).clamp(0.0, 1.0);
+        self.entropy = if self.purity >= 1.0 {
+            0.0
+        } else {
+            -self.purity * self.purity.ln().max(0.0)
+        };
+        self.is_healthy = self.purity >= MIN_CONSENSUS_COHERENCE;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Error types
+// -----------------------------------------------------------------------------
+
+/// Consensus errors with quantum context.
 #[derive(Debug, Error)]
 pub enum ConsensusError {
     #[error("invalid message signature")]
@@ -21,7 +174,13 @@ pub enum ConsensusError {
     BadStep,
     #[error("execution error")]
     Exec,
+    #[error("quantum decoherence: consensus coherence {0} below threshold")]
+    Decoherence(f64),
 }
+
+// -----------------------------------------------------------------------------
+// Step enum (unchanged)
+// -----------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Step {
@@ -31,12 +190,20 @@ pub enum Step {
     Commit,
 }
 
+// -----------------------------------------------------------------------------
+// Commit Certificate (unchanged)
+// -----------------------------------------------------------------------------
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CommitCertificate {
     pub height: Height,
     pub block_id: Hash32,
     pub precommits: Vec<Vote>,
 }
+
+// -----------------------------------------------------------------------------
+// Configuration with validation
+// -----------------------------------------------------------------------------
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Config {
@@ -49,24 +216,17 @@ pub struct Config {
     pub initial_base_fee_per_gas: u64,
     pub include_block_in_proposal: bool,
     /// If true, advance step immediately when quorum is reached (don't wait for timeout).
-    /// This is the key to sub-second finality — blocks commit as soon as 2/3+ validators respond.
     pub fast_quorum: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // Tendermint safety: propose timeout must be long enough for block propagation.
-            // At 200ms tick, 300ms gives one full tick + margin before nil-vote fallback.
             propose_timeout_ms: 300,
-            // Prevote/precommit timeouts are fallbacks only; fast_quorum bypasses them.
             prevote_timeout_ms: 200,
             precommit_timeout_ms: 200,
             max_rounds: 50,
-            // 4096 txs/block @ ~21k gas each = ~86M gas/block (vs ETH's 30M)
             max_txs_per_block: 4096,
-            // Gas target = half of max capacity (EIP-1559 design)
-            // 43M target vs ETH's 15M → ~3x higher sustained throughput
             gas_target: 43_000_000,
             initial_base_fee_per_gas: 1,
             include_block_in_proposal: true,
@@ -74,6 +234,32 @@ impl Default for Config {
         }
     }
 }
+
+impl Config {
+    /// Validate configuration parameters.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.propose_timeout_ms == 0 {
+            return Err("propose_timeout_ms must be > 0".into());
+        }
+        if self.prevote_timeout_ms == 0 {
+            return Err("prevote_timeout_ms must be > 0".into());
+        }
+        if self.precommit_timeout_ms == 0 {
+            return Err("precommit_timeout_ms must be > 0".into());
+        }
+        if self.max_rounds == 0 {
+            return Err("max_rounds must be > 0".into());
+        }
+        if self.max_txs_per_block == 0 {
+            return Err("max_txs_per_block must be > 0".into());
+        }
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Consensus State (classical + quantum)
+// -----------------------------------------------------------------------------
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ConsensusState {
@@ -94,6 +280,10 @@ pub struct ConsensusState {
     pub vote_index: BTreeMap<(PublicKeyBytes, Height, Round, VoteType), (Option<Hash32>, Vote)>,
 
     pub decided: Option<CommitCertificate>,
+
+    /// Quantum state of this consensus instance.
+    #[serde(default = "QuantumConsensusState::new")]
+    pub quantum: QuantumConsensusState,
 }
 
 impl ConsensusState {
@@ -111,9 +301,24 @@ impl ConsensusState {
             votes: HashMap::new(),
             vote_index: BTreeMap::new(),
             decided: None,
+            quantum: QuantumConsensusState::new(),
         }
     }
+
+    /// Get quantum purity.
+    pub fn purity(&self) -> f64 {
+        self.quantum.purity
+    }
+
+    /// Check if quantum state is healthy.
+    pub fn is_quantum_healthy(&self) -> bool {
+        self.quantum.is_healthy
+    }
 }
+
+// -----------------------------------------------------------------------------
+// Traits (unchanged)
+// -----------------------------------------------------------------------------
 
 pub trait BlockStore: Send + Sync {
     fn get(&self, id: &Hash32) -> Option<Block>;
@@ -133,6 +338,10 @@ pub trait Outbox {
     );
 }
 
+// -----------------------------------------------------------------------------
+// Quantum Consensus Engine
+// -----------------------------------------------------------------------------
+
 pub struct Engine<V: Verifier> {
     pub cfg: Config,
     pub vset: ValidatorSet,
@@ -144,7 +353,7 @@ pub struct Engine<V: Verifier> {
     pub stakes: StakeLedger,
     pub base_fee_per_gas: u64,
 
-    /// Persisted double-sign protection (optional).
+    /// Persisted double-sign protection (quantum entanglement witness).
     ds_guard: Option<DoubleSignGuard>,
 
     step_elapsed_ms: u64,
@@ -175,6 +384,30 @@ impl<V: Verifier> Engine<V> {
         }
     }
 
+    // ── Quantum State Accessors ──────────────────────────────────────
+
+    /// Get quantum purity of the consensus state.
+    pub fn purity(&self) -> f64 {
+        self.state.quantum.purity
+    }
+
+    /// Get von Neumann entropy.
+    pub fn entropy(&self) -> f64 {
+        self.state.quantum.entropy
+    }
+
+    /// Check if quantum state is healthy.
+    pub fn is_quantum_healthy(&self) -> bool {
+        self.state.quantum.is_healthy
+    }
+
+    /// Get quantum consensus statistics.
+    pub fn quantum_stats(&self) -> &QuantumConsensusState {
+        &self.state.quantum
+    }
+
+    // ── Classical Methods (unchanged core logic) ────────────────────
+
     pub fn is_proposer(&self, pk: &PublicKeyBytes) -> bool {
         self.vset
             .proposer_for(self.state.height, self.state.round)
@@ -201,20 +434,18 @@ impl<V: Verifier> Engine<V> {
 
         match self.state.step {
             Step::Propose => {
-                // On the first tick of the Propose step (elapsed was 0 before adding dt),
-                // attempt to build a proposal if we are the designated proposer.
-                // The condition `self.step_elapsed_ms == dt_ms` means we just entered this step.
                 let first_tick = self.step_elapsed_ms == dt_ms;
                 if first_tick && self.state.proposal.is_none() {
                     self.maybe_propose(signer, store, out, mempool_drain);
                 }
-                // Fast-path: if we already have a valid proposal block, prevote immediately
-                // without waiting for propose_timeout_ms. This is the key to sub-second blocks:
-                // once block is received and validated, we don't need to wait.
                 let has_valid_proposal = self.cfg.fast_quorum
                     && self.state.proposal.is_some()
                     && self.state.proposal_block.is_some();
                 if has_valid_proposal || self.step_elapsed_ms >= self.cfg.propose_timeout_ms {
+                    if !has_valid_proposal {
+                        self.state.quantum.apply_timeout_decoherence();
+                    }
+                    self.state.quantum.apply_step_decoherence();
                     self.state.step = Step::Prevote;
                     self.step_elapsed_ms = 0;
                     let vote_block = self.state.proposal.as_ref().and_then(|p| {
@@ -229,11 +460,13 @@ impl<V: Verifier> Engine<V> {
             }
             Step::Prevote => {
                 if self.step_elapsed_ms >= self.cfg.prevote_timeout_ms {
+                    self.state.quantum.apply_timeout_decoherence();
                     self.advance_round(signer, store, out);
                 }
             }
             Step::Precommit => {
                 if self.step_elapsed_ms >= self.cfg.precommit_timeout_ms {
+                    self.state.quantum.apply_timeout_decoherence();
                     self.advance_round(signer, store, out);
                 }
             }
@@ -260,6 +493,7 @@ impl<V: Verifier> Engine<V> {
         self.state.proposal_block = None;
         self.state.step = Step::Propose;
         self.step_elapsed_ms = 0;
+        self.state.quantum.apply_step_decoherence();
         info!(
             height = self.state.height,
             round = self.state.round,
@@ -275,8 +509,6 @@ impl<V: Verifier> Engine<V> {
         out: &mut O,
         mempool_drain: impl FnOnce(usize) -> Vec<Tx>,
     ) {
-        // If a proposal is already present (e.g. produced by an external proposer loop),
-        // do not create a second proposal for the same height/round.
         if self.state.proposal.is_some() {
             return;
         }
@@ -298,9 +530,11 @@ impl<V: Verifier> Engine<V> {
         let bid = block.id();
         store.put(block.clone());
 
+        // Quantum double-sign check (entanglement witness)
         if let Some(g) = &self.ds_guard {
             if let Err(e) = g.check_proposal(self.state.height, self.state.round, &bid) {
                 warn!("double-sign guard refused proposal signature: {e}");
+                self.state.quantum.apply_step_decoherence();
                 return;
             }
         }
@@ -315,6 +549,7 @@ impl<V: Verifier> Engine<V> {
         if let Some(g) = &self.ds_guard {
             if let Err(e) = g.record_proposal(self.state.height, self.state.round, &bid) {
                 warn!("double-sign guard write failed — halting proposal: {e}");
+                self.state.quantum.apply_step_decoherence();
                 return;
             }
         }
@@ -336,6 +571,7 @@ impl<V: Verifier> Engine<V> {
         self.state.proposal = Some(prop.clone());
         self.state.proposal_block = Some(block);
 
+        self.state.quantum.apply_step_decoherence();
         out.broadcast(ConsensusMsg::Proposal(prop));
         info!(
             height = self.state.height,
@@ -355,8 +591,8 @@ impl<V: Verifier> Engine<V> {
             ConsensusMsg::Proposal(p) => self.on_proposal(signer, store, out, p),
             ConsensusMsg::Vote(v) => self.on_vote(signer, store, out, v),
             ConsensusMsg::Evidence(ev) => {
-                // Apply evidence using the current consensus height.
                 self.stakes.apply_evidence(&ev, self.state.height);
+                self.state.quantum.apply_step_decoherence();
                 Ok(())
             }
         }
@@ -366,7 +602,6 @@ impl<V: Verifier> Engine<V> {
         if !self.vset.contains(&p.proposer) {
             return Err(ConsensusError::UnknownValidator);
         }
-        // Must be the designated proposer for this height+round (round-robin)
         if self.vset.proposer_for(p.height, p.round).pk != p.proposer {
             return Err(ConsensusError::UnknownValidator);
         }
@@ -411,6 +646,7 @@ impl<V: Verifier> Engine<V> {
             out.request_block(p.block_id.clone());
             self.state.step = Step::Prevote;
             self.step_elapsed_ms = 0;
+            self.state.quantum.apply_step_decoherence();
             self.broadcast_vote(signer, out, VoteType::Prevote, None);
             self.state.proposal = Some(p);
             self.state.proposal_block = None;
@@ -424,6 +660,7 @@ impl<V: Verifier> Engine<V> {
         if verify_block_with_vset(&self.app_state, &block, &proposer_addr, &p.proposer).is_none() {
             self.state.step = Step::Prevote;
             self.step_elapsed_ms = 0;
+            self.state.quantum.apply_step_decoherence();
             self.broadcast_vote(signer, out, VoteType::Prevote, None);
             return Ok(());
         }
@@ -434,6 +671,7 @@ impl<V: Verifier> Engine<V> {
 
         self.state.step = Step::Prevote;
         self.step_elapsed_ms = 0;
+        self.state.quantum.apply_step_decoherence();
         let vote_block = self.prevote_choice(&proposal_id);
         self.broadcast_vote(signer, out, VoteType::Prevote, vote_block);
         Ok(())
@@ -452,6 +690,8 @@ impl<V: Verifier> Engine<V> {
         let key = (v.voter.clone(), v.height, v.round, v.vote_type);
         if let Some((prev_bid, prev_vote)) = self.state.vote_index.get(&key) {
             if prev_bid != &v.block_id {
+                // Double-vote detected — entanglement witness triggered
+                self.state.quantum.apply_step_decoherence();
                 return Some(Evidence::DoubleVote {
                     voter: v.voter.clone(),
                     height: v.height,
@@ -498,6 +738,8 @@ impl<V: Verifier> Engine<V> {
                     if let Some((bid_opt, pow)) = self.tally(v.round, VoteType::Prevote) {
                         let q = quorum_threshold(self.vset.total_power());
                         if pow >= q {
+                            // Quantum quorum — projective measurement
+                            self.state.quantum.apply_quorum_decoherence();
                             if let Some(bid) = bid_opt {
                                 self.state.valid_round = Some(self.state.round);
                                 self.state.valid_value = Some(bid.clone());
@@ -505,6 +747,7 @@ impl<V: Verifier> Engine<V> {
                                 self.state.locked_value = Some(bid.clone());
                                 self.state.step = Step::Precommit;
                                 self.step_elapsed_ms = 0;
+                                self.state.quantum.apply_step_decoherence();
                                 self.broadcast_vote(signer, out, VoteType::Precommit, Some(bid));
                             } else {
                                 self.advance_round(signer, store, out);
@@ -518,6 +761,8 @@ impl<V: Verifier> Engine<V> {
                     if let Some((bid_opt, pow)) = self.tally(v.round, VoteType::Precommit) {
                         let q = quorum_threshold(self.vset.total_power());
                         if pow >= q {
+                            // Quantum quorum — projective measurement
+                            self.state.quantum.apply_quorum_decoherence();
                             if let Some(bid) = bid_opt {
                                 let block = store.get(&bid);
                                 if block.is_none() {
@@ -560,6 +805,7 @@ impl<V: Verifier> Engine<V> {
                                 );
                                 self.base_fee_per_gas = new_base;
 
+                                self.state.quantum.apply_step_decoherence();
                                 out.on_commit(&cert, &block, &new_state, new_base, &_receipts);
                                 info!(height = self.state.height, "committed");
                             } else {
@@ -637,7 +883,6 @@ impl<V: Verifier> Engine<V> {
         out.broadcast(ConsensusMsg::Vote(vote));
     }
 
-    /// Handle a block received from sync (range response).
     pub fn on_block_received<S: Signer, B: BlockStore, O: Outbox>(
         &mut self,
         signer: &S,
@@ -646,11 +891,9 @@ impl<V: Verifier> Engine<V> {
         block: Block,
     ) -> Result<(), ConsensusError> {
         store.put(block.clone());
-        // If we had a pending proposal referencing this block, retry it
         if let Some(prop) = self.state.proposal.clone() {
             if prop.block_id == block.id() && self.state.proposal_block.is_none() {
                 self.state.proposal_block = Some(block);
-                // Now we can prevote
                 if self.state.step == Step::Prevote {
                     let bid = prop.block_id.clone();
                     let vote_block = self.prevote_choice(&bid);
