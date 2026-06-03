@@ -1,23 +1,27 @@
-//! Simple PoS block producer.
+//! Simple PoS block producer — production‑grade.
 //!
-//! This module is intentionally minimal: it does *one* thing — if the local node
-//! is the designated proposer (round‑robin) for the current height/round, it
-//! builds a block from mempool transactions, signs a `Proposal`, persists the
-//! block to the block store, and broadcasts the proposal over P2P.
+//! This module implements a minimal round‑robin block producer. When the
+//! local node is the designated proposer for the current height/round, it:
+//! 1. Validates that all preconditions are met.
+//! 2. Drains transactions from the mempool (up to `max_txs`).
+//! 3. Builds a deterministic block using `build_block`.
+//! 4. Persists the block to the block store.
+//! 5. Signs and broadcasts a `Proposal` message over P2P.
 //!
-//! It does **not** create votes or handle quorum/finality. Those remain the
-//! responsibility of the consensus engine (if enabled).
+//! The producer does **not** handle voting, quorum, or finality — those
+//! are the responsibility of the consensus engine.
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use iona::consensus::block_producer::{SimpleBlockProducer, SimpleProducerCfg};
+//! use iona::consensus::block_producer::{SimpleBlockProducer, ProducerConfig, ProducerError};
 //!
-//! let cfg = SimpleProducerCfg::default();
-//! let producer = SimpleBlockProducer::new(cfg);
-//! let txs = mempool.drain_best(cfg.max_txs);
-//! if producer.try_produce(&mut engine, &signer, &store, &mut outbox, txs) {
-//!     println!("Proposal broadcast");
+//! let cfg = ProducerConfig::default();
+//! let producer = SimpleBlockProducer::new(cfg)?;
+//! match producer.try_produce(&mut engine, &signer, &store, &mut outbox, txs) {
+//!     Ok(true) => println!("Proposal broadcast"),
+//!     Ok(false) => println!("Not our turn"),
+//!     Err(e) => eprintln!("Production failed: {e}"),
 //! }
 //! ```
 
@@ -25,25 +29,68 @@ use crate::consensus::{proposal_sign_bytes, ConsensusMsg, Outbox, Proposal, Step
 use crate::crypto::Signer;
 use crate::execution::build_block;
 use crate::types::Tx;
+use thiserror::Error;
 use tracing::{debug, info, warn};
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Default maximum number of transactions to include in a proposed block.
+/// Default maximum number of transactions per block.
 const DEFAULT_MAX_TXS: usize = 4096;
 
-/// Default setting: embed full block inside the proposal message.
+/// Default: embed full block inside the proposal message.
 const DEFAULT_INCLUDE_BLOCK: bool = true;
+
+/// Minimum allowed value for `max_txs`.
+const MIN_MAX_TXS: usize = 1;
+
+/// Maximum allowed value for `max_txs` (prevents memory exhaustion).
+const MAX_ALLOWED_TXS: usize = 100_000;
+
+// -----------------------------------------------------------------------------
+// Error types
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during block production.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ProducerError {
+    #[error("invalid configuration: max_txs={max_txs}, must be {min}..={max}")]
+    InvalidMaxTxs {
+        max_txs: usize,
+        min: usize,
+        max: usize,
+    },
+
+    #[error("engine not in Propose step (current: {step:?})")]
+    NotInProposeStep { step: Step },
+
+    #[error("proposal already exists for round {round}")]
+    ProposalAlreadyExists { round: u32 },
+
+    #[error("node is not the designated proposer for height {height}, round {round}")]
+    NotProposer { height: u64, round: u32 },
+
+    #[error("block store error: {reason}")]
+    BlockStoreError { reason: String },
+
+    #[error("block building failed: {reason}")]
+    BlockBuildError { reason: String },
+
+    #[error("signing failed: {reason}")]
+    SigningError { reason: String },
+}
+
+/// Result type for producer operations.
+pub type ProducerResult<T> = Result<T, ProducerError>;
 
 // -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------
 
-/// Minimal producer configuration.
-#[derive(Clone, Debug)]
-pub struct SimpleProducerCfg {
+/// Producer configuration with validation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProducerConfig {
     /// Maximum number of transactions to include in a proposed block.
     pub max_txs: usize,
     /// Whether to embed the full block inside the proposal message.
@@ -51,7 +98,7 @@ pub struct SimpleProducerCfg {
     pub include_block_in_proposal: bool,
 }
 
-impl Default for SimpleProducerCfg {
+impl Default for ProducerConfig {
     fn default() -> Self {
         Self {
             max_txs: DEFAULT_MAX_TXS,
@@ -60,20 +107,48 @@ impl Default for SimpleProducerCfg {
     }
 }
 
+impl ProducerConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> ProducerResult<()> {
+        if self.max_txs < MIN_MAX_TXS || self.max_txs > MAX_ALLOWED_TXS {
+            return Err(ProducerError::InvalidMaxTxs {
+                max_txs: self.max_txs,
+                min: MIN_MAX_TXS,
+                max: MAX_ALLOWED_TXS,
+            });
+        }
+        Ok(())
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Producer
 // -----------------------------------------------------------------------------
 
-/// A simple round‑robin PoS producer.
+/// A simple round‑robin PoS block producer.
+///
+/// The producer is stateless — all state is held by the consensus engine,
+/// block store, and mempool. This struct only holds validated configuration.
 #[derive(Clone, Debug)]
 pub struct SimpleBlockProducer {
-    pub cfg: SimpleProducerCfg,
+    cfg: ProducerConfig,
 }
 
 impl SimpleBlockProducer {
     /// Create a new producer with the given configuration.
-    pub fn new(cfg: SimpleProducerCfg) -> Self {
-        Self { cfg }
+    ///
+    /// Returns an error if the configuration is invalid.
+    pub fn new(cfg: ProducerConfig) -> ProducerResult<Self> {
+        cfg.validate()?;
+        Ok(Self { cfg })
+    }
+
+    /// Derive the proposer address (20‑byte hex) from a signer's public key.
+    /// This matches the address format used in `build_block`.
+    pub fn proposer_address(signer: &dyn Signer) -> String {
+        let pk_bytes = &signer.public_key().0;
+        let hash = blake3::hash(pk_bytes);
+        hex::encode(&hash.as_bytes()[..20])
     }
 
     /// Check if the local node is the proposer for the current engine state.
@@ -85,20 +160,17 @@ impl SimpleBlockProducer {
         engine.is_proposer(&signer.public_key())
     }
 
-    /// Derive the proposer address (20‑byte hex) from a public key.
-    /// This matches the address used in `build_block`.
-    pub fn proposer_address(signer: &dyn Signer) -> String {
-        hex::encode(&blake3::hash(&signer.public_key().0).as_bytes()[..20])
-    }
-
-    /// Attempt to produce and broadcast a proposal for the engine's current height/round.
+    /// Attempt to produce and broadcast a proposal.
     ///
-    /// Returns `true` if a proposal was produced and broadcast.
+    /// # Returns
+    /// - `Ok(true)` — proposal was produced and broadcast.
+    /// - `Ok(false)` — preconditions not met (wrong step, not proposer, etc.).
+    /// - `Err(e)` — a fatal error occurred during production.
     ///
-    /// # Conditions
-    /// - Engine must be in `Propose` step.
-    /// - No proposal already exists for this round.
-    /// - Local node must be the designated proposer.
+    /// # Preconditions (checked in order)
+    /// 1. Engine must be in the `Propose` step.
+    /// 2. No proposal must already exist for this round.
+    /// 3. The local node must be the designated proposer.
     pub fn try_produce<
         V: crate::crypto::Verifier,
         S: Signer,
@@ -111,35 +183,50 @@ impl SimpleBlockProducer {
         store: &B,
         out: &mut O,
         txs: Vec<Tx>,
-    ) -> bool {
-        // Only propose in the Propose step.
+    ) -> ProducerResult<bool> {
+        // ── Precondition 1: Correct step ──────────────────────────────────
         if engine.state.step != Step::Propose {
-            debug!(step = ?engine.state.step, "not in propose step, skipping proposal");
-            return false;
+            debug!(
+                step = ?engine.state.step,
+                "not in propose step, skipping proposal"
+            );
+            return Ok(false);
         }
 
-        // Don't double‑propose.
+        // ── Precondition 2: No existing proposal ──────────────────────────
         if engine.state.proposal.is_some() {
-            debug!("proposal already exists for this round");
-            return false;
+            debug!(
+                round = engine.state.round,
+                "proposal already exists for this round"
+            );
+            return Ok(false);
         }
 
-        // Only the designated proposer may produce.
+        // ── Precondition 3: Designated proposer ───────────────────────────
         if !engine.is_proposer(&signer.public_key()) {
-            debug!("not the designated proposer");
-            return false;
+            debug!(
+                height = engine.state.height,
+                round = engine.state.round,
+                "not the designated proposer"
+            );
+            return Ok(false);
         }
 
+        // ── All preconditions met — produce the block ─────────────────────
         info!(
             height = engine.state.height,
             round = engine.state.round,
+            max_txs = self.cfg.max_txs,
             "producing proposal"
         );
 
         let proposer_addr = Self::proposer_address(signer);
 
-        // Build the block.
+        // Limit transactions to max_txs
         let txs_to_include: Vec<Tx> = txs.into_iter().take(self.cfg.max_txs).collect();
+        let tx_count = txs_to_include.len();
+
+        // Build the block
         let (block, _next_state, _receipts) = build_block(
             engine.state.height,
             engine.state.round,
@@ -152,12 +239,16 @@ impl SimpleBlockProducer {
         );
 
         let block_id = block.id();
-        debug!(block_id = %hex::encode(&block_id.0[..8]), tx_count = block.txs.len(), "block built");
+        debug!(
+            block_id = %hex::encode(&block_id.0[..8]),
+            tx_count = tx_count,
+            "block built"
+        );
 
-        // Store the block.
+        // Persist the block
         store.put(block.clone());
 
-        // Sign the proposal.
+        // Sign the proposal
         let sign_bytes = proposal_sign_bytes(
             engine.state.height,
             engine.state.round,
@@ -180,19 +271,22 @@ impl SimpleBlockProducer {
             signature,
         };
 
-        // Update local engine state so `Engine::tick` doesn't try to produce again.
+        // Update engine state
         engine.state.proposal = Some(proposal.clone());
         engine.state.proposal_block = Some(block);
 
+        // Broadcast
         out.broadcast(ConsensusMsg::Proposal(proposal));
+
         info!(
             height = engine.state.height,
             round = engine.state.round,
             block_id = %hex::encode(&block_id.0[..8]),
+            tx_count = tx_count,
             "proposal broadcast"
         );
 
-        true
+        Ok(true)
     }
 }
 
@@ -209,16 +303,22 @@ mod tests {
     use crate::execution::KvState;
     use crate::slashing::StakeLedger;
     use crate::types::{Hash32, Height};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
-    /// Mock block store for testing.
+    // ── Mock implementations ────────────────────────────────────────────
+
     struct MockBlockStore {
-        blocks: std::sync::Mutex<std::collections::HashMap<Hash32, crate::types::Block>>,
+        blocks: Mutex<HashMap<Hash32, crate::types::Block>>,
     }
     impl MockBlockStore {
         fn new() -> Self {
             Self {
-                blocks: std::sync::Mutex::new(std::collections::HashMap::new()),
+                blocks: Mutex::new(HashMap::new()),
             }
+        }
+        fn stored_count(&self) -> usize {
+            self.blocks.lock().unwrap().len()
         }
     }
     impl crate::consensus::BlockStore for MockBlockStore {
@@ -230,26 +330,33 @@ mod tests {
         }
     }
 
-    /// Mock outbox that records broadcasts.
     struct MockOutbox {
-        broadcasts: std::sync::Mutex<Vec<ConsensusMsg>>,
+        broadcasts: Mutex<Vec<ConsensusMsg>>,
     }
     impl MockOutbox {
         fn new() -> Self {
             Self {
-                broadcasts: std::sync::Mutex::new(Vec::new()),
+                broadcasts: Mutex::new(Vec::new()),
             }
+        }
+        fn proposal_count(&self) -> usize {
+            self.broadcasts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| matches!(m, ConsensusMsg::Proposal(_)))
+                .count()
         }
         fn last_proposal(&self) -> Option<Proposal> {
             self.broadcasts
                 .lock()
                 .unwrap()
                 .iter()
-                .filter_map(|msg| match msg {
+                .rev()
+                .find_map(|msg| match msg {
                     ConsensusMsg::Proposal(p) => Some(p.clone()),
                     _ => None,
                 })
-                .last()
         }
     }
     impl Outbox for MockOutbox {
@@ -267,6 +374,8 @@ mod tests {
         ) {
         }
     }
+
+    // ── Helpers ─────────────────────────────────────────────────────────
 
     fn make_engine(proposer_pk: &Ed25519Keypair) -> Engine<Ed25519Verifier> {
         let vset = ValidatorSet {
@@ -286,53 +395,121 @@ mod tests {
         )
     }
 
+    fn make_tx(nonce: u64) -> Tx {
+        Tx {
+            pubkey: vec![0; 32],
+            from: format!("sender{}", nonce),
+            nonce,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+            gas_limit: 100_000,
+            payload: format!("set key{} val{}", nonce, nonce),
+            signature: vec![0; 64],
+            chain_id: 1,
+        }
+    }
+
+    // ── Configuration tests ─────────────────────────────────────────────
+    #[test]
+    fn test_config_valid() {
+        let cfg = ProducerConfig::default();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_zero_max_txs() {
+        let cfg = ProducerConfig {
+            max_txs: 0,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_excessive_max_txs() {
+        let cfg = ProducerConfig {
+            max_txs: MAX_ALLOWED_TXS + 1,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_producer_creation_with_invalid_config() {
+        let cfg = ProducerConfig {
+            max_txs: 0,
+            ..Default::default()
+        };
+        assert!(SimpleBlockProducer::new(cfg).is_err());
+    }
+
+    // ── Production tests ────────────────────────────────────────────────
     #[test]
     fn test_producer_proposes_when_proposer() {
         let signer = Ed25519Keypair::from_seed([1u8; 32]);
         let mut engine = make_engine(&signer);
         let store = MockBlockStore::new();
         let mut outbox = MockOutbox::new();
-        let producer = SimpleBlockProducer::new(SimpleProducerCfg::default());
+        let producer = SimpleBlockProducer::new(ProducerConfig::default()).unwrap();
 
         assert_eq!(engine.state.step, Step::Propose);
         assert!(engine.state.proposal.is_none());
 
-        let result = producer.try_produce(&mut engine, &signer, &store, &mut outbox, vec![]);
+        let result = producer
+            .try_produce(&mut engine, &signer, &store, &mut outbox, vec![])
+            .unwrap();
 
         assert!(result);
         assert!(engine.state.proposal.is_some());
+        assert_eq!(store.stored_count(), 1);
+        assert_eq!(outbox.proposal_count(), 1);
+
         let proposal = outbox.last_proposal().unwrap();
         assert_eq!(proposal.height, 1);
         assert_eq!(proposal.round, 0);
         assert_eq!(proposal.proposer, signer.public_key());
+        assert!(proposal.block.is_some());
     }
 
     #[test]
-    fn test_producer_does_not_propose_when_not_proposer() {
+    fn test_producer_skips_when_not_proposer() {
         let proposer = Ed25519Keypair::from_seed([1u8; 32]);
         let non_proposer = Ed25519Keypair::from_seed([2u8; 32]);
         let mut engine = make_engine(&proposer);
         let store = MockBlockStore::new();
         let mut outbox = MockOutbox::new();
-        let producer = SimpleBlockProducer::new(SimpleProducerCfg::default());
+        let producer = SimpleBlockProducer::new(ProducerConfig::default()).unwrap();
 
-        let result = producer.try_produce(&mut engine, &non_proposer, &store, &mut outbox, vec![]);
+        let result = producer
+            .try_produce(&mut engine, &non_proposer, &store, &mut outbox, vec![])
+            .unwrap();
+
         assert!(!result);
-        assert!(outbox.last_proposal().is_none());
+        assert!(engine.state.proposal.is_none());
+        assert_eq!(store.stored_count(), 0);
+        assert_eq!(outbox.proposal_count(), 0);
     }
 
     #[test]
-    fn test_producer_does_not_propose_twice() {
+    fn test_producer_skips_when_proposal_exists() {
         let signer = Ed25519Keypair::from_seed([1u8; 32]);
         let mut engine = make_engine(&signer);
         let store = MockBlockStore::new();
         let mut outbox = MockOutbox::new();
-        let producer = SimpleBlockProducer::new(SimpleProducerCfg::default());
+        let producer = SimpleBlockProducer::new(ProducerConfig::default()).unwrap();
 
-        let first = producer.try_produce(&mut engine, &signer, &store, &mut outbox, vec![]);
+        // First proposal
+        let first = producer
+            .try_produce(&mut engine, &signer, &store, &mut outbox, vec![])
+            .unwrap();
         assert!(first);
-        let second = producer.try_produce(&mut engine, &signer, &store, &mut outbox, vec![]);
+
+        // Second attempt — should skip
+        let second = producer
+            .try_produce(&mut engine, &signer, &store, &mut outbox, vec![])
+            .unwrap();
         assert!(!second);
+        assert_eq!(outbox.proposal_count(), 1);
     }
 
     #[test]
@@ -341,39 +518,65 @@ mod tests {
         let mut engine = make_engine(&signer);
         let store = MockBlockStore::new();
         let mut outbox = MockOutbox::new();
-        let cfg = SimpleProducerCfg {
-            max_txs: 2,
+        let cfg = ProducerConfig {
+            max_txs: 3,
             include_block_in_proposal: true,
         };
-        let producer = SimpleBlockProducer::new(cfg);
+        let producer = SimpleBlockProducer::new(cfg).unwrap();
 
-        let txs: Vec<Tx> = (0..5)
-            .map(|i| Tx {
-                pubkey: vec![],
-                from: format!("sender{}", i),
-                nonce: i,
-                max_fee_per_gas: 0,
-                max_priority_fee_per_gas: 0,
-                gas_limit: 21_000,
-                payload: "test".into(),
-                signature: vec![],
-                chain_id: 1,
-            })
-            .collect();
+        let txs: Vec<Tx> = (0..10).map(make_tx).collect();
+        let result = producer
+            .try_produce(&mut engine, &signer, &store, &mut outbox, txs)
+            .unwrap();
 
-        let result = producer.try_produce(&mut engine, &signer, &store, &mut outbox, txs);
         assert!(result);
-
         let proposal = outbox.last_proposal().unwrap();
         let block = proposal.block.as_ref().unwrap();
-        assert_eq!(block.txs.len(), 2);
+        assert_eq!(block.txs.len(), 3);
+    }
+
+    #[test]
+    fn test_producer_with_empty_txs() {
+        let signer = Ed25519Keypair::from_seed([1u8; 32]);
+        let mut engine = make_engine(&signer);
+        let store = MockBlockStore::new();
+        let mut outbox = MockOutbox::new();
+        let producer = SimpleBlockProducer::new(ProducerConfig::default()).unwrap();
+
+        let result = producer
+            .try_produce(&mut engine, &signer, &store, &mut outbox, vec![])
+            .unwrap();
+
+        assert!(result);
+        let proposal = outbox.last_proposal().unwrap();
+        let block = proposal.block.as_ref().unwrap();
+        assert_eq!(block.txs.len(), 0);
     }
 
     #[test]
     fn test_proposer_address_derivation() {
         let signer = Ed25519Keypair::from_seed([42u8; 32]);
         let addr = SimpleBlockProducer::proposer_address(&signer);
-        assert_eq!(addr.len(), 40); // 20 bytes in hex = 40 chars
+        assert_eq!(addr.len(), 40);
         assert!(addr.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_proposer_address_deterministic() {
+        let signer = Ed25519Keypair::from_seed([99u8; 32]);
+        let addr1 = SimpleBlockProducer::proposer_address(&signer);
+        let addr2 = SimpleBlockProducer::proposer_address(&signer);
+        assert_eq!(addr1, addr2);
+    }
+
+    #[test]
+    fn test_is_proposer() {
+        let proposer = Ed25519Keypair::from_seed([1u8; 32]);
+        let non_proposer = Ed25519Keypair::from_seed([2u8; 32]);
+        let engine = make_engine(&proposer);
+        let producer = SimpleBlockProducer::new(ProducerConfig::default()).unwrap();
+
+        assert!(producer.is_proposer(&engine, &proposer));
+        assert!(!producer.is_proposer(&engine, &non_proposer));
     }
 }
