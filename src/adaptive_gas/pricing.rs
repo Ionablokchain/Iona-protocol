@@ -1,71 +1,189 @@
-//! Multi-dimensional gas pricing with EIP-1559 per dimension.
-use serde::{Deserialize, Serialize};
-use crate::adaptive_gas::resource_meter::ResourceUsage;
+//! Dynamic resource pricing – adjusts prices based on recent block utilization.
+//!
+//! Each resource has a base price and an elasticity factor.
+//! After every block, the price is updated proportionally to how close
+//! the block usage was to the target.
 
-/// Per-resource base fees (adjusted each block like EIP-1559).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceBaseFees {
-    pub cpu_per_op:       u64,   // gwei per CPU op
-    pub io_read_per_op:   u64,   // gwei per storage read
-    pub io_write_per_op:  u64,   // gwei per storage write
-    pub network_per_byte: u64,   // gwei per network byte
-    pub memory_per_kb:    u64,   // gwei per KB memory
-    pub precompile_per_op: u64,  // gwei per precompile op
+use super::resource_meter::{Resource, ResourceUsage, ResourceLimits};
+
+// -----------------------------------------------------------------------------
+// Resource prices
+// -----------------------------------------------------------------------------
+
+/// Current prices for each resource dimension (in wei per gas‑equivalent unit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourcePrices {
+    pub cpu: u64,
+    pub io: u64,
+    pub net: u64,
+    pub storage: u64,
 }
 
-impl Default for ResourceBaseFees {
+impl Default for ResourcePrices {
     fn default() -> Self {
         Self {
-            cpu_per_op:        1,
-            io_read_per_op:    100,
-            io_write_per_op:   2_000,
-            network_per_byte:  1,
-            memory_per_kb:     10,
-            precompile_per_op: 10,
+            cpu: 1,
+            io: 2,
+            net: 3,
+            storage: 5,
         }
     }
 }
 
-impl ResourceBaseFees {
-    /// Calculate the total fee for a transaction's resource usage.
-    pub fn calculate_fee(&self, usage: &ResourceUsage) -> u64 {
-        let cpu    = usage.cpu_ops        * self.cpu_per_op;
-        let io_r   = usage.io_reads       * self.io_read_per_op;
-        let io_w   = usage.io_writes      * self.io_write_per_op;
-        let net    = usage.network_bytes  * self.network_per_byte;
-        let mem    = (usage.memory_bytes / 1024).saturating_add(1) * self.memory_per_kb;
-        let pre    = usage.precompile_ops * self.precompile_per_op;
-        cpu + io_r + io_w + net + mem + pre
+impl ResourcePrices {
+    /// Price for a specific resource.
+    pub fn get(&self, resource: Resource) -> u64 {
+        match resource {
+            Resource::Cpu => self.cpu,
+            Resource::Io => self.io,
+            Resource::Net => self.net,
+            Resource::Storage => self.storage,
+        }
     }
 
-    /// Update base fees based on actual vs target utilization (EIP-1559 per dimension).
-    pub fn update(&mut self, actual: &ResourceUsage, target: &ResourceUsage) {
-        const MAX_CHANGE_BPS: u64 = 125; // 12.5% max change per block (like EIP-1559)
-        let adjust = |fee: u64, actual: u64, target: u64| -> u64 {
-            if target == 0 { return fee; }
-            let delta = (fee * MAX_CHANGE_BPS / 1000) as i64;
-            if actual > target { (fee as i64 + delta).max(1) as u64 }
-            else if actual < target { (fee as i64 - delta).max(1) as u64 }
-            else { fee }
-        };
-        self.cpu_per_op       = adjust(self.cpu_per_op,       actual.cpu_ops,       target.cpu_ops);
-        self.io_read_per_op   = adjust(self.io_read_per_op,   actual.io_reads,      target.io_reads);
-        self.io_write_per_op  = adjust(self.io_write_per_op,  actual.io_writes,     target.io_writes);
-        self.network_per_byte = adjust(self.network_per_byte, actual.network_bytes, target.network_bytes);
+    /// Compute the cost of a resource usage given current prices.
+    pub fn compute_cost(&self, usage: &ResourceUsage) -> u64 {
+        usage.cpu.saturating_mul(self.cpu)
+            .saturating_add(usage.io.saturating_mul(self.io))
+            .saturating_add(usage.net.saturating_mul(self.net))
+            .saturating_add(usage.storage.saturating_mul(self.storage))
     }
 }
+
+// -----------------------------------------------------------------------------
+// Price adjuster
+// -----------------------------------------------------------------------------
+
+/// Configuration for the multi‑dimensional price adjuster.
+#[derive(Debug, Clone)]
+pub struct PriceAdjusterConfig {
+    /// Target utilization per resource (0.0 – 1.0).
+    pub target_utilization: f64,
+    /// Maximum price change per block (as a fraction, e.g. 0.125 = 12.5%).
+    pub max_change_per_block: f64,
+    /// Minimum price floor for each resource.
+    pub min_price: u64,
+}
+
+impl Default for PriceAdjusterConfig {
+    fn default() -> Self {
+        Self {
+            target_utilization: 0.5,
+            max_change_per_block: 0.125,
+            min_price: 1,
+        }
+    }
+}
+
+/// Adjusts resource prices after each block.
+#[derive(Debug, Clone)]
+pub struct PriceAdjuster {
+    pub config: PriceAdjusterConfig,
+    pub prices: ResourcePrices,
+}
+
+impl PriceAdjuster {
+    /// Create a new adjuster with the given configuration and initial prices.
+    pub fn new(config: PriceAdjusterConfig, initial_prices: ResourcePrices) -> Self {
+        Self {
+            config,
+            prices: initial_prices,
+        }
+    }
+
+    /// Update prices based on the block usage and block limits.
+    ///
+    /// For each resource, the new price is:
+    /// ```text
+    /// new_price = old_price * (1 + elasticity * (utilization - target))
+    /// ```
+    /// where elasticity is derived from `max_change_per_block` and the
+    /// change is clamped to `±max_change_per_block`.
+    pub fn update(&mut self, block_usage: &ResourceUsage, block_limits: &ResourceLimits) {
+        for &resource in &Resource::ALL {
+            let utilization = self.utilization(resource, block_usage, block_limits);
+            let target = self.config.target_utilization;
+            let delta = utilization - target;
+            let change = delta * self.config.max_change_per_block * 2.0; // scale so that at util=1.0 change=+max
+            let factor = 1.0 + change.clamp(
+                -self.config.max_change_per_block,
+                self.config.max_change_per_block,
+            );
+
+            let old_price = self.prices.get(resource);
+            let new_price = (old_price as f64 * factor).round() as u64;
+            let new_price = new_price.max(self.config.min_price);
+            match resource {
+                Resource::Cpu => self.prices.cpu = new_price,
+                Resource::Io => self.prices.io = new_price,
+                Resource::Net => self.prices.net = new_price,
+                Resource::Storage => self.prices.storage = new_price,
+            }
+        }
+    }
+
+    /// Compute utilization of a single resource from block usage.
+    fn utilization(
+        &self,
+        resource: Resource,
+        block_usage: &ResourceUsage,
+        block_limits: &ResourceLimits,
+    ) -> f64 {
+        let used = match resource {
+            Resource::Cpu => block_usage.cpu,
+            Resource::Io => block_usage.io,
+            Resource::Net => block_usage.net,
+            Resource::Storage => block_usage.storage,
+        };
+        let limit = match resource {
+            Resource::Cpu => block_limits.max_cpu,
+            Resource::Io => block_limits.max_io,
+            Resource::Net => block_limits.max_net,
+            Resource::Storage => block_limits.max_storage,
+        };
+        if limit == 0 {
+            return 1.0;
+        }
+        (used as f64 / limit as f64).clamp(0.0, 1.0)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn fee_calculation() {
-        let fees = ResourceBaseFees::default();
-        let usage = ResourceUsage::evm_transfer();
-        let fee = fees.calculate_fee(&usage);
-        assert!(fee > 0);
-        // Contract call should cost more than transfer
-        let contract_usage = ResourceUsage::evm_contract_call(256, 10);
-        assert!(fees.calculate_fee(&contract_usage) > fee);
+    fn test_price_increase_on_high_utilization() {
+        let config = PriceAdjusterConfig::default();
+        let initial = ResourcePrices::default();
+        let mut adjuster = PriceAdjuster::new(config, initial);
+        let usage = ResourceUsage {
+            cpu: 8_000_000,
+            ..Default::default()
+        };
+        let limits = ResourceLimits {
+            max_cpu: 10_000_000,
+            ..Default::default()
+        };
+        adjuster.update(&usage, &limits);
+        assert!(adjuster.prices.cpu > initial.cpu);
+    }
+
+    #[test]
+    fn test_price_never_below_floor() {
+        let config = PriceAdjusterConfig::default();
+        let initial = ResourcePrices::default();
+        let mut adjuster = PriceAdjuster::new(config, initial);
+        let usage = ResourceUsage::default();
+        let limits = ResourceLimits::default();
+        // Apply many blocks of zero usage
+        for _ in 0..100 {
+            adjuster.update(&usage, &limits);
+        }
+        assert!(adjuster.prices.cpu >= config.min_price);
     }
 }
