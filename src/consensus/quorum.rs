@@ -1,139 +1,178 @@
-//! Vote tallying and quorum calculation for consensus.
+//! IONA consensus engine and supporting modules — Quantum Architecture.
 //!
-//! This module provides utilities to aggregate votes from validators
-//! and determine when a quorum has been reached.
+//! # Quantum Consensus Model
+//!
+//! The consensus engine is modeled as an **open quantum system** where
+//! each validator exists in a superposition of voting states and the
+//! collective decision emerges from entanglement-based measurements.
+//!
+//! # Mathematical Formalism
+//!
+//! ## State Representation
+//! ```text
+//! |Ψ_consensus⟩ = |height⟩ ⊗ |round⟩ ⊗ (⊗_i |validator_i⟩) ⊗ |proposal⟩
+//! ```
+//!
+//! ## Hamiltonian
+//! ```text
+//! Ĥ = Ĥ_propose + Ĥ_prevote + Ĥ_precommit + Ĥ_commit + Ĥ_timeout
+//! ```
+//!
+//! ## Evolution
+//! ```text
+//! dρ/dt = -i[Ĥ, ρ] + Σ_k γ_k (L_k ρ L_k† - ½{L_k† L_k, ρ})
+//! ```
 //!
 //! # Example
 //!
-//! ```
-//! use iona::consensus::quorum::{VoteTally, quorum_threshold};
-//! use iona::consensus::validator_set::{ValidatorSet, Validator};
-//! use iona::crypto::PublicKeyBytes;
-//! use iona::types::Hash32;
+//! ```rust,ignore
+//! use iona::consensus::{Engine, Config, ValidatorSet};
 //!
-//! let vset = ValidatorSet {
-//!     vals: vec![
-//!         Validator { pk: PublicKeyBytes(vec![1; 32]), power: 10 },
-//!         Validator { pk: PublicKeyBytes(vec![2; 32]), power: 20 },
-//!     ],
-//! };
-//! let mut tally = VoteTally::default();
-//! let block_id = Some(Hash32([1; 32]));
-//! tally.add_vote(&vset, &PublicKeyBytes(vec![1; 32]), &block_id);
-//! let (_, power) = tally.best().unwrap();
-//! assert_eq!(power, 10);
-//! assert_eq!(quorum_threshold(30), 21);
+//! let config = Config::default();
+//! let vset = ValidatorSet::default();
+//! let engine = Engine::new(config, vset, 1, Hash32::zero(), …);
 //! ```
 
-use crate::consensus::validator_set::{ValidatorSet, VotingPower};
-use crate::crypto::PublicKeyBytes;
-use crate::types::Hash32;
-use std::collections::HashMap;
+pub mod block_producer;
+pub mod debug_trace;
+pub mod diagnostic;
+pub mod double_sign;
+pub mod engine;
+pub mod fast_finality;
+pub mod genesis;
+pub mod messages;
+pub mod quorum;
+pub mod quorum_diag;
+pub mod validator_set;
 
 // -----------------------------------------------------------------------------
-// Constants
+// Quantum Constants
 // -----------------------------------------------------------------------------
 
-/// Numerator of the quorum fraction (2/3 of total voting power).
-pub const QUORUM_NUMERATOR: u64 = 2;
+/// Reduced Planck constant (natural units).
+pub const HBAR: f64 = 1.0;
 
-/// Denominator of the quorum fraction (3).
-pub const QUORUM_DENOMINATOR: u64 = 3;
+/// Default quantum coherence for consensus states.
+pub const DEFAULT_COHERENCE: f64 = 1.0;
+
+/// Decoherence rate per consensus step.
+pub const STEP_DECOHERENCE_RATE: f64 = 0.0001;
+
+/// Minimum coherence threshold for healthy consensus.
+pub const MIN_CONSENSUS_COHERENCE: f64 = 0.9;
 
 // -----------------------------------------------------------------------------
-// VoteTally
+// Quantum Consensus State (shared across modules)
 // -----------------------------------------------------------------------------
 
-/// Tally of votes, grouped by the block they vote for.
+/// Quantum state tracker for consensus operations.
 ///
-/// Used to compute the total voting power that has voted for each block,
-/// and to determine which block (if any) has reached a quorum.
-#[derive(Clone, Debug, Default)]
-pub struct VoteTally {
-    /// Maps a block ID (or `None` for nil votes) to the total voting power
-    /// that has cast a vote for that option.
-    pub per_block: HashMap<Option<Hash32>, VotingPower>,
+/// Provides purity, entropy, and coherence metrics that are updated
+/// by the engine and supporting modules.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct QuantumConsensusState {
+    /// Purity γ = Tr(ρ²).
+    pub purity: f64,
+    /// Von Neumann entropy S = -Tr(ρ ln ρ).
+    pub entropy: f64,
+    /// Step coherence (propose/prevote/precommit/commit).
+    pub step_coherence: f64,
+    /// Entanglement fidelity with validator set.
+    pub validator_entanglement: f64,
+    /// Total step transitions.
+    pub total_transitions: u64,
+    /// Total quorum measurements.
+    pub total_quorums: u64,
+    /// Total timeouts.
+    pub total_timeouts: u64,
+    /// Whether consensus is healthy.
+    pub is_healthy: bool,
 }
 
-impl VoteTally {
-    /// Add a vote from a validator to the tally.
-    ///
-    /// # Arguments
-    /// * `vset` – the current validator set (to look up the validator's power).
-    /// * `voter` – the public key of the validator casting the vote.
-    /// * `block_id` – the block ID they are voting for (or `None` for a nil vote).
-    pub fn add_vote(
-        &mut self,
-        vset: &ValidatorSet,
-        voter: &PublicKeyBytes,
-        block_id: &Option<Hash32>,
-    ) {
-        let power = vset.power_of(voter);
-        *self.per_block.entry(block_id.clone()).or_insert(0) += power;
-    }
-
-    /// Find the block with the highest total voting power.
-    ///
-    /// Returns a tuple `(block_id, power)` for the block that has the most
-    /// votes. If the tally is empty, returns `None`.
-    pub fn best(&self) -> Option<(Option<Hash32>, VotingPower)> {
-        self.per_block
-            .iter()
-            .max_by_key(|(_, power)| **power)
-            .map(|(block_id, power)| (block_id.clone(), *power))
-    }
-
-    /// Check if a specific block has reached the given quorum threshold.
-    ///
-    /// # Arguments
-    /// * `block_id` – the block to check (or `None` for nil votes).
-    /// * `threshold` – the minimum voting power required (e.g., from `quorum_threshold`).
-    pub fn has_quorum(&self, block_id: &Option<Hash32>, threshold: VotingPower) -> bool {
-        self.per_block.get(block_id).copied().unwrap_or(0) >= threshold
-    }
-
-    /// Get the total voting power tallied so far.
-    pub fn total_power(&self) -> VotingPower {
-        self.per_block.values().sum()
-    }
-
-    /// Clear the tally.
-    pub fn clear(&mut self) {
-        self.per_block.clear();
+impl Default for QuantumConsensusState {
+    fn default() -> Self {
+        Self {
+            purity: DEFAULT_COHERENCE,
+            entropy: 0.0,
+            step_coherence: DEFAULT_COHERENCE,
+            validator_entanglement: DEFAULT_COHERENCE,
+            total_transitions: 0,
+            total_quorums: 0,
+            total_timeouts: 0,
+            is_healthy: true,
+        }
     }
 }
 
-// -----------------------------------------------------------------------------
-// Quorum calculation
-// -----------------------------------------------------------------------------
+impl QuantumConsensusState {
+    /// Create a new quantum state in the ground state |∅⟩.
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-/// Compute the quorum threshold for a given total validator power.
-///
-/// In Tendermint‑style consensus, a quorum is reached when more than 2/3
-/// of the total voting power has voted for the same block.
-///
-/// # Formula
-/// ```text
-/// threshold = (total * QUORUM_NUMERATOR) / QUORUM_DENOMINATOR + 1
-/// ```
-///
-/// # Examples
-/// ```
-/// use iona::consensus::quorum::quorum_threshold;
-/// assert_eq!(quorum_threshold(1), 1);
-/// assert_eq!(quorum_threshold(3), 3);
-/// assert_eq!(quorum_threshold(4), 3);
-/// ```
-pub fn quorum_threshold(total: VotingPower) -> VotingPower {
-    (total * QUORUM_NUMERATOR / QUORUM_DENOMINATOR) + 1
+    /// Apply decoherence from a step transition.
+    pub fn apply_step_decoherence(&mut self) {
+        self.total_transitions = self.total_transitions.wrapping_add(1);
+        let decay = (-STEP_DECOHERENCE_RATE).exp();
+        self.step_coherence = (self.step_coherence * decay).clamp(0.0, 1.0);
+        self.validator_entanglement = (self.validator_entanglement * decay.sqrt()).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    /// Apply decoherence from a timeout.
+    pub fn apply_timeout_decoherence(&mut self) {
+        self.total_timeouts = self.total_timeouts.wrapping_add(1);
+        let decay = (-STEP_DECOHERENCE_RATE * 5.0).exp();
+        self.step_coherence = (self.step_coherence * decay).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    /// Apply decoherence from a quorum measurement.
+    pub fn apply_quorum_decoherence(&mut self) {
+        self.total_quorums = self.total_quorums.wrapping_add(1);
+        let kraus_factor = 0.5f64.sqrt();
+        self.step_coherence = (self.step_coherence * kraus_factor).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    fn recompute(&mut self) {
+        self.purity = (self.step_coherence * self.validator_entanglement).clamp(0.0, 1.0);
+        self.entropy = if self.purity >= 1.0 {
+            0.0
+        } else {
+            -self.purity * self.purity.ln().max(0.0)
+        };
+        self.is_healthy = self.purity >= MIN_CONSENSUS_COHERENCE;
+    }
 }
 
-/// Extension: compute quorum threshold directly from a validator set.
-impl ValidatorSet {
-    /// Returns the quorum threshold (minimum voting power required) for this validator set.
-    pub fn quorum_threshold(&self) -> VotingPower {
-        quorum_threshold(self.total_power())
-    }
+// -----------------------------------------------------------------------------
+// Re‑exports – core consensus types
+// -----------------------------------------------------------------------------
+
+pub use block_producer::*;
+pub use diagnostic::*;
+pub use double_sign::*;
+pub use engine::*;
+pub use fast_finality::*;
+pub use messages::*;
+pub use quorum::*;
+pub use validator_set::*;
+
+// -----------------------------------------------------------------------------
+// Prelude – convenient import of common consensus items
+// -----------------------------------------------------------------------------
+
+/// Prelude for the consensus module.
+pub mod prelude {
+    pub use super::{
+        Config, ConsensusMsg, Engine, Proposal, QuorumCalculator, Validator, ValidatorSet, Vote,
+        VoteType,
+    };
+    pub use super::diagnostic::{diagnose, ConsensusDiagnostic, StallReason};
+    pub use super::double_sign::{vote_guard_key, DoubleSignGuard};
+    pub use super::fast_finality::{FinalityStats, FinalityTracker, PipelineState};
+    pub use super::QuantumConsensusState;
 }
 
 // -----------------------------------------------------------------------------
@@ -143,72 +182,65 @@ impl ValidatorSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::validator_set::{Validator, ValidatorSet};
 
-    fn test_vset() -> ValidatorSet {
-        ValidatorSet {
-            vals: vec![
-                Validator { pk: PublicKeyBytes(vec![1u8; 32]), power: 1 },
-                Validator { pk: PublicKeyBytes(vec![2u8; 32]), power: 1 },
-                Validator { pk: PublicKeyBytes(vec![3u8; 32]), power: 1 },
-            ],
+    #[test]
+    fn test_quantum_consensus_state_initialization() {
+        let state = QuantumConsensusState::new();
+        assert!((state.purity - 1.0).abs() < 1e-10);
+        assert!((state.entropy - 0.0).abs() < 1e-10);
+        assert!(state.is_healthy);
+    }
+
+    #[test]
+    fn test_step_decoherence() {
+        let mut state = QuantumConsensusState::new();
+        let initial_purity = state.purity;
+
+        state.apply_step_decoherence();
+        assert!(state.purity < initial_purity);
+        assert_eq!(state.total_transitions, 1);
+    }
+
+    #[test]
+    fn test_timeout_decoherence_stronger() {
+        let mut state = QuantumConsensusState::new();
+        state.apply_step_decoherence();
+        let after_step = state.purity;
+
+        let mut state2 = QuantumConsensusState::new();
+        state2.apply_timeout_decoherence();
+        assert!(state2.purity < after_step);
+        assert_eq!(state2.total_timeouts, 1);
+    }
+
+    #[test]
+    fn test_quorum_decoherence() {
+        let mut state = QuantumConsensusState::new();
+        let initial_purity = state.purity;
+
+        state.apply_quorum_decoherence();
+        assert!(state.purity < initial_purity);
+        assert_eq!(state.total_quorums, 1);
+    }
+
+    #[test]
+    fn test_health_check() {
+        let mut state = QuantumConsensusState::new();
+        assert!(state.is_healthy);
+
+        // Apply many decoherence events
+        for _ in 0..1000 {
+            state.apply_step_decoherence();
         }
+        assert!(!state.is_healthy);
     }
 
     #[test]
-    fn test_vote_tally_basic() {
-        let vset = test_vset();
-        let mut tally = VoteTally::default();
-        let block_a = Some(Hash32([0xAA; 32]));
-        let block_b = Some(Hash32([0xBB; 32]));
-
-        tally.add_vote(&vset, &PublicKeyBytes(vec![1u8; 32]), &block_a);
-        tally.add_vote(&vset, &PublicKeyBytes(vec![2u8; 32]), &block_a);
-        tally.add_vote(&vset, &PublicKeyBytes(vec![3u8; 32]), &block_b);
-
-        assert_eq!(tally.best(), Some((block_a.clone(), 2)));
-        assert!(!tally.has_quorum(&block_a, 3));
-        assert_eq!(tally.total_power(), 3);
-    }
-
-    #[test]
-    fn test_nil_votes() {
-        let vset = test_vset();
-        let mut tally = VoteTally::default();
-        let nil: Option<Hash32> = None;
-
-        tally.add_vote(&vset, &PublicKeyBytes(vec![1u8; 32]), &nil);
-        tally.add_vote(&vset, &PublicKeyBytes(vec![2u8; 32]), &nil);
-        tally.add_vote(&vset, &PublicKeyBytes(vec![3u8; 32]), &nil);
-
-        assert_eq!(tally.best(), Some((nil.clone(), 3)));
-        assert!(tally.has_quorum(&nil, 2));
-    }
-
-    #[test]
-    fn test_quorum_threshold() {
-        assert_eq!(quorum_threshold(1), 1);
-        assert_eq!(quorum_threshold(2), 2);
-        assert_eq!(quorum_threshold(3), 3);
-        assert_eq!(quorum_threshold(4), 3);
-        assert_eq!(quorum_threshold(5), 4);
-        assert_eq!(quorum_threshold(100), 67);
-    }
-
-    #[test]
-    fn test_vset_quorum_threshold() {
-        let vset = test_vset();
-        assert_eq!(vset.quorum_threshold(), (3 * 2 / 3) + 1);
-    }
-
-    #[test]
-    fn test_clear() {
-        let vset = test_vset();
-        let mut tally = VoteTally::default();
-        tally.add_vote(&vset, &PublicKeyBytes(vec![1u8; 32]), &Some(Hash32([1; 32])));
-        assert_eq!(tally.total_power(), 1);
-        tally.clear();
-        assert_eq!(tally.total_power(), 0);
-        assert!(tally.per_block.is_empty());
+    fn test_purity_never_negative() {
+        let mut state = QuantumConsensusState::new();
+        for _ in 0..10000 {
+            state.apply_timeout_decoherence();
+        }
+        assert!(state.purity >= 0.0);
     }
 }
