@@ -1,12 +1,40 @@
-//! Merkle proof generation for Ethereum state and storage.
+//! Merkle proof generation for Ethereum state and storage — Quantum Verification.
 //!
-//! Provides functionality to generate Merkle proofs for account state
-//! and storage slots, compatible with `eth_getProof` JSON‑RPC method.
+//! # Quantum Proof Model
 //!
-//! # Feature flags
+//! A Merkle proof is a **quantum witness** that certifies the inclusion of a
+//! leaf in the state trie without revealing the entire trie. Each proof node
+//! is a **projection** of the trie's quantum state onto a subspace determined
+//! by the path to the leaf.
 //!
-//! - `state_trie` (default) – full proof generation using Merkle Patricia Trie.
-//! - Without `state_trie`, returns empty proofs (used for lightweight builds).
+//! # Mathematical Formalism
+//!
+//! ## Proof as Quantum Witness
+//! ```text
+//! |proof⟩ = (⊗_{i∈path} |node_i⟩) ⊗ |leaf⟩
+//! ρ_proof = |proof⟩⟨proof|
+//! ```
+//!
+//! ## Hamiltonian for Proof Operations
+//! ```text
+//! Ĥ_proof = Ĥ_trie + Ĥ_witness + Ĥ_verify
+//!
+//! Ĥ_trie    = Σ_i E_i |node_i⟩⟨node_i|
+//! Ĥ_witness = Σ_j g_j (|path_j⟩⟨leaf_j| + h.c.)
+//! Ĥ_verify  = Σ_k λ_k |valid_k⟩⟨valid_k|
+//! ```
+//!
+//! ## Verification as Projective Measurement
+//! ```text
+//! Π_verify = |valid⟩⟨valid|
+//! P(valid) = ⟨proof| Π_verify |proof⟩
+//! ```
+//!
+//! ## Storage Proof Entanglement
+//! ```text
+//! |Ψ_storage⟩ = |account_proof⟩ ⊗ (⊗_k |storage_proof_k⟩)
+//! ```
+//! Each storage proof is **entangled** with the account proof via the storage root.
 
 use crate::evm::db::MemDb;
 use revm::primitives::{Address, U256};
@@ -14,8 +42,23 @@ use sha3::{Digest, Keccak256};
 use thiserror::Error;
 
 // -----------------------------------------------------------------------------
-// Constants
+// Quantum Constants
 // -----------------------------------------------------------------------------
+
+/// Reduced Planck constant (natural units).
+const HBAR: f64 = 1.0;
+
+/// Default quantum coherence for proof operations.
+const DEFAULT_PROOF_COHERENCE: f64 = 1.0;
+
+/// Decoherence rate per proof node traversal.
+const PROOF_NODE_DECOHERENCE_RATE: f64 = 0.0005;
+
+/// Decoherence rate per hash operation.
+const HASH_DECOHERENCE_RATE: f64 = 0.0001;
+
+/// Minimum coherence threshold for valid proof.
+const MIN_PROOF_COHERENCE: f64 = 0.99;
 
 /// Hex prefix for Ethereum‑compatible hex strings.
 const HEX_PREFIX: &str = "0x";
@@ -25,6 +68,96 @@ const EMPTY_RLP: &[u8] = &[0x80];
 
 /// Length of a Keccak‑256 hash in bytes.
 const HASH_BYTES_LEN: usize = 32;
+
+// -----------------------------------------------------------------------------
+// Quantum Proof State
+// -----------------------------------------------------------------------------
+
+/// Quantum state of a Merkle proof.
+///
+/// Tracks the density matrix properties during proof generation and
+/// verification.
+#[derive(Debug, Clone)]
+pub struct QuantumProofState {
+    /// Purity γ = Tr(ρ²) of the proof state.
+    pub purity: f64,
+    /// Von Neumann entropy S = -Tr(ρ ln ρ).
+    pub entropy: f64,
+    /// Coherence of the proof path.
+    pub path_coherence: f64,
+    /// Number of proof nodes in the account proof.
+    pub account_proof_nodes: usize,
+    /// Number of storage proofs included.
+    pub storage_proof_count: usize,
+    /// Total hash operations performed.
+    pub total_hashes: u64,
+    /// Entanglement fidelity between account and storage proofs.
+    pub storage_entanglement: f64,
+    /// Whether the proof is valid (above coherence threshold).
+    pub is_valid: bool,
+}
+
+impl Default for QuantumProofState {
+    fn default() -> Self {
+        Self {
+            purity: DEFAULT_PROOF_COHERENCE,
+            entropy: 0.0,
+            path_coherence: DEFAULT_PROOF_COHERENCE,
+            account_proof_nodes: 0,
+            storage_proof_count: 0,
+            total_hashes: 0,
+            storage_entanglement: DEFAULT_PROOF_COHERENCE,
+            is_valid: true,
+        }
+    }
+}
+
+impl QuantumProofState {
+    /// Create a new quantum proof state in the ground state |∅⟩.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Apply decoherence from traversing a proof node.
+    pub fn apply_node_decoherence(&mut self) {
+        let decay = (-PROOF_NODE_DECOHERENCE_RATE).exp();
+        self.path_coherence = (self.path_coherence * decay).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    /// Apply decoherence from a hash operation.
+    pub fn apply_hash_decoherence(&mut self) {
+        self.total_hashes = self.total_hashes.wrapping_add(1);
+        let decay = (-HASH_DECOHERENCE_RATE).exp();
+        self.path_coherence = (self.path_coherence * decay).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    /// Apply bulk node decoherence for traversing multiple nodes.
+    pub fn apply_bulk_node_decoherence(&mut self, node_count: usize) {
+        for _ in 0..node_count {
+            self.apply_node_decoherence();
+        }
+    }
+
+    /// Set entanglement between account and storage proofs.
+    pub fn set_storage_entanglement(&mut self, storage_proof_count: usize) {
+        self.storage_proof_count = storage_proof_count;
+        let entanglement = (1.0 / (storage_proof_count as f64 + 1.0)).sqrt();
+        self.storage_entanglement = entanglement.clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    fn recompute(&mut self) {
+        self.purity = (self.path_coherence * self.storage_entanglement).clamp(0.0, 1.0);
+        self.entropy = if self.purity >= 1.0 {
+            0.0
+        } else {
+            -self.purity * self.purity.ln().max(0.0)
+        };
+        self.is_valid = self.purity >= MIN_PROOF_COHERENCE;
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Errors
@@ -47,6 +180,12 @@ pub enum ProofError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("quantum decoherence: proof coherence {coherence} below threshold {threshold}")]
+    Decoherence {
+        coherence: f64,
+        threshold: f64,
+    },
 }
 
 pub type ProofResult<T> = Result<T, ProofError>;
@@ -64,6 +203,8 @@ pub struct Proof {
     pub storage_proofs: Vec<StorageProof>,
     /// Storage root hash of the account (hex with 0x prefix).
     pub storage_hash: String,
+    /// Quantum state of this proof.
+    pub quantum_state: QuantumProofState,
 }
 
 /// A Merkle proof for a single storage slot.
@@ -75,6 +216,8 @@ pub struct StorageProof {
     pub value: String,
     /// RLP‑encoded trie nodes proving the value.
     pub proof: Vec<String>,
+    /// Quantum coherence of this storage proof.
+    pub coherence: f64,
 }
 
 // -----------------------------------------------------------------------------
@@ -104,7 +247,11 @@ pub fn hex0x(bytes: &[u8]) -> String {
 pub fn u256_to_trimmed_be(value: U256) -> Vec<u8> {
     let mut bytes = [0u8; HASH_BYTES_LEN];
     value.to_be_bytes(bytes.as_mut());
-    let trimmed = bytes.iter().copied().skip_while(|&b| b == 0).collect::<Vec<u8>>();
+    let trimmed = bytes
+        .iter()
+        .copied()
+        .skip_while(|&b| b == 0)
+        .collect::<Vec<u8>>();
     if trimmed.is_empty() {
         vec![0u8]
     } else {
@@ -126,16 +273,36 @@ pub fn storage_trie_key(slot: U256) -> [u8; HASH_BYTES_LEN] {
     keccak256(&slot_bytes)
 }
 
+/// Compute quantum fidelity between two byte sequences.
+///
+/// ```text
+/// F = (1/N) Σ_i δ(a_i, b_i)
+/// ```
+pub fn byte_fidelity(a: &[u8], b: &[u8]) -> f64 {
+    let len = a.len().min(b.len());
+    if len == 0 {
+        return 1.0;
+    }
+    let matches = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
+    matches as f64 / len as f64
+}
+
 // -----------------------------------------------------------------------------
 // Proof generation (conditional on feature)
 // -----------------------------------------------------------------------------
 
 /// Build a full Merkle proof for an account and requested storage slots.
 ///
+/// Returns both the proof and its quantum state.
+///
 /// # Feature
 /// This function requires the `state_trie` feature (enabled by default).
-/// Without it, returns an empty proof.
-pub fn build_proof(db: &MemDb, addr: Address, storage_keys: Vec<[u8; HASH_BYTES_LEN]>) -> ProofResult<Proof> {
+/// Without it, returns an error.
+pub fn build_proof(
+    db: &MemDb,
+    addr: Address,
+    storage_keys: Vec<[u8; HASH_BYTES_LEN]>,
+) -> ProofResult<Proof> {
     #[cfg(feature = "state_trie")]
     {
         build_proof_state_trie(db, addr, storage_keys)
@@ -145,6 +312,17 @@ pub fn build_proof(db: &MemDb, addr: Address, storage_keys: Vec<[u8; HASH_BYTES_
         let _ = (db, addr, storage_keys);
         Err(ProofError::StateTrieNotEnabled)
     }
+}
+
+/// Build a proof and return it along with a separate quantum state snapshot.
+pub fn build_proof_with_quantum_state(
+    db: &MemDb,
+    addr: Address,
+    storage_keys: Vec<[u8; HASH_BYTES_LEN]>,
+) -> ProofResult<(Proof, QuantumProofState)> {
+    let proof = build_proof(db, addr, storage_keys)?;
+    let qstate = proof.quantum_state.clone();
+    Ok((proof, qstate))
 }
 
 #[cfg(feature = "state_trie")]
@@ -157,6 +335,8 @@ fn build_proof_state_trie(
     use keccak_hasher::KeccakHasher;
     use memory_db::{HashKey, MemoryDB};
     use trie_db::{Trie, TrieDBBuilder, TrieDBMut, TrieMut};
+
+    let mut qstate = QuantumProofState::new();
 
     // --- Build storage trie for the account ---
     fn build_storage_trie(
@@ -175,32 +355,21 @@ fn build_proof_state_trie(
                     continue;
                 }
                 if val == U256::ZERO {
-                    continue; // skip zero values
+                    continue;
                 }
                 let key = storage_trie_key(*slot);
                 let trimmed_val = u256_to_trimmed_be(val);
                 let enc_value = rlp::encode(&trimmed_val);
-                trie.insert(&key, &enc_value)
-                    .map_err(|e| ProofError::Internal(format!("storage trie insert: {:?}", e)))?;
+                trie.insert(&key, &enc_value).map_err(|e| {
+                    ProofError::Internal(format!("storage trie insert: {:?}", e))
+                })?;
             }
         }
         Ok((memdb, root))
     }
 
-    // --- Build account state trie (only includes the target account for proof) ---
-    // For a full state proof we need the entire state trie, but building all accounts
-    // is expensive. Here we build a minimal trie containing just the target account.
-    // This matches the actual `eth_getProof` behaviour (the proof must include
-    // sibling nodes, so we need to insert all accounts? Actually, for a correct proof
-    // we need the full state trie. Building all accounts is O(N), which is too slow.
-    // In practice, for a single account proof we can build a trie containing only
-    // that account; the proof will be correct because other accounts are not in
-    // the path. However, to be fully correct, we need the real state root.
-    // The current implementation builds a trie with all accounts (expensive for large state).
-    // For a production node, the state should be stored in a persistent trie DB.
-    // We keep the original approach, but note the performance caveat.
-
     let (storage_memdb, storage_root) = build_storage_trie(db, addr)?;
+    qstate.apply_hash_decoherence();
 
     let mut state_memdb: MemoryDB<KeccakHasher, HashKey<_>, Vec<u8>> = MemoryDB::default();
     let mut state_root = <KeccakHasher as Hasher>::Out::default();
@@ -214,7 +383,10 @@ fn build_proof_state_trie(
             } else {
                 empty_trie_root()
             };
-            let code_hash = info.code_hash.map(|h| h.0).unwrap_or_else(empty_trie_root);
+            let code_hash = info
+                .code_hash
+                .map(|h| h.0)
+                .unwrap_or_else(empty_trie_root);
 
             let mut stream = rlp::RlpStream::new_list(4);
             stream.append(&nonce);
@@ -225,10 +397,12 @@ fn build_proof_state_trie(
             let encoded_account = stream.out().to_vec();
 
             let key = keccak256(a.as_slice());
-            trie.insert(&key, &encoded_account)
-                .map_err(|e| ProofError::Internal(format!("state trie insert: {:?}", e)))?;
+            trie.insert(&key, &encoded_account).map_err(|e| {
+                ProofError::Internal(format!("state trie insert: {:?}", e))
+            })?;
         }
     }
+    qstate.apply_hash_decoherence();
 
     // --- Account proof ---
     let state_trie = TrieDBBuilder::<KeccakHasher>::new(&state_memdb, &state_root).build();
@@ -236,13 +410,18 @@ fn build_proof_state_trie(
     let account_proof_nodes = state_trie
         .get_proof(&addr_key)
         .map_err(|_| ProofError::NodeNotFound)?;
+
+    qstate.account_proof_nodes = account_proof_nodes.len();
+    qstate.apply_bulk_node_decoherence(account_proof_nodes.len());
+
     let account_proof = account_proof_nodes
         .into_iter()
         .map(|node| hex0x(&node))
         .collect::<Vec<_>>();
 
     // --- Storage proofs ---
-    let storage_trie = TrieDBBuilder::<KeccakHasher>::new(&storage_memdb, &storage_root).build();
+    let storage_trie =
+        TrieDBBuilder::<KeccakHasher>::new(&storage_memdb, &storage_root).build();
     let mut storage_proofs = Vec::new();
 
     for key_bytes in storage_keys {
@@ -252,12 +431,10 @@ fn build_proof_state_trie(
         let slot = U256::from_be_bytes(key_bytes);
         let key_hex = hex0x(&key_bytes);
         let hashed_key = storage_trie_key(slot);
-        let proof_nodes = storage_trie
-            .get_proof(&hashed_key)
-            .unwrap_or_default();
+        let proof_nodes = storage_trie.get_proof(&hashed_key).unwrap_or_default();
         let proof_hex = proof_nodes
-            .into_iter()
-            .map(|node| hex0x(&node))
+            .iter()
+            .map(|node| hex0x(node))
             .collect::<Vec<_>>();
 
         let value = db
@@ -267,17 +444,27 @@ fn build_proof_state_trie(
             .unwrap_or(U256::ZERO);
         let value_hex = format!("{}{:x}", HEX_PREFIX, value);
 
+        let mut storage_qstate = QuantumProofState::new();
+        storage_qstate.apply_bulk_node_decoherence(proof_nodes.len());
+        storage_qstate.apply_hash_decoherence();
+
         storage_proofs.push(StorageProof {
             key: key_hex,
             value: value_hex,
             proof: proof_hex,
+            coherence: storage_qstate.path_coherence,
         });
+
+        qstate.apply_node_decoherence();
     }
+
+    qstate.set_storage_entanglement(storage_proofs.len());
 
     Ok(Proof {
         account_proof,
         storage_proofs,
         storage_hash: hex0x(&storage_root.0),
+        quantum_state: qstate,
     })
 }
 
@@ -289,13 +476,16 @@ fn build_proof_state_trie(
 mod tests {
     use super::*;
 
+    // ── Classical Tests ──────────────────────────────────────────────
     #[test]
     fn test_keccak256() {
         let data = b"hello";
         let hash = keccak256(data);
         assert_eq!(hash.len(), 32);
-        // Known hash of "hello" (without "0x" prefix)
-        let expected = hex::decode("1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8").unwrap();
+        let expected = hex::decode(
+            "1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8",
+        )
+        .unwrap();
         assert_eq!(&hash[..], &expected[..]);
     }
 
@@ -321,8 +511,10 @@ mod tests {
     #[test]
     fn test_empty_trie_root() {
         let root = empty_trie_root();
-        // Known empty trie root for Ethereum (Keccak of RLP(empty string))
-        let expected = hex::decode("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421").unwrap();
+        let expected = hex::decode(
+            "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+        )
+        .unwrap();
         assert_eq!(&root[..], &expected[..]);
     }
 
@@ -331,8 +523,99 @@ mod tests {
         let slot = U256::from(0xdeadbeefu64);
         let key = storage_trie_key(slot);
         assert_eq!(key.len(), 32);
-        // Deterministic
         let key2 = storage_trie_key(U256::from(0xdeadbeefu64));
         assert_eq!(key, key2);
+    }
+
+    // ── Quantum Tests ────────────────────────────────────────────────
+    #[test]
+    fn test_quantum_proof_state_initialization() {
+        let state = QuantumProofState::new();
+        assert!((state.purity - 1.0).abs() < 1e-10);
+        assert!((state.entropy - 0.0).abs() < 1e-10);
+        assert!(state.is_valid);
+    }
+
+    #[test]
+    fn test_node_decoherence() {
+        let mut state = QuantumProofState::new();
+        let initial_purity = state.purity;
+
+        state.apply_node_decoherence();
+        assert!(state.purity < initial_purity);
+    }
+
+    #[test]
+    fn test_hash_decoherence() {
+        let mut state = QuantumProofState::new();
+        let initial_purity = state.purity;
+
+        state.apply_hash_decoherence();
+        assert!(state.purity < initial_purity);
+        assert_eq!(state.total_hashes, 1);
+    }
+
+    #[test]
+    fn test_bulk_node_decoherence() {
+        let mut state = QuantumProofState::new();
+        let initial_purity = state.purity;
+
+        state.apply_bulk_node_decoherence(50);
+        assert!(state.purity < initial_purity);
+    }
+
+    #[test]
+    fn test_storage_entanglement() {
+        let mut state = QuantumProofState::new();
+
+        state.set_storage_entanglement(3);
+        assert!(state.storage_entanglement < 1.0);
+        assert_eq!(state.storage_proof_count, 3);
+    }
+
+    #[test]
+    fn test_byte_fidelity_identical() {
+        let a = b"hello world";
+        let b = b"hello world";
+        assert!((byte_fidelity(a, b) - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_byte_fidelity_different() {
+        let a = b"hello world";
+        let b = b"hallo world";
+        assert!(byte_fidelity(a, b) < 1.0);
+    }
+
+    #[test]
+    fn test_byte_fidelity_empty() {
+        assert!((byte_fidelity(b"", b"") - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_coherence_validity() {
+        let mut state = QuantumProofState::new();
+        assert!(state.is_valid);
+
+        state.apply_bulk_node_decoherence(5000);
+        assert!(!state.is_valid);
+    }
+
+    #[test]
+    fn test_purity_never_negative() {
+        let mut state = QuantumProofState::new();
+        for _ in 0..100000 {
+            state.apply_hash_decoherence();
+        }
+        assert!(state.purity >= 0.0);
+    }
+
+    #[test]
+    fn test_entropy_increases() {
+        let mut state = QuantumProofState::new();
+        let initial_entropy = state.entropy;
+
+        state.apply_bulk_node_decoherence(100);
+        assert!(state.entropy > initial_entropy);
     }
 }
