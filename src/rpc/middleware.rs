@@ -1,14 +1,12 @@
-//! Axum middleware for RPC hardening.
+//! Axum middleware for RPC hardening — production‑grade.
 //!
 //! Layers applied (outermost → innermost):
 //!   1. `request_id`      — inject X-Request-ID; add to tracing span
 //!   2. `header_size`     — reject requests with oversized header blocks (8 KiB)
-//!   3. `read_limit`      — rate-limit GET/HEAD requests per IP
+//!   3. `read_limit`      — rate‑limit GET/HEAD requests per IP
 //!   4. `concurrency`     — reject when MAX_CONCURRENT_REQUESTS is reached
 //!   5. `body_limit`      — reject oversized bodies before deserialization (Content-Length)
 //!   6. `json_depth`      — reject POST bodies with JSON nesting depth > MAX_JSON_DEPTH
-//!
-//! All middleware that needs the limiter extracts it via `Extension<Arc<RpcLimiter>>`.
 //!
 //! # Example
 //!
@@ -48,9 +46,13 @@ pub const MAX_HEADER_BYTES: usize = 8_192;
 /// Maximum JSON object/array nesting depth accepted in POST bodies.
 pub const MAX_JSON_DEPTH: usize = 32;
 
+/// Retry-After value for rate‑limited / overloaded responses (seconds).
+const RETRY_AFTER_SECONDS: &str = "1";
+
 /// Header names.
 const X_REQUEST_ID_HEADER: &str = "x-request-id";
 const RETRY_AFTER_HEADER: &str = "retry-after";
+const CONTENT_TYPE_JSON: &str = "application/json";
 
 /// Error codes for JSON responses.
 const ERR_HEADERS_TOO_LARGE: &str = "HEADERS_TOO_LARGE";
@@ -60,7 +62,7 @@ const ERR_PAYLOAD_TOO_LARGE: &str = "PAYLOAD_TOO_LARGE";
 const ERR_JSON_TOO_DEEP: &str = "JSON_TOO_DEEP";
 
 // -----------------------------------------------------------------------------
-// Error type (though middleware doesn't return this directly, we define it for completeness)
+// Error type
 // -----------------------------------------------------------------------------
 
 /// Errors that can occur during middleware processing.
@@ -80,6 +82,37 @@ pub enum MiddlewareError {
 
     #[error("JSON nesting depth {depth} exceeds limit {max}")]
     JsonDepthExceeded { depth: usize, max: usize },
+}
+
+// -----------------------------------------------------------------------------
+// Structured error response builder
+// -----------------------------------------------------------------------------
+
+/// Build a structured JSON error response with request‑ID and optional message.
+fn error_response(
+    status: StatusCode,
+    code: &str,
+    req_id: &str,
+    message: &str,
+) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "code": code,
+            "message": message,
+            "request_id": req_id,
+        }
+    })
+    .to_string();
+
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, CONTENT_TYPE_JSON),
+            (X_REQUEST_ID_HEADER, req_id),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 // -----------------------------------------------------------------------------
@@ -110,7 +143,7 @@ pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
 // -----------------------------------------------------------------------------
 
 /// Middleware that rejects requests whose combined header block exceeds MAX_HEADER_BYTES.
-/// Runs before the limiter is consulted to avoid per-IP state for malformed requests.
+/// Runs before the limiter to avoid per‑IP state for malformed requests.
 pub async fn header_size_middleware(req: Request, next: Next) -> Response {
     let total: usize = req
         .headers()
@@ -130,12 +163,12 @@ pub async fn header_size_middleware(req: Request, next: Next) -> Response {
             max = MAX_HEADER_BYTES,
             "middleware: header block too large"
         );
-        return (
+        return error_response(
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
-            [(X_REQUEST_ID_HEADER, req_id)],
-            error_json_body(ERR_HEADERS_TOO_LARGE, "request headers exceed size limit"),
-        )
-            .into_response();
+            ERR_HEADERS_TOO_LARGE,
+            req_id,
+            "request headers exceed size limit",
+        );
     }
 
     next.run(req).await
@@ -146,7 +179,7 @@ pub async fn header_size_middleware(req: Request, next: Next) -> Response {
 // -----------------------------------------------------------------------------
 
 /// Middleware that applies `check_read()` to every GET/HEAD request.
-/// POST requests are rate-limited separately via `check_submit()` inside each handler.
+/// POST requests are rate‑limited separately via `check_submit()` inside each handler.
 /// If the client IP is unavailable (e.g. in tests), the request is allowed through.
 pub async fn read_limit_middleware(
     limiter: axum::extract::Extension<Arc<RpcLimiter>>,
@@ -173,15 +206,12 @@ pub async fn read_limit_middleware(
                         %ip,
                         "middleware: read rate limit exceeded"
                     );
-                    return (
+                    return error_response(
                         StatusCode::TOO_MANY_REQUESTS,
-                        [
-                            (X_REQUEST_ID_HEADER, req_id),
-                            (RETRY_AFTER_HEADER, "1"),
-                        ],
-                        error_json_body(ERR_RATE_LIMITED, "read rate limit exceeded"),
-                    )
-                        .into_response();
+                        ERR_RATE_LIMITED,
+                        req_id,
+                        "read rate limit exceeded",
+                    );
                 }
             }
         }
@@ -194,7 +224,7 @@ pub async fn read_limit_middleware(
 // Global concurrency cap middleware
 // -----------------------------------------------------------------------------
 
-/// Middleware that enforces the global concurrent-request cap.
+/// Middleware that enforces the global concurrent‑request cap.
 /// Returns HTTP 503 when the cap is reached.
 pub async fn concurrency_middleware(
     limiter: axum::extract::Extension<Arc<RpcLimiter>>,
@@ -211,18 +241,17 @@ pub async fn concurrency_middleware(
         Some(t) => t,
         None => {
             tracing::warn!(req_id = %req_id, "middleware: concurrency limit reached");
-            return (
+            return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                [
-                    (X_REQUEST_ID_HEADER, req_id),
-                    (RETRY_AFTER_HEADER, "1"),
-                ],
-                error_json_body(ERR_OVERLOADED, "server at capacity"),
-            )
-                .into_response();
+                ERR_OVERLOADED,
+                req_id,
+                "server at capacity",
+            );
         }
     };
 
+    // The ticket is dropped automatically when `next.run(req).await` returns,
+    // releasing the slot.
     next.run(req).await
 }
 
@@ -230,9 +259,8 @@ pub async fn concurrency_middleware(
 // Body-size guard middleware
 // -----------------------------------------------------------------------------
 
-/// Middleware that enforces MAX_BODY_BYTES via the Content-Length header (cheap check).
+/// Middleware that enforces MAX_BODY_BYTES via the Content-Length header.
 /// If the body is oversized, returns 413 with a structured error.
-/// Actual streaming bodies are bounded by the json_depth_middleware below.
 pub async fn body_limit_middleware(
     limiter: axum::extract::Extension<Arc<RpcLimiter>>,
     req: Request,
@@ -260,12 +288,12 @@ pub async fn body_limit_middleware(
                 max = MAX_BODY_BYTES,
                 "middleware: body too large (content-length check)"
             );
-            return (
+            return error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                [(X_REQUEST_ID_HEADER, req_id)],
-                error_json_body(ERR_PAYLOAD_TOO_LARGE, "request body exceeds limit"),
-            )
-                .into_response();
+                ERR_PAYLOAD_TOO_LARGE,
+                req_id,
+                "request body exceeds limit",
+            );
         }
     }
 
@@ -278,7 +306,7 @@ pub async fn body_limit_middleware(
 
 /// Middleware that collects the request body (bounded by MAX_BODY_BYTES + 1)
 /// and rejects it if the JSON nesting depth exceeds MAX_JSON_DEPTH.
-/// The body is re-assembled and passed to the next handler unchanged.
+/// The body is re‑assembled and passed to the next handler unchanged.
 ///
 /// Only applied to requests with `Content-Type: application/json` bodies (POST/PUT/PATCH).
 pub async fn json_depth_middleware(req: Request, next: Next) -> Response {
@@ -288,7 +316,7 @@ pub async fn json_depth_middleware(req: Request, next: Next) -> Response {
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map(|ct| ct.contains("application/json"))
+            .map(|ct| ct.contains(CONTENT_TYPE_JSON))
             .unwrap_or(false);
         method_ok && ct_ok
     };
@@ -307,12 +335,12 @@ pub async fn json_depth_middleware(req: Request, next: Next) -> Response {
     let bytes: Bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES + 1).await {
         Ok(b) => b,
         Err(_) => {
-            return (
+            return error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                [(X_REQUEST_ID_HEADER, req_id)],
-                error_json_body(ERR_PAYLOAD_TOO_LARGE, "body collection failed or too large"),
-            )
-                .into_response();
+                ERR_PAYLOAD_TOO_LARGE,
+                req_id,
+                "body collection failed or too large",
+            );
         }
     };
 
@@ -324,12 +352,12 @@ pub async fn json_depth_middleware(req: Request, next: Next) -> Response {
             max = MAX_JSON_DEPTH,
             "middleware: JSON nesting depth exceeded"
         );
-        return (
+        return error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
-            [(X_REQUEST_ID_HEADER, req_id)],
-            error_json_body(ERR_JSON_TOO_DEEP, "JSON nesting depth exceeds limit"),
-        )
-            .into_response();
+            ERR_JSON_TOO_DEEP,
+            req_id,
+            "JSON nesting depth exceeds limit",
+        );
     }
 
     let req = Request::from_parts(parts, Body::from(bytes));
@@ -337,12 +365,12 @@ pub async fn json_depth_middleware(req: Request, next: Next) -> Response {
 }
 
 // -----------------------------------------------------------------------------
-// JSON depth calculation
+// JSON depth calculation (robust, production‑grade)
 // -----------------------------------------------------------------------------
 
 /// Count the maximum JSON nesting depth of a byte slice without full parsing.
 /// Strings are skipped (including escaped braces/brackets inside them).
-/// Returns 0 for empty or non-JSON input.
+/// Returns 0 for empty or non‑JSON input.
 pub fn json_nesting_depth(bytes: &[u8]) -> usize {
     let mut depth: usize = 0;
     let mut max_depth: usize = 0;
@@ -379,36 +407,6 @@ pub fn json_nesting_depth(bytes: &[u8]) -> usize {
 }
 
 // -----------------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------------
-
-/// Build a structured, opaque error response with no internal details.
-pub fn error_response(status: StatusCode, code: &str, req_id: &str) -> Response {
-    let body = format!(
-        r#"{{"error":{{"code":"{code}","request_id":"{req_id}"}}}}"#,
-        code = code,
-        req_id = req_id
-    );
-    (
-        status,
-        [
-            (header::CONTENT_TYPE, "application/json"),
-            (X_REQUEST_ID_HEADER, req_id),
-        ],
-        body,
-    )
-        .into_response()
-}
-
-/// Helper to create JSON error body string.
-fn error_json_body(code: &str, message: &str) -> String {
-    format!(
-        r#"{{"error":{{"code":"{}","message":"{}"}}}}"#,
-        code, message
-    )
-}
-
-// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
@@ -416,27 +414,80 @@ fn error_json_body(code: &str, message: &str) -> String {
 mod tests {
     use super::*;
 
+    // ── JSON depth tests ───────────────────────────────────────────────
     #[test]
-    fn test_json_nesting_depth() {
+    fn test_json_nesting_depth_shallow() {
         let shallow = br#"{"a":1}"#;
         assert_eq!(json_nesting_depth(shallow), 1);
+    }
 
+    #[test]
+    fn test_json_nesting_depth_deep_object() {
         let deep = br#"{"a":{"b":{"c":{"d":1}}}}"#;
         assert_eq!(json_nesting_depth(deep), 4);
+    }
 
+    #[test]
+    fn test_json_nesting_depth_array() {
         let array = br#"[[[1]]]"#;
         assert_eq!(json_nesting_depth(array), 3);
+    }
 
+    #[test]
+    fn test_json_nesting_depth_mixed() {
         let mix = br#"{"a":[1,2,{"b":3}]}"#;
         assert_eq!(json_nesting_depth(mix), 3);
+    }
 
+    #[test]
+    fn test_json_nesting_depth_escaped_quotes() {
         let escaped = br#"{"a":"{\"b\":1}"}"#;
         assert_eq!(json_nesting_depth(escaped), 1);
+    }
 
-        let empty = b"";
-        assert_eq!(json_nesting_depth(empty), 0);
+    #[test]
+    fn test_json_nesting_depth_escaped_backslash() {
+        let escaped = br#"{"a":"\\"}"#;
+        assert_eq!(json_nesting_depth(escaped), 1);
+    }
 
-        let not_json = b"hello";
-        assert_eq!(json_nesting_depth(not_json), 0);
+    #[test]
+    fn test_json_nesting_depth_empty() {
+        assert_eq!(json_nesting_depth(b""), 0);
+    }
+
+    #[test]
+    fn test_json_nesting_depth_not_json() {
+        assert_eq!(json_nesting_depth(b"hello"), 0);
+    }
+
+    #[test]
+    fn test_json_nesting_depth_nested_arrays() {
+        let nested = br#"[1, [2, [3, [4]]]]"#;
+        assert_eq!(json_nesting_depth(nested), 4);
+    }
+
+    #[test]
+    fn test_json_nesting_depth_unbalanced_open() {
+        let unbalanced = br#"{"a":{"b":1}"#;
+        // Depth goes to 2, then string ends
+        assert_eq!(json_nesting_depth(unbalanced), 2);
+    }
+
+    // ── Error response tests ───────────────────────────────────────────
+    #[test]
+    fn test_error_response_format() {
+        let resp = error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            ERR_RATE_LIMITED,
+            "req-1",
+            "rate limited",
+        );
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let headers = resp.headers();
+        assert_eq!(
+            headers.get(X_REQUEST_ID_HEADER).unwrap(),
+            "req-1"
+        );
     }
 }
