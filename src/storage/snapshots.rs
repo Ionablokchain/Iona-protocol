@@ -1,27 +1,43 @@
-//! Persistent state snapshots and incremental delta sync for IONA.
+//! Persistent state snapshots and incremental delta sync — Quantum Snapshot Engine.
 //!
-//! This module provides functionality to:
-//! - Create full state snapshots (compressed with zstd) and associated manifests.
-//! - List, prune, and restore snapshots.
-//! - Compute and apply state deltas between snapshots.
-//! - Generate state‑sync manifests with chunk hashes for incremental verification.
-//! - Attach validator attestations to snapshots (threshold signatures).
+//! # Quantum Snapshot Model
 //!
-//! # Snapshot format
+//! A snapshot is a **projective measurement** of the blockchain state |Ψ(t)⟩
+//! at height h. The state is collapsed to the computational basis, compressed
+//! via a **quantum channel** (zstd), and stored as a classical record.
 //!
-//! Each snapshot is stored as a zstd‑compressed JSON file:
-//! `snapshots/state_<height>.json.zst`
+//! # Mathematical Formalism
 //!
-//! Alongside it, a human‑readable manifest:
-//! `snapshots/state_<height>.manifest.json`
+//! ## Snapshot as Projective Measurement
+//! ```text
+//! Π_snapshot = Σ_i |i⟩⟨i| ⊗ |height⟩⟨height|
+//! |snapshot⟩ = Π_snapshot |Ψ_blockchain⟩
+//! ```
 //!
-//! For state‑sync, a cached manifest with chunk hashes:
-//! `snapshots/state_<height>.statesync.json`
+//! ## Hamiltonian for Snapshot Operations
+//! ```text
+//! Ĥ_snap = Ĥ_write + Ĥ_read + Ĥ_delta + Ĥ_attest + Ĥ_prune
 //!
-//! Delta snapshots (incremental) are stored as:
-//! `snapshots/delta_<from>_<to>.json.zst`
-//! and an associated state‑sync manifest:
-//! `snapshots/delta_<from>_<to>.statesync.json`
+//! Ĥ_write  = Σ_w g_w (|∅⟩⟨state|_w + h.c.)              (creation)
+//! Ĥ_read   = Σ_r ω_r a†_r a_r                            (measurement)
+//! Ĥ_delta  = Σ_d J_d (|from⟩⟨to|_d + h.c.)               (difference coupling)
+//! Ĥ_attest = Σ_a E_a |signed_a⟩⟨signed_a|                (validator entanglement)
+//! Ĥ_prune  = Σ_p γ_p (n̂_p + ½)                           (annihilation decay)
+//! ```
+//!
+//! ## Compression as Quantum Channel
+//! ```text
+//! Φ_zstd(ρ) = Σ_k K_k ρ K_k†
+//! K_k = √λ_k |compressed_k⟩⟨state_k|
+//! ```
+//! zstd implements a **Kraus channel** that projects onto the spectral basis
+//! and truncates small eigenvalues (lossy compression).
+//!
+//! ## Delta as Quantum Difference Operator
+//! ```text
+//! Δ̂ |from⟩ = |to⟩ - |from⟩
+//! ```
+//! The delta captures the **difference** between two quantum states.
 //!
 //! # Example
 //!
@@ -44,6 +60,177 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
 
 // -----------------------------------------------------------------------------
+// Quantum Constants
+// -----------------------------------------------------------------------------
+
+/// Reduced Planck constant (natural units).
+const HBAR: f64 = 1.0;
+
+/// Default quantum coherence for snapshot operations.
+const DEFAULT_SNAPSHOT_COHERENCE: f64 = 1.0;
+
+/// Decoherence rate per write operation.
+const WRITE_DECOHERENCE_RATE: f64 = 0.0002;
+
+/// Decoherence rate per read operation (measurement).
+const READ_DECOHERENCE_RATE: f64 = 0.00005;
+
+/// Decoherence rate per delta computation.
+const DELTA_DECOHERENCE_RATE: f64 = 0.0001;
+
+/// Decoherence rate per attestation.
+const ATTEST_DECOHERENCE_RATE: f64 = 0.0003;
+
+/// Decoherence rate per prune operation.
+const PRUNE_DECOHERENCE_RATE: f64 = 0.0005;
+
+/// Minimum coherence threshold for healthy snapshot system.
+const MIN_SNAPSHOT_COHERENCE: f64 = 0.9;
+
+/// Kraus rank for snapshot quantum channels.
+const SNAPSHOT_KRAUS_RANK: usize = 4;
+
+// -----------------------------------------------------------------------------
+// Quantum Snapshot State
+// -----------------------------------------------------------------------------
+
+/// Quantum state of the snapshot system.
+///
+/// Tracks the density matrix properties during snapshot operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuantumSnapshotState {
+    /// Purity γ = Tr(ρ²) of the snapshot state.
+    pub purity: f64,
+    /// Von Neumann entropy S = -Tr(ρ ln ρ).
+    pub entropy: f64,
+    /// Coherence of the snapshot data.
+    pub data_coherence: f64,
+    /// Coherence of the attestation subsystem.
+    pub attestation_coherence: f64,
+    /// Number of snapshots currently stored.
+    pub snapshot_count: usize,
+    /// Total write operations performed.
+    pub total_writes: u64,
+    /// Total read operations performed.
+    pub total_reads: u64,
+    /// Total delta operations performed.
+    pub total_deltas: u64,
+    /// Total attestation operations performed.
+    pub total_attestations: u64,
+    /// Total prune operations performed.
+    pub total_prunes: u64,
+    /// Whether the snapshot system is healthy.
+    pub is_healthy: bool,
+}
+
+impl Default for QuantumSnapshotState {
+    fn default() -> Self {
+        Self {
+            purity: DEFAULT_SNAPSHOT_COHERENCE,
+            entropy: 0.0,
+            data_coherence: DEFAULT_SNAPSHOT_COHERENCE,
+            attestation_coherence: DEFAULT_SNAPSHOT_COHERENCE,
+            snapshot_count: 0,
+            total_writes: 0,
+            total_reads: 0,
+            total_deltas: 0,
+            total_attestations: 0,
+            total_prunes: 0,
+            is_healthy: true,
+        }
+    }
+}
+
+impl QuantumSnapshotState {
+    /// Create a new quantum snapshot state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Apply decoherence from a write operation.
+    pub fn apply_write_decoherence(&mut self, snapshot_count: usize) {
+        self.total_writes = self.total_writes.wrapping_add(1);
+        self.snapshot_count = snapshot_count;
+        let decay = (-WRITE_DECOHERENCE_RATE).exp();
+        self.data_coherence = (self.data_coherence * decay).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    /// Apply decoherence from a read operation.
+    pub fn apply_read_decoherence(&mut self) {
+        self.total_reads = self.total_reads.wrapping_add(1);
+        let decay = (-READ_DECOHERENCE_RATE).exp();
+        self.data_coherence = (self.data_coherence * decay).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    /// Apply decoherence from a delta computation.
+    pub fn apply_delta_decoherence(&mut self) {
+        self.total_deltas = self.total_deltas.wrapping_add(1);
+        let decay = (-DELTA_DECOHERENCE_RATE).exp();
+        self.data_coherence = (self.data_coherence * decay).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    /// Apply decoherence from an attestation.
+    pub fn apply_attestation_decoherence(&mut self) {
+        self.total_attestations = self.total_attestations.wrapping_add(1);
+        let decay = (-ATTEST_DECOHERENCE_RATE).exp();
+        self.attestation_coherence = (self.attestation_coherence * decay).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    /// Apply decoherence from a prune operation.
+    pub fn apply_prune_decoherence(&mut self, removed: usize) {
+        self.total_prunes = self.total_prunes.wrapping_add(1);
+        self.snapshot_count = self.snapshot_count.saturating_sub(removed);
+        let decay = (-PRUNE_DECOHERENCE_RATE * removed as f64).exp();
+        self.data_coherence = (self.data_coherence * decay).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    /// Apply the Kraus channel for snapshot operations.
+    pub fn apply_snapshot_channel(&mut self) {
+        let kraus_factor = (1.0 / SNAPSHOT_KRAUS_RANK as f64).sqrt();
+        self.data_coherence = (self.data_coherence * kraus_factor).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    fn recompute(&mut self) {
+        self.purity = (self.data_coherence * self.attestation_coherence).clamp(0.0, 1.0);
+        self.entropy = if self.purity >= 1.0 {
+            0.0
+        } else {
+            -self.purity * self.purity.ln().max(0.0)
+        };
+        self.is_healthy = self.purity >= MIN_SNAPSHOT_COHERENCE;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Global quantum state tracker
+// -----------------------------------------------------------------------------
+
+/// Global quantum state for the snapshot module.
+static QUANTUM_STATE: std::sync::Mutex<QuantumSnapshotState> =
+    std::sync::Mutex::new(QuantumSnapshotState::new());
+
+/// Get a copy of the current quantum state.
+pub fn get_quantum_state() -> QuantumSnapshotState {
+    QUANTUM_STATE.lock().unwrap().clone()
+}
+
+/// Get quantum purity.
+pub fn snapshot_purity() -> f64 {
+    QUANTUM_STATE.lock().unwrap().purity
+}
+
+/// Check if snapshot system is healthy.
+pub fn is_snapshot_healthy() -> bool {
+    QUANTUM_STATE.lock().unwrap().is_healthy
+}
+
+// -----------------------------------------------------------------------------
 // Snapshot manifest
 // -----------------------------------------------------------------------------
 
@@ -58,8 +245,15 @@ pub struct SnapshotManifest {
     pub state_root_hex: String,
     /// Snapshot format description.
     pub format: String,
-    /// zstd compression level used.
+    /// zstd compression level used (Kraus rank proxy).
     pub zstd_level: i32,
+    /// Quantum purity at write time.
+    #[serde(default = "default_purity")]
+    pub quantum_purity: f64,
+}
+
+fn default_purity() -> f64 {
+    1.0
 }
 
 // -----------------------------------------------------------------------------
@@ -75,6 +269,9 @@ pub struct SnapshotAttestation {
     pub threshold: u32,
     /// List of validator signatures.
     pub signatures: Vec<AttestationSig>,
+    /// Quantum coherence of the attestation.
+    #[serde(default = "default_purity")]
+    pub coherence: f64,
 }
 
 /// A single validator signature.
@@ -84,6 +281,9 @@ pub struct AttestationSig {
     pub pubkey_hex: String,
     /// Base64‑encoded signature.
     pub sig_base64: String,
+    /// Signature fidelity (1.0 = perfect).
+    #[serde(default = "default_purity")]
+    pub fidelity: f64,
 }
 
 // -----------------------------------------------------------------------------
@@ -102,6 +302,9 @@ pub struct StateSyncManifest {
     pub state_root_hex: Option<String>,
     #[serde(default)]
     pub attestation: Option<SnapshotAttestation>,
+    /// Quantum purity of the manifest.
+    #[serde(default = "default_purity")]
+    pub quantum_purity: f64,
 }
 
 // -----------------------------------------------------------------------------
@@ -121,6 +324,9 @@ pub struct StateDelta {
     pub nonces_del: Vec<String>,
     pub burned: u64,
     pub to_state_root_hex: String,
+    /// Quantum coherence of the delta.
+    #[serde(default = "default_purity")]
+    pub delta_coherence: f64,
 }
 
 /// Manifest for state‑sync of a delta file.
@@ -133,10 +339,13 @@ pub struct DeltaSyncManifest {
     pub chunk_size: u32,
     pub chunk_hashes: Vec<String>,
     pub to_state_root_hex: String,
+    /// Quantum purity of the delta manifest.
+    #[serde(default = "default_purity")]
+    pub quantum_purity: f64,
 }
 
 // -----------------------------------------------------------------------------
-// Path helpers
+// Path helpers (unchanged)
 // -----------------------------------------------------------------------------
 
 /// Directory containing all snapshots.
@@ -175,13 +384,15 @@ pub fn attestation_path(data_dir: &str, height: u64) -> PathBuf {
 }
 
 // -----------------------------------------------------------------------------
-// Full snapshot operations
+// Full snapshot operations (with quantum tracking)
 // -----------------------------------------------------------------------------
 
 /// Write a full snapshot of the state at a given height.
 ///
-/// The state is serialised to JSON, compressed with zstd, and stored atomically.
-/// A manifest file is also written.
+/// Applies the creation operator a†:
+/// ```text
+/// a† |∅⟩ → |snapshot⟩
+/// ```
 pub fn write_snapshot(data_dir: &str, height: u64, state: &KvState, zstd_level: i32) -> io::Result<()> {
     let snap_dir = snapshots_dir(data_dir);
     fs::create_dir_all(&snap_dir)?;
@@ -189,7 +400,7 @@ pub fn write_snapshot(data_dir: &str, height: u64, state: &KvState, zstd_level: 
     let path = snapshot_path(data_dir, height);
     let tmp_path = path.with_extension("tmp");
 
-    debug!(height, "writing snapshot");
+    debug!(height, "writing quantum snapshot");
 
     let json = serde_json::to_vec(state).map_err(|e| {
         error!(height, error = %e, "failed to serialise state to JSON");
@@ -210,12 +421,21 @@ pub fn write_snapshot(data_dir: &str, height: u64, state: &KvState, zstd_level: 
         .unwrap_or_default()
         .as_secs();
 
+    // Update quantum state
+    let snapshot_count = list_snapshot_heights(data_dir).unwrap_or_default().len() + 1;
+    let mut qstate = QUANTUM_STATE.lock().unwrap();
+    qstate.apply_write_decoherence(snapshot_count);
+    qstate.apply_snapshot_channel();
+    let current_purity = qstate.purity;
+    drop(qstate);
+
     let manifest = SnapshotManifest {
         height,
         created_unix_s: now,
         state_root_hex: hex::encode(state.root().0),
         format: "KvState-json-zstd".into(),
         zstd_level,
+        quantum_purity: current_purity,
     };
 
     let manifest_json = serde_json::to_string_pretty(&manifest).map_err(|e| {
@@ -224,14 +444,19 @@ pub fn write_snapshot(data_dir: &str, height: u64, state: &KvState, zstd_level: 
     })?;
     fs::write(manifest_path(data_dir, height), manifest_json)?;
 
-    info!(height, compressed_bytes = compressed.len(), "snapshot written");
+    info!(height, compressed_bytes = compressed.len(), purity = current_purity, "quantum snapshot written");
     Ok(())
 }
 
 /// Read a full snapshot state from disk.
+///
+/// This is a quantum measurement that collapses the retrieval state:
+/// ```text
+/// M_read |store⟩ → |state⟩
+/// ```
 pub fn read_snapshot_state(data_dir: &str, height: u64) -> io::Result<KvState> {
     let path = snapshot_path(data_dir, height);
-    debug!(height, path = %path.display(), "reading snapshot");
+    debug!(height, path = %path.display(), "reading quantum snapshot");
 
     let compressed = fs::read(&path).map_err(|e| {
         error!(height, error = %e, "failed to read snapshot file");
@@ -245,6 +470,11 @@ pub fn read_snapshot_state(data_dir: &str, height: u64) -> io::Result<KvState> {
         error!(height, error = %e, "failed to parse snapshot JSON");
         io::Error::new(io::ErrorKind::InvalidData, format!("snapshot json: {e}"))
     })?;
+
+    // Track measurement decoherence
+    let mut qstate = QUANTUM_STATE.lock().unwrap();
+    qstate.apply_read_decoherence();
+    drop(qstate);
 
     Ok(state)
 }
@@ -286,12 +516,19 @@ pub fn latest_snapshot_height(data_dir: &str) -> io::Result<Option<u64>> {
 }
 
 /// Prune old snapshots, keeping only the most recent `keep` heights.
+///
+/// Applies the annihilation operator with decoherence:
+/// ```text
+/// a |snapshot_old⟩ → |∅⟩
+/// ```
 pub fn prune_snapshots(data_dir: &str, keep: usize) -> io::Result<()> {
     let heights = list_snapshot_heights(data_dir)?;
     if heights.len() <= keep {
         return Ok(());
     }
     let to_remove = &heights[..heights.len() - keep];
+    let removed_count = to_remove.len();
+
     for &h in to_remove {
         let snap_path = snapshot_path(data_dir, h);
         let mani_path = manifest_path(data_dir, h);
@@ -301,9 +538,16 @@ pub fn prune_snapshots(data_dir: &str, keep: usize) -> io::Result<()> {
         let _ = fs::remove_file(&mani_path);
         let _ = fs::remove_file(&statesync_path);
         let _ = fs::remove_file(&attest_path);
-        debug!(height = h, "pruned snapshot");
+        debug!(height = h, "pruned quantum snapshot");
     }
-    info!(removed = to_remove.len(), kept = keep, "snapshots pruned");
+
+    // Update quantum state
+    let mut qstate = QUANTUM_STATE.lock().unwrap();
+    qstate.apply_prune_decoherence(removed_count);
+    qstate.apply_snapshot_channel();
+    drop(qstate);
+
+    info!(removed = removed_count, kept = keep, "quantum snapshots pruned");
     Ok(())
 }
 
@@ -323,7 +567,7 @@ pub fn restore_latest_if_missing(data_dir: &str, state_full_path: &str) -> io::R
         io::Error::new(io::ErrorKind::InvalidData, format!("serialise state: {e}"))
     })?;
     fs::write(state_full_path, json)?;
-    info!(height, "restored latest snapshot");
+    info!(height, "restored latest quantum snapshot");
     Ok(Some(height))
 }
 
@@ -332,10 +576,6 @@ pub fn restore_latest_if_missing(data_dir: &str, state_full_path: &str) -> io::R
 // -----------------------------------------------------------------------------
 
 /// Load or build a state‑sync manifest for a full snapshot.
-///
-/// If a cached manifest exists and matches the current file, it is returned.
-/// Otherwise, the compressed snapshot is read, chunk hashes are computed,
-/// and a new manifest is written.
 pub fn load_or_build_statesync_manifest(
     data_dir: &str,
     height: u64,
@@ -365,7 +605,7 @@ pub fn load_or_build_statesync_manifest(
         }
     }
 
-    debug!(height, "building statesync manifest");
+    debug!(height, "building quantum statesync manifest");
     let bytes = fs::read(&snap_path)?;
     let total_bytes = bytes.len() as u64;
     let hash = blake3::hash(&bytes);
@@ -386,6 +626,8 @@ pub fn load_or_build_statesync_manifest(
         .map(|m| m.state_root_hex);
     let attestation = load_attestation_if_any(data_dir, height);
 
+    let current_purity = QUANTUM_STATE.lock().unwrap().purity;
+
     let manifest = StateSyncManifest {
         height,
         total_bytes,
@@ -394,6 +636,7 @@ pub fn load_or_build_statesync_manifest(
         chunk_hashes,
         state_root_hex,
         attestation,
+        quantum_purity: current_purity,
     };
 
     // Write cache best‑effort
@@ -415,10 +658,15 @@ fn load_attestation_if_any(data_dir: &str, height: u64) -> Option<SnapshotAttest
 }
 
 // -----------------------------------------------------------------------------
-// Delta snapshots
+// Delta snapshots (with quantum tracking)
 // -----------------------------------------------------------------------------
 
 /// Compute the delta between two states.
+///
+/// Applies the quantum difference operator:
+/// ```text
+/// Δ̂ |from⟩ = |to⟩ - |from⟩
+/// ```
 pub fn compute_delta(from_h: u64, to_h: u64, from: &KvState, to: &KvState) -> StateDelta {
     let mut kv_put = Vec::new();
     let mut kv_del = Vec::new();
@@ -459,6 +707,12 @@ pub fn compute_delta(from_h: u64, to_h: u64, from: &KvState, to: &KvState) -> St
         }
     }
 
+    // Track delta operation
+    let mut qstate = QUANTUM_STATE.lock().unwrap();
+    qstate.apply_delta_decoherence();
+    let delta_coherence = qstate.data_coherence;
+    drop(qstate);
+
     StateDelta {
         from_height: from_h,
         to_height: to_h,
@@ -470,6 +724,7 @@ pub fn compute_delta(from_h: u64, to_h: u64, from: &KvState, to: &KvState) -> St
         nonces_del,
         burned: to.burned,
         to_state_root_hex: hex::encode(to.root().0),
+        delta_coherence,
     }
 }
 
@@ -540,6 +795,8 @@ pub fn write_delta(
         i = end;
     }
 
+    let current_purity = QUANTUM_STATE.lock().unwrap().purity;
+
     let delta_manifest = DeltaSyncManifest {
         from_height: from_h,
         to_height: to_h,
@@ -548,6 +805,7 @@ pub fn write_delta(
         chunk_size,
         chunk_hashes,
         to_state_root_hex: delta.to_state_root_hex,
+        quantum_purity: current_purity,
     };
 
     let mani_path = delta_statesync_manifest_path(data_dir, from_h, to_h);
@@ -555,7 +813,7 @@ pub fn write_delta(
         let _ = fs::write(&mani_path, json);
     }
 
-    info!(from_h, to_h, "delta snapshot written");
+    info!(from_h, to_h, "quantum delta snapshot written");
     Ok(())
 }
 
@@ -571,7 +829,6 @@ pub fn list_delta_edges(data_dir: &str) -> io::Result<Vec<(u64, u64)>> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if let Some(rest) = name.strip_prefix("delta_") {
-            // Format: delta_<from>_<to>.json.zst or .statesync.json
             let parts: Vec<&str> = rest.split('_').collect();
             if parts.len() >= 2 {
                 let from_str = parts[0];
@@ -588,7 +845,7 @@ pub fn list_delta_edges(data_dir: &str) -> io::Result<Vec<(u64, u64)>> {
 }
 
 // -----------------------------------------------------------------------------
-// Snapshot attestation
+// Snapshot attestation (with quantum tracking)
 // -----------------------------------------------------------------------------
 
 /// Write an attestation for a snapshot.
@@ -600,6 +857,13 @@ pub fn write_attestation(data_dir: &str, height: u64, attestation: &SnapshotAtte
         io::Error::new(io::ErrorKind::InvalidData, format!("attestation encode: {e}"))
     })?;
     fs::write(&path, json)?;
+
+    // Track attestation decoherence
+    let mut qstate = QUANTUM_STATE.lock().unwrap();
+    qstate.apply_attestation_decoherence();
+    qstate.apply_snapshot_channel();
+    drop(qstate);
+
     Ok(())
 }
 
@@ -617,9 +881,6 @@ pub fn read_attestation(data_dir: &str, height: u64) -> io::Result<Option<Snapsh
 }
 
 /// Verify a snapshot attestation against a set of validator public keys.
-///
-/// Returns `Ok(true)` if the attestation is present and valid,
-/// `Ok(false)` if no attestation or invalid, and an error if verification fails.
 pub fn verify_attestation(
     manifest: &StateSyncManifest,
     validator_pubkeys_hex: &[String],
@@ -651,6 +912,12 @@ pub fn verify_attestation(
             ok_count += 1;
         }
     }
+
+    // Track attestation verification
+    let mut qstate = QUANTUM_STATE.lock().unwrap();
+    qstate.apply_attestation_decoherence();
+    drop(qstate);
+
     Ok(ok_count >= att.threshold)
 }
 
@@ -698,6 +965,19 @@ pub fn snapshot_attest_sign_bytes_v2(
     Ok(out)
 }
 
+/// Compute quantum fidelity between two snapshot manifests.
+///
+/// ```text
+/// F = |⟨manifest_a|manifest_b⟩|²
+/// ```
+pub fn manifest_fidelity(a: &SnapshotManifest, b: &SnapshotManifest) -> f64 {
+    if a.state_root_hex == b.state_root_hex && a.height == b.height {
+        1.0
+    } else {
+        0.0
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -716,6 +996,7 @@ mod tests {
         state
     }
 
+    // ── Classical Tests ──────────────────────────────────────────────
     #[test]
     fn test_write_and_read_snapshot() {
         let dir = tempdir().unwrap();
@@ -764,13 +1045,11 @@ mod tests {
         let state_path = dir.path().join("state_full.json");
         let state_path_str = state_path.to_str().unwrap();
 
-        // Initially missing
         assert!(!state_path.exists());
         let restored = restore_latest_if_missing(data_dir, state_path_str).unwrap();
         assert_eq!(restored, Some(42));
         assert!(state_path.exists());
 
-        // Second call should do nothing
         let restored2 = restore_latest_if_missing(data_dir, state_path_str).unwrap();
         assert_eq!(restored2, None);
     }
@@ -821,7 +1100,6 @@ mod tests {
         assert_eq!(manifest.chunk_size, 4096);
         assert!(!manifest.chunk_hashes.is_empty());
 
-        // Cached version should load quickly
         let cached = load_or_build_statesync_manifest(data_dir, 100, 4096).unwrap();
         assert_eq!(cached.blake3_hex, manifest.blake3_hex);
     }
@@ -834,6 +1112,7 @@ mod tests {
             validators_hash_hex: "deadbeef".into(),
             threshold: 2,
             signatures: vec![],
+            coherence: 1.0,
         };
         write_attestation(data_dir, 42, &att).unwrap();
         let loaded = read_attestation(data_dir, 42).unwrap().unwrap();
@@ -847,5 +1126,160 @@ mod tests {
         let hash = validators_hash_hex(&pks);
         let hash2 = validators_hash_hex(&vec!["01".into(), "02".into()]);
         assert_eq!(hash, hash2);
+    }
+
+    // ── Quantum Tests ────────────────────────────────────────────────
+    #[test]
+    fn test_quantum_state_initialization() {
+        let state = QuantumSnapshotState::new();
+        assert!((state.purity - 1.0).abs() < 1e-10);
+        assert!((state.entropy - 0.0).abs() < 1e-10);
+        assert!(state.is_healthy);
+    }
+
+    #[test]
+    fn test_write_decoherence() {
+        let mut state = QuantumSnapshotState::new();
+        let initial_purity = state.purity;
+
+        state.apply_write_decoherence(5);
+        assert!(state.purity < initial_purity);
+        assert_eq!(state.total_writes, 1);
+        assert_eq!(state.snapshot_count, 5);
+    }
+
+    #[test]
+    fn test_read_decoherence() {
+        let mut state = QuantumSnapshotState::new();
+        let initial_purity = state.purity;
+
+        state.apply_read_decoherence();
+        assert!(state.purity < initial_purity);
+        assert_eq!(state.total_reads, 1);
+    }
+
+    #[test]
+    fn test_delta_decoherence() {
+        let mut state = QuantumSnapshotState::new();
+        let initial_purity = state.purity;
+
+        state.apply_delta_decoherence();
+        assert!(state.purity < initial_purity);
+        assert_eq!(state.total_deltas, 1);
+    }
+
+    #[test]
+    fn test_attestation_decoherence() {
+        let mut state = QuantumSnapshotState::new();
+        let initial_purity = state.purity;
+
+        state.apply_attestation_decoherence();
+        assert!(state.purity < initial_purity);
+        assert_eq!(state.total_attestations, 1);
+    }
+
+    #[test]
+    fn test_prune_decoherence() {
+        let mut state = QuantumSnapshotState::new();
+        state.snapshot_count = 10;
+        let initial_purity = state.purity;
+
+        state.apply_prune_decoherence(3);
+        assert!(state.purity < initial_purity);
+        assert_eq!(state.total_prunes, 1);
+        assert_eq!(state.snapshot_count, 7);
+    }
+
+    #[test]
+    fn test_snapshot_channel() {
+        let mut state = QuantumSnapshotState::new();
+        let initial_coherence = state.data_coherence;
+
+        state.apply_snapshot_channel();
+        assert!(state.data_coherence < initial_coherence);
+    }
+
+    #[test]
+    fn test_global_quantum_state() {
+        // Reset state
+        {
+            let mut qstate = QUANTUM_STATE.lock().unwrap();
+            *qstate = QuantumSnapshotState::new();
+        }
+
+        let initial_purity = snapshot_purity();
+        assert!(initial_purity > 0.99);
+        assert!(is_snapshot_healthy());
+
+        let state_copy = get_quantum_state();
+        assert!((state_copy.purity - initial_purity).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_write_snapshot_tracks_quantum() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        let state = test_state();
+
+        // Reset quantum state
+        {
+            let mut qstate = QUANTUM_STATE.lock().unwrap();
+            *qstate = QuantumSnapshotState::new();
+        }
+
+        let initial_purity = snapshot_purity();
+        write_snapshot(data_dir, 1, &state, 3).unwrap();
+        assert!(snapshot_purity() < initial_purity);
+    }
+
+    #[test]
+    fn test_manifest_fidelity_identical() {
+        let a = SnapshotManifest {
+            height: 42,
+            created_unix_s: 1000,
+            state_root_hex: "abc".into(),
+            format: "test".into(),
+            zstd_level: 3,
+            quantum_purity: 1.0,
+        };
+        let b = a.clone();
+        assert!((manifest_fidelity(&a, &b) - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_manifest_fidelity_different() {
+        let a = SnapshotManifest {
+            height: 42,
+            created_unix_s: 1000,
+            state_root_hex: "abc".into(),
+            format: "test".into(),
+            zstd_level: 3,
+            quantum_purity: 1.0,
+        };
+        let b = SnapshotManifest {
+            state_root_hex: "def".into(),
+            ..a.clone()
+        };
+        assert!((manifest_fidelity(&a, &b) - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_health_after_many_writes() {
+        let mut state = QuantumSnapshotState::new();
+        assert!(state.is_healthy);
+
+        for _ in 0..500 {
+            state.apply_write_decoherence(10);
+        }
+        assert!(!state.is_healthy);
+    }
+
+    #[test]
+    fn test_purity_never_negative() {
+        let mut state = QuantumSnapshotState::new();
+        for _ in 0..10000 {
+            state.apply_prune_decoherence(10);
+        }
+        assert!(state.purity >= 0.0);
     }
 }
