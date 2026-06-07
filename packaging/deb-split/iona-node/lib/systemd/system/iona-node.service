@@ -1,54 +1,152 @@
-[Unit]
-Description=IONA Blockchain Node - Byzantine Fault Tolerant Consensus
-Documentation=https://github.com/iona/iona
-After=network-online.target
-Wants=network-online.target
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  IONA Blockchain Node — Production Systemd Unit                           ║
+# ║  Version: 30.0.0                                                          ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
+# Installation:
+#   sudo cp iona-node.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable iona-node
+#   sudo systemctl start iona-node
+#
+# Environment overrides (create /etc/iona/environment if needed):
+#   IONA_CONFIG        — path to config file (default: /etc/iona/config.toml)
+#   IONA_DATA_DIR      — data directory (default: /var/lib/iona)
+#   IONA_LOG_LEVEL     — log level: trace, debug, info, warn, error
+#   IONA_PROFILE       — execution profile: prod, validator, archive
+#   IONA_GOMAXPROCS    — GOMAXPROCS equivalent for Rust (default: auto)
+#   IONA_MALLOC_CONF   — jemalloc configuration (default: background_thread:true,dirty_decay_ms:1000)
 
+[Unit]
+Description=IONA Blockchain Node v30.0.0 — Byzantine Fault Tolerant Consensus
+Documentation=https://docs.iona.network
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+Before=shutdown.target
+Conflicts=shutdown.target
+
+# Only start if network is truly online (not just link up)
+Requires=network-online.target
+
+# ── Service Definition ────────────────────────────────────────────────────────
 [Service]
-Type=simple
+Type=exec
 User=iona
 Group=iona
 
-# Execution
-ExecStartPre=/usr/local/bin/iona-node --check-compat --config /etc/iona/config.toml
-ExecStart=/usr/local/bin/iona-node --config /etc/iona/config.toml --data /var/lib/iona --profile prod
+# ── Environment ──────────────────────────────────────────────────────────────
+EnvironmentFile=-/etc/iona/environment
+Environment=IONA_CONFIG=/etc/iona/config.toml
+Environment=IONA_DATA_DIR=/var/lib/iona
+Environment=IONA_LOG_LEVEL=info
+Environment=IONA_PROFILE=prod
+Environment=RUST_BACKTRACE=0
+Environment=IONA_MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:5000
+
+# ── Pre‑start validation ─────────────────────────────────────────────────────
+# Verify binary integrity before attempting to start
+ExecStartPre=/usr/bin/sha256sum --check /etc/iona/binary.sha256
+ExecStartPre=/usr/local/bin/iona-node --check-compat --config ${IONA_CONFIG}
+ExecStartPre=/usr/bin/find ${IONA_DATA_DIR} -maxdepth 0 -type d -writable || (echo "Data directory not writable" && exit 1)
+
+# ── Main execution ───────────────────────────────────────────────────────────
+ExecStart=/usr/local/bin/iona-node \
+    --config ${IONA_CONFIG} \
+    --data ${IONA_DATA_DIR} \
+    --profile ${IONA_PROFILE} \
+    --log-level ${IONA_LOG_LEVEL}
+
+# Graceful reload sends HUP signal
 ExecReload=/bin/kill -HUP $MAINPID
 
-# Restart policy
+# ── Post‑stop cleanup ────────────────────────────────────────────────────────
+# Ensure any temporary files are cleaned up
+ExecStopPost=/usr/bin/find /tmp -name 'iona-*' -mmin +60 -delete 2>/dev/null || true
+
+# ── Restart policy ───────────────────────────────────────────────────────────
+# Restart on failure, with exponential backoff up to 300 seconds
 Restart=on-failure
 RestartSec=5
+RestartSteps=10
+RestartMaxDelaySec=300
 StartLimitInterval=600
 StartLimitBurst=10
 
-# Resource limits
-LimitNOFILE=65536
-LimitNPROC=65536
-MemoryLimit=2G
+# ── Timeouts ─────────────────────────────────────────────────────────────────
+TimeoutStartSec=120
+TimeoutStopSec=60
+TimeoutAbortSec=30
+WatchdogSec=30
 
-# Security hardening
-NoNewPrivileges=true
-MemoryDenyWriteExecute=true
+# ── Exit codes that trigger restart ──────────────────────────────────────────
+# Restart on OOM (exit 137), SIGSEGV (exit 139), and explicit restart request
+RestartForceExitStatus=137 139 143
+
+# ── File descriptor and process limits ────────────────────────────────────────
+LimitNOFILE=131072
+LimitNPROC=65536
+LimitCORE=0                    # Disable core dumps (security)
+LimitMEMLOCK=67108864          # 64 MB for sensitive key material
+
+# ── CPU and I/O scheduling ───────────────────────────────────────────────────
+CPUWeight=1000
+IOWeight=800
+Nice=-5
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+
+# ── Memory limits ────────────────────────────────────────────────────────────
+MemoryHigh=4G
+MemoryMax=6G
+MemorySwapMax=0                # Disable swap for validator (prevents page faults)
+
+# ── Security hardening (systemd ≥ 232) ───────────────────────────────────────
+NoNewPrivileges=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateMounts=no                # Allow /var/lib/iona to be a mount point
 ProtectSystem=strict
 ProtectHome=yes
-PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-LockPersonality=yes
-ProtectClock=yes
-ProtectHostname=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
 
-# Logging
+# Allow only the necessary system calls
+SystemCallFilter=@system-service @network-io @signal @process @io-event
+SystemCallErrorNumber=EPERM
+
+# Whitelist specific paths for read/write
+ReadWritePaths=${IONA_DATA_DIR} /var/log/iona
+ReadOnlyPaths=/etc/iona /usr/local/bin
+InaccessiblePaths=/root /home
+
+# ── Logging ──────────────────────────────────────────────────────────────────
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=iona-node
+LogLevelMax=info
 
-# Working directory and umask
-WorkingDirectory=/var/lib/iona
+# ── Working directory ────────────────────────────────────────────────────────
+WorkingDirectory=${IONA_DATA_DIR}
 UMask=0077
 
+# ── Notify systemd when service is ready (if compiled with sd_notify) ────────
+# NotifyAccess=main
+# Type=notify
+
+# ── Sandboxing with user namespaces (optional, requires kernel ≥ 4.14) ───────
+# PrivateUsers=yes
+
+# ── Install ──────────────────────────────────────────────────────────────────
 [Install]
 WantedBy=multi-user.target
