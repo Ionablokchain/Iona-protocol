@@ -8,6 +8,7 @@
 #   curl -sSf https://install.iona.sh | sh -s -- --version v30.0.0
 #   curl -sSf https://install.iona.sh | sh -s -- --deb
 #   sudo bash install.sh --uninstall
+#   sudo bash install.sh --air-gapped --tarball ./iona-node-v30.0.0.tar.gz
 #
 # Environment overrides:
 #   IONA_VERSION            — specific tag to install (default: latest stable)
@@ -16,13 +17,18 @@
 #   IONA_CONFIG_DIR         — config directory (default: /etc/iona)
 #   IONA_LOG_DIR            — log directory (default: /var/log/iona)
 #   IONA_SERVICE_USER       — system user for the service (default: iona)
-#   GITHUB_REPO             — repository slug (default: iona/iona)
+#   GITHUB_REPO             — repository slug (default: ionablokchain/Iona-protocol)
 #   COSIGN_PUBLIC_KEY       — path or URL to cosign public key (optional)
 #   GPG_KEY_URL             — URL to release signing GPG key (optional)
 #   IONA_NO_START           — if set, don't start service after install
 #   IONA_SKIP_VERIFY        — if set, skip signature verification
 #   IONA_SKIP_SERVICE       — if set, don't install systemd service at all
 #   IONA_VERBOSE            — enable verbose output
+#   IONA_YES                — skip all prompts (non-interactive mode)
+#   IONA_AIR_GAPPED         — air-gapped mode (skip downloads)
+#   IONA_TARBALL            — path to local tarball (air-gapped mode)
+#   IONA_PROXY              — HTTP proxy for downloads (e.g. http://proxy:8080)
+#   IONA_CA_BUNDLE          — path to custom CA bundle for TLS verification
 #
 # This installer:
 #   1. Detects OS and CPU architecture
@@ -65,7 +71,7 @@ ok() {
     echo -e "  ${GREEN}✓${NC} $*"
 }
 
-fail() {
+fail_check() {
     echo -e "  ${RED}✗${NC} $*"
     return 1
 }
@@ -93,18 +99,28 @@ DO_UNINSTALL=false
 IONA_NO_START="${IONA_NO_START:-0}"
 IONA_SKIP_SERVICE="${IONA_SKIP_SERVICE:-0}"
 IONA_VERBOSE="${IONA_VERBOSE:-0}"
+IONA_YES="${IONA_YES:-0}"
+IONA_AIR_GAPPED="${IONA_AIR_GAPPED:-0}"
+IONA_TARBALL="${IONA_TARBALL:-}"
+IONA_PROXY="${IONA_PROXY:-}"
+IONA_CA_BUNDLE="${IONA_CA_BUNDLE:-}"
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --version)       IONA_VERSION="$2"; shift 2 ;;
-        --version=*)     IONA_VERSION="${1#*=}"; shift ;;
-        --deb)           PREFER_DEB=true; shift ;;
-        --skip-verify)   IONA_SKIP_VERIFY=1; shift ;;
-        --no-start)      IONA_NO_START=1; shift ;;
-        --skip-service)  IONA_SKIP_SERVICE=1; shift ;;
-        --uninstall)     DO_UNINSTALL=true; shift ;;
-        --verbose|-v)    IONA_VERBOSE=1; shift ;;
+        --version)        IONA_VERSION="$2"; shift 2 ;;
+        --version=*)      IONA_VERSION="${1#*=}"; shift ;;
+        --deb)            PREFER_DEB=true; shift ;;
+        --skip-verify)    IONA_SKIP_VERIFY=1; shift ;;
+        --no-start)       IONA_NO_START=1; shift ;;
+        --skip-service)   IONA_SKIP_SERVICE=1; shift ;;
+        --uninstall)      DO_UNINSTALL=true; shift ;;
+        --verbose|-v)     IONA_VERBOSE=1; shift ;;
+        --yes|-y)         IONA_YES=1; shift ;;
+        --air-gapped)     IONA_AIR_GAPPED=1; shift ;;
+        --tarball)        IONA_TARBALL="$2"; shift 2 ;;
+        --proxy)          IONA_PROXY="$2"; shift 2 ;;
+        --ca-bundle)      IONA_CA_BUNDLE="$2"; shift 2 ;;
         --help|-h)
             sed -n '/^# Usage:/,/^# ─────────────────/p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -117,6 +133,20 @@ done
 command_exists() {
     command -v "$1" &>/dev/null
 }
+
+# ── Setup proxy if configured ─────────────────────────────────────────────────
+if [[ -n "$IONA_PROXY" ]]; then
+    export http_proxy="$IONA_PROXY"
+    export https_proxy="$IONA_PROXY"
+    log_verbose "Proxy configured: $IONA_PROXY"
+fi
+
+# Setup custom CA bundle if configured
+if [[ -n "$IONA_CA_BUNDLE" ]] && [[ -f "$IONA_CA_BUNDLE" ]]; then
+    export CURL_CA_BUNDLE="$IONA_CA_BUNDLE"
+    export SSL_CERT_FILE="$IONA_CA_BUNDLE"
+    log_verbose "Custom CA bundle: $IONA_CA_BUNDLE"
+fi
 
 # ── Root check ────────────────────────────────────────────────────────────────
 if [[ "${EUID}" -ne 0 ]]; then
@@ -136,6 +166,12 @@ echo -e "${NC}  IONA Node Installer — Official v30.0.0\n"
 # ── Uninstall path ────────────────────────────────────────────────────────────
 if [[ "${DO_UNINSTALL}" == true ]]; then
     section "Uninstalling IONA"
+    
+    if [[ "$IONA_YES" -ne 1 ]]; then
+        read -p "Are you sure you want to uninstall IONA? Data will be preserved. [y/N] " -r REPLY
+        [[ ! "$REPLY" =~ ^[Yy]$ ]] && die "Uninstall cancelled"
+    fi
+    
     systemctl stop  iona-node 2>/dev/null && ok "Service stopped" || true
     systemctl disable iona-node 2>/dev/null && ok "Service disabled" || true
     rm -f /lib/systemd/system/iona-node.service
@@ -150,9 +186,17 @@ if [[ "${DO_UNINSTALL}" == true ]]; then
     exit 0
 fi
 
-# ── OS + architecture detection ──────────────────────────────────────────────
-section "System detection"
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
+section "Pre-flight checks"
 
+# Check minimum disk space (1GB)
+AVAILABLE_DISK=$(df /usr/local/bin 2>/dev/null | awk 'NR==2 {print $4}' || df / | awk 'NR==2 {print $4}')
+if [[ -n "$AVAILABLE_DISK" ]] && [[ "$AVAILABLE_DISK" -lt 1048576 ]]; then
+    die "Insufficient disk space. Need at least 1GB free. Available: $((AVAILABLE_DISK / 1024))MB"
+fi
+ok "Disk space: sufficient"
+
+# Check architecture support
 UNAME_OS="$(uname -s)"
 UNAME_ARCH="$(uname -m)"
 
@@ -168,29 +212,61 @@ case "${UNAME_ARCH}" in
     *)             die "Unsupported architecture: ${UNAME_ARCH} (supported: x86_64, aarch64)" ;;
 esac
 
+ok "OS: ${UNAME_OS} (${OS})"
+ok "Architecture: ${UNAME_ARCH} (${ARCH})"
+
 # Detect Debian family
 IS_DEBIAN=false
 if [[ -f /etc/debian_version ]] || command_exists dpkg; then
     IS_DEBIAN=true
 fi
-
-ok "OS: ${UNAME_OS} (${OS})"
-ok "Architecture: ${UNAME_ARCH} (${ARCH})"
 ok "Debian-family: ${IS_DEBIAN}"
 
-# Decide install method
-USE_DEB=false
+# Check for existing installation
+if [[ -f "${IONA_INSTALL_DIR}/iona-node" ]]; then
+    EXISTING_VER="$("${IONA_INSTALL_DIR}/iona-node" --version 2>/dev/null || echo "unknown")"
+    warn "Existing IONA installation found: ${EXISTING_VER}"
+    if [[ "$IONA_YES" -ne 1 ]]; then
+        read -p "Continue with installation? [Y/n] " -r REPLY
+        [[ "$REPLY" =~ ^[Nn]$ ]] && die "Installation cancelled"
+    fi
+fi
+
+# ── Resolve version ───────────────────────────────────────────────────────────
+if [[ "$IONA_AIR_GAPPED" -ne 1 ]]; then
+    section "Resolving version"
+
+    if [[ -z "${IONA_VERSION}" ]]; then
+        info "Fetching latest stable release from GitHub..."
+        IONA_VERSION="$(
+            curl -fsSL \
+                -H "Accept: application/vnd.github.v3+json" \
+                "${GITHUB_API}/releases/latest" \
+            | grep '"tag_name"' \
+            | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/'
+        )" || die "Could not fetch latest version. Set IONA_VERSION manually or check your internet connection."
+    fi
+
+    # Ensure tag starts with 'v'
+    [[ "${IONA_VERSION}" != v* ]] && IONA_VERSION="v${IONA_VERSION}"
+    VERSION_CLEAN="${IONA_VERSION#v}"
+
+    ok "Target version: ${IONA_VERSION}"
+fi
+
+# ── Decide install method ─────────────────────────────────────────────────────
 if [[ "${PREFER_DEB}" == true ]] && [[ "${IS_DEBIAN}" == true ]]; then
     USE_DEB=true
     ok "Install method: .deb package"
 else
+    USE_DEB=false
     ok "Install method: tarball"
 fi
 
 # ── Check dependencies ────────────────────────────────────────────────────────
 section "Checking dependencies"
 
-REQUIRED_CMDS=("curl" "tar" "sha256sum")
+REQUIRED_CMDS=("curl" "tar")
 for cmd in "${REQUIRED_CMDS[@]}"; do
     if command_exists "$cmd"; then
         ok "$cmd"
@@ -198,6 +274,18 @@ for cmd in "${REQUIRED_CMDS[@]}"; do
         die "Required tool not found: $cmd"
     fi
 done
+
+# SHA256 tool detection
+SHA256_CMD=""
+if command_exists sha256sum; then
+    SHA256_CMD="sha256sum"
+    ok "sha256sum"
+elif command_exists shasum; then
+    SHA256_CMD="shasum -a 256"
+    ok "shasum (sha256)"
+else
+    die "No SHA256 tool found. Install coreutils or equivalent."
+fi
 
 # Optional tools
 for cmd in gpg cosign sha512sum dpkg; do
@@ -208,62 +296,75 @@ for cmd in gpg cosign sha512sum dpkg; do
     fi
 done
 
-# ── Resolve version ───────────────────────────────────────────────────────────
-section "Resolving version"
-
-if [[ -z "${IONA_VERSION}" ]]; then
-    info "Fetching latest stable release from GitHub..."
-    IONA_VERSION="$(
-        curl -fsSL \
-            -H "Accept: application/vnd.github.v3+json" \
-            "${GITHUB_API}/releases/latest" \
-        | grep '"tag_name"' \
-        | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/'
-    )" || die "Could not fetch latest version. Set IONA_VERSION manually or check your internet connection."
-fi
-
-# Ensure tag starts with 'v'
-[[ "${IONA_VERSION}" != v* ]] && IONA_VERSION="v${IONA_VERSION}"
-VERSION_CLEAN="${IONA_VERSION#v}"   # e.g. 30.0.0
-
-ok "Target version: ${IONA_VERSION}"
-
-# ── Download artefacts ────────────────────────────────────────────────────────
-section "Downloading artefacts"
-
-TMPDIR="$(mktemp -d)"
-trap 'rm -rf "${TMPDIR}"' EXIT
-
-BASE_URL="${GITHUB_DL}/${IONA_VERSION}"
-
-if [[ "${USE_DEB}" == true ]]; then
-    DEB_FILE="iona-node_${VERSION_CLEAN}_${DEB_ARCH}.deb"
-    DOWNLOAD_FILE="${DEB_FILE}"
+# ── Air-gapped mode ───────────────────────────────────────────────────────────
+if [[ "$IONA_AIR_GAPPED" -eq 1 ]]; then
+    section "Air-gapped installation"
+    
+    if [[ -z "$IONA_TARBALL" ]]; then
+        die "Air-gapped mode requires --tarball <path>"
+    fi
+    
+    if [[ ! -f "$IONA_TARBALL" ]]; then
+        die "Tarball not found: $IONA_TARBALL"
+    fi
+    
+    TMPDIR="$(mktemp -d)"
+    trap 'rm -rf "${TMPDIR}"' EXIT
+    
+    cp "$IONA_TARBALL" "${TMPDIR}/"
+    DOWNLOAD_FILE="$(basename "$IONA_TARBALL")"
+    
+    # Try to find checksum files alongside the tarball
+    TARBALL_DIR="$(dirname "$IONA_TARBALL")"
+    for f in SHA256SUMS SHA256SUMS.asc; do
+        if [[ -f "${TARBALL_DIR}/${f}" ]]; then
+            cp "${TARBALL_DIR}/${f}" "${TMPDIR}/"
+            ok "Found ${f}"
+        fi
+    done
+    
+    USE_DEB=false
+    ok "Air-gapped mode ready"
 else
-    TARBALL="iona-node-${IONA_VERSION}-${ARCH}-${OS}.tar.gz"
-    DOWNLOAD_FILE="${TARBALL}"
+    # ── Download artefacts ────────────────────────────────────────────────────
+    section "Downloading artefacts"
+
+    TMPDIR="$(mktemp -d)"
+    trap 'rm -rf "${TMPDIR}"' EXIT
+
+    BASE_URL="${GITHUB_DL}/${IONA_VERSION}"
+
+    if [[ "${USE_DEB}" == true ]]; then
+        DEB_FILE="iona-node_${VERSION_CLEAN}_${DEB_ARCH}.deb"
+        DOWNLOAD_FILE="${DEB_FILE}"
+    else
+        TARBALL="iona-node-${IONA_VERSION}-${ARCH}-${OS}.tar.gz"
+        DOWNLOAD_FILE="${TARBALL}"
+    fi
+
+    info "Downloading ${DOWNLOAD_FILE}..."
+    curl -fL --progress-bar \
+        "${BASE_URL}/${DOWNLOAD_FILE}" \
+        -o "${TMPDIR}/${DOWNLOAD_FILE}" \
+    || die "Download failed. Verify that ${IONA_VERSION} exists at:\n  https://github.com/${GITHUB_REPO}/releases"
+
+    info "Downloading SHA256SUMS..."
+    curl -fsSL "${BASE_URL}/SHA256SUMS" -o "${TMPDIR}/SHA256SUMS" \
+    || die "Could not download SHA256SUMS — release may be incomplete or version invalid."
+
+    # Optional artefacts (non-fatal if absent)
+    for f in SHA512SUMS SHA256SUMS.asc; do
+        curl -fsSL "${BASE_URL}/${f}" -o "${TMPDIR}/${f}" 2>/dev/null && ok "Downloaded ${f}" || true
+    done
+    for f in "${DOWNLOAD_FILE}.sig" "${DOWNLOAD_FILE}.cert"; do
+        curl -fsSL "${BASE_URL}/${f}" -o "${TMPDIR}/${f}" 2>/dev/null && ok "Downloaded ${f}" || true
+    done
+    curl -fsSL "${BASE_URL}/cosign.pub" -o "${TMPDIR}/cosign.pub" 2>/dev/null || true
+    curl -fsSL "${BASE_URL}/iona-release-signing-key.asc" \
+        -o "${TMPDIR}/iona-release-signing-key.asc" 2>/dev/null || true
+
+    ok "Download complete: ${DOWNLOAD_FILE}"
 fi
-
-info "Downloading ${DOWNLOAD_FILE}..."
-curl -fL --progress-bar \
-    "${BASE_URL}/${DOWNLOAD_FILE}" \
-    -o "${TMPDIR}/${DOWNLOAD_FILE}" \
-|| die "Download failed. Verify that ${IONA_VERSION} exists at:\n  https://github.com/${GITHUB_REPO}/releases"
-
-info "Downloading SHA256SUMS..."
-curl -fsSL "${BASE_URL}/SHA256SUMS" -o "${TMPDIR}/SHA256SUMS" \
-|| die "Could not download SHA256SUMS — release may be incomplete or version invalid."
-
-# Optional artefacts (non-fatal if absent)
-curl -fsSL "${BASE_URL}/SHA512SUMS"          -o "${TMPDIR}/SHA512SUMS"          2>/dev/null || true
-curl -fsSL "${BASE_URL}/SHA256SUMS.asc"      -o "${TMPDIR}/SHA256SUMS.asc"      2>/dev/null || true
-curl -fsSL "${BASE_URL}/${DOWNLOAD_FILE}.sig"  -o "${TMPDIR}/${DOWNLOAD_FILE}.sig"  2>/dev/null || true
-curl -fsSL "${BASE_URL}/${DOWNLOAD_FILE}.cert" -o "${TMPDIR}/${DOWNLOAD_FILE}.cert" 2>/dev/null || true
-curl -fsSL "${BASE_URL}/cosign.pub"          -o "${TMPDIR}/cosign.pub"          2>/dev/null || true
-curl -fsSL "${BASE_URL}/iona-release-signing-key.asc" \
-    -o "${TMPDIR}/iona-release-signing-key.asc" 2>/dev/null || true
-
-ok "Download complete: ${DOWNLOAD_FILE}"
 
 # ── Integrity verification ────────────────────────────────────────────────────
 section "Verifying integrity"
@@ -276,10 +377,14 @@ else
     sub_section "SHA-256 checksum verification (mandatory)"
     (
         cd "${TMPDIR}"
-        if sha256sum --check --ignore-missing --strict SHA256SUMS 2>/dev/null; then
-            ok "SHA-256 checksum: PASSED"
+        if [[ -f SHA256SUMS ]]; then
+            if $SHA256_CMD --check --ignore-missing --strict SHA256SUMS 2>/dev/null; then
+                ok "SHA-256 checksum: PASSED"
+            else
+                die "SHA-256 checksum FAILED.\nThe download may be corrupt or tampered with.\nDo NOT proceed."
+            fi
         else
-            die "SHA-256 checksum FAILED.\nThe download may be corrupt or tampered with.\nDo NOT proceed. Re-download and verify."
+            die "SHA256SUMS not found — cannot verify integrity."
         fi
     )
 
@@ -299,7 +404,6 @@ else
     # ── GPG signature ─────────────────────────────────────────────────────────
     if [[ -f "${TMPDIR}/SHA256SUMS.asc" ]] && command_exists gpg; then
         sub_section "GPG signature verification"
-        # Import release key (bundled or from URL)
         if [[ -f "${TMPDIR}/iona-release-signing-key.asc" ]]; then
             gpg --batch --import "${TMPDIR}/iona-release-signing-key.asc" 2>/dev/null || true
         fi
@@ -313,8 +417,6 @@ else
             warn "To verify manually: gpg --verify SHA256SUMS.asc SHA256SUMS"
             warn "Fingerprint: see https://iona.network/security"
         fi
-    else
-        warn "Skipping GPG verification (gpg not available or signature not downloaded)"
     fi
 
     # ── cosign ────────────────────────────────────────────────────────────────
@@ -331,8 +433,6 @@ else
             else
                 warn "cosign verification failed — investigate before continuing"
             fi
-        else
-            warn "cosign: no public key available — skipping"
         fi
     fi
 fi
@@ -355,6 +455,8 @@ else
     # ── Tarball install path ───────────────────────────────────────────────────
     info "Extracting ${DOWNLOAD_FILE}..."
     tar -xzf "${TMPDIR}/${DOWNLOAD_FILE}" -C "${TMPDIR}/"
+    
+    # Locate extracted directory
     EXTRACT_DIR="${TMPDIR}/iona-${IONA_VERSION}-${ARCH}-${OS}"
     if [[ ! -d "${EXTRACT_DIR}" ]]; then
         EXTRACT_DIR="$(find "${TMPDIR}" -maxdepth 1 -type d -name 'iona-*' | head -1)"
@@ -362,6 +464,18 @@ else
     if [[ -z "${EXTRACT_DIR}" ]]; then
         die "Failed to locate extracted directory"
     fi
+    ok "Extracted to ${EXTRACT_DIR}"
+
+    # Backup existing binaries if present
+    sub_section "Backing up existing installation"
+    BACKUP_DIR="${IONA_DATA_DIR}/backup-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$BACKUP_DIR"
+    for bin in iona-node iona-cli iona-remote-signer; do
+        if [[ -f "${IONA_INSTALL_DIR}/${bin}" ]]; then
+            cp "${IONA_INSTALL_DIR}/${bin}" "${BACKUP_DIR}/${bin}"
+            ok "Backed up: ${bin}"
+        fi
+    done
 
     # Install binaries
     info "Installing binaries to ${IONA_INSTALL_DIR}/"
@@ -408,6 +522,12 @@ else
     done
 
     # Install default config (do not overwrite existing)
+    if [[ -f "${IONA_CONFIG_DIR}/config.toml" ]]; then
+        # Backup existing config
+        cp "${IONA_CONFIG_DIR}/config.toml" "${BACKUP_DIR}/config.toml"
+        ok "Existing config backed up to ${BACKUP_DIR}"
+    fi
+
     if [[ ! -f "${IONA_CONFIG_DIR}/config.toml" ]]; then
         if [[ -f "${EXTRACT_DIR}/config.toml.default" ]]; then
             install -m 0640 \
@@ -425,7 +545,8 @@ else
     # Install systemd service
     if [[ "${IONA_SKIP_SERVICE}" != 1 ]] && command_exists systemctl; then
         sub_section "Installing systemd service"
-        cat > /lib/systemd/system/iona-node.service << SERVICE
+        SERVICE_FILE="/lib/systemd/system/iona-node.service"
+        cat > "$SERVICE_FILE" << SERVICE
 [Unit]
 Description=IONA Blockchain Node v${VERSION_CLEAN}
 Documentation=https://github.com/ionablokchain/Iona-protocol
@@ -476,11 +597,14 @@ fi
 # ── Post-install verification ─────────────────────────────────────────────────
 section "Post-install verification"
 
+VERIFICATION_FAILED=0
+
 if command_exists "${IONA_INSTALL_DIR}/iona-node"; then
     INSTALLED_VER="$("${IONA_INSTALL_DIR}/iona-node" --version 2>/dev/null || echo "${IONA_VERSION}")"
     ok "iona-node: ${INSTALLED_VER}"
 else
-    warn "iona-node binary not found in ${IONA_INSTALL_DIR}"
+    fail_check "iona-node binary not found in ${IONA_INSTALL_DIR}"
+    VERIFICATION_FAILED=1
 fi
 
 if command_exists "${IONA_INSTALL_DIR}/iona-cli"; then
@@ -493,11 +617,13 @@ fi
 if [[ "${IONA_SKIP_SERVICE}" != 1 ]] && command_exists systemctl; then
     if [[ "${IONA_NO_START}" != 1 ]]; then
         sub_section "Starting service"
-        systemctl start iona-node && ok "iona-node service started" || {
+        if systemctl start iona-node 2>/dev/null; then
+            ok "iona-node service started"
+        else
             warn "Service failed to start — this is normal if config.toml is not yet configured."
             warn "Configure first: sudo nano ${IONA_CONFIG_DIR}/config.toml"
             warn "Then start:      sudo systemctl start iona-node"
-        }
+        fi
         sleep 2
         if systemctl is-active iona-node &>/dev/null; then
             ok "Service status: active (running)"
@@ -525,6 +651,7 @@ echo -e "
     Config  : ${IONA_CONFIG_DIR}/config.toml
     Data    : ${IONA_DATA_DIR}/
     Logs    : ${IONA_LOG_DIR}/
+    Backup  : ${BACKUP_DIR}/
 
   ${CYAN}Next steps${NC}
     1. Edit config   : sudo nano ${IONA_CONFIG_DIR}/config.toml
@@ -544,5 +671,10 @@ echo -e "
   ${YELLOW}Security issues${NC}
     security@iona.example.com
 "
+
+if [[ $VERIFICATION_FAILED -eq 1 ]]; then
+    warn "Some post-install checks failed. Review the output above."
+    exit 1
+fi
 
 exit 0
