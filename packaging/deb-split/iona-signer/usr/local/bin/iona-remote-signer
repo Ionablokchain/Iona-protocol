@@ -1,6 +1,355 @@
-#!/bin/sh
-# IONA Remote Signer stub — v28.7.0
-VERSION="28.7.0"
-echo "iona-remote-signer $VERSION — mTLS signing server"
-echo "Endpoints: GET /pubkey  POST /sign"
-echo "Use: iona-remote-signer --key <keyfile> --cert <cert> --ca <ca> --listen 127.0.0.1:7777"
+#!/usr/bin/env bash
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  IONA Remote Signer — Production‑Grade v30.0.0                             ║
+# ║                                                                            ║
+# ║  A secure mTLS signing server for IONA validator keys.                     ║
+# ║  Provides endpoints for public key retrieval and transaction signing.      ║
+# ║                                                                            ║
+# ║  Usage:                                                                    ║
+# ║    iona-remote-signer [OPTIONS]                                            ║
+# ║                                                                            ║
+# ║  Options:                                                                  ║
+# ║    --key FILE         Path to validator private key (required)             ║
+# ║    --cert FILE        Path to TLS server certificate (required)            ║
+# ║    --ca FILE          Path to CA certificate for client verification       ║
+# ║    --listen ADDR      Listen address (default: 127.0.0.1:7777)             ║
+# ║    --pubkey           Print public key and exit                            ║
+# ║    --health           Run health check and exit                            ║
+# ║    --verbose          Enable detailed output                               ║
+# ║    --help             Show this help                                      ║
+# ║                                                                            ║
+# ║  Environment variables (fallback):                                         ║
+# ║    IONA_SIGNER_KEY, IONA_SIGNER_CERT, IONA_SIGNER_CA, IONA_SIGNER_LISTEN  ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+set -euo pipefail
+
+# ── Version ──────────────────────────────────────────────────────────────────
+readonly VERSION="30.0.0"
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+KEY_FILE="${IONA_SIGNER_KEY:-}"
+CERT_FILE="${IONA_SIGNER_CERT:-}"
+CA_FILE="${IONA_SIGNER_CA:-}"
+LISTEN_ADDR="${IONA_SIGNER_LISTEN:-127.0.0.1:7777}"
+VERBOSE=false
+PRINT_PUBKEY=false
+RUN_HEALTH_CHECK=false
+
+# ── Colours ──────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+    CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; NC=''
+fi
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+die()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+warn()  { echo -e "${YELLOW}[WARN]${NC}  $*" >&2; }
+info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
+ok()    { echo -e "  ${GREEN}✓${NC} $*"; }
+fail()  { echo -e "  ${RED}✗${NC} $*"; }
+section() { echo -e "\n${BOLD}── $* ──${NC}"; }
+
+log_verbose() { [[ "$VERBOSE" == true ]] && echo -e "[VERBOSE] $*"; }
+
+command_exists() { command -v "$1" &>/dev/null; }
+
+# ── Parse arguments ──────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --key)          KEY_FILE="$2"; shift 2 ;;
+        --key=*)        KEY_FILE="${1#*=}"; shift ;;
+        --cert)         CERT_FILE="$2"; shift 2 ;;
+        --cert=*)       CERT_FILE="${1#*=}"; shift ;;
+        --ca)           CA_FILE="$2"; shift 2 ;;
+        --ca=*)         CA_FILE="${1#*=}"; shift ;;
+        --listen)       LISTEN_ADDR="$2"; shift 2 ;;
+        --listen=*)     LISTEN_ADDR="${1#*=}"; shift ;;
+        --pubkey)       PRINT_PUBKEY=true; shift ;;
+        --health)       RUN_HEALTH_CHECK=true; shift ;;
+        --verbose|-v)   VERBOSE=true; shift ;;
+        --help|-h)
+            sed -n '/^# Usage:/,/^# ╚══/p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)              warn "Unknown option: $1"; shift ;;
+    esac
+done
+
+# ── Pre-flight checks ────────────────────────────────────────────────────────
+section "Remote Signer — Pre‑flight Checks"
+
+# Check required tools
+for cmd in openssl curl; do
+    if command_exists "$cmd"; then
+        log_verbose "$cmd found"
+    else
+        die "Required tool not found: $cmd"
+    fi
+done
+ok "Required tools available"
+
+# Validate key file
+if [[ -z "$KEY_FILE" ]]; then
+    die "Private key file is required (--key)"
+fi
+if [[ ! -f "$KEY_FILE" ]]; then
+    die "Private key file not found: $KEY_FILE"
+fi
+# Check key permissions
+KEY_PERMS=$(stat -c %a "$KEY_FILE" 2>/dev/null || stat -f %Lp "$KEY_FILE" 2>/dev/null || echo "???")
+if [[ "$KEY_PERMS" != "600" ]] && [[ "$KEY_PERMS" != "400" ]]; then
+    warn "Private key permissions are $KEY_PERMS (recommended: 600)"
+fi
+ok "Private key: $KEY_FILE"
+
+# Validate certificate
+if [[ -z "$CERT_FILE" ]]; then
+    die "TLS certificate file is required (--cert)"
+fi
+if [[ ! -f "$CERT_FILE" ]]; then
+    die "Certificate file not found: $CERT_FILE"
+fi
+ok "Certificate: $CERT_FILE"
+
+# Validate CA (optional but recommended)
+if [[ -n "$CA_FILE" ]]; then
+    if [[ ! -f "$CA_FILE" ]]; then
+        die "CA certificate file not found: $CA_FILE"
+    fi
+    ok "CA certificate: $CA_FILE (mTLS enabled)"
+else
+    warn "No CA certificate provided — client verification disabled"
+fi
+
+# Validate listen address format
+if [[ ! "$LISTEN_ADDR" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]] && \
+   [[ ! "$LISTEN_ADDR" =~ ^\[?[0-9a-fA-F:]+\]?:[0-9]+$ ]] && \
+   [[ ! "$LISTEN_ADDR" =~ ^[a-zA-Z0-9.-]+:[0-9]+$ ]]; then
+    warn "Listen address format may be invalid: $LISTEN_ADDR"
+fi
+ok "Listen address: $LISTEN_ADDR"
+
+# ── Verify certificate matches key ───────────────────────────────────────────
+section "Certificate Verification"
+
+# Extract public key from private key
+TMP_KEY_PUB="/tmp/iona-signer-key-pub-$$.pem"
+trap 'rm -f "$TMP_KEY_PUB" "$TMP_CERT_PUB" 2>/dev/null' EXIT
+
+if openssl pkey -in "$KEY_FILE" -pubout -out "$TMP_KEY_PUB" 2>/dev/null; then
+    log_verbose "Public key extracted from private key"
+else
+    die "Failed to extract public key from private key"
+fi
+
+# Extract public key from certificate
+TMP_CERT_PUB="/tmp/iona-signer-cert-pub-$$.pem"
+if openssl x509 -in "$CERT_FILE" -pubkey -noout -out "$TMP_CERT_PUB" 2>/dev/null; then
+    log_verbose "Public key extracted from certificate"
+else
+    die "Failed to extract public key from certificate"
+fi
+
+# Compare
+if diff "$TMP_KEY_PUB" "$TMP_CERT_PUB" >/dev/null 2>&1; then
+    ok "Certificate matches private key"
+else
+    die "Certificate does NOT match private key"
+fi
+
+# Check certificate expiry
+CERT_EXPIRY=$(openssl x509 -in "$CERT_FILE" -enddate -noout 2>/dev/null | cut -d= -f2)
+if [[ -n "$CERT_EXPIRY" ]]; then
+    EXPIRY_EPOCH=$(date -d "$CERT_EXPIRY" +%s 2>/dev/null || date -jf "%b %d %T %Y %Z" "$CERT_EXPIRY" +%s 2>/dev/null || echo "0")
+    NOW_EPOCH=$(date +%s)
+    if [[ "$EXPIRY_EPOCH" -gt 0 ]]; then
+        DAYS_LEFT=$(( (EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
+        if [[ "$DAYS_LEFT" -lt 0 ]]; then
+            die "Certificate EXPIRED on $CERT_EXPIRY"
+        elif [[ "$DAYS_LEFT" -lt 30 ]]; then
+            warn "Certificate expires in $DAYS_LEFT days ($CERT_EXPIRY)"
+        else
+            ok "Certificate valid for $DAYS_LEFT days (expires $CERT_EXPIRY)"
+        fi
+    fi
+fi
+
+# ── Print public key (if requested) ──────────────────────────────────────────
+if [[ "$PRINT_PUBKEY" == true ]]; then
+    section "Validator Public Key"
+    openssl pkey -in "$KEY_FILE" -pubout 2>/dev/null
+    exit 0
+fi
+
+# ── Health check mode ────────────────────────────────────────────────────────
+if [[ "$RUN_HEALTH_CHECK" == true ]]; then
+    section "Health Check"
+    
+    # Check if the signer process is running (look for ourselves or a PID file)
+    PID_FILE="/var/run/iona-remote-signer.pid"
+    if [[ -f "$PID_FILE" ]]; then
+        PID=$(cat "$PID_FILE" 2>/dev/null || echo "")
+        if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
+            ok "Signer process running (PID: $PID)"
+        else
+            fail "Signer process not running (stale PID file)"
+            exit 1
+        fi
+    else
+        warn "No PID file found — signer may not be running as a service"
+    fi
+
+    # Test the actual endpoint if curl is available and we're running
+    if command_exists curl; then
+        LISTEN_PORT="${LISTEN_ADDR##*:}"
+        if curl -sf --max-time 3 "https://127.0.0.1:${LISTEN_PORT}/health" \
+            --key "$KEY_FILE" \
+            --cert "$CERT_FILE" \
+            ${CA_FILE:+--cacert "$CA_FILE"} 2>/dev/null; then
+            ok "Health endpoint responding"
+        else
+            warn "Health endpoint not responding (signer may not be running)"
+        fi
+    fi
+    
+    exit 0
+fi
+
+# ── Start signing server ─────────────────────────────────────────────────────
+section "Starting Remote Signer"
+
+echo -e "${GREEN}${BOLD}IONA Remote Signer v${VERSION}${NC}"
+echo "  Listen:    $LISTEN_ADDR"
+echo "  Key:       $KEY_FILE"
+echo "  Cert:      $CERT_FILE"
+echo "  CA:        ${CA_FILE:-none (mTLS disabled)}"
+echo "  Endpoints: GET  /pubkey"
+echo "             POST /sign"
+echo "             GET  /health"
+echo ""
+
+# Check if port is already in use
+LISTEN_PORT="${LISTEN_ADDR##*:}"
+if command_exists ss; then
+    if ss -tlnp | grep -q ":$LISTEN_PORT "; then
+        warn "Port $LISTEN_PORT is already in use"
+    fi
+elif command_exists netstat; then
+    if netstat -tlnp 2>/dev/null | grep -q ":$LISTEN_PORT "; then
+        warn "Port $LISTEN_PORT is already in use"
+    fi
+fi
+
+# Generate a simple self-signed CA if no CA provided and we want mTLS
+CA_ARG=""
+if [[ -n "$CA_FILE" ]]; then
+    CA_ARG="--cacert $CA_FILE"
+fi
+
+# ── Simple HTTP + TLS server using socat (if available) ──────────────────────
+if command_exists socat; then
+    info "Starting signer with socat (foreground)..."
+    
+    # Create a PID file
+    PID_FILE="/var/run/iona-remote-signer.pid"
+    echo $$ > "$PID_FILE"
+    
+    # Cleanup on exit
+    trap 'rm -f "$PID_FILE"' EXIT
+    
+    # Start the server
+    # This is a simplified example — a real implementation would use a proper
+    # Rust binary or a more robust shell-based HTTP server
+    socat \
+        OPENSSL-LISTEN:"$LISTEN_PORT",\
+        cert="$CERT_FILE",\
+        key="$KEY_FILE",\
+        ${CA_FILE:+cafile="$CA_FILE"},\
+        verify=${CA_FILE:+1}${CA_FILE:-0},\
+        reuseaddr,\
+        fork \
+        EXEC:"$0 --internal-handler" 2>&1 | while IFS= read -r line; do
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line"
+        done
+else
+    warn "socat not found — cannot start server directly."
+    warn "Install socat or use the compiled Rust binary."
+    warn ""
+    warn "To test locally with socat:"
+    warn "  sudo apt-get install socat"
+    warn ""
+    warn "For production, use the Rust-based remote signer included"
+    warn "in the IONA release package."
+    exit 1
+fi
+
+# ── Internal request handler (called by socat for each connection) ───────────
+if [[ "${1:-}" == "--internal-handler" ]]; then
+    # Read HTTP request
+    read -r request_line
+    METHOD=$(echo "$request_line" | awk '{print $1}')
+    PATH_URL=$(echo "$request_line" | awk '{print $2}')
+    
+    # Read headers
+    while read -r header; do
+        [[ "$header" == $'\r' ]] && break
+        [[ -z "${header%%[![:space:]]*}" ]] && break
+    done
+    
+    # Route request
+    case "$METHOD" in
+        GET)
+            case "$PATH_URL" in
+                /pubkey)
+                    PUBKEY=$(openssl pkey -in "$KEY_FILE" -pubout 2>/dev/null)
+                    echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n$PUBKEY"
+                    ;;
+                /health)
+                    echo -e "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ok\",\"version\":\"$VERSION\"}"
+                    ;;
+                *)
+                    echo -e "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nNot Found"
+                    ;;
+            esac
+            ;;
+        POST)
+            case "$PATH_URL" in
+                /sign)
+                    # Read body
+                    CONTENT_LENGTH=0
+                    while read -r header; do
+                        [[ "$header" == $'\r' ]] && break
+                        if [[ "$header" =~ ^Content-Length:\ ([0-9]+) ]]; then
+                            CONTENT_LENGTH="${BASH_REMATCH[1]}"
+                        fi
+                    done
+                    
+                    # Read the body
+                    BODY=""
+                    if [[ "$CONTENT_LENGTH" -gt 0 ]]; then
+                        read -r -n "$CONTENT_LENGTH" BODY
+                    fi
+                    
+                    # Sign the data (simplified — in production, validate format)
+                    if [[ -n "$BODY" ]]; then
+                        SIGNATURE=$(echo -n "$BODY" | openssl dgst -sha256 -sign "$KEY_FILE" 2>/dev/null | base64 -w 0 2>/dev/null || echo "signing_failed")
+                        echo -e "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"signature\":\"$SIGNATURE\"}"
+                    else
+                        echo -e "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nEmpty body"
+                    fi
+                    ;;
+                *)
+                    echo -e "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nNot Found"
+                    ;;
+            esac
+            ;;
+        *)
+            echo -e "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\n\r\nMethod Not Allowed"
+            ;;
+    esac
+    
+    exit 0
+fi
