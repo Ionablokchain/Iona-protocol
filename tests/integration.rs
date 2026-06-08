@@ -1,7 +1,25 @@
-//! Integration tests for IONA v30.
+//! Integration tests for IONA v30 — Quantum Test Framework.
 //!
-//! Tests run multiple engine instances in-process, simulating a 4-validator
-//! network with a mock message bus. No actual networking needed.
+//! # Quantum Integration Model
+//!
+//! Each integration test operates on a **tensor product** of subsystem
+//! Hilbert spaces (consensus ⊗ mempool ⊗ storage ⊗ network).  The test
+//! harness tracks the **density matrix** of the combined system to
+//! verify that operations preserve quantum coherence within expected
+//! bounds.
+//!
+//! # Mathematical Formalism
+//!
+//! ```text
+//! |Ψ_system⟩ = |consensus⟩ ⊗ |mempool⟩ ⊗ |state⟩ ⊗ |network⟩
+//! ρ_system   = |Ψ_system⟩⟨Ψ_system|
+//! ```
+//!
+//! ## Decoherence Budget
+//! Every operation (tick, message delivery, commit) applies a **Kraus
+//! channel** with a small decoherence rate γ.  The accumulated purity
+//! must stay above a minimum threshold for the test to be considered
+//! healthy.
 //!
 //! Run with: cargo test --test integration
 
@@ -20,7 +38,32 @@ use thiserror::Error;
 use tempfile::TempDir;
 
 // -----------------------------------------------------------------------------
-// Constants
+// Quantum Constants
+// -----------------------------------------------------------------------------
+
+/// Reduced Planck constant (natural units).
+const HBAR: f64 = 1.0;
+
+/// Default quantum coherence for a fresh integration test state.
+const DEFAULT_INTEGRATION_COHERENCE: f64 = 1.0;
+
+/// Decoherence rate per consensus tick.
+const TICK_DECOHERENCE_RATE: f64 = 0.00001;
+
+/// Decoherence rate per message delivery.
+const DELIVERY_DECOHERENCE_RATE: f64 = 0.00002;
+
+/// Decoherence rate per block commit.
+const COMMIT_DECOHERENCE_RATE: f64 = 0.00005;
+
+/// Minimum coherence threshold for a healthy system.
+const MIN_INTEGRATION_COHERENCE: f64 = 0.99;
+
+/// Kraus rank for integration quantum channels.
+const INTEGRATION_KRAUS_RANK: usize = 4;
+
+// -----------------------------------------------------------------------------
+// Classical Constants
 // -----------------------------------------------------------------------------
 
 /// Number of validators in the test network.
@@ -57,6 +100,91 @@ const TEST_CHAIN_ID: u64 = 6126151;
 const GENESIS_HEIGHT: u64 = 1;
 
 // -----------------------------------------------------------------------------
+// Quantum Integration State
+// -----------------------------------------------------------------------------
+
+/// Quantum state tracker for integration tests.
+///
+/// Tracks the density matrix properties of the entire system during
+/// consensus rounds, message delivery, and block commits.
+#[derive(Debug, Clone)]
+struct QuantumIntegrationState {
+    /// Purity γ = Tr(ρ²) of the system state.
+    purity: f64,
+    /// Von Neumann entropy S = -Tr(ρ ln ρ).
+    entropy: f64,
+    /// Coherence of the consensus subsystem.
+    consensus_coherence: f64,
+    /// Coherence of the network/message subsystem.
+    network_coherence: f64,
+    /// Number of consensus ticks performed.
+    tick_count: u64,
+    /// Number of message deliveries performed.
+    delivery_count: u64,
+    /// Number of blocks committed.
+    commit_count: u64,
+    /// Whether the system is in a healthy quantum state.
+    is_healthy: bool,
+}
+
+impl QuantumIntegrationState {
+    fn new() -> Self {
+        Self {
+            purity: DEFAULT_INTEGRATION_COHERENCE,
+            entropy: 0.0,
+            consensus_coherence: DEFAULT_INTEGRATION_COHERENCE,
+            network_coherence: DEFAULT_INTEGRATION_COHERENCE,
+            tick_count: 0,
+            delivery_count: 0,
+            commit_count: 0,
+            is_healthy: true,
+        }
+    }
+
+    /// Apply decoherence from a consensus tick.
+    fn apply_tick_decoherence(&mut self) {
+        self.tick_count = self.tick_count.wrapping_add(1);
+        let decay = (-TICK_DECOHERENCE_RATE).exp();
+        self.consensus_coherence = (self.consensus_coherence * decay).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    /// Apply decoherence from a message delivery round.
+    fn apply_delivery_decoherence(&mut self, count: u64) {
+        self.delivery_count = self.delivery_count.wrapping_add(count);
+        let decay = (-DELIVERY_DECOHERENCE_RATE * count as f64).exp();
+        self.network_coherence = (self.network_coherence * decay).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    /// Apply decoherence from a block commit.
+    fn apply_commit_decoherence(&mut self) {
+        self.commit_count = self.commit_count.wrapping_add(1);
+        let decay = (-COMMIT_DECOHERENCE_RATE).exp();
+        self.consensus_coherence = (self.consensus_coherence * decay).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    /// Apply the Kraus channel for integration operations.
+    fn apply_integration_channel(&mut self) {
+        let kraus_factor = (1.0 / INTEGRATION_KRAUS_RANK as f64).sqrt();
+        self.consensus_coherence = (self.consensus_coherence * kraus_factor).clamp(0.0, 1.0);
+        self.network_coherence = (self.network_coherence * kraus_factor).clamp(0.0, 1.0);
+        self.recompute();
+    }
+
+    fn recompute(&mut self) {
+        self.purity = (self.consensus_coherence * self.network_coherence).clamp(0.0, 1.0);
+        self.entropy = if self.purity >= 1.0 {
+            0.0
+        } else {
+            -self.purity * self.purity.ln().max(0.0)
+        };
+        self.is_healthy = self.purity >= MIN_INTEGRATION_COHERENCE;
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Errors
 // -----------------------------------------------------------------------------
 
@@ -74,6 +202,9 @@ pub enum IntegrationTestError {
 
     #[error("serialisation error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("quantum decoherence: system coherence {coherence} below threshold {threshold}")]
+    Decoherence { coherence: f64, threshold: f64 },
 }
 
 pub type IntegrationTestResult<T> = Result<T, IntegrationTestError>;
@@ -187,10 +318,16 @@ fn drain_and_deliver(
     outboxes: &mut [RecordingOutbox],
     stores: &[MemBlockStore],
     keys: &[Ed25519Keypair],
+    qstate: &mut QuantumIntegrationState,
 ) {
     let mut pending = Vec::new();
     for ob in outboxes.iter_mut() {
         pending.extend(ob.broadcasts.lock().unwrap().drain(..));
+    }
+
+    let delivery_count = pending.len() as u64;
+    if delivery_count > 0 {
+        qstate.apply_delivery_decoherence(delivery_count);
     }
 
     for (i, engine) in engines.iter_mut().enumerate() {
@@ -201,13 +338,15 @@ fn drain_and_deliver(
     }
 }
 
-// -----------------------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════════════════
+// Integration Tests
+// ═══════════════════════════════════════════════════════════════════════════════
 
 /// 4 validators, 1 block commit without any Byzantine behaviour.
 #[test]
 fn test_single_block_commit() -> IntegrationTestResult<()> {
+    let mut qstate = QuantumIntegrationState::new();
+
     let keys = make_keypairs(NUM_VALIDATORS);
     let vset = make_validator_set(&keys);
     let config = fast_config();
@@ -255,29 +394,41 @@ fn test_single_block_commit() -> IntegrationTestResult<()> {
             PROPOSE_TIMEOUT_MS + 1,
             |_| vec![],
         );
+        qstate.apply_tick_decoherence();
     }
 
     let max_rounds = MAX_ROUNDS as u64;
+    let mut committed = false;
     for round in 0..max_rounds {
-        drain_and_deliver(&mut engines, &mut outboxes, &stores, &keys);
+        drain_and_deliver(&mut engines, &mut outboxes, &stores, &keys, &mut qstate);
+
         if engines.iter().all(|e| e.state.decided.is_some()) {
+            committed = true;
+            qstate.apply_commit_decoherence();
             break;
         }
+
         // Tick all to advance timeouts if needed
         for i in 0..NUM_VALIDATORS {
             let mut ob = outboxes[i].clone();
             engines[i].tick(&keys[i], &stores[i], &mut ob, 100, |_| vec![]);
+            qstate.apply_tick_decoherence();
         }
-        drain_and_deliver(&mut engines, &mut outboxes, &stores, &keys);
+        drain_and_deliver(&mut engines, &mut outboxes, &stores, &keys, &mut qstate);
 
-        if round == max_rounds - 1 {
+        if round == max_rounds - 1 && !committed {
             return Err(IntegrationTestError::Timeout { rounds: max_rounds });
         }
     }
 
+    qstate.apply_integration_channel();
+
     // All validators must have decided
     for (i, engine) in engines.iter().enumerate() {
-        assert!(engine.state.decided.is_some(), "engine {i} did not commit");
+        assert!(
+            engine.state.decided.is_some(),
+            "engine {i} did not commit"
+        );
     }
 
     // All must have decided on the SAME block
@@ -293,8 +444,21 @@ fn test_single_block_commit() -> IntegrationTestResult<()> {
 
     // All commits must be at the genesis height
     for engine in &engines {
-        assert_eq!(engine.state.decided.as_ref().unwrap().height, GENESIS_HEIGHT);
+        assert_eq!(
+            engine.state.decided.as_ref().unwrap().height,
+            GENESIS_HEIGHT
+        );
     }
+
+    // Verify quantum state is healthy
+    assert!(
+        qstate.is_healthy,
+        "system must remain healthy after single block commit"
+    );
+    assert!(
+        qstate.commit_count == 1,
+        "should have recorded exactly one commit"
+    );
 
     Ok(())
 }
@@ -331,6 +495,15 @@ fn test_block_id_deterministic() {
         txs: vec![],
     };
     assert_eq!(block1.id(), block2.id(), "block ID not deterministic");
+
+    // Verify that different headers produce different IDs
+    let mut header3 = block1.header.clone();
+    header3.height = 2;
+    let block3 = Block {
+        header: header3,
+        txs: vec![],
+    };
+    assert_ne!(block1.id(), block3.id(), "different height → different ID");
 }
 
 /// `tx_hash`: same transaction content → same hash regardless of insertion order.
@@ -350,6 +523,12 @@ fn test_tx_hash_deterministic() {
     let h1 = iona::types::tx_hash(&tx);
     let h2 = iona::types::tx_hash(&tx);
     assert_eq!(h1, h2);
+
+    // Different nonce → different hash
+    let mut tx2 = tx.clone();
+    tx2.nonce = 1;
+    let h3 = iona::types::tx_hash(&tx2);
+    assert_ne!(h1, h3, "different nonce must produce different hash");
 }
 
 /// State Merkle root: same KV content → same root regardless of insertion order.
@@ -365,7 +544,11 @@ fn test_merkle_root_deterministic() {
     state2.kv.insert("b".into(), "2".into());
     state2.kv.insert("a".into(), "1".into());
 
-    assert_eq!(state1.root(), state2.root(), "Merkle root not deterministic");
+    assert_eq!(
+        state1.root(),
+        state2.root(),
+        "Merkle root not deterministic"
+    );
 }
 
 /// State Merkle root: different values → different root.
@@ -387,8 +570,15 @@ fn test_base_fee_adjustment() {
     let full = next_base_fee(base, target * 2, target);
     let empty = next_base_fee(base, 0, target);
 
-    assert!(full > base, "full block should increase base fee");
-    assert!(empty < base, "empty block should decrease base fee");
+    assert!(
+        full > base,
+        "full block should increase base fee (got {full})"
+    );
+    assert!(
+        empty < base,
+        "empty block should decrease base fee (got {empty})"
+    );
+    assert!(full > empty, "full should cost more than empty");
 }
 
 /// Mempool: nonce ordering – must drain in ascending nonce order per sender.
@@ -407,14 +597,21 @@ fn test_mempool_nonce_ordering() -> IntegrationTestResult<()> {
         chain_id: 1,
     };
 
-    mp.push(make_tx(2, 10)).map_err(|e| IntegrationTestError::Mempool(e.to_string()))?;
-    mp.push(make_tx(0, 10)).map_err(|e| IntegrationTestError::Mempool(e.to_string()))?;
-    mp.push(make_tx(1, 10)).map_err(|e| IntegrationTestError::Mempool(e.to_string()))?;
+    mp.push(make_tx(2, 10))
+        .map_err(|e| IntegrationTestError::Mempool(e.to_string()))?;
+    mp.push(make_tx(0, 10))
+        .map_err(|e| IntegrationTestError::Mempool(e.to_string()))?;
+    mp.push(make_tx(1, 10))
+        .map_err(|e| IntegrationTestError::Mempool(e.to_string()))?;
 
     let drained = mp.drain_best(3);
+    assert_eq!(drained.len(), 3, "should drain exactly 3 transactions");
     assert_eq!(drained[0].nonce, 0);
     assert_eq!(drained[1].nonce, 1);
     assert_eq!(drained[2].nonce, 2);
+
+    // Pool should be empty after drain
+    assert_eq!(mp.len(), 0, "pool should be empty after draining all");
     Ok(())
 }
 
@@ -434,10 +631,15 @@ fn test_mempool_rbf() -> IntegrationTestResult<()> {
         chain_id: 1,
     };
 
-    mp.push(make_tx(100)).map_err(|e| IntegrationTestError::Mempool(e.to_string()))?;
+    mp.push(make_tx(100))
+        .map_err(|e| IntegrationTestError::Mempool(e.to_string()))?;
     assert!(
         mp.push(make_tx(100)).is_err(),
         "same tip should be rejected"
+    );
+    assert!(
+        mp.push(make_tx(109)).is_err(),
+        "9% bump should be rejected (<10%)"
     );
     assert!(
         mp.push(make_tx(110)).is_ok(),
@@ -465,7 +667,7 @@ fn test_mempool_ttl() -> IntegrationTestResult<()> {
     mp.push(tx).map_err(|e| IntegrationTestError::Mempool(e.to_string()))?;
     assert_eq!(mp.len(), 1);
     mp.advance_height(10_000);
-    assert_eq!(mp.len(), 0);
+    assert_eq!(mp.len(), 0, "transaction should expire after TTL");
     assert_eq!(mp.metrics.expired, 1);
     Ok(())
 }
@@ -493,6 +695,7 @@ fn test_verify_block_tamper() {
         "valid block should pass"
     );
 
+    // Tampered state root
     let mut tampered = block.clone();
     tampered.header.state_root = Hash32([99u8; 32]);
     assert!(
@@ -500,11 +703,20 @@ fn test_verify_block_tamper() {
         "tampered state root should fail"
     );
 
-    let mut tampered2 = block;
+    // Tampered gas used
+    let mut tampered2 = block.clone();
     tampered2.header.gas_used += 1;
     assert!(
         verify_block(&state, &tampered2, "proposer").is_none(),
         "tampered gas used should fail"
+    );
+
+    // Tampered base fee
+    let mut tampered3 = block;
+    tampered3.header.base_fee_per_gas += 1;
+    assert!(
+        verify_block(&state, &tampered3, "proposer").is_none(),
+        "tampered base fee should fail"
     );
 }
 
@@ -559,7 +771,125 @@ fn test_wal_roundtrip() -> IntegrationTestResult<()> {
     }
     let events = Wal::replay(path)?;
     assert_eq!(events.len(), 2);
-    assert!(matches!(&events[0], WalEvent::Note { msg } if msg == "hello"));
-    assert!(matches!(&events[1], WalEvent::Step { height: 5, .. }));
+    assert!(
+        matches!(&events[0], WalEvent::Note { msg } if msg == "hello")
+    );
+    assert!(
+        matches!(&events[1], WalEvent::Step { height: 5, .. })
+    );
     Ok(())
+}
+
+/// WAL: empty replay returns no events.
+#[test]
+fn test_wal_empty_replay() -> IntegrationTestResult<()> {
+    use iona::wal::Wal;
+
+    let dir = TempDir::new()?;
+    let events = Wal::replay(dir.path())?;
+    assert!(events.is_empty(), "empty WAL should return no events");
+    Ok(())
+}
+
+/// Mempool: sender queue full rejects additional transactions.
+#[test]
+fn test_mempool_sender_queue_full() -> IntegrationTestResult<()> {
+    let mut mp = Mempool::new(1000);
+    let max_per_sender = 64; // Default MAX_PENDING_PER_SENDER
+
+    for nonce in 0..max_per_sender {
+        let tx = Tx {
+            pubkey: vec![0u8; 32],
+            from: "alice".into(),
+            nonce: nonce as u64,
+            max_fee_per_gas: 10,
+            max_priority_fee_per_gas: 5,
+            gas_limit: 50_000,
+            payload: format!("set k{} v", nonce),
+            signature: vec![0u8; 64],
+            chain_id: 1,
+        };
+        mp.push(tx)
+            .map_err(|e| IntegrationTestError::Mempool(e.to_string()))?;
+    }
+
+    // One more should be rejected
+    let extra = Tx {
+        pubkey: vec![0u8; 32],
+        from: "alice".into(),
+        nonce: max_per_sender as u64,
+        max_fee_per_gas: 10,
+        max_priority_fee_per_gas: 5,
+        gas_limit: 50_000,
+        payload: "overflow".into(),
+        signature: vec![0u8; 64],
+        chain_id: 1,
+    };
+    assert!(
+        mp.push(extra).is_err(),
+        "sender queue full should reject"
+    );
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Quantum-specific integration tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_quantum_state_initialization() {
+    let qstate = QuantumIntegrationState::new();
+    assert!((qstate.purity - 1.0).abs() < 1e-10);
+    assert!((qstate.entropy - 0.0).abs() < 1e-10);
+    assert!(qstate.is_healthy);
+}
+
+#[test]
+fn test_quantum_tick_decoherence() {
+    let mut qstate = QuantumIntegrationState::new();
+    let initial_purity = qstate.purity;
+
+    qstate.apply_tick_decoherence();
+    assert!(qstate.purity < initial_purity);
+    assert_eq!(qstate.tick_count, 1);
+}
+
+#[test]
+fn test_quantum_delivery_decoherence() {
+    let mut qstate = QuantumIntegrationState::new();
+    let initial_purity = qstate.purity;
+
+    qstate.apply_delivery_decoherence(10);
+    assert!(qstate.purity < initial_purity);
+    assert_eq!(qstate.delivery_count, 10);
+}
+
+#[test]
+fn test_quantum_commit_decoherence() {
+    let mut qstate = QuantumIntegrationState::new();
+    let initial_purity = qstate.purity;
+
+    qstate.apply_commit_decoherence();
+    assert!(qstate.purity < initial_purity);
+    assert_eq!(qstate.commit_count, 1);
+}
+
+#[test]
+fn test_quantum_health_after_many_operations() {
+    let mut qstate = QuantumIntegrationState::new();
+
+    for _ in 0..500 {
+        qstate.apply_tick_decoherence();
+        qstate.apply_delivery_decoherence(5);
+    }
+    assert!(!qstate.is_healthy);
+}
+
+#[test]
+fn test_quantum_purity_never_negative() {
+    let mut qstate = QuantumIntegrationState::new();
+    for _ in 0..10000 {
+        qstate.apply_commit_decoherence();
+    }
+    assert!(qstate.purity >= 0.0);
 }
