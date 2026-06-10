@@ -1,130 +1,356 @@
 # =============================================================================
-# IONA Prometheus Alert Rules — Production‑Ready
+# IONA Prometheus Alert Rules — Production‑Grade v30
 # =============================================================================
-# These alerts are designed for a validator or full node.
+# These alerts are designed for a production validator or full node.
 # Adjust thresholds based on your environment (testnet / mainnet).
 #
 # Severity levels:
-#   - page   (critical, requires immediate action)
-#   - ticket (warning, investigate within business hours)
-#   - info   (informational, no immediate action)
+#   - critical (page immediately, 24/7 on‑call)
+#   - warning  (investigate within business hours)
+#   - info     (informational, no immediate action required)
+#
+# Usage:
+#   Include in prometheus.yml under rule_files:
+#     rule_files:
+#       - "/etc/prometheus/rules/iona_alerts.yml"
 # =============================================================================
 
 groups:
   # ---------------------------------------------------------------------------
   # Node liveness and health
   # ---------------------------------------------------------------------------
-  - name: iona.health
+  - name: iona-health
+    interval: 15s
     rules:
       - alert: IonaNodeDown
-        expr: up{job="iona-node"} == 0
+        expr: up{job=~"iona-node|iona_validators"} == 0
         for: 30s
         labels:
-          severity: page
+          severity: critical
+          priority: P1
           team: ops
+          component: node
         annotations:
           summary: "IONA node is down on {{ $labels.instance }}"
-          description: "The node has been unreachable for more than 30 seconds."
+          description: |
+            The node has been unreachable for more than 30 seconds.
+            Check: systemctl status iona-node
+            Check: docker ps | grep iona
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/node_down.md"
+          dashboard: "https://grafana.example.com/d/iona-node-health"
+
+      - alert: IonaNodeFlapping
+        expr: changes(up{job=~"iona-node|iona_validators"}[10m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+          priority: P2
+          team: ops
+          component: node
+        annotations:
+          summary: "IONA node is flapping on {{ $labels.instance }}"
+          description: |
+            The node has restarted more than 3 times in the last 10 minutes.
+            Check logs: journalctl -u iona-node -n 100
 
       - alert: IonaNodeHighCPU
-        expr: (100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)) > 90
+        expr: |
+          (100 - (avg by (instance) (
+            rate(node_cpu_seconds_total{mode="idle"}[5m])
+          ) * 100)) > 90
         for: 10m
         labels:
-          severity: ticket
+          severity: warning
+          priority: P2
           team: ops
+          component: system
         annotations:
-          summary: "High CPU usage on {{ $labels.instance }}: {{ $value }}%"
-          description: "CPU usage has exceeded 90% for 10 minutes."
+          summary: "High CPU usage on {{ $labels.instance }}: {{ $value | humanize }}%"
+          description: |
+            CPU usage has exceeded 90% for 10 minutes.
+            Check top processes: top -o %CPU
+
+      - alert: IonaNodeHighMemory
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+        for: 10m
+        labels:
+          severity: warning
+          priority: P2
+          team: ops
+          component: system
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}: {{ $value | humanize }}%"
+          description: "Memory usage has exceeded 90% for 10 minutes."
 
   # ---------------------------------------------------------------------------
   # Consensus and finality
   # ---------------------------------------------------------------------------
-  - name: iona.consensus
+  - name: iona-consensus
+    interval: 10s
     rules:
       - alert: IonaHighFinalityLag
         expr: iona_finality_lag_seconds > 10
         for: 2m
         labels:
-          severity: ticket
+          severity: warning
+          priority: P2
           team: validators
+          component: consensus
         annotations:
           summary: "High finality lag on {{ $labels.instance }}: {{ $value }}s"
-          description: "Blocks are taking more than 10 seconds to finalise."
+          description: |
+            Blocks are taking more than 10 seconds to finalise.
+            Check peer connectivity and validator health.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/finality_lag.md"
+          dashboard: "https://grafana.example.com/d/iona-consensus"
+
+      - alert: IonaCriticalFinalityLag
+        expr: iona_finality_lag_seconds > 60
+        for: 1m
+        labels:
+          severity: critical
+          priority: P1
+          team: validators
+          component: consensus
+        annotations:
+          summary: "CRITICAL finality lag on {{ $labels.instance }}: {{ $value }}s"
+          description: |
+            Blocks are taking more than 60 seconds to finalise.
+            IMMEDIATE ACTION REQUIRED. Chain may be halted.
 
       - alert: IonaNoBlocksFor5Minutes
         expr: (time() - iona_block_timestamp_seconds) > 300
         for: 0m
         labels:
-          severity: page
+          severity: critical
+          priority: P1
           team: validators
+          component: consensus
         annotations:
           summary: "No new blocks for 5+ minutes on {{ $labels.instance }}"
-          description: "Last block timestamp is more than 300 seconds old. Chain may be halted."
+          description: |
+            Last block timestamp is more than 300 seconds old.
+            Chain may be halted. Check consensus logs immediately.
+          runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/chain_halt.md"
+
+      - alert: IonaMissedBlocks
+        expr: rate(iona_blocks_missed_total[1h]) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+          priority: P3
+          team: validators
+          component: consensus
+        annotations:
+          summary: "Validator missing blocks on {{ $labels.instance }}"
+          description: |
+            More than 10% of blocks missed in the last hour.
+            Check signing infrastructure and network latency.
 
   # ---------------------------------------------------------------------------
   # Peer connectivity
   # ---------------------------------------------------------------------------
-  - name: iona.network
+  - name: iona-network
+    interval: 30s
     rules:
       - alert: IonaLowPeers
         expr: iona_peer_count < 3
         for: 5m
         labels:
-          severity: ticket
+          severity: warning
+          priority: P2
           team: ops
+          component: p2p
         annotations:
           summary: "Low peer count on {{ $labels.instance }}: {{ $value }}"
-          description: "Node has fewer than 3 connected peers for 5 minutes."
+          description: |
+            Node has fewer than 3 connected peers for 5 minutes.
+            Check firewall rules and bootstrap nodes.
+
+      - alert: IonaNoPeers
+        expr: iona_peer_count == 0
+        for: 2m
+        labels:
+          severity: critical
+          priority: P1
+          team: ops
+          component: p2p
+        annotations:
+          summary: "No peers connected on {{ $labels.instance }}"
+          description: |
+            Node has zero connected peers. Network is completely isolated.
+            Check network configuration and connectivity.
+
+      - alert: IonaPeerChurn
+        expr: rate(iona_peer_disconnections_total[10m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+          priority: P3
+          team: ops
+          component: p2p
+        annotations:
+          summary: "High peer churn on {{ $labels.instance }}"
+          description: |
+            More than 5 peer disconnections per second in the last 10 minutes.
+            Possible network instability.
 
   # ---------------------------------------------------------------------------
   # Storage and memory pressure
   # ---------------------------------------------------------------------------
-  - name: iona.storage
+  - name: iona-storage
+    interval: 30s
     rules:
       - alert: IonaHighDiskUsage
-        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 10
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint="/"} /
+           node_filesystem_size_bytes{mountpoint="/"}) * 100 < 10
         for: 5m
         labels:
-          severity: page
+          severity: critical
+          priority: P1
           team: ops
+          component: storage
         annotations:
-          summary: "Low disk space on {{ $labels.instance }}: {{ $value }}% available"
-          description: "Less than 10% disk space remaining."
+          summary: "Low disk space on {{ $labels.instance }}: {{ $value | humanize }}% available"
+          description: |
+            Less than 10% disk space remaining on root partition.
+            Run: du -sh /var/lib/iona/* | sort -rh | head -10
+
+      - alert: IonaHighDiskUsageWarning
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint="/"} /
+           node_filesystem_size_bytes{mountpoint="/"}) * 100 < 25
+        for: 15m
+        labels:
+          severity: warning
+          priority: P2
+          team: ops
+          component: storage
+        annotations:
+          summary: "Disk space running low on {{ $labels.instance }}: {{ $value | humanize }}% available"
+          description: "Less than 25% disk space remaining. Plan for expansion."
 
       - alert: IonaMempoolFull
         expr: iona_mempool_size / iona_mempool_capacity > 0.95
         for: 2m
         labels:
-          severity: ticket
+          severity: warning
+          priority: P3
           team: ops
+          component: mempool
         annotations:
           summary: "Mempool nearly full on {{ $labels.instance }}: {{ $value | humanizePercentage }}"
-          description: "Mempool capacity is >95% used. Consider increasing capacity or processing more transactions."
+          description: |
+            Mempool capacity is >95% used.
+            Consider increasing capacity or processing more transactions.
+
+      - alert: IonaMempoolCriticalFull
+        expr: iona_mempool_size / iona_mempool_capacity > 0.99
+        for: 1m
+        labels:
+          severity: critical
+          priority: P2
+          team: ops
+          component: mempool
+        annotations:
+          summary: "Mempool critically full on {{ $labels.instance }}"
+          description: "Mempool is at 99%+ capacity. Transactions will be rejected."
 
   # ---------------------------------------------------------------------------
   # Security and anomalies
   # ---------------------------------------------------------------------------
-  - name: iona.security
+  - name: iona-security
+    interval: 15s
     rules:
       - alert: IonaTooManyRateLimitHits
         expr: rate(iona_rpc_rate_limited_total[1m]) > 10
         for: 2m
         labels:
-          severity: ticket
+          severity: warning
+          priority: P2
           team: security
+          component: rpc
         annotations:
           summary: "High rate of RPC rate limiting on {{ $labels.instance }}"
-          description: "More than 10 requests per second are being rate‑limited. Possible abuse."
+          description: |
+            More than 10 requests per second are being rate‑limited.
+            Possible abuse or misconfigured client.
 
       - alert: IonaAuditIntegrityFailure
         expr: iona_audit_chain_integrity == 0
         for: 1m
         labels:
-          severity: page
+          severity: critical
+          priority: P1
           team: security
+          component: audit
         annotations:
           summary: "Audit chain integrity failure on {{ $labels.instance }}"
-          description: "The audit log tamper‑evident chain is broken. Run verification immediately."
+          description: |
+            The audit log tamper‑evident chain is broken.
+            Run: iona-cli audit verify
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/audit_chain_break.md"
+
+      - alert: IonaTLSCertExpiringSoon
+        expr: iona_tls_cert_expiry_seconds < 86400 * 30
+        for: 1h
+        labels:
+          severity: warning
+          priority: P2
+          team: security
+          component: tls
+        annotations:
+          summary: "TLS certificate expires in {{ $value | humanizeDuration }} on {{ $labels.instance }}"
+          description: "Renew the TLS certificate before it expires."
+
+      - alert: IonaTLSCertCriticalExpiry
+        expr: iona_tls_cert_expiry_seconds < 86400 * 7
+        for: 5m
+        labels:
+          severity: critical
+          priority: P1
+          team: security
+          component: tls
+        annotations:
+          summary: "TLS certificate expires in {{ $value | humanizeDuration }} — RENEW NOW"
+          description: "Certificate expires within 7 days. Immediate renewal required."
+
+      - alert: IonaDoubleSignDetected
+        expr: increase(iona_double_sign_detected_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          priority: P0
+          team: security
+          component: validator
+        annotations:
+          summary: "DOUBLE-SIGN detected on {{ $labels.instance }} — STOP NODE NOW"
+          description: |
+            A double-sign event has been detected.
+            IMMEDIATE ACTION REQUIRED:
+            1. Stop the node: systemctl stop iona-node
+            2. Do NOT restart before speaking with security team
+            3. Preserve all logs and WAL files
+          runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/double_sign.md"
+
+  # ---------------------------------------------------------------------------
+  # Informational (no immediate action required)
+  # ---------------------------------------------------------------------------
+  - name: iona-info
+    interval: 60s
+    rules:
+      - alert: IonaVersionSkewDetected
+        expr: count(count by (version) (iona_node_info)) > 1
+        for: 30m
+        labels:
+          severity: info
+          priority: P4
+          team: ops
+          component: upgrade
+        annotations:
+          summary: "Multiple IONA versions running in validator set"
+          description: |
+            Validators are running different IONA versions.
+            Ensure all nodes complete the upgrade within the agreed SLA.
