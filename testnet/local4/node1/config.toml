@@ -30,7 +30,7 @@ genesis_file = "/home/claude/iona_v30/testnet/local4/genesis.json"
 
 # Keystore mode: "plain" (insecure, only for testing) 
 #                "encrypted" (recommended for production)
-keystore = "plain"
+keystore = "encrypted"
 
 # Password for encrypted keystore (fallback if env var not set)
 # DO NOT hardcode – use environment variable.
@@ -167,6 +167,19 @@ listen = "127.0.0.1:9001"
 # Optional API key for admin endpoints (empty = disabled)
 # Use environment variable for production.
 api_key = ""
+
+# RBAC policy for admin endpoints
+rbac_enabled = true
+rbac_path = "/home/claude/iona_v30/testnet/local4/node1/config/rbac.toml"
+
+# mTLS configuration for admin server
+require_mtls = false
+tls_cert_pem = ""
+tls_key_pem  = ""
+tls_ca_cert_pem = ""
+
+# Audit logging for admin operations
+audit_log_path = "/home/claude/iona_v30/testnet/local4/node1/data/audit.log"
 
 # -----------------------------------------------------------------------------
 # Consensus engine
