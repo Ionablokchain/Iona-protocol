@@ -1,11 +1,12 @@
 # =============================================================================
-# IONA Testnet v28.7.0 — Prometheus Configuration
+# IONA Testnet v30.0.0 — Prometheus Configuration
 # =============================================================================
-# Scrapes metrics from 4 validator nodes and Prometheus itself.
+# Scrapes metrics from N validator nodes and Prometheus itself.
 #
 # Usage:
 #   Place this file in ./prometheus/prometheus.yml
 #   Then start Prometheus: docker-compose up -d prometheus
+#   Or run directly: prometheus --config.file=./prometheus.yml
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -25,6 +26,7 @@ global:
   external_labels:
     monitor: 'iona-testnet'
     environment: 'testnet'
+    version: 'v30.0.0'
 
 # -----------------------------------------------------------------------------
 # Alerting (optional – uncomment if you have alertmanager)
@@ -37,8 +39,8 @@ global:
 # -----------------------------------------------------------------------------
 # Rule files (optional – uncomment if you have alert rules)
 # -----------------------------------------------------------------------------
-# rule_files:
-#   - "/etc/prometheus/alerts/*.yml"
+rule_files:
+  - "/etc/prometheus/alerts/iona_alerts.yml"
 
 # -----------------------------------------------------------------------------
 # Scrape configurations
@@ -56,13 +58,14 @@ scrape_configs:
     # Static targets (IPs or hostnames as defined in docker-compose)
     static_configs:
       - targets:
-          - 'validator-1:6001'
-          - 'validator-2:6001'
-          - 'validator-3:6001'
-          - 'validator-4:6001'
+          - 'validator-1:9091'
+          - 'validator-2:9091'
+          - 'validator-3:9091'
+          - 'validator-4:9091'
         labels:
           network: 'iona-testnet-1'
           role: 'validator'
+          chain_id: '6126151'
           # Optional: add instance label separately if needed
           # instance: 'validator-${NODE_ID}'
 
