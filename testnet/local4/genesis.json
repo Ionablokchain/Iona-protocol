@@ -1,6 +1,6 @@
 {
   "_comment": "IONA v30.0.0 genesis configuration for iona-testnet-local4",
-  "_description": "Local 4‑validator testnet with deterministic seeds and local addresses",
+  "_description": "Local 4‑validator testnet with deterministic seeds and local addresses. Do not use in production without changing seeds, addresses, and keys.",
 
   "chain_id": 6126151,
   "chain_name": "iona-testnet-local4",
@@ -51,7 +51,7 @@
       "balance": "1000000000000000000000000",
       "nonce": 0
     },
-    "_comment_accounts": "Additional accounts can be added here"
+    "_comment_accounts": "Additional pre‑funded accounts can be added here with address, balance, and nonce."
   },
 
   "bootnodes": [
@@ -78,7 +78,7 @@
     "timeout_propose": "3000ms",
     "timeout_prevote": "1000ms",
     "timeout_precommit": "1000ms",
-      "timeout_commit": "5000ms"
+    "timeout_commit": "5000ms"
   },
 
   "staking_params": {
@@ -114,6 +114,14 @@
   "network_params": {
     "max_peers": 50,
     "max_packet_msg_payload_size": 1048576
+  },
+
+  "app_state": {
+    "_comment": "Initial on‑chain state.  Modify for custom genesis.",
+    "kv_store": {},
+    "evm_accounts": [],
+    "evm_storage": {},
+    "evm_code": {}
   },
 
   "_note": "This genesis file is for local testing only. Do not use in production without changing seeds and addresses."
