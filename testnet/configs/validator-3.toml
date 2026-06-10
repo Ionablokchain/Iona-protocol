@@ -1,9 +1,43 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  IONA Node Configuration — Production‑Grade v30                             ║
+# ║  Validator 3                                                               ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+# ------------------------------------------------------------------------------
+# NODE IDENTITY
+# ------------------------------------------------------------------------------
 [node]
 chain_id = "iona-testnet-1"
 data_dir = "/var/lib/iona"
 seed = 3003
 profile = "prod"
+log_level = "info"
+keystore = "encrypted"
+keystore_password = ""
+keystore_password_env = "IONA_KEYSTORE_PASSWORD"
 
+# ------------------------------------------------------------------------------
+# CONSENSUS ENGINE
+# ------------------------------------------------------------------------------
+[consensus]
+propose_timeout_ms   = 1000
+prevote_timeout_ms   = 1000
+precommit_timeout_ms = 1000
+commit_timeout_ms    = 100
+timeout_commit       = 1000
+max_txs_per_block    = 4096
+max_block_bytes      = 2_097_152
+gas_target           = 43_000_000
+initial_base_fee     = 1
+elasticity_multiplier = 2
+fast_quorum          = true
+stake_each           = 1000
+simple_producer      = true
+validator_seeds      = [1001, 1002, 1003, 1004]
+
+# ------------------------------------------------------------------------------
+# P2P NETWORKING
+# ------------------------------------------------------------------------------
 [network]
 listen = "0.0.0.0:7001"
 peers = [
@@ -11,26 +45,118 @@ peers = [
   "validator-2:7001",
   "validator-4:7001"
 ]
-max_connections = 100
-handshake_timeout_ms = 5000
-message_buffer_size = 1024
+bootnodes = []
+max_connections_total       = 100
+max_connections_per_peer    = 8
+max_inbound_connections     = 80
+max_outbound_connections    = 80
+handshake_timeout_ms        = 5000
+message_buffer_size         = 1024
+enable_mdns = false
+enable_kad  = true
+reconnect_s = 30
+rr_max_req_per_sec            = 25
+rr_strikes_before_ban         = 3
+rr_strikes_before_quarantine  = 2
+rr_quarantines_before_ban     = 2
+peer_quarantine_s             = 60
+peer_score_decay_s            = 60
+persist_quarantine            = true
+eclipse_profile = "mainnet"
 
+[network.gossipsub]
+allowed_topics        = ["iona/tx", "iona/blocks", "iona/evidence"]
+deny_unknown_topics   = true
+max_publish_msgs_per_sec = 30
+max_in_msgs_per_sec   = 60
+
+# ------------------------------------------------------------------------------
+# RPC API
+# ------------------------------------------------------------------------------
 [rpc]
-listen = "0.0.0.0:9001"
+listen = "127.0.0.1:9001"
 enable_websocket = true
 websocket_max_clients = 100
 request_timeout_ms = 30000
-cors_allowed_origins = ["*"]
+cors_allow_all = false
+cors_allowed_origins = ["https://explorer.iona.network"]
+rpc_rate_limit_enabled = true
+rpc_read_rate_per_sec  = 500
+rpc_submit_rate_per_sec = 100
+enable_faucet = false
 
-[consensus]
-propose_timeout_ms = 1000
-prevote_timeout_ms = 1000
-precommit_timeout_ms = 1000
-commit_timeout_ms = 100
-timeout_commit = 1000
+# ------------------------------------------------------------------------------
+# MEMPOOL
+# ------------------------------------------------------------------------------
+[mempool]
+capacity = 200_000
+max_pending_per_sender = 64
+ttl_blocks = 300
+rbf_bump_percent = 10
+mev_protection = false
+mev_commit_reveal = false
+mev_threshold_encryption = false
 
+# ------------------------------------------------------------------------------
+# STORAGE
+# ------------------------------------------------------------------------------
+[storage]
+enable_snapshots          = true
+snapshot_every_n_blocks   = 500
+snapshot_keep             = 10
+snapshot_zstd_level       = 3
+db_backend                = "rocksdb"
+db_cache_size_mb          = 512
+db_max_open_files         = 1024
+
+# ------------------------------------------------------------------------------
+# SECURITY
+# ------------------------------------------------------------------------------
 [security]
 rbac_enabled = true
-audit_logging_enabled = true
-audit_log_path = "/var/log/iona/audit.log"
-max_audit_log_size_mb = 512
+rbac_policy_path = "/etc/iona/rbac.toml"
+audit_logging_enabled    = true
+audit_log_path           = "/var/log/iona/audit.log"
+max_audit_log_size_mb    = 512
+audit_log_retention_days = 30
+double_sign_guard_enabled = true
+double_sign_guard_path    = "/var/lib/iona/doublesign"
+
+# ------------------------------------------------------------------------------
+# ADMINISTRATION
+# ------------------------------------------------------------------------------
+[admin]
+listen         = "127.0.0.1:9002"
+require_mtls   = true
+tls_cert_pem   = "/etc/iona/tls/admin-server.crt.pem"
+tls_key_pem    = "/etc/iona/tls/admin-server.key.pem"
+tls_ca_cert_pem = "/etc/iona/tls/ca.crt.pem"
+
+# ------------------------------------------------------------------------------
+# SIGNING
+# ------------------------------------------------------------------------------
+[signing]
+mode = "local"
+remote_url = "http://127.0.0.1:9100"
+remote_timeout_s = 10
+remote_tls_client_cert_pem = ""
+remote_tls_client_key_pem  = ""
+remote_tls_ca_cert_pem     = ""
+remote_tls_server_name     = ""
+
+# ------------------------------------------------------------------------------
+# OBSERVABILITY
+# ------------------------------------------------------------------------------
+[observability]
+enable_metrics = true
+metrics_listen = "127.0.0.1:9090"
+metrics_path   = "/metrics"
+enable_otel   = false
+otel_endpoint = "http://127.0.0.1:4317"
+service_name  = "iona-node"
+
+# ------------------------------------------------------------------------------
+# UPGRADES
+# ------------------------------------------------------------------------------
+[upgrades]
+auto_migrate = true
