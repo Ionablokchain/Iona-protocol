@@ -1,36 +1,251 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  IONA Node Configuration — Production‑Grade v30                             ║
+# ║                                                                            ║
+# ║  All tunable parameters for a production validator or full node.            ║
+# ║  Sensitive fields can be overridden via environment variables (see below).  ║
+# ║  Run `iona-node --check-compat --config <this-file>` to validate.           ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+# ------------------------------------------------------------------------------
+# NODE IDENTITY
+# ------------------------------------------------------------------------------
 [node]
+# Unique chain identifier – must match the genesis file and all peers.
 chain_id = "iona-testnet-1"
+
+# Root directory for chain data, keys, and logs.
 data_dir = "/var/lib/iona"
+
+# Deterministic seed for key derivation (change per node).
 seed = 1001
+
+# Execution profile: "prod" | "validator" | "archive" | "dev"
 profile = "prod"
 
+# Log level: trace | debug | info | warn | error
+log_level = "info"
+
+# Keystore type: "plain" | "encrypted"
+keystore = "encrypted"
+# Password for encrypted keystore (fallback if env var is not set).
+# Prefer the IONA_KEYSTORE_PASSWORD environment variable.
+keystore_password = ""
+keystore_password_env = "IONA_KEYSTORE_PASSWORD"
+
+# ------------------------------------------------------------------------------
+# CONSENSUS ENGINE
+# ------------------------------------------------------------------------------
+[consensus]
+# Timeouts in milliseconds.
+propose_timeout_ms   = 1000    # wait for proposal before nil‑voting
+prevote_timeout_ms   = 1000    # prevote phase timeout
+precommit_timeout_ms = 1000    # precommit phase timeout
+commit_timeout_ms    = 100     # time to finalise after quorum (kept short)
+
+# Block construction limits.
+max_txs_per_block  = 4096
+max_block_bytes    = 2_097_152  # 2 MiB – hard limit for block size
+
+# EIP‑1559 gas parameters.
+gas_target           = 43_000_000   # target gas per block
+initial_base_fee     = 1            # initial base fee (in wei)
+elasticity_multiplier = 2           # max block gas = target * multiplier
+
+# Fast‑quorum: advance step immediately when 2/3+ votes arrive.
+fast_quorum = true
+
+# Stake assigned to each validator in simple‑producer mode (testnet only).
+stake_each = 1000
+
+# Simple‑producer mode – validators take turns proposing (set false for full BFT).
+simple_producer = true
+
+# Validator seeds used in simple‑producer mode (must match across all nodes).
+validator_seeds = [1001, 1002, 1003, 1004]
+
+# Protocol upgrade activation schedule.
+# [[consensus.protocol_activations]]
+# protocol_version = 2
+# activation_height = 1_000_000
+
+# ------------------------------------------------------------------------------
+# P2P NETWORKING
+# ------------------------------------------------------------------------------
 [network]
+# Listen multi‑address.
 listen = "0.0.0.0:7001"
+
+# Static peer list (multi‑addresses or host:port).
 peers = [
   "validator-2:7001",
   "validator-3:7001",
   "validator-4:7001"
 ]
-max_connections = 100
+bootnodes = []
+
+# Connection limits (anti‑DoS).
+max_connections_total       = 100
+max_connections_per_peer    = 8
+max_inbound_connections     = 80
+max_outbound_connections    = 80
+
+# Handshake timeout in milliseconds.
 handshake_timeout_ms = 5000
+
+# Message buffer size per peer.
 message_buffer_size = 1024
 
+# Peer discovery.
+enable_mdns = false          # local network discovery
+enable_kad  = true           # Kademlia DHT
+
+# Reconnect interval to static peers (seconds).
+reconnect_s = 30
+
+# Peer scoring / rate‑limiting (request‑response protocol).
+rr_max_req_per_sec            = 25
+rr_strikes_before_ban         = 3
+rr_strikes_before_quarantine  = 2
+rr_quarantines_before_ban     = 2
+peer_quarantine_s             = 60
+peer_score_decay_s            = 60
+persist_quarantine            = true
+
+# Eclipse protection (peer diversity).
+eclipse_profile = "mainnet"
+
+# Gossipsub topic limits.
+[network.gossipsub]
+allowed_topics        = ["iona/tx", "iona/blocks", "iona/evidence"]
+deny_unknown_topics   = true
+max_publish_msgs_per_sec = 30
+max_in_msgs_per_sec   = 60
+
+# ------------------------------------------------------------------------------
+# RPC API
+# ------------------------------------------------------------------------------
 [rpc]
-listen = "0.0.0.0:9001"
+# Listen address (loopback‑only for security).
+listen = "127.0.0.1:9001"
+
+# Enable WebSocket subscriptions (eth_subscribe).
 enable_websocket = true
 websocket_max_clients = 100
+
+# Request timeout (milliseconds).
 request_timeout_ms = 30000
-cors_allowed_origins = ["*"]
 
-[consensus]
-propose_timeout_ms = 1000
-prevote_timeout_ms = 1000
-precommit_timeout_ms = 1000
-commit_timeout_ms = 100
-timeout_commit = 1000
+# CORS – restrict in production to your frontend domain(s).
+cors_allow_all = false
+cors_allowed_origins = ["https://explorer.iona.network"]
 
+# Rate‑limiting for RPC requests (per‑IP token bucket).
+rpc_rate_limit_enabled = true
+rpc_read_rate_per_sec  = 500
+rpc_submit_rate_per_sec = 100
+
+# Faucet (testnet only – disable on mainnet).
+enable_faucet = false
+
+# ------------------------------------------------------------------------------
+# MEMPOOL
+# ------------------------------------------------------------------------------
+[mempool]
+# Maximum number of pending transactions.
+capacity = 200_000
+
+# Per‑sender limits.
+max_pending_per_sender = 64
+
+# Transaction TTL (blocks).
+ttl_blocks = 300
+
+# Replace‑by‑fee bump percentage (e.g. 10 = 10%).
+rbf_bump_percent = 10
+
+# Enable MEV‑resistant features (commit‑reveal, threshold encryption).
+mev_protection = false
+mev_commit_reveal = false
+mev_threshold_encryption = false
+
+# ------------------------------------------------------------------------------
+# STORAGE
+# ------------------------------------------------------------------------------
+[storage]
+# Snapshot management.
+enable_snapshots          = true
+snapshot_every_n_blocks   = 500
+snapshot_keep             = 10
+snapshot_zstd_level       = 3
+
+# State database.
+db_backend                = "rocksdb"   # rocksdb | lmdb
+db_cache_size_mb          = 512
+db_max_open_files         = 1024
+
+# ------------------------------------------------------------------------------
+# SECURITY
+# ------------------------------------------------------------------------------
 [security]
+# Role‑Based Access Control for admin endpoints.
 rbac_enabled = true
-audit_logging_enabled = true
-audit_log_path = "/var/log/iona/audit.log"
-max_audit_log_size_mb = 512
+rbac_policy_path = "/etc/iona/rbac.toml"
+
+# Audit logging.
+audit_logging_enabled    = true
+audit_log_path           = "/var/log/iona/audit.log"
+max_audit_log_size_mb    = 512
+audit_log_retention_days = 30
+
+# Double‑sign protection.
+double_sign_guard_enabled = true
+double_sign_guard_path    = "/var/lib/iona/doublesign"
+
+# ------------------------------------------------------------------------------
+# ADMINISTRATION
+# ------------------------------------------------------------------------------
+[admin]
+# Admin server (mTLS required in production).
+listen         = "127.0.0.1:9002"
+require_mtls   = true
+tls_cert_pem   = "/etc/iona/tls/admin-server.crt.pem"
+tls_key_pem    = "/etc/iona/tls/admin-server.key.pem"
+tls_ca_cert_pem = "/etc/iona/tls/ca.crt.pem"
+
+# ------------------------------------------------------------------------------
+# SIGNING
+# ------------------------------------------------------------------------------
+[signing]
+# Signing mode: "local" (embedded key) or "remote" (external signer).
+mode = "local"
+
+# Remote signer configuration (when mode = "remote").
+remote_url = "http://127.0.0.1:9100"
+remote_timeout_s = 10
+remote_tls_client_cert_pem = ""
+remote_tls_client_key_pem  = ""
+remote_tls_ca_cert_pem     = ""
+remote_tls_server_name     = ""
+
+# ------------------------------------------------------------------------------
+# OBSERVABILITY
+# ------------------------------------------------------------------------------
+[observability]
+# Prometheus metrics.
+enable_metrics = true
+metrics_listen = "127.0.0.1:9090"
+metrics_path   = "/metrics"
+
+# OpenTelemetry tracing.
+enable_otel   = false
+otel_endpoint = "http://127.0.0.1:4317"
+service_name  = "iona-node"
+
+# ------------------------------------------------------------------------------
+# UPGRADES
+# ------------------------------------------------------------------------------
+[upgrades]
+# Allow automatic state‑schema migrations on boot.
+auto_migrate = true
+# Height at which the next hard‑fork protocol version activates.
+# activation_height = 0   # 0 = not scheduled
