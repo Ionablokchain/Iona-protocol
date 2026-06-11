@@ -1,30 +1,93 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  IONA RPC Node Service — Production‑Grade Systemd Unit                      ║
+# ║  Public JSON‑RPC / REST API Endpoint                                        ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
+# Installation:
+#   sudo cp iona-rpc.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable iona-rpc
+#   sudo systemctl start iona-rpc
+
 [Unit]
-Description=IONA RPC Node (Public Endpoint)
-After=network-online.target
-Wants=network-online.target
-# Start after producers are likely up
+Description=IONA RPC Node — Public JSON‑RPC Endpoint
+Documentation=https://docs.iona.network
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+
+# Start after producers have formed quorum (adjust service names as needed)
 After=iona-val2.service iona-val3.service iona-val4.service
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
-Type=simple
+Type=exec
 User=iona
 Group=iona
+
+# ── Environment ──────────────────────────────────────────────────────────────
+Environment=RUST_LOG=info
+Environment=IONA_KEYSTORE_PASSWORD=
+EnvironmentFile=-/etc/iona/rpc.env
+
+# ── Pre‑start validation ─────────────────────────────────────────────────────
+ExecStartPre=/usr/bin/sha256sum --check /etc/iona/binary.sha256
+ExecStartPre=/usr/local/bin/iona-node --check-compat --config /etc/iona/rpc.toml
+
+# ── Main execution ───────────────────────────────────────────────────────────
 ExecStart=/usr/local/bin/iona-node --config /etc/iona/rpc.toml
+ExecReload=/bin/kill -HUP $MAINPID
+
+# ── Restart policy ───────────────────────────────────────────────────────────
 Restart=on-failure
-RestartSec=2
+RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=60
+
+# ── Timeouts ─────────────────────────────────────────────────────────────────
+TimeoutStartSec=120
 TimeoutStopSec=30
 
-# Security hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/iona/rpc
-LimitNOFILE=1048576
+# ── Resource limits ──────────────────────────────────────────────────────────
+LimitNOFILE=65536
+LimitNPROC=32768
+LimitCORE=0
+MemoryHigh=2G
+MemoryMax=4G
 
-# Environment
-Environment=RUST_LOG=info
-EnvironmentFile=-/etc/iona/rpc.env
+# ── Security hardening ───────────────────────────────────────────────────────
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/iona/rpc /var/log/iona
+ReadOnlyPaths=/etc/iona
+InaccessiblePaths=/root /home
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+SystemCallFilter=@system-service @network-io @signal
+SystemCallErrorNumber=EPERM
+RemoveIPC=yes
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=iona-rpc
+
+# ── Working directory ────────────────────────────────────────────────────────
+WorkingDirectory=/var/lib/iona/rpc
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
