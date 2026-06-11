@@ -1,19 +1,88 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  IONA Node Service — Production‑Grade Systemd Unit                          ║
+# ║  Validator / Full Node                                                      ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
+# Installation:
+#   sudo cp iona-node@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable iona-node@val1
+#   sudo systemctl start iona-node@val1
+
 [Unit]
-Description=Iona Node
-After=network.target
+Description=IONA Blockchain Node — Byzantine Fault Tolerant Consensus
+Documentation=https://docs.iona.network
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
+Type=exec
 User=iona
 Group=iona
-ExecStart=/usr/local/bin/iona-node --config /etc/iona/config.toml
+
+# ── Environment ──────────────────────────────────────────────────────────────
+Environment=IONA_CONFIG=/etc/iona/config.toml
+Environment=IONA_DATA_DIR=/var/lib/iona
+Environment=RUST_LOG=info
+Environment=IONA_KEYSTORE_PASSWORD=
+
+# ── Pre‑start validation ─────────────────────────────────────────────────────
+ExecStartPre=/usr/bin/sha256sum --check /etc/iona/binary.sha256
+ExecStartPre=/usr/local/bin/iona-node --check-compat --config /etc/iona/config.toml
+
+# ── Main execution ───────────────────────────────────────────────────────────
+ExecStart=/usr/local/bin/iona-node --config /etc/iona/config.toml --data /var/lib/iona
+ExecReload=/bin/kill -HUP $MAINPID
+
+# ── Restart policy ───────────────────────────────────────────────────────────
 Restart=on-failure
-RestartSec=2
-NoNewPrivileges=true
-PrivateTmp=true
+RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=60
+
+# ── Timeouts ─────────────────────────────────────────────────────────────────
+TimeoutStartSec=120
+TimeoutStopSec=60
+
+# ── Resource limits ──────────────────────────────────────────────────────────
+LimitNOFILE=131072
+LimitNPROC=65536
+LimitCORE=0
+MemoryHigh=4G
+MemoryMax=6G
+
+# ── Security hardening ───────────────────────────────────────────────────────
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
 ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/iona
-LimitNOFILE=65535
+ProtectHome=yes
+ReadWritePaths=/var/lib/iona /var/log/iona
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+SystemCallFilter=@system-service @network-io @signal
+SystemCallErrorNumber=EPERM
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=iona-node
+
+# ── Working directory ────────────────────────────────────────────────────────
+WorkingDirectory=/var/lib/iona
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
