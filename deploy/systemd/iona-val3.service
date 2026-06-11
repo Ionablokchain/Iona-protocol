@@ -1,28 +1,90 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  IONA Validator 3 Service — Production‑Grade Systemd Unit                   ║
+# ║  Block Producer Node                                                        ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
+# Installation:
+#   sudo cp iona-val3.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable iona-val3
+#   sudo systemctl start iona-val3
+
 [Unit]
-Description=IONA Validator 3 (Producer)
-After=network-online.target
-Wants=network-online.target
+Description=IONA Validator 3 — Block Producer Node
+Documentation=https://docs.iona.network
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=exec
 User=iona
 Group=iona
+
+# ── Environment ──────────────────────────────────────────────────────────────
+Environment=RUST_LOG=info
+Environment=IONA_KEYSTORE_PASSWORD=
+EnvironmentFile=-/etc/iona/val3.env
+
+# ── Pre‑start validation ─────────────────────────────────────────────────────
+ExecStartPre=/usr/bin/sha256sum --check /etc/iona/binary.sha256
+ExecStartPre=/usr/local/bin/iona-node --check-compat --config /etc/iona/val3.toml
+
+# ── Main execution ───────────────────────────────────────────────────────────
 ExecStart=/usr/local/bin/iona-node --config /etc/iona/val3.toml
+ExecReload=/bin/kill -HUP $MAINPID
+
+# ── Restart policy ───────────────────────────────────────────────────────────
 Restart=on-failure
-RestartSec=2
+RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=60
+
+# ── Timeouts ─────────────────────────────────────────────────────────────────
+TimeoutStartSec=120
 TimeoutStopSec=30
 
-# Security hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/iona/val3
-LimitNOFILE=1048576
+# ── Resource limits ──────────────────────────────────────────────────────────
+LimitNOFILE=131072
+LimitNPROC=65536
+LimitCORE=0
+MemoryHigh=4G
+MemoryMax=6G
 
-# Environment
-Environment=RUST_LOG=info
-EnvironmentFile=-/etc/iona/val3.env
+# ── Security hardening ───────────────────────────────────────────────────────
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/iona/val3 /var/log/iona
+ReadOnlyPaths=/etc/iona
+InaccessiblePaths=/root /home
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+SystemCallFilter=@system-service @network-io @signal
+SystemCallErrorNumber=EPERM
+RemoveIPC=yes
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=iona-val3
+
+# ── Working directory ────────────────────────────────────────────────────────
+WorkingDirectory=/var/lib/iona/val3
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
