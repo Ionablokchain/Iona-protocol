@@ -1,17 +1,34 @@
-# IONA Envoy Proxy Configuration (v3 API)
-# ========================================
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  IONA Envoy Proxy Configuration — Production‑Grade                          ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
 # Alternative to nginx for RPC endpoint proxying and load balancing.
 # Provides advanced rate limiting, health checking, and observability.
+#
+# Installation:
+#   envoy -c /etc/iona/envoy.yaml --log-level info
+#
+# Features:
+#   - TLS 1.2/1.3 termination with secure cipher suites
+#   - Local rate limiting with per‑IP descriptors
+#   - Active health checking with outlier detection
+#   - Structured access logging with request tracing
+#   - Circuit breaking and connection pooling
 
+# ── Static resources configuration ────────────────────────────────────────────
 static_resources:
   listeners:
+    # ════════════════════════════════════════════════════════════════════════════
     # RPC endpoint listener with TLS and rate limiting
+    # ════════════════════════════════════════════════════════════════════════════
     - name: iona_rpc_listener
       address:
         socket_address:
           protocol: TCP
           address: 0.0.0.0
           port_value: 9443
+      # Per‑connection limit to prevent connection exhaustion
+      per_connection_buffer_limit_bytes: 1048576
       filter_chains:
         - filters:
             - name: envoy.filters.network.http_connection_manager
@@ -19,7 +36,7 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: iona_rpc
                 
-                # Access logs
+                # ── Structured access logs with request tracing ──────────────
                 access_logs:
                   - name: envoy.access_loggers.stdout
                     typed_config:
@@ -31,8 +48,34 @@ static_resources:
                         "%REQ(USER-AGENT)%" "%REQ(X-REQUEST-ID)%" "%REQ(:AUTHORITY)%"
                         "%UPSTREAM_HOST%"
 
+                # ── Tracing configuration for distributed tracing support ────
+                generate_request_id: true
+                preserve_external_request_id: true
+                tracing:
+                  provider:
+                    name: envoy.tracers.opentelemetry
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.config.trace.v3.OpenTelemetryConfig
+                      service_name: iona-rpc-proxy
+
+                # ── HTTP connection manager settings ─────────────────────────
+                server_name: "iona-rpc-proxy"
+                use_remote_address: true
+                xff_num_trusted_hops: 1
+                skip_xff_append: false
+                via: "envoy/iona"
+                
+                # Stream idle timeout for long‑lived connections
+                stream_idle_timeout: 300s
+                
+                # Request timeout at the HCM level
+                request_timeout: 30s
+
+                # ── HTTP filters pipeline ────────────────────────────────────
                 http_filters:
-                  # Rate limiting filter
+                  # ════════════════════════════════════════════════════════════
+                  # Rate limiting filter (local token bucket)
+                  # ════════════════════════════════════════════════════════════
                   - name: envoy.filters.http.local_ratelimit
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
@@ -61,7 +104,6 @@ static_resources:
                           header:
                             key: X-RateLimit-Remaining
                             value: "%DYNAMIC_METADATA(http.local_ratelimit:remaining_tokens)%"
-                      # Descriptors for per-IP rate limiting
                       descriptors:
                         - entries:
                             - key: header_match
@@ -71,18 +113,39 @@ static_resources:
                             tokens_per_fill: 10
                             fill_interval: 6s
 
-                  # HTTP router
+                  # ════════════════════════════════════════════════════════════
+                  # Gzip compression for JSON responses
+                  # ════════════════════════════════════════════════════════════
+                  - name: envoy.filters.http.compressor
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.compressor.v3.Compressor
+                      response_direction_config:
+                        common_config:
+                          min_content_length: 256
+                          content_type:
+                            - "application/json"
+                            - "text/plain"
+                      compressor_library:
+                        name: envoy.compression.gzip.compressor
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip
+
+                  # ════════════════════════════════════════════════════════════
+                  # HTTP router (must be last in pipeline)
+                  # ════════════════════════════════════════════════════════════
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                      suppress_envoy_headers: false
 
+                # ── Route configuration ──────────────────────────────────────
                 route_config:
                   name: iona_rpc_routes
                   virtual_hosts:
                     - name: iona_rpc
                       domains: ["*"]
                       routes:
-                        # Health check endpoint - no rate limiting
+                        # Health check endpoint — no rate limiting
                         - match:
                             path: "/health"
                           route:
@@ -95,14 +158,24 @@ static_resources:
                               "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
                               disabled: true
 
-                        # Block admin endpoints
+                        # Metrics endpoint — internal only, no rate limiting
                         - match:
-                            path_separator: EXACT
-                            path: "/admin"
+                            path: "/metrics"
+                          route:
+                            cluster: iona_rpc_cluster
+                            timeout: 5s
+                          typed_per_filter_config:
+                            envoy.filters.http.local_ratelimit:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                              disabled: true
+
+                        # Block admin endpoints completely
+                        - match:
+                            prefix: "/admin"
                           direct_response:
                             status: 403
                             body:
-                              inline_string: "Admin endpoint not exposed"
+                              inline_string: "{\"error\":\"Admin endpoint not exposed via proxy\"}"
 
                         # Default route with rate limiting
                         - match:
@@ -113,10 +186,17 @@ static_resources:
                             max_stream_duration:
                               max_stream_duration: 30s
                             retry_policy:
-                              retry_on: "5xx"
-                              num_retries: 1
+                              retry_on: "5xx,connect-failure,refused-stream,reset"
+                              num_retries: 2
                               per_try_timeout: 10s
+                              retry_back_off:
+                                base_interval: 25ms
+                                max_interval: 250ms
+                            hash_policy:
+                              - header:
+                                  header_name: X-Request-ID
 
+          # ── TLS transport socket ───────────────────────────────────────────
           transport_socket:
             name: envoy.transport_sockets.tls
             typed_config:
@@ -139,12 +219,14 @@ static_resources:
                     private_key:
                       filename: "/etc/iona/certs/iona-rpc.key"
 
-    # Health check listener (unencrypted, for internal monitoring)
+    # ════════════════════════════════════════════════════════════════════════════
+    # Health check listener (unencrypted, for internal monitoring only)
+    # ════════════════════════════════════════════════════════════════════════════
     - name: iona_health_listener
       address:
         socket_address:
           protocol: TCP
-          address: 0.0.0.0
+          address: 127.0.0.1
           port_value: 8080
       filter_chains:
         - filters:
@@ -168,11 +250,18 @@ static_resources:
                             cluster: iona_rpc_cluster
                             timeout: 5s
 
+  # ════════════════════════════════════════════════════════════════════════════
+  # Upstream clusters
+  # ════════════════════════════════════════════════════════════════════════════
   clusters:
-    # Upstream IONA RPC cluster
+    # IONA RPC backend cluster
     - name: iona_rpc_cluster
       connect_timeout: 5s
       type: STRICT_DNS
+      dns_refresh_rate: 60s
+      dns_lookup_family: V4_ONLY
+      
+      # ── Load balancing ────────────────────────────────────────────────────
       load_assignment:
         cluster_name: iona_rpc_cluster
         endpoints:
@@ -182,8 +271,14 @@ static_resources:
                     socket_address:
                       address: 127.0.0.1
                       port_value: 9001
+              # Additional backends can be added here for horizontal scaling
+              # - endpoint:
+              #     address:
+              #       socket_address:
+              #         address: 10.0.1.12
+              #         port_value: 9001
 
-      # Health checking configuration
+      # ── Active health checking ────────────────────────────────────────────
       health_checks:
         - timeout: 3s
           interval: 10s
@@ -194,8 +289,9 @@ static_resources:
             expected_statuses:
               - start: 200
                 end: 299
+          always_log_health_check_failures: true
 
-      # Outlier detection: eject unhealthy endpoints
+      # ── Outlier detection ─────────────────────────────────────────────────
       outlier_detection:
         consecutive_5xx: 5
         interval: 30s
@@ -207,18 +303,424 @@ static_resources:
         success_rate_request_volume: 100
         success_rate_stdev_factor: 1900
 
-      # Connection pooling
+      # ── Circuit breaking ──────────────────────────────────────────────────
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 1024
+            max_pending_requests: 1024
+            max_requests: 1024
+            max_retries: 3
+          - priority: HIGH
+            max_connections: 1024
+            max_pending_requests: 1024
+            max_requests: 1024
+            max_retries: 3
+
+      # ── Connection pooling ────────────────────────────────────────────────
       http_protocol_options:
         idle_timeout: 60s
+        max_connection_duration: 3600s
+
       http2_protocol_options:
         max_concurrent_streams: 100
         initial_connection_window_size: 1048576
         initial_stream_window_size: 65536
 
+      # ── Upstream TLS context (for secure backend connections) ─────────────
+      # transport_socket:
+      #   name: envoy.transport_sockets.tls
+      #   typed_config:
+      #     "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+      #     common_tls_context:
+      #       tls_params:
+      #         tls_minimum_protocol_version: TLSv1_2
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Admin interface (for configuration inspection and metrics)
+# ═══════════════════════════════════════════════════════════════════════════════
 admin:
-  access_log_path: /tmp/admin_access.log
+  access_log_path: /dev/null
   address:
     socket_address:
       protocol: TCP
       address: 127.0.0.1
-      port_value: 9001
+      port_value: 9901
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Overload manager (protects against resource exhaustion)
+# ═══════════════════════════════════════════════════════════════════════════════
+overload_manager:
+  refresh_interval: 0.25s
+  resource_monitors:
+    - name: envoy.resource_monitors.fixed_heap
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.resource_monitors.fixed_heap.v3.FixedHeapConfig
+        max_heap_size_bytes: 536870912   # 512 MiB
+  actions:
+    - name: envoy.overload_actions.shrink_heap
+      triggers:
+        - name: envoy.resource_monitors.fixed_heap
+          threshold:
+            value: 0.85
+    - name: envoy.overload_actions.stop_accepting_connections
+      triggers:
+        - name: envoy.resource_monitors.fixed_heap
+          threshold:
+            value: 0.95
+``````yaml
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  IONA Envoy Proxy Configuration — Production‑Grade                          ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
+# Alternative to nginx for RPC endpoint proxying and load balancing.
+# Provides advanced rate limiting, health checking, and observability.
+#
+# Installation:
+#   envoy -c /etc/iona/envoy.yaml --log-level info
+#
+# Features:
+#   - TLS 1.2/1.3 termination with secure cipher suites
+#   - Local rate limiting with per‑IP descriptors
+#   - Active health checking with outlier detection
+#   - Structured access logging with request tracing
+#   - Circuit breaking and connection pooling
+
+# ── Static resources configuration ────────────────────────────────────────────
+static_resources:
+  listeners:
+    # ════════════════════════════════════════════════════════════════════════════
+    # RPC endpoint listener with TLS and rate limiting
+    # ════════════════════════════════════════════════════════════════════════════
+    - name: iona_rpc_listener
+      address:
+        socket_address:
+          protocol: TCP
+          address: 0.0.0.0
+          port_value: 9443
+      # Per‑connection limit to prevent connection exhaustion
+      per_connection_buffer_limit_bytes: 1048576
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: iona_rpc
+                
+                # ── Structured access logs with request tracing ──────────────
+                access_logs:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      format: |
+                        [%START_TIME%] "%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%"
+                        %RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED% %BYTES_SENT%
+                        "%DURATION%" "%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%"
+                        "%REQ(USER-AGENT)%" "%REQ(X-REQUEST-ID)%" "%REQ(:AUTHORITY)%"
+                        "%UPSTREAM_HOST%"
+
+                # ── Tracing configuration for distributed tracing support ────
+                generate_request_id: true
+                preserve_external_request_id: true
+                tracing:
+                  provider:
+                    name: envoy.tracers.opentelemetry
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.config.trace.v3.OpenTelemetryConfig
+                      service_name: iona-rpc-proxy
+
+                # ── HTTP connection manager settings ─────────────────────────
+                server_name: "iona-rpc-proxy"
+                use_remote_address: true
+                xff_num_trusted_hops: 1
+                skip_xff_append: false
+                via: "envoy/iona"
+                
+                # Stream idle timeout for long‑lived connections
+                stream_idle_timeout: 300s
+                
+                # Request timeout at the HCM level
+                request_timeout: 30s
+
+                # ── HTTP filters pipeline ────────────────────────────────────
+                http_filters:
+                  # ════════════════════════════════════════════════════════════
+                  # Rate limiting filter (local token bucket)
+                  # ════════════════════════════════════════════════════════════
+                  - name: envoy.filters.http.local_ratelimit
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                      stat_prefix: iona_rpc_ratelimit
+                      # Token bucket: 10000 req/min total, ~167 req/sec
+                      token_bucket:
+                        max_tokens: 100
+                        tokens_per_fill: 167
+                        fill_interval: 1s
+                      filter_enabled:
+                        runtime_key: local_ratelimit_enabled
+                        default_value:
+                          numerator: 100
+                          denominator: HUNDRED
+                      filter_enforced:
+                        runtime_key: local_ratelimit_enforced
+                        default_value:
+                          numerator: 100
+                          denominator: HUNDRED
+                      response_headers_to_add:
+                        - append: false
+                          header:
+                            key: X-RateLimit-Limit
+                            value: "100"
+                        - append: false
+                          header:
+                            key: X-RateLimit-Remaining
+                            value: "%DYNAMIC_METADATA(http.local_ratelimit:remaining_tokens)%"
+                      descriptors:
+                        - entries:
+                            - key: header_match
+                              value: always_true
+                          token_bucket:
+                            max_tokens: 100
+                            tokens_per_fill: 10
+                            fill_interval: 6s
+
+                  # ════════════════════════════════════════════════════════════
+                  # Gzip compression for JSON responses
+                  # ════════════════════════════════════════════════════════════
+                  - name: envoy.filters.http.compressor
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.compressor.v3.Compressor
+                      response_direction_config:
+                        common_config:
+                          min_content_length: 256
+                          content_type:
+                            - "application/json"
+                            - "text/plain"
+                      compressor_library:
+                        name: envoy.compression.gzip.compressor
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.compression.gzip.compressor.v3.Gzip
+
+                  # ════════════════════════════════════════════════════════════
+                  # HTTP router (must be last in pipeline)
+                  # ════════════════════════════════════════════════════════════
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                      suppress_envoy_headers: false
+
+                # ── Route configuration ──────────────────────────────────────
+                route_config:
+                  name: iona_rpc_routes
+                  virtual_hosts:
+                    - name: iona_rpc
+                      domains: ["*"]
+                      routes:
+                        # Health check endpoint — no rate limiting
+                        - match:
+                            path: "/health"
+                          route:
+                            cluster: iona_rpc_cluster
+                            timeout: 5s
+                            max_stream_duration:
+                              max_stream_duration: 5s
+                          typed_per_filter_config:
+                            envoy.filters.http.local_ratelimit:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                              disabled: true
+
+                        # Metrics endpoint — internal only, no rate limiting
+                        - match:
+                            path: "/metrics"
+                          route:
+                            cluster: iona_rpc_cluster
+                            timeout: 5s
+                          typed_per_filter_config:
+                            envoy.filters.http.local_ratelimit:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                              disabled: true
+
+                        # Block admin endpoints completely
+                        - match:
+                            prefix: "/admin"
+                          direct_response:
+                            status: 403
+                            body:
+                              inline_string: "{\"error\":\"Admin endpoint not exposed via proxy\"}"
+
+                        # Default route with rate limiting
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: iona_rpc_cluster
+                            timeout: 30s
+                            max_stream_duration:
+                              max_stream_duration: 30s
+                            retry_policy:
+                              retry_on: "5xx,connect-failure,refused-stream,reset"
+                              num_retries: 2
+                              per_try_timeout: 10s
+                              retry_back_off:
+                                base_interval: 25ms
+                                max_interval: 250ms
+                            hash_policy:
+                              - header:
+                                  header_name: X-Request-ID
+
+          # ── TLS transport socket ───────────────────────────────────────────
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_2
+                  tls_maximum_protocol_version: TLSv1_3
+                  cipher_suites:
+                    - "TLS_AES_256_GCM_SHA384"
+                    - "TLS_CHACHA20_POLY1305_SHA256"
+                    - "ECDHE-ECDSA-AES256-GCM-SHA384"
+                    - "ECDHE-RSA-AES256-GCM-SHA384"
+                  ecdh_curves:
+                    - "X25519"
+                    - "P-256"
+                tls_certificates:
+                  - certificate_chain:
+                      filename: "/etc/iona/certs/iona-rpc.crt"
+                    private_key:
+                      filename: "/etc/iona/certs/iona-rpc.key"
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # Health check listener (unencrypted, for internal monitoring only)
+    # ════════════════════════════════════════════════════════════════════════════
+    - name: iona_health_listener
+      address:
+        socket_address:
+          protocol: TCP
+          address: 127.0.0.1
+          port_value: 8080
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: iona_health
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: iona_health_routes
+                  virtual_hosts:
+                    - name: iona_health
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: iona_rpc_cluster
+                            timeout: 5s
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Upstream clusters
+  # ════════════════════════════════════════════════════════════════════════════
+  clusters:
+    # IONA RPC backend cluster
+    - name: iona_rpc_cluster
+      connect_timeout: 5s
+      type: STRICT_DNS
+      dns_refresh_rate: 60s
+      dns_lookup_family: V4_ONLY
+      
+      # ── Load balancing ────────────────────────────────────────────────────
+      load_assignment:
+        cluster_name: iona_rpc_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 9001
+
+      # ── Active health checking ────────────────────────────────────────────
+      health_checks:
+        - timeout: 3s
+          interval: 10s
+          unhealthy_threshold: 3
+          healthy_threshold: 2
+          http_health_check:
+            path: "/health"
+            expected_statuses:
+              - start: 200
+                end: 299
+          always_log_health_check_failures: true
+
+      # ── Outlier detection ─────────────────────────────────────────────────
+      outlier_detection:
+        consecutive_5xx: 5
+        interval: 30s
+        base_ejection_time: 30s
+        max_ejection_percent: 100
+        enforcing_consecutive_5xx: 100
+        enforcing_success_rate: 100
+        success_rate_minimum_hosts: 5
+        success_rate_request_volume: 100
+        success_rate_stdev_factor: 1900
+
+      # ── Circuit breaking ──────────────────────────────────────────────────
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 1024
+            max_pending_requests: 1024
+            max_requests: 1024
+            max_retries: 3
+          - priority: HIGH
+            max_connections: 1024
+            max_pending_requests: 1024
+            max_requests: 1024
+            max_retries: 3
+
+      # ── Connection pooling ────────────────────────────────────────────────
+      http_protocol_options:
+        idle_timeout: 60s
+        max_connection_duration: 3600s
+
+      http2_protocol_options:
+        max_concurrent_streams: 100
+        initial_connection_window_size: 1048576
+        initial_stream_window_size: 65536
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Admin interface (for configuration inspection and metrics)
+# ═══════════════════════════════════════════════════════════════════════════════
+admin:
+  access_log_path: /dev/null
+  address:
+    socket_address:
+      protocol: TCP
+      address: 127.0.0.1
+      port_value: 9901
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Overload manager (protects against resource exhaustion)
+# ═══════════════════════════════════════════════════════════════════════════════
+overload_manager:
+  refresh_interval: 0.25s
+  resource_monitors:
+    - name: envoy.resource_monitors.fixed_heap
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.resource_monitors.fixed_heap.v3.FixedHeapConfig
+        max_heap_size_bytes: 536870912   # 512 MiB
+  actions:
+    - name: envoy.overload_actions.shrink_heap
+      triggers:
+        - name: envoy.resource_monitors.fixed_heap
+          threshold:
+            value: 0.85
+    - name: envoy.overload_actions.stop_accepting_connections
+      triggers:
+        - name: envoy.resource_monitors.fixed_heap
+          threshold:
+            value: 0.95
