@@ -1,12 +1,20 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  IONA Validator Service — Production‑Grade Systemd Unit                     ║
+# ║  Blockchain Validator Node                                                  ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
+# Installation:
+#   sudo cp iona-validator.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable iona-validator
+#   sudo systemctl start iona-validator
+
 [Unit]
-# IONA Node Validator Service Unit
-# This service manages the IONA blockchain validator node process.
-# The validator maintains blockchain consensus and proposes/signs blocks.
-Description=IONA v28 Blockchain Validator Node
-Documentation=https://docs.iona.io/validator-setup
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=500
+Description=IONA Validator Node — Byzantine Fault Tolerant Consensus
+Documentation=https://docs.iona.network
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
@@ -15,80 +23,77 @@ User=iona
 Group=iona
 WorkingDirectory=/opt/iona
 
-# Load environment variables if present (TLS certs, secrets, etc.)
+# ── Environment ──────────────────────────────────────────────────────────────
+Environment=RUST_LOG=info
+Environment=IONA_KEYSTORE_PASSWORD=
 EnvironmentFile=-/etc/iona/iona.env
 
-# Pre-start validation: check binary compatibility and config syntax
+# ── Pre‑start validation ─────────────────────────────────────────────────────
+# Verify binary integrity and config compatibility before each start
+ExecStartPre=/usr/bin/sha256sum --check /etc/iona/binary.sha256
 ExecStartPre=/usr/local/bin/iona-node --check-compat --config /etc/iona/config.toml
+# Ensure the data directory is writable
+ExecStartPre=/usr/bin/find /opt/iona/data -maxdepth 0 -type d -writable || (echo "Data directory not writable" && exit 1)
 
-# Start the validator with production profile for optimized performance
+# ── Main execution ───────────────────────────────────────────────────────────
 ExecStart=/usr/local/bin/iona-node --config /etc/iona/config.toml --profile prod
-
-# Reload signal: gracefully reload configuration without restart
 ExecReload=/bin/kill -HUP $MAINPID
 
-# Restart policy: automatically restart on abnormal termination
+# ── Restart policy ───────────────────────────────────────────────────────────
 Restart=on-failure
-RestartSec=10s
+RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=60
 
-# Timeout settings
-TimeoutStartSec=120s
-TimeoutStopSec=60s
+# ── Timeouts ─────────────────────────────────────────────────────────────────
+TimeoutStartSec=120
+TimeoutStopSec=60
+TimeoutAbortSec=30
 
-# Kill behavior: use mixed mode for graceful shutdown
+# ── Kill behavior ────────────────────────────────────────────────────────────
 KillMode=mixed
 KillSignal=SIGTERM
 
-# Resource limits
-LimitNOFILE=65536
-LimitNPROC=4096
+# ── Resource limits ──────────────────────────────────────────────────────────
+LimitNOFILE=131072
+LimitNPROC=65536
+LimitCORE=0                       # disable core dumps
+MemoryHigh=4G
+MemoryMax=6G
+MemorySwapMax=0                   # disable swap for validator
 
-# SECURITY HARDENING DIRECTIVES
-# ==============================
-# NoNewPrivileges: prevent process from gaining new privileges via setuid/setgid
+# ── Security hardening ───────────────────────────────────────────────────────
 NoNewPrivileges=yes
-
-# PrivateTmp: private /tmp and /var/tmp namespaces (blocks tmpfs attacks)
 PrivateTmp=yes
-
-# PrivateDevices: private /dev namespace (prevents access to hardware devices)
 PrivateDevices=yes
-
-# ProtectSystem: filesystem read-only except for specified paths
-# "strict" mode provides maximum hardening
 ProtectSystem=strict
-
-# ProtectHome: hide /root, /home from service
 ProtectHome=yes
-
-# ReadWritePaths: explicitly allow writes only to data and log directories
 ReadWritePaths=/opt/iona/data /var/log/iona
-
-# Protect kernel subsystems from modification
+ReadOnlyPaths=/etc/iona /usr/local/bin
+InaccessiblePaths=/root /home
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
-
-# Prevent setuid/setgid bits from being used
-RestrictSUIDSGID=yes
-
-# Deny executable memory mapping (prevents JIT attacks, but blocks WASM JIT)
-# Comment out if dynamic code execution is needed
-MemoryDenyWriteExecute=yes
-
-# Prevent realtime scheduling
+ProtectClock=yes
+ProtectHostname=yes
 RestrictRealtime=yes
-
-# Restrict namespace creation
 RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+SystemCallFilter=@system-service @network-io @signal
+SystemCallErrorNumber=EPERM
+RemoveIPC=yes
 
-# Restrict to default system service syscalls
-SystemCallFilter=@system-service
-
-# Logging configuration
+# ── Logging ──────────────────────────────────────────────────────────────────
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=iona-node
+SyslogIdentifier=iona-validator
+
+# ── Working directory permissions ────────────────────────────────────────────
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
