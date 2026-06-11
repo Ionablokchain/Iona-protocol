@@ -1,13 +1,24 @@
-[Unit]
-# IONA Node Template Service Unit
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  IONA Validator Template Service — Production‑Grade Systemd Unit            ║
+# ║  Multi‑Instance Blockchain Validator Node                                   ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
 # Instantiate as: iona-node@validator1.service, iona-node@validator2.service, etc.
 # This allows running multiple validator instances on the same machine.
-Description=IONA v28 Blockchain Validator Node %i
-Documentation=https://docs.iona.io/validator-setup
-After=network-online.target
-Wants=network-online.target
+#
+# Installation:
+#   sudo cp iona-node@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable iona-node@validator1
+#   sudo systemctl start iona-node@validator1
+
+[Unit]
+Description=IONA Validator Node (%i) — Byzantine Fault Tolerant Consensus
+Documentation=https://docs.iona.network
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 BindsTo=iona-node-setup@%i.service
-StartLimitIntervalSec=500
+StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
@@ -16,54 +27,75 @@ User=iona
 Group=iona
 WorkingDirectory=/opt/iona/%i
 
-# Load instance-specific environment variables
+# ── Environment ──────────────────────────────────────────────────────────────
+Environment=RUST_LOG=info
+Environment=IONA_KEYSTORE_PASSWORD=
 EnvironmentFile=-/etc/iona/%i/iona.env
 
-# Pre-start validation for this instance
+# ── Pre‑start validation ─────────────────────────────────────────────────────
+ExecStartPre=/usr/bin/sha256sum --check /etc/iona/binary.sha256
 ExecStartPre=/usr/local/bin/iona-node --check-compat --config /etc/iona/%i/config.toml
+ExecStartPre=/usr/bin/find /opt/iona/%i/data -maxdepth 0 -type d -writable || (echo "Data directory not writable" && exit 1)
 
-# Start the validator with instance-specific configuration
+# ── Main execution ───────────────────────────────────────────────────────────
 ExecStart=/usr/local/bin/iona-node --config /etc/iona/%i/config.toml --profile prod
-
-# Reload signal
 ExecReload=/bin/kill -HUP $MAINPID
 
-# Restart policy
+# ── Restart policy ───────────────────────────────────────────────────────────
 Restart=on-failure
-RestartSec=10s
+RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=60
 
-# Timeout settings
-TimeoutStartSec=120s
-TimeoutStopSec=60s
+# ── Timeouts ─────────────────────────────────────────────────────────────────
+TimeoutStartSec=120
+TimeoutStopSec=60
+TimeoutAbortSec=30
 
-# Kill behavior
+# ── Kill behavior ────────────────────────────────────────────────────────────
 KillMode=mixed
 KillSignal=SIGTERM
 
-# Resource limits
-LimitNOFILE=65536
-LimitNPROC=4096
+# ── Resource limits ──────────────────────────────────────────────────────────
+LimitNOFILE=131072
+LimitNPROC=65536
+LimitCORE=0
+MemoryHigh=4G
+MemoryMax=6G
+MemorySwapMax=0
 
-# SECURITY HARDENING DIRECTIVES
+# ── Security hardening ───────────────────────────────────────────────────────
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/opt/iona/%i/data /var/log/iona
+ReadOnlyPaths=/etc/iona /usr/local/bin
+InaccessiblePaths=/root /home
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
-RestrictSUIDSGID=yes
-MemoryDenyWriteExecute=yes
+ProtectClock=yes
+ProtectHostname=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes
-SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+SystemCallFilter=@system-service @network-io @signal
+SystemCallErrorNumber=EPERM
+RemoveIPC=yes
 
-# Logging configuration
+# ── Logging ──────────────────────────────────────────────────────────────────
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=iona-node-%i
+
+# ── Working directory permissions ────────────────────────────────────────────
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
