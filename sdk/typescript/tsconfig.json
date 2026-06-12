@@ -1,10 +1,61 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
-    "module": "ES2020",
+    // ── Language & Environment ──────────────────────────────────────────
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+
+    // ── Strictness ──────────────────────────────────────────────────────
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": false,
+
+    // ── Emit ────────────────────────────────────────────────────────────
     "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
     "outDir": "dist",
-    "strict": true
+    "rootDir": "src",
+    "removeComments": false,
+
+    // ── Module Resolution ───────────────────────────────────────────────
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+
+    // ── Decorators (for future DI / validation) ─────────────────────────
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+
+    // ── Linting ─────────────────────────────────────────────────────────
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "allowUnreachableCode": false,
+    "allowUnusedLabels": false,
+
+    // ── JavaScript Support ──────────────────────────────────────────────
+    "allowJs": false,
+    "checkJs": false,
+
+    // ── Performance ─────────────────────────────────────────────────────
+    "skipLibCheck": true,
+    "incremental": true,
+    "tsBuildInfoFile": "dist/.tsbuildinfo"
   },
-  "include": ["src/**/*.ts"]
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "coverage",
+    "docs",
+    "**/*.test.ts",
+    "**/*.spec.ts"
+  ]
 }
