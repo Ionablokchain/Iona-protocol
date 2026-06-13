@@ -1,5 +1,5 @@
 # =============================================================================
-# IONA v28 — Validator 4 (producer)
+# IONA v28 — Validator 4 (producer) — PRODUCTION READY
 # =============================================================================
 # Topology: val2, val3, val4 = producers; val1 = follower; rpc = public endpoint
 # Chain: iona-testnet-1 (chain_id=6126151), launch=2026-03-01T12:00:00Z
@@ -8,6 +8,14 @@
 #
 # Security: This node holds an encrypted validator signing key. The keystore
 # password must be provided via environment variable.
+#
+# Environment variables:
+#   IONA_DATA_DIR          - Override data directory (default: /var/lib/iona/val4)
+#   IONA_P2P_PORT          - Override P2P port (default: 30336)
+#   IONA_RPC_PORT          - Override RPC port (default: 9004)
+#   IONA_SEED              - Node seed (default: 4)
+#   IONA_LOG_LEVEL         - Log level (default: info)
+#   IONA_KEYSTORE_PASSWORD - Password for encrypted keystore (MANDATORY)
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -15,23 +23,25 @@
 # -----------------------------------------------------------------------------
 [node]
 # Data directory – ensure it exists and has correct permissions (0700)
-data_dir = "/var/lib/iona/val4"
+data_dir = "${IONA_DATA_DIR:-/var/lib/iona/val4}"
 
 # Deterministic seed for key generation (must be unique per validator)
-seed = 4
+seed = ${IONA_SEED:-4}
 
 # Chain ID – must match all nodes in the network
 chain_id = 6126151
 
 # Log level: trace | debug | info | warn | error
-log_level = "info"
+log_level = "${IONA_LOG_LEVEL:-info}"
+
+# Log format: "plain" or "json" (recommended for production)
+log_format = "json"
 
 # Keystore mode: "encrypted" (mandatory for validators in production)
 keystore = "encrypted"
 
-# Keystore password – DO NOT hardcode. Provide via environment variable.
-# Plaintext password in config is used as fallback if env not set (not recommended).
-keystore_password = ""
+# Keystore password – MUST be provided via environment variable.
+keystore_password = "${IONA_KEYSTORE_PASSWORD}"
 keystore_password_env = "IONA_KEYSTORE_PASSWORD"
 
 # -----------------------------------------------------------------------------
@@ -63,17 +73,51 @@ simple_producer = true
 validator_seeds = [2, 3, 4]
 
 # Protocol upgrade schedule (optional; uses defaults if omitted)
-# protocol_activations = [
-#   { protocol_version = 1, activation_height = null, grace_blocks = 0 },
-#   { protocol_version = 2, activation_height = 100000, grace_blocks = 10 }
-# ]
+# [[consensus.protocol_activations]]
+# protocol_version = 1
+# activation_height = null
+# grace_blocks = 0
+#
+# [[consensus.protocol_activations]]
+# protocol_version = 2
+# activation_height = 100000
+# grace_blocks = 10
+
+# -----------------------------------------------------------------------------
+# P2P network security (aggressive limits for a producer)
+# -----------------------------------------------------------------------------
+[security]
+# Maximum size of a single P2P message (1 MiB)
+max_message_size = 1_048_576
+
+# Maximum number of inflight requests per peer (prevent resource exhaustion)
+max_inflight_requests_per_peer = 32
+
+# Request timeout (milliseconds)
+request_timeout_ms = 5000
+
+# Handshake timeout (milliseconds)
+handshake_timeout_ms = 3000
+
+# Idle connection timeout (milliseconds) – close idle peers
+idle_connection_timeout_ms = 30_000
+
+# Total connection limit (inbound + outbound)
+max_connections = 200
+
+# Maximum connections per IP (prevent Sybil)
+max_connections_per_ip = 20
+
+# Optional caps on inbound/outbound connections
+max_inbound_connections = 150
+max_outbound_connections = 50
 
 # -----------------------------------------------------------------------------
 # P2P networking (standard producer, not a bootnode)
 # -----------------------------------------------------------------------------
 [network]
 # Listen multiaddress – P2P port
-listen = "/ip4/0.0.0.0/tcp/30336"
+listen = "/ip4/0.0.0.0/tcp/${IONA_P2P_PORT:-30336}"
 
 # Static peers – connect to other producers and the follower (do NOT include self)
 peers = [
@@ -95,40 +139,56 @@ enable_kad  = true    # enable Kademlia DHT for peer discovery
 # Reconnection interval (seconds)
 reconnect_s = 30
 
-# Connection limits (anti‑DoS)
-max_connections_total    = 200
-max_connections_per_peer = 8
+# Peer scoring and quarantine (aggressive)
+[network.rr_limits]
+max_req_per_sec_block   = 15
+max_req_per_sec_status  = 30
+max_req_per_sec_range   = 5
+max_req_per_sec_state   = 10
+max_bytes_per_sec_block  = 1_000_000
+max_bytes_per_sec_status = 100_000
+max_bytes_per_sec_range  = 500_000
+
+peer_strike_decay_s = 60
+peer_score_decay_s  = 120
+peer_quarantine_s   = 300
+rr_strikes_before_quarantine = 2
+rr_strikes_before_ban        = 3
+rr_quarantines_before_ban    = 1
+persist_quarantine = true
+quarantine_path = "${IONA_DATA_DIR:-/var/lib/iona/val4}/quarantine.json"
+
+# Eclipse attack protection (diversity buckets)
+[network.diversity]
+bucket_kind = "ip16"
+max_inbound_per_bucket = 4
+max_outbound_per_bucket = 2
+eclipse_detection_min_buckets = 3
+reseed_cooldown_s = 60
+
+# Gossipsub limits (reduce spam)
+[network.gossipsub]
+allowed_topics = ["iona/tx", "iona/blocks", "iona/evidence"]
+deny_unknown_topics = true
+max_publish_msgs_per_sec = 30
+max_publish_bytes_per_sec = 2_000_000
+max_in_msgs_per_sec = 100
+max_in_bytes_per_sec = 5_000_000
 
 # P2P state sync – producers also support state sync for fast bootstrap
 enable_p2p_state_sync    = true
 state_sync_chunk_bytes   = 1_048_576   # 1 MiB
 state_sync_timeout_s     = 15
 
-# Optional: request‑response rate limits (adjust as needed)
-# rr_max_req_per_sec_block   = 15
-# rr_max_req_per_sec_status  = 30
-# rr_max_req_per_sec_range   = 5
-# rr_max_req_per_sec_state   = 10
-
-# Optional: peer scoring and quarantine
-# peer_quarantine_s = 60
-# rr_strikes_before_quarantine = 2
-
-# Eclipse attack protection (diversity buckets)
-# diversity_bucket_kind = "ip16"
-# max_inbound_per_bucket = 4
-# eclipse_detection_min_buckets = 3
-# reseed_cooldown_s = 60
-
-# Optional: persist quarantine list
-# quarantine_path = "/var/lib/iona/val4/quarantine.json"
-# persist_quarantine = true
-
 # -----------------------------------------------------------------------------
 # Mempool
 # -----------------------------------------------------------------------------
 [mempool]
-capacity = 200_000   # maximum pending transactions
+capacity = 200_000
+max_tx_size = 32768
+min_gas_price = 10
+max_gas_price = 10_000
+max_priority_fee_per_gas = 100
 
 # -----------------------------------------------------------------------------
 # RPC server (internal only)
@@ -136,65 +196,77 @@ capacity = 200_000   # maximum pending transactions
 [rpc]
 # Listen on loopback only – not exposed publicly.
 # Use a reverse proxy if external access is required.
-listen = "127.0.0.1:9004"
+listen = "127.0.0.1:${IONA_RPC_PORT:-9004}"
 
-# Faucet disabled – producers should never expose faucet
+# Disable faucet and API key (internal node)
+enable_api_key = false
 enable_faucet = false
-
-# CORS: restrict to internal tools
 cors_allow_all = false
+cors_allowed_origins = []
 
-# Optional: RPC rate limiting (see rpc_limits.rs)
-# max_concurrent_requests = 100
-# submit_rate_per_sec = 100
-# read_rate_per_sec = 500
+# Rate limiting (optional)
+rate_limit_enabled = false
+max_body_bytes = 1_048_576
+max_json_depth = 16
+max_concurrent_requests = 100
 
 # -----------------------------------------------------------------------------
 # Storage and snapshots
 # -----------------------------------------------------------------------------
 [storage]
-# Enable periodic snapshots for faster restart
 enable_snapshots = true
-
-# Snapshot frequency (blocks)
 snapshot_every_n_blocks = 500
-
-# Number of snapshots to keep
 snapshot_keep = 10
-
-# Compression level (1‑22, 3 = good balance)
 snapshot_zstd_level = 3
+db_cache_size_mb = 1024
+max_concurrent_tasks = 128
 
-# Maximum concurrent background tasks (default: 256)
-# max_concurrent_tasks = 256
+[storage.wal]
+max_segment_bytes = 67_108_864   # 64 MiB
+keep_segments = 3
+fsync_every_write = true
+
+# -----------------------------------------------------------------------------
+# Audit logging (security‑critical events)
+# -----------------------------------------------------------------------------
+[audit]
+log_path = "${IONA_DATA_DIR:-/var/lib/iona/val4}/audit.jsonl"
+max_file_size_bytes = 104_857_600   # 100 MiB
+rotate_count = 10
+emit_to_tracing = true
 
 # -----------------------------------------------------------------------------
 # Observability (optional)
 # -----------------------------------------------------------------------------
 [observability]
-# OpenTelemetry export (requires --features otel)
 enable_otel = false
 otel_endpoint = "http://127.0.0.1:4317"
 service_name = "iona-val4"
 
 # -----------------------------------------------------------------------------
-# Remote signer (local signer used)
+# Remote signer (local signer used by default; for mainnet consider remote)
 # -----------------------------------------------------------------------------
 [signing]
 mode = "local"
 # remote_url = "http://127.0.0.1:9100"
 # remote_timeout_s = 10
-# remote_tls_* options omitted
+# remote_tls_cert = "/path/to/cert.pem"
 
 # =============================================================================
 # Security checklist for this producer node:
 # =============================================================================
 # 1. Use a dedicated non‑root user (e.g., `iona`) with 0700 permissions on data_dir.
-# 2. Store the keystore password securely (e.g., systemd service file with secure environment).
-# 3. Firewall: allow P2P (30336) inbound only from other nodes in the validator set.
-# 4. Do NOT expose the RPC port (9004) to the internet.
-# 5. Rotate logs and monitor disk usage.
-# 6. Keep the node software up‑to‑date.
-# 7. This node is critical for liveness – consider redundant power and network.
-# 8. Use a hardware security module (HSM) or remote signer for production mainnet.
+# 2. Store the keystore password securely (e.g., systemd service file with 
+#    EnvironmentFile, or HashiCorp Vault). Do NOT embed in the config.
+# 3. Firewall: allow P2P (30336) inbound ONLY from other nodes in the validator set
+#    and the follower. Block all other inbound traffic.
+# 4. Do NOT expose the RPC port (9004) to the internet – bind only to 127.0.0.1.
+# 5. Enable audit logging and monitor the audit log for suspicious activities.
+# 6. Rotate logs and monitor disk usage (use logrotate).
+# 7. Keep the node software up‑to‑date; subscribe to security advisories.
+# 8. This node is critical for liveness – consider redundant power and network,
+#    and run in a geographically diverse location.
+# 9. For production mainnet, use a hardware security module (HSM) or a remote
+#    signer with TLS mutual authentication.
+# 10. Regularly backup the data directory (excluding `quarantine.json`).
 # =============================================================================
