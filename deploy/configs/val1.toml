@@ -1,5 +1,5 @@
 # =============================================================================
-# IONA v28 — Validator 1 (full node / follower / indexer)
+# IONA v28 — Validator 1 (full node / follower / indexer) — PRODUCTION READY
 # =============================================================================
 # Topology: val2, val3, val4 = producers; val1 = follower; rpc = public endpoint
 # Chain: iona-testnet-1 (chain_id=6126151), launch=2026-03-01T12:00:00Z
@@ -16,23 +16,25 @@
 # -----------------------------------------------------------------------------
 [node]
 # Data directory – ensure it exists and has correct permissions (0700)
-data_dir = "/var/lib/iona/val1"
+data_dir = "${IONA_DATA_DIR:-/var/lib/iona/val1}"
 
 # Deterministic seed for key generation (must be unique per node)
-seed = 1
+seed = ${IONA_SEED:-1}
 
 # Chain ID – must match all nodes in the network
 chain_id = 6126151
 
 # Log level: trace | debug | info | warn | error
-log_level = "info"
+log_level = "${IONA_LOG_LEVEL:-info}"
+
+# Log format: "plain" or "json" (recommended for production)
+log_format = "json"
 
 # Keystore mode: "encrypted" (recommended for validator keys)
 keystore = "encrypted"
 
-# Keystore password – DO NOT hardcode. Provide via environment variable.
-# Plaintext password in config is used as fallback if env not set.
-keystore_password = ""
+# Keystore password – MUST be set via environment variable.
+keystore_password = "${IONA_KEYSTORE_PASSWORD}"
 keystore_password_env = "IONA_KEYSTORE_PASSWORD"
 
 # -----------------------------------------------------------------------------
@@ -64,17 +66,22 @@ simple_producer = false
 validator_seeds = [2, 3, 4]
 
 # Protocol upgrade schedule (optional; uses defaults if omitted)
-# protocol_activations = [
-#   { protocol_version = 1, activation_height = null, grace_blocks = 0 },
-#   { protocol_version = 2, activation_height = 100000, grace_blocks = 10 }
-# ]
+# [[consensus.protocol_activations]]
+# protocol_version = 1
+# activation_height = null
+# grace_blocks = 0
+#
+# [[consensus.protocol_activations]]
+# protocol_version = 2
+# activation_height = 100000
+# grace_blocks = 10
 
 # -----------------------------------------------------------------------------
 # P2P networking
 # -----------------------------------------------------------------------------
 [network]
-# Listen multiaddress – P2P port (internal network)
-listen = "/ip4/0.0.0.0/tcp/30333"
+# Listen multiaddress – P2P port (internal network, but can be exposed)
+listen = "/ip4/0.0.0.0/tcp/${IONA_P2P_PORT:-30333}"
 
 # Static peers – connect to all producers for consensus and state sync
 peers = [
@@ -97,39 +104,62 @@ enable_kad  = true    # enable Kademlia DHT for peer discovery
 reconnect_s = 30
 
 # Connection limits (anti‑DoS)
-max_connections_total    = 200
-max_connections_per_peer = 8
+max_connections          = 200
+max_inbound_connections  = 150   # protect against inbound floods
+max_outbound_connections = 50
+max_connections_per_ip   = 20    # prevent Sybil
 
 # P2P state sync – fast bootstrap from peers
 enable_p2p_state_sync    = true
 state_sync_chunk_bytes   = 1_048_576   # 1 MiB
 state_sync_timeout_s     = 15
 
-# Optional: request‑response rate limits (adjust as needed)
-# rr_max_req_per_sec_block   = 15
-# rr_max_req_per_sec_status  = 30
-# rr_max_req_per_sec_range   = 5
-# rr_max_req_per_sec_state   = 10
+# Request‑response rate limits (prevent resource exhaustion)
+[network.rr_limits]
+max_req_per_sec_block   = 15
+max_req_per_sec_status  = 30
+max_req_per_sec_range   = 5
+max_req_per_sec_state   = 10
+max_bytes_per_sec_block  = 1_000_000
+max_bytes_per_sec_status = 100_000
+max_bytes_per_sec_range  = 500_000
 
-# Optional: peer scoring and quarantine
-# peer_quarantine_s = 60
-# rr_strikes_before_quarantine = 2
+# Peer scoring and quarantine (aggressive)
+peer_strike_decay_s = 60
+peer_score_decay_s  = 120
+peer_quarantine_s   = 300
+rr_strikes_before_quarantine = 2
+rr_strikes_before_ban        = 3
+rr_quarantines_before_ban    = 1
+persist_quarantine = true
+quarantine_path = "${IONA_DATA_DIR:-/var/lib/iona/val1}/quarantine.json"
 
 # Eclipse attack protection (diversity buckets)
-# diversity_bucket_kind = "ip16"
-# max_inbound_per_bucket = 4
-# eclipse_detection_min_buckets = 3
-# reseed_cooldown_s = 60
+[network.diversity]
+bucket_kind = "ip16"
+max_inbound_per_bucket = 4
+max_outbound_per_bucket = 2
+eclipse_detection_min_buckets = 3
+reseed_cooldown_s = 60
 
-# Optional: persist quarantine list
-# quarantine_path = "/var/lib/iona/val1/quarantine.json"
-# persist_quarantine = true
+# Gossipsub limits (reduce spam)
+[network.gossipsub]
+allowed_topics = ["iona/tx", "iona/blocks", "iona/evidence"]
+deny_unknown_topics = true
+max_publish_msgs_per_sec = 30
+max_publish_bytes_per_sec = 2_000_000
+max_in_msgs_per_sec = 100
+max_in_bytes_per_sec = 5_000_000
 
 # -----------------------------------------------------------------------------
 # Mempool (follower maintains a mempool for submitted transactions)
 # -----------------------------------------------------------------------------
 [mempool]
-capacity = 200_000   # maximum pending transactions
+capacity = 200_000          # maximum pending transactions
+max_tx_size = 32768         # 32 KiB per transaction
+min_gas_price = 10          # reject underpriced transactions
+max_gas_price = 10_000      # upper bound
+max_priority_fee_per_gas = 100
 
 # -----------------------------------------------------------------------------
 # RPC server (internal only)
@@ -137,18 +167,33 @@ capacity = 200_000   # maximum pending transactions
 [rpc]
 # Listen on loopback only – not exposed publicly.
 # Use a reverse proxy if external access is required.
-listen = "127.0.0.1:9001"
+listen = "127.0.0.1:${IONA_RPC_PORT:-9001}"
+
+# API key authentication – optional for internal, but can be enabled
+enable_api_key = false
+# api_key_header = "X-API-Key"
+# api_key_value = "${IONA_RPC_API_KEY}"
 
 # Faucet disabled – this is an internal node
 enable_faucet = false
 
 # CORS: restrict to internal tools
 cors_allow_all = false
+cors_allowed_origins = []
 
-# Optional: RPC rate limiting (see rpc_limits.rs)
-# max_concurrent_requests = 100
-# submit_rate_per_sec = 100
-# read_rate_per_sec = 500
+# Rate limiting (requests per second per IP)
+rate_limit_enabled = true
+rate_limit_requests_per_second = 100
+rate_limit_burst = 200
+
+# Maximum body size (1 MiB)
+max_body_bytes = 1_048_576
+
+# Maximum JSON depth
+max_json_depth = 16
+
+# Concurrent request limit
+max_concurrent_requests = 50
 
 # -----------------------------------------------------------------------------
 # Storage and snapshots
@@ -166,8 +211,26 @@ snapshot_keep = 10
 # Compression level (1‑22, 3 = good balance)
 snapshot_zstd_level = 3
 
-# Maximum concurrent background tasks (default: 256)
-# max_concurrent_tasks = 256
+# Database cache (MB)
+db_cache_size_mb = 1024
+
+# Maximum concurrent background tasks
+max_concurrent_tasks = 128
+
+# Write‑ahead log settings
+[storage.wal]
+max_segment_bytes = 67_108_864   # 64 MiB
+keep_segments = 3
+fsync_every_write = true
+
+# -----------------------------------------------------------------------------
+# Audit logging (security‑critical events)
+# -----------------------------------------------------------------------------
+[audit]
+log_path = "${IONA_DATA_DIR:-/var/lib/iona/val1}/audit.jsonl"
+max_file_size_bytes = 104_857_600   # 100 MiB
+rotate_count = 10
+emit_to_tracing = true
 
 # -----------------------------------------------------------------------------
 # Observability (optional)
@@ -185,7 +248,6 @@ service_name = "iona-val1"
 mode = "local"
 # remote_url = "http://127.0.0.1:9100"
 # remote_timeout_s = 10
-# remote_tls_* options omitted
 
 # =============================================================================
 # Security checklist for this follower node:
