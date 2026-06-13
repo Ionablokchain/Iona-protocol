@@ -29,7 +29,7 @@ use crate::types::Height;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
 
 // -----------------------------------------------------------------------------
 // Quantum Constants
@@ -260,6 +260,16 @@ impl ValidatorRecord {
         matches!(self.status, ValidatorStatus::Active)
     }
 
+    /// Check if the validator is jailed.
+    pub const fn is_jailed(&self) -> bool {
+        matches!(self.status, ValidatorStatus::Jailed { .. })
+    }
+
+    /// Check if the validator is tombstoned.
+    pub const fn is_tombstoned(&self) -> bool {
+        matches!(self.status, ValidatorStatus::Tombstoned)
+    }
+
     /// Check if the validator can be unjailed at the given height.
     pub fn can_unjail(&self, current_height: Height) -> bool {
         match &self.status {
@@ -273,14 +283,6 @@ impl ValidatorRecord {
     /// Apply decoherence to this validator (from slashing/jailing).
     pub fn apply_decoherence(&mut self, rate: f64) {
         self.coherence = (self.coherence * (-rate).exp()).clamp(0.0, 1.0);
-    }
-
-    /// Validate that the stake is within sensible bounds.
-    pub fn validate(&self) -> Result<(), SlashingError> {
-        if self.stake == 0 && self.is_active() {
-            // Active validator with zero stake should be jailed, but we don't error here.
-        }
-        Ok(())
     }
 }
 
@@ -303,21 +305,6 @@ impl StakeLedger {
         Self::default()
     }
 
-    /// Create a demo ledger (for testing).
-    pub fn default_demo() -> Self {
-        Self::default()
-    }
-
-    /// Create a demo ledger with specific validators and stake.
-    pub fn default_demo_with(validators: &[PublicKeyBytes], stake_each: u64) -> Self {
-        let mut s = Self::new();
-        for v in validators {
-            s.validators
-                .insert(v.clone(), ValidatorRecord::new(stake_each));
-        }
-        s
-    }
-
     /// Total active voting power.
     pub fn total_power(&self) -> u64 {
         self.validators
@@ -336,7 +323,7 @@ impl StakeLedger {
             .unwrap_or(0)
     }
 
-    /// Backward compatibility: raw stake map (includes jailed validators).
+    /// Raw stake map (includes jailed validators).
     pub fn stake_raw(&self) -> BTreeMap<PublicKeyBytes, u64> {
         self.validators
             .iter()
@@ -384,6 +371,7 @@ impl StakeLedger {
         record.stake = record.stake.saturating_sub(slash);
         record.slashed_total += slash;
 
+        // Determine if tombstoned (second serious offence)
         let is_tombstone = matches!(&record.status,
             ValidatorStatus::Jailed { slash_count, .. } if *slash_count >= 2
         );
@@ -393,7 +381,7 @@ impl StakeLedger {
             record.coherence = 0.0; // complete decoherence
             warn!(
                 offender = %hex::encode(&offender.0),
-                "validator tombstoned (repeated double‑vote/ double‑proposal)"
+                "validator tombstoned (repeated double‑vote/double‑proposal)"
             );
         } else {
             let slash_count = match &record.status {
@@ -416,6 +404,14 @@ impl StakeLedger {
 
         self.quantum.apply_slash_decoherence(is_tombstone);
         self.quantum.apply_slashing_channel();
+
+        // Check ledger health
+        if !self.quantum.is_healthy {
+            warn!(
+                coherence = self.quantum.purity,
+                "ledger quantum coherence below threshold"
+            );
+        }
         Ok(())
     }
 
@@ -454,9 +450,11 @@ impl StakeLedger {
                 }
                 record.status = ValidatorStatus::Active;
                 record.jailed_at = None;
-                record.coherence = (record.coherence * 1.1).min(1.0); // restore some coherence
+                // Restore some coherence (but not full)
+                record.coherence = (record.coherence * 1.1).min(1.0);
                 self.quantum.apply_unjail_decoherence();
                 self.quantum.apply_slashing_channel();
+                info!(validator = %hex::encode(&pk.0), "validator unjailed");
                 Ok(())
             }
         }
@@ -519,6 +517,11 @@ impl StakeLedger {
     /// Status report for all validators.
     pub fn status_report(&self) -> Vec<(PublicKeyBytes, &ValidatorRecord)> {
         self.validators.iter().map(|(k, v)| (k.clone(), v)).collect()
+    }
+
+    /// Add a new validator (for genesis or later addition).
+    pub fn add_validator(&mut self, pk: PublicKeyBytes, stake: u64) {
+        self.validators.insert(pk, ValidatorRecord::new(stake));
     }
 }
 
@@ -648,7 +651,6 @@ mod tests {
         assert!(v.is_active());
         assert_eq!(v.stake, 1000);
         assert_eq!(v.slashed_total, 0);
-        assert!(v.validate().is_ok());
         assert!((v.coherence - 1.0).abs() < 1e-10);
     }
 
@@ -656,9 +658,7 @@ mod tests {
     fn test_slash_double_vote() -> SlashingResult<()> {
         let mut ledger = StakeLedger::new();
         let pk = dummy_pk(1);
-        ledger
-            .validators
-            .insert(pk.clone(), ValidatorRecord::new(1000));
+        ledger.add_validator(pk.clone(), 1000);
 
         let evidence = Evidence::DoubleVote {
             voter: pk.clone(),
@@ -681,9 +681,7 @@ mod tests {
     fn test_unjail() -> SlashingResult<()> {
         let mut ledger = StakeLedger::new();
         let pk = dummy_pk(2);
-        ledger
-            .validators
-            .insert(pk.clone(), ValidatorRecord::new(1000));
+        ledger.add_validator(pk.clone(), 1000);
         let evidence = Evidence::DoubleVote {
             voter: pk.clone(),
             height: 10,
@@ -712,9 +710,7 @@ mod tests {
     fn test_downtime_slash() -> SlashingResult<()> {
         let mut ledger = StakeLedger::new();
         let pk = dummy_pk(3);
-        ledger
-            .validators
-            .insert(pk.clone(), ValidatorRecord::new(1000));
+        ledger.add_validator(pk.clone(), 1000);
         ledger.slash_downtime(&pk, 100)?;
         let record = ledger.validators.get(&pk).unwrap();
         assert_eq!(record.stake, 1000 - (1000 / 100));
@@ -787,9 +783,7 @@ mod tests {
     fn test_apply_evidence_quantum() -> SlashingResult<()> {
         let mut ledger = StakeLedger::new();
         let pk = dummy_pk(10);
-        ledger
-            .validators
-            .insert(pk.clone(), ValidatorRecord::new(1000));
+        ledger.add_validator(pk.clone(), 1000);
 
         let evidence = Evidence::DoubleVote {
             voter: pk.clone(),
@@ -812,9 +806,7 @@ mod tests {
     fn test_unjail_quantum() -> SlashingResult<()> {
         let mut ledger = StakeLedger::new();
         let pk = dummy_pk(11);
-        ledger
-            .validators
-            .insert(pk.clone(), ValidatorRecord::new(1000));
+        ledger.add_validator(pk.clone(), 1000);
         let evidence = Evidence::DoubleVote {
             voter: pk.clone(),
             height: 10,
@@ -836,9 +828,7 @@ mod tests {
     fn test_downtime_quantum() -> SlashingResult<()> {
         let mut ledger = StakeLedger::new();
         let pk = dummy_pk(12);
-        ledger
-            .validators
-            .insert(pk.clone(), ValidatorRecord::new(1000));
+        ledger.add_validator(pk.clone(), 1000);
         let (result, qstate) = ledger.slash_downtime_quantum(&pk, 100);
         assert!(result.is_ok());
         assert!(qstate.total_downtime_slashes > 0);
