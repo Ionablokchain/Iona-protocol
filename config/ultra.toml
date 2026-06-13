@@ -9,6 +9,7 @@
 #   - Use environment variables (IONA_KEYSTORE_PASSWORD, IONA_API_KEY) instead.
 #   - Run behind a reverse proxy (nginx, caddy) with TLS and rate limiting.
 #   - Enable fail2ban or similar for SSH and RPC protection.
+#   - The node will fail to start if required environment variables are missing.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -16,25 +17,28 @@
 # -----------------------------------------------------------------------------
 [node]
 # Base directory for node data (database, snapshots, quarantines, keys)
-data_dir = "./data/ultra-node"
+data_dir = "~/iona-data/ultra-node"
 
 # Deterministic key seed (change per node). 
 # ⚠️ WARNING: Keep secret in production. Use encrypted keystore instead.
-seed = 1
+#            Set via environment variable IONA_NODE_SEED.
+seed = ${IONA_NODE_SEED:-1}
 
 # Unique chain identifier (must match genesis)
 chain_id = 6126151
 
 # Log level: trace | debug | info | warn | error
-log_level = "warn"   # Reduced log volume, more security
+# Production: warn or error to reduce volume and potential info leaks
+log_level = "warn"
 
 # Keystore mode: "encrypted" (MANDATORY for public nodes)
 keystore = "encrypted"
 
-# Password for encrypted keystore – DO NOT hardcode. Use environment variable.
-keystore_password = ""
+# Password for encrypted keystore – MUST be set via environment variable.
+# The node will fail if this variable is not set when keystore="encrypted".
+keystore_password = ${IONA_KEYSTORE_PASSWORD}
 
-# Environment variable name containing the keystore password
+# Environment variable name containing the keystore password (for reference)
 keystore_password_env = "IONA_KEYSTORE_PASSWORD"
 
 # Maximum number of concurrent background tasks (e.g., snapshot generation)
@@ -45,29 +49,30 @@ max_concurrent_tasks = 128
 # -----------------------------------------------------------------------------
 [consensus]
 # Timeouts (milliseconds) – longer than default for unstable networks
+# Reduces chance of spurious timeouts and forks
 propose_timeout_ms   = 500
 prevote_timeout_ms   = 400
 precommit_timeout_ms = 400
 
-# Maximum number of transactions per block (reduced to limit DoS)
+# Maximum number of transactions per block – limited to mitigate DoS
 max_txs_per_block = 2048
 
 # EIP-1559 target gas per block
 gas_target = 30_000_000
 
-# Fast quorum disabled to avoid premature commits in high‑latency networks
+# Fast quorum disabled – avoids premature commits under high latency
 fast_quorum = false
 
 # Initial base fee for EIP-1559
 initial_base_fee = 1
 
-# Stake per validator (testnet only)
+# Stake per validator (testnet only – override for mainnet)
 stake_each = 1000
 
-# Maximum rounds before giving up
+# Maximum rounds before giving up – prevents endless rounds
 max_rounds = 20
 
-# Minimum number of validators required
+# Minimum number of validators required for consensus
 min_validator_count = 4
 
 # Protocol activation schedule (see UPGRADE_SPEC.md)
@@ -85,16 +90,16 @@ grace_blocks = 1000
 # P2P network security (aggressive limits)
 # -----------------------------------------------------------------------------
 [security]
-# Maximum size of a single P2P message (1 MiB)
+# Maximum size of a single P2P message (1 MiB) – prevents OOM
 max_message_size = 1_048_576
 
-# Maximum number of inflight requests per peer (prevent resource exhaustion)
+# Maximum number of inflight requests per peer – avoid resource exhaustion
 max_inflight_requests_per_peer = 32
 
 # Request timeout (milliseconds)
 request_timeout_ms = 5000
 
-# Handshake timeout (milliseconds)
+# Handshake timeout (milliseconds) – tighter than default
 handshake_timeout_ms = 3000
 
 # Idle connection timeout (milliseconds) – close idle peers
@@ -103,10 +108,10 @@ idle_connection_timeout_ms = 30_000
 # Total connection limit (inbound + outbound)
 max_connections = 200
 
-# Maximum connections per IP (prevent Sybil)
+# Maximum connections per IP – prevents Sybil attacks
 max_connections_per_ip = 20
 
-# Optional caps on inbound/outbound connections
+# Optional caps on inbound/outbound connections (stricter inbound)
 max_inbound_connections = 150
 max_outbound_connections = 50
 
@@ -114,29 +119,31 @@ max_outbound_connections = 50
 # P2P network configuration
 # -----------------------------------------------------------------------------
 [network]
-# Listen address for P2P (multiaddr format)
+# Listen address for P2P (multiaddr format) – bind to all interfaces for public
 listen = "/ip4/0.0.0.0/tcp/7001"
 
-# Static peers (multiaddrs) – define your trusted peers here
+# Static peers (multiaddrs) – define your trusted peers here.
+# Example: "/ip4/1.2.3.4/tcp/7001/p2p/12D3KooW..."
 peers = [
-  # "/ip4/1.2.3.4/tcp/7001/p2p/12D3KooW...",
+  # "/ip4/trusted-peer-1/tcp/7001/p2p/Qm...",
 ]
 
 # Bootnodes for peer discovery (must include peer ID)
+# At least one reliable bootnode is required for initial discovery.
 bootnodes = [
-  # "/dns4/node.example/tcp/7001/p2p/12D3KooW...",
+  # "/dns4/bootnode.iona.org/tcp/7001/p2p/12D3KooW...",
 ]
 
-# Enable mDNS for local network discovery (disabled for security)
+# Enable mDNS for local network discovery – disabled for security
 enable_mdns = false
 
-# Enable Kademlia DHT for peer discovery
+# Enable Kademlia DHT for peer discovery – required for public networks
 enable_kad = true
 
 # Reconnect interval to static peers (seconds)
 reconnect_s = 30
 
-# Peer scoring and quarantine settings
+# Peer scoring and quarantine settings – very aggressive
 [network.rr_limits]
 max_req_per_sec_block  = 10
 max_req_per_sec_status = 20
@@ -145,11 +152,11 @@ max_bytes_per_sec_block  = 1_000_000
 max_bytes_per_sec_status = 100_000
 max_bytes_per_sec_range  = 2_000_000
 
-# Global bandwidth caps (bytes/sec)
+# Global bandwidth caps (bytes/sec) – protects node from bandwidth saturation
 global_in_bytes_per_sec  = 5_000_000
 global_out_bytes_per_sec = 5_000_000
 
-# Peer scoring (aggressive quarantine)
+# Peer scoring: quarantining after one strike, banning after two strikes
 peer_strike_decay_s = 60
 peer_score_decay_s  = 120
 peer_quarantine_s   = 300
@@ -158,15 +165,15 @@ rr_strikes_before_ban        = 2
 rr_quarantines_before_ban    = 1
 persist_quarantine = true
 
-# Eclipse attack protection (tight diversity)
+# Eclipse attack protection – enforce IP diversity
 [network.diversity]
-bucket_kind = "ip16"
+bucket_kind = "ip16"          # Group by /16 subnet
 max_inbound_per_bucket = 2
 max_outbound_per_bucket = 2
 eclipse_detection_min_buckets = 4
 reseed_cooldown_s = 300
 
-# Gossipsub limits
+# Gossipsub limits – strict topic and rate controls
 [network.gossipsub]
 allowed_topics = ["iona/tx", "iona/blocks", "iona/evidence"]
 deny_unknown_topics = true
@@ -175,7 +182,7 @@ max_publish_bytes_per_sec = 2_000_000
 max_in_msgs_per_sec = 50
 max_in_bytes_per_sec = 5_000_000
 
-# State sync security (require attestation)
+# State sync security – require attestation to prevent malicious snapshots
 [network.state_sync_security]
 bind_validator_set = true
 bind_epoch = true
@@ -183,27 +190,29 @@ attestation_epoch_s = 60
 require_attestation = true
 use_aggregated_signatures = false
 
-# P2P state sync
+# Enable P2P state sync (optional, but safe with attestation)
 enable_p2p_state_sync = true
 state_sync_chunk_bytes = 1_048_576   # 1 MiB
 state_sync_timeout_s = 15
 
-# Snapshot attestation
+# Snapshot attestation – require multiple attestations
 enable_snapshot_attestation = true
 snapshot_attestation_threshold = 2
 snapshot_attestation_collect_s = 8
 
 # -----------------------------------------------------------------------------
-# Mempool (aggressive limits)
+# Mempool (aggressive limits to prevent spam)
 # -----------------------------------------------------------------------------
 [mempool]
-capacity = 100_000
-max_tx_size = 32768
-min_gas_price = 10
-max_gas_price = 10_000
-max_priority_fee_per_gas = 100
+capacity = 100_000                # Maximum pending transactions
+max_tx_size = 32768               # 32 KiB per tx
+min_gas_price = 10                # Minimum gas price (gwei)
+max_gas_price = 10_000            # Upper bound
+max_priority_fee_per_gas = 100    # Prevent fee spikes
 
-# MEV protection
+# -----------------------------------------------------------------------------
+# MEV protection (fair ordering and commit-reveal)
+# -----------------------------------------------------------------------------
 [mev]
 enable_commit_reveal = true
 enable_threshold_encryption = true
@@ -217,10 +226,12 @@ max_pending_commits = 100_000
 # RPC server (local only by default; expose via reverse proxy)
 # -----------------------------------------------------------------------------
 [rpc]
+# Bind to localhost only – never expose directly to the Internet
 bind = "127.0.0.1:8080"
 enable_api_key = true
 api_key_header = "x-api-key"
-api_key_value = ""                    # MUST be set via environment variable
+# API key MUST be set via environment variable IONA_API_KEY
+api_key_value = ${IONA_API_KEY}
 cors_allowed_origins = ["http://localhost:3000"]
 max_body_bytes = 1_048_576
 rate_limit_enabled = true
@@ -245,10 +256,10 @@ keep_segments = 3
 fsync_every_write = true
 
 # -----------------------------------------------------------------------------
-# Audit logging (security‑critical)
+# Audit logging (security‑critical) – all sensitive events are logged
 # -----------------------------------------------------------------------------
 [audit]
-log_path = "./data/ultra-node/audit.jsonl"
+log_path = "~/iona-data/ultra-node/audit.jsonl"
 max_file_size_bytes = 104_857_600   # 100 MiB
 rotate_count = 10
 emit_to_tracing = true
@@ -262,7 +273,7 @@ otel_endpoint = "http://127.0.0.1:4317"
 service_name = "iona-ultra-node"
 
 # -----------------------------------------------------------------------------
-# Governance parameters
+# Governance parameters (mainnet values)
 # -----------------------------------------------------------------------------
 [governance]
 min_deposit = 1_000_000
@@ -271,7 +282,7 @@ quorum_bps = 3340      # 33.4%
 threshold_bps = 5000   # 50%
 
 # -----------------------------------------------------------------------------
-# Economics (testnet defaults)
+# Economics (mainnet defaults – override as needed)
 # -----------------------------------------------------------------------------
 [economics]
 base_inflation_bps = 500
