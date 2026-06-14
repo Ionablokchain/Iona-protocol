@@ -1,5 +1,5 @@
 #![no_main]
-//! State-transition fuzzer.
+//! State-transition fuzzer for IONA execution layer.
 //!
 //! Generates arbitrary sequences of (key, value, op) triples and applies them
 //! to a fresh `KvState` through the public `apply_tx` path, verifying that
@@ -13,10 +13,23 @@
 //!   I5. A failed transaction (bad signature / insufficient balance) must leave
 //!       the state root unchanged.
 //!   I6. No panic on any structurally valid input (panic = libFuzzer crash).
+//!
+//! # Run instructions
+//! ```bash
+//! cargo fuzz run state_transition -- -max_len=4194304 -max_total_time=600
+//! ```
+//!
+//! # Security
+//! - Maximum operations per input: 64 (prevents timeouts)
+//! - Maximum key/value length: 64 bytes (prevents memory blowup)
+//! - Gas and fee limits are capped
+//! - All invariants are checked with assertions
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use std::collections::BTreeMap;
+use std::hint::black_box;
+use std::panic;
 
 use iona::execution::{apply_tx, KvState};
 use iona::types::Tx;
@@ -31,8 +44,8 @@ const MAX_OPS: usize = 64;
 /// Synthetic address count.
 const NUM_SYNTHETIC_ADDRS: usize = 8;
 
-/// Maximum payload size for `Raw` variant (avoids huge allocations).
-const MAX_RAW_PAYLOAD_LEN: usize = 256;
+/// Maximum key/value length in bytes (prevents memory blowup).
+const MAX_STR_LEN: usize = 64;
 
 /// Initial balance for each synthetic address (enough to cover gas).
 const INITIAL_BALANCE: u64 = 1_000_000_000_000;
@@ -81,7 +94,7 @@ enum FuzzPayload {
     Raw(Vec<u8>),
 }
 
-/// A string capped at 32 bytes to keep corpus entries small.
+/// A string capped at a safe length.
 #[derive(Arbitrary, Debug, Clone)]
 struct SmallStr(Vec<u8>);
 
@@ -90,7 +103,7 @@ impl SmallStr {
     fn as_safe_str(&self) -> String {
         self.0
             .iter()
-            .take(32)
+            .take(MAX_STR_LEN)
             .map(|&b| {
                 if b.is_ascii_alphanumeric() || b == b'_' {
                     b as char
@@ -111,7 +124,7 @@ impl FuzzPayload {
             FuzzPayload::Del { key } => format!("del {}", key.as_safe_str()),
             FuzzPayload::Inc { key } => format!("inc {}", key.as_safe_str()),
             FuzzPayload::Raw(bytes) => {
-                let len = bytes.len().min(MAX_RAW_PAYLOAD_LEN);
+                let len = bytes.len().min(256);
                 String::from_utf8_lossy(&bytes[..len]).into_owned()
             }
         }
@@ -127,7 +140,6 @@ fn synthetic_from(idx: u8) -> String {
 }
 
 fn synthetic_pubkey(idx: u8) -> Vec<u8> {
-    // 32‑byte dummy public key.
     vec![idx % NUM_SYNTHETIC_ADDRS as u8; 32]
 }
 
@@ -219,6 +231,7 @@ fn check_failed_tx_unchanged(root_before: &iona::types::Hash32, state: &KvState)
 // -----------------------------------------------------------------------------
 
 fuzz_target!(|ops: Vec<FuzzOp>| {
+    // Limit number of operations to avoid timeouts
     let ops = &ops[..ops.len().min(MAX_OPS)];
 
     let mut state = KvState::default();
@@ -226,9 +239,10 @@ fuzz_target!(|ops: Vec<FuzzOp>| {
 
     // Seed synthetic addresses with sufficient balance.
     for i in 0..NUM_SYNTHETIC_ADDRS {
-        state
-            .balances
-            .insert(synthetic_from(i as u8), INITIAL_BALANCE);
+        let addr = synthetic_from(i as u8);
+        state.balances.insert(addr, INITIAL_BALANCE);
+        // Also set initial nonce to 0 (default)
+        state.nonces.insert(synthetic_from(i as u8), 0);
     }
 
     let mut state_twin = state.clone();
@@ -243,7 +257,10 @@ fuzz_target!(|ops: Vec<FuzzOp>| {
         if op.bad_sig {
             let root_before = state.root();
             let tx = bad_tx(op);
-            let (receipt, new_state) = apply_tx(&state, &tx, BASE_FEE, PROPOSER_ADDR);
+            // I6: ensure no panic
+            let (receipt, new_state) = panic::catch_unwind(|| apply_tx(&state, &tx, BASE_FEE, PROPOSER_ADDR))
+                .unwrap_or_else(|_| panic!("I6 violated: apply_tx panicked on bad_sig transaction"));
+            black_box(&receipt);
 
             if !receipt.success {
                 check_failed_tx_unchanged(&root_before, &new_state);
@@ -257,9 +274,14 @@ fuzz_target!(|ops: Vec<FuzzOp>| {
             let root_before = state.root();
             let tx_twin = tx.clone();
 
-            let (receipt, new_state) = apply_tx(&state, &tx, BASE_FEE, PROPOSER_ADDR);
-            let (receipt_twin, new_state_twin) =
-                apply_tx(&state_twin, &tx_twin, BASE_FEE, PROPOSER_ADDR);
+            // Apply to both states, catching panics
+            let (receipt, new_state) = panic::catch_unwind(|| apply_tx(&state, &tx, BASE_FEE, PROPOSER_ADDR))
+                .unwrap_or_else(|_| panic!("I6 violated: apply_tx panicked on valid transaction"));
+            let (receipt_twin, new_state_twin) = panic::catch_unwind(|| apply_tx(&state_twin, &tx_twin, BASE_FEE, PROPOSER_ADDR))
+                .unwrap_or_else(|_| panic!("I6 violated: apply_tx panicked on twin state"));
+
+            black_box(&receipt);
+            black_box(&receipt_twin);
 
             check_determinism(&new_state, &new_state_twin);
             assert_eq!(
