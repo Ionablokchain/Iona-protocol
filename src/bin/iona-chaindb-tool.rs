@@ -9,13 +9,16 @@
 //! ```text
 //! iona-chaindb-tool --chain-db-dir ./chaindb info
 //! iona-chaindb-tool --chain-db-dir ./chaindb prune-compact --keep-blocks 10000
-//! iona-chaindb-tool --chain-db-dir ./chaindb compact --keep-blocks 10000
+//! iona-chaindb-tool --chain-db-dir ./chaindb compact --keep-blocks 10000 --dry-run
 //! ```
 
 use clap::{Parser, Subcommand};
 use iona::rpc::eth_rpc::EthRpcState;
 use iona::rpc::chain_store::{self, ensure_meta, files, load_jsonl, prune_and_compact};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 // -----------------------------------------------------------------------------
@@ -27,6 +30,9 @@ const DEFAULT_CHAIN_DB_DIR: &str = "./chaindb";
 
 /// Default number of blocks to keep when pruning.
 const DEFAULT_KEEP_BLOCKS: usize = 10_000;
+
+/// Backup directory suffix format.
+const BACKUP_SUFFIX_FORMAT: &str = "%Y%m%d_%H%M%S";
 
 // -----------------------------------------------------------------------------
 // Errors
@@ -49,6 +55,15 @@ pub enum ToolError {
 
     #[error("keep_blocks must be > 0, got {0}")]
     InvalidKeepBlocks(usize),
+
+    #[error("keep_blocks ({keep_blocks}) exceeds total blocks ({total_blocks})")]
+    KeepBlocksExceedsTotal { keep_blocks: usize, total_blocks: usize },
+
+    #[error("backup failed: {0}")]
+    BackupFailed(String),
+
+    #[error("user aborted")]
+    Aborted,
 }
 
 pub type ToolResult<T> = Result<T, ToolError>;
@@ -65,6 +80,10 @@ struct Args {
     #[arg(long, default_value = DEFAULT_CHAIN_DB_DIR)]
     chain_db_dir: PathBuf,
 
+    /// Do not ask for confirmation (dangerous).
+    #[arg(long, default_value_t = false)]
+    force: bool,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -79,6 +98,10 @@ enum Cmd {
         /// Number of blocks to keep (oldest are removed).
         #[arg(long, default_value_t = DEFAULT_KEEP_BLOCKS)]
         keep_blocks: usize,
+
+        /// Show what would be done without actually doing it.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
 
     /// Full rebuild: load state, then write fresh compacted files.
@@ -86,6 +109,10 @@ enum Cmd {
         /// Number of blocks to keep.
         #[arg(long, default_value_t = DEFAULT_KEEP_BLOCKS)]
         keep_blocks: usize,
+
+        /// Show what would be done without actually doing it.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
 }
 
@@ -97,28 +124,79 @@ fn main() -> ToolResult<()> {
     let args = Args::parse();
     let dir = &args.chain_db_dir;
 
-    // Validate directory existence (if it should exist for certain commands)
+    // Validate directory existence for commands that need it
     match args.cmd {
         Cmd::Info => {
             if !dir.exists() {
                 return Err(ToolError::InvalidDirectory(dir.clone()));
             }
         }
-        Cmd::PruneCompact { keep_blocks } | Cmd::Compact { keep_blocks } => {
+        Cmd::PruneCompact { keep_blocks, .. } | Cmd::Compact { keep_blocks, .. } => {
             if !dir.exists() {
                 return Err(ToolError::InvalidDirectory(dir.clone()));
             }
             if keep_blocks == 0 {
                 return Err(ToolError::InvalidKeepBlocks(keep_blocks));
             }
+            // Check total blocks later
         }
     }
 
     match args.cmd {
         Cmd::Info => cmd_info(dir),
-        Cmd::PruneCompact { keep_blocks } => cmd_prune_compact(dir, keep_blocks),
-        Cmd::Compact { keep_blocks } => cmd_compact(dir, keep_blocks),
+        Cmd::PruneCompact { keep_blocks, dry_run } => cmd_prune_compact(dir, keep_blocks, dry_run, args.force),
+        Cmd::Compact { keep_blocks, dry_run } => cmd_compact(dir, keep_blocks, dry_run, args.force),
     }
+}
+
+// -----------------------------------------------------------------------------
+// Helper functions
+// -----------------------------------------------------------------------------
+
+/// Create a timestamped backup directory and copy original files.
+fn create_backup(dir: &Path) -> ToolResult<PathBuf> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let timestamp = chrono::NaiveDateTime::from_timestamp_opt(now as i64, 0)
+        .unwrap()
+        .format(BACKUP_SUFFIX_FORMAT)
+        .to_string();
+    let backup_dir = dir.parent().unwrap_or(Path::new("."))
+        .join(format!("{}_backup_{}", dir.file_name().unwrap_or_default().to_string_lossy(), timestamp));
+    fs::create_dir_all(&backup_dir)?;
+
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            let dest = backup_dir.join(path.file_name().unwrap());
+            fs::copy(&path, &dest)?;
+        }
+    }
+    Ok(backup_dir)
+}
+
+/// Compute total number of blocks in the database.
+fn count_blocks(dir: &Path) -> ToolResult<usize> {
+    let file_set = files(dir);
+    let reader = BufReader::new(File::open(&file_set.blocks)?);
+    let mut count = 0;
+    for line in reader.lines() {
+        let _ = line?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Ask user for confirmation.
+fn confirm(question: &str) -> ToolResult<bool> {
+    print!("{} [y/N] ", question);
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(input.trim().eq_ignore_ascii_case("y"))
 }
 
 // -----------------------------------------------------------------------------
@@ -133,14 +211,10 @@ fn cmd_info(dir: &Path) -> ToolResult<()> {
     println!("  created_at_unix: {}", meta.created_at_unix);
 
     let file_set = files(dir);
-    let blocks: Vec<ionafaston::rpc::eth_rpc::Block> = load_jsonl(&file_set.blocks)
-        .map_err(|e| ToolError::ChainStore(e))?;
-    let receipts: Vec<ionafast::rpc::eth_rpc::Receipt> = load_jsonl(&file_set.receipts)
-        .map_err(|e| ToolError::ChainStore(e))?;
-    let txs: Vec<ionafast::rpc::eth_rpc::TxRecord> = load_jsonl(&file_set.txs)
-        .map_err(|e| ToolError::ChainStore(e))?;
-    let logs: Vec<ionafast::rpc::eth_rpc::Log> = load_jsonl(&file_set.logs)
-        .map_err(|e| ToolError::ChainStore(e))?;
+    let blocks: Vec<ionafaston::rpc::eth_rpc::Block> = load_jsonl(&file_set.blocks)?;
+    let receipts: Vec<ionafast::rpc::eth_rpc::Receipt> = load_jsonl(&file_set.receipts)?;
+    let txs: Vec<ionafast::rpc::eth_rpc::TxRecord> = load_jsonl(&file_set.txs)?;
+    let logs: Vec<ionafast::rpc::eth_rpc::Log> = load_jsonl(&file_set.logs)?;
 
     println!("Counts:");
     println!("  blocks:    {}", blocks.len());
@@ -152,7 +226,26 @@ fn cmd_info(dir: &Path) -> ToolResult<()> {
 }
 
 /// Prune and compact: remove old blocks, compact files, rebuild indices.
-fn cmd_prune_compact(dir: &Path, keep_blocks: usize) -> ToolResult<()> {
+fn cmd_prune_compact(dir: &Path, keep_blocks: usize, dry_run: bool, force: bool) -> ToolResult<()> {
+    let total_blocks = count_blocks(dir)?;
+    if keep_blocks > total_blocks {
+        return Err(ToolError::KeepBlocksExceedsTotal { keep_blocks, total_blocks });
+    }
+    println!("Current total blocks: {}", total_blocks);
+    println!("Will keep the most recent {} blocks.", keep_blocks);
+    if dry_run {
+        println!("DRY RUN: No changes will be made.");
+        return Ok(());
+    }
+
+    if !force {
+        let backup_dir = create_backup(dir)?;
+        println!("Backup created at: {}", backup_dir.display());
+        if !confirm("Proceed with prune and compact?")? {
+            return Err(ToolError::Aborted);
+        }
+    }
+
     let mut state = EthRpcState::default();
     state.chain_db_dir = Some(dir.to_path_buf());
     chain_store::load_into_state(dir, &mut state)?;
@@ -162,7 +255,26 @@ fn cmd_prune_compact(dir: &Path, keep_blocks: usize) -> ToolResult<()> {
 }
 
 /// Full rebuild: load state, then write fresh compacted files.
-fn cmd_compact(dir: &Path, keep_blocks: usize) -> ToolResult<()> {
+fn cmd_compact(dir: &Path, keep_blocks: usize, dry_run: bool, force: bool) -> ToolResult<()> {
+    let total_blocks = count_blocks(dir)?;
+    if keep_blocks > total_blocks {
+        return Err(ToolError::KeepBlocksExceedsTotal { keep_blocks, total_blocks });
+    }
+    println!("Current total blocks: {}", total_blocks);
+    println!("Will keep the most recent {} blocks.", keep_blocks);
+    if dry_run {
+        println!("DRY RUN: No changes will be made.");
+        return Ok(());
+    }
+
+    if !force {
+        let backup_dir = create_backup(dir)?;
+        println!("Backup created at: {}", backup_dir.display());
+        if !confirm("Proceed with full compact? This may take a while.")? {
+            return Err(ToolError::Aborted);
+        }
+    }
+
     let mut state = EthRpcState::default();
     state.chain_db_dir = Some(dir.to_path_buf());
     chain_store::load_into_state(dir, &mut state)?;
