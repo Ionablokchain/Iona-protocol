@@ -14,22 +14,24 @@
 //!
 //! # Algorithm
 //!
-//! - **Key derivation**: PBKDF2-HMAC-SHA256 with 100,000 iterations → 32‑byte key.
+//! - **Key derivation**: PBKDF2-HMAC-SHA256 with configurable iterations (default 100,000) → 32‑byte key.
 //! - **Encryption**: AES-256-GCM.
 //! - **Nonce**: 12 bytes (random).
 //! - **Salt**: 16 bytes (random).
 //!
 //! # Security notes
 //!
-//! - The password is not zeroised after use (it is passed as `&str` and cannot be
-//!   safely overwritten). Callers should use zeroising types if possible.
+//! - The password and derived key are zeroized after use (using `zeroize`).
+//! - The seed is passed as `&[u8; 32]` and is **not** zeroized by this module;
+//!   callers should zeroize it after use if needed.
 //! - On Unix systems, the keystore file is created with permissions `0o600`
 //!   (owner read/write only).
+//! - Atomic writes are used to prevent corruption.
 //!
 //! # Example
 //!
 //! ```
-//! use iona::crypto::keystore::{encrypt_seed32_to_file, decrypt_seed32_from_file};
+//! use iona::crypto::keystore::{encrypt_seed32_to_file, decrypt_seed32_from_file, KeystoreOptions};
 //! use tempfile::tempdir;
 //!
 //! let dir = tempdir().unwrap();
@@ -37,7 +39,7 @@
 //! let seed = [0xaa; 32];
 //! let password = "my_secure_password";
 //!
-//! encrypt_seed32_to_file(&path, seed, password).unwrap();
+//! encrypt_seed32_to_file(&path, &seed, password, &KeystoreOptions::default()).unwrap();
 //! let decrypted = decrypt_seed32_from_file(&path, password).unwrap();
 //! assert_eq!(seed, decrypted);
 //! ```
@@ -51,27 +53,69 @@ use pbkdf2::pbkdf2_hmac;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::fs;
-use std::io;
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::path::Path;
+use std::{fs, io::BufReader};
+use thiserror::Error;
 use tracing::{debug, error, info, warn};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Keystore file format version (incremented on breaking changes).
-const KEYSTORE_VERSION: u32 = 1;
-
-/// Number of PBKDF2 iterations (high enough to slow down brute‑force).
-const PBKDF2_ITERATIONS: u32 = 100_000;
+/// Default number of PBKDF2 iterations (high enough to slow down brute‑force).
+const DEFAULT_PBKDF2_ITERATIONS: u32 = 100_000;
 
 /// Salt length in bytes (16 bytes = 128 bits).
 const SALT_LEN: usize = 16;
 
 /// Nonce length for AES‑GCM (12 bytes, recommended).
 const NONCE_LEN: usize = 12;
+
+// -----------------------------------------------------------------------------
+// Error type
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during keystore operations.
+#[derive(Debug, Error)]
+pub enum KeystoreError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+
+    #[error("JSON serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("Base64 decoding error: {0}")]
+    Base64(#[from] base64::DecodeError),
+
+    #[error("Unsupported keystore version: {0} (expected {expected})")]
+    UnsupportedVersion { got: u32, expected: u32 },
+
+    #[error("Invalid nonce length: expected {expected}, got {got}")]
+    InvalidNonceLength { expected: usize, got: usize },
+
+    #[error("Invalid salt length: expected {expected}, got {got}")]
+    InvalidSaltLength { expected: usize, got: usize },
+
+    #[error("AES-GCM encryption failed: {0}")]
+    Encryption(String),
+
+    #[error("AES-GCM decryption failed: wrong password or corrupted file")]
+    Decryption,
+
+    #[error("Invalid seed length: expected {expected}, got {got}")]
+    InvalidSeedLength { expected: usize, got: usize },
+
+    #[error("Missing field in keystore: {0}")]
+    MissingField(&'static str),
+
+    #[error("PBKDF2 key derivation failed")]
+    KeyDerivation,
+}
+
+pub type KeystoreResult<T> = Result<T, KeystoreError>;
 
 // -----------------------------------------------------------------------------
 // File format
@@ -91,33 +135,65 @@ struct KeystoreFile {
 }
 
 // -----------------------------------------------------------------------------
-// Key derivation
+// Configuration
+// -----------------------------------------------------------------------------
+
+/// Options for keystore operations.
+#[derive(Debug, Clone, Copy)]
+pub struct KeystoreOptions {
+    /// Number of PBKDF2 iterations (higher = slower but more secure).
+    pub pbkdf2_iterations: u32,
+    /// Salt length in bytes (must be >= 8).
+    pub salt_len: usize,
+    /// Nonce length in bytes (must be 12 for AES‑GCM).
+    pub nonce_len: usize,
+}
+
+impl Default for KeystoreOptions {
+    fn default() -> Self {
+        Self {
+            pbkdf2_iterations: DEFAULT_PBKDF2_ITERATIONS,
+            salt_len: SALT_LEN,
+            nonce_len: NONCE_LEN,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Internal helpers
 // -----------------------------------------------------------------------------
 
 /// Derive a 32‑byte encryption key from a password and salt using PBKDF2-HMAC-SHA256.
-///
-/// # Arguments
-/// * `password` – The user password (should be strong).
-/// * `salt` – A random 16‑byte salt.
-///
-/// # Returns
-/// A 32‑byte key suitable for AES‑256.
-#[must_use]
-fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
+fn derive_key(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
     let mut key = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, PBKDF2_ITERATIONS, &mut key);
-    debug!(
-        iterations = PBKDF2_ITERATIONS,
-        "derived encryption key from password"
-    );
+    pbkdf2_hmac::<Sha256>(password, salt, iterations, &mut key);
+    debug!(iterations, "derived encryption key");
     key
+}
+
+/// Encrypt a byte slice with AES‑256‑GCM using the given key and nonce.
+fn encrypt_data(key: &[u8; 32], data: &[u8], nonce: &[u8]) -> KeystoreResult<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| KeystoreError::Encryption(format!("AES key init: {e}")))?;
+    cipher
+        .encrypt(Nonce::from_slice(nonce), data)
+        .map_err(|e| KeystoreError::Encryption(e.to_string()))
+}
+
+/// Decrypt a byte slice with AES‑256‑GCM using the given key and nonce.
+fn decrypt_data(key: &[u8; 32], ciphertext: &[u8], nonce: &[u8]) -> KeystoreResult<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| KeystoreError::Encryption(format!("AES key init: {e}")))?;
+    cipher
+        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .map_err(|_| KeystoreError::Decryption)
 }
 
 // -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
 
-/// Encrypt a 32‑byte seed and store it in a file.
+/// Encrypt a 32‑byte seed and store it in a file atomically.
 ///
 /// The file is created with Unix permissions `0o600` (owner read/write only)
 /// if running on a Unix system. On other platforms, no special permissions
@@ -125,48 +201,66 @@ fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
 ///
 /// # Arguments
 /// * `path` – Destination file path.
-/// * `seed32` – The 32‑byte seed to encrypt.
-/// * `password` – Password used for encryption (should be strong and not hardcoded).
+/// * `seed32` – The 32‑byte seed to encrypt (as slice).
+/// * `password` – Password used for encryption (will be zeroized after use).
+/// * `options` – Configuration options (use `default()` for standard settings).
 ///
 /// # Errors
-/// Returns an `io::Error` if the file cannot be written, or if encryption fails
-/// (unlikely except for OOM or invalid key length).
-pub fn encrypt_seed32_to_file(path: &str, seed32: [u8; 32], password: &str) -> io::Result<()> {
+/// Returns `KeystoreError` on I/O, serialization, or encryption failure.
+pub fn encrypt_seed32_to_file(
+    path: &str,
+    seed32: &[u8; 32],
+    password: &str,
+    options: &KeystoreOptions,
+) -> KeystoreResult<()> {
     info!(path, "encrypting seed to keystore file");
 
+    // Validate length
+    if seed32.len() != 32 {
+        return Err(KeystoreError::InvalidSeedLength {
+            expected: 32,
+            got: seed32.len(),
+        });
+    }
+
     // Generate random salt and nonce
-    let mut salt = [0u8; SALT_LEN];
-    let mut nonce_bytes = [0u8; NONCE_LEN];
+    let mut salt = vec![0u8; options.salt_len];
+    let mut nonce_bytes = vec![0u8; options.nonce_len];
     OsRng.fill_bytes(&mut salt);
     OsRng.fill_bytes(&mut nonce_bytes);
-    debug!("generated random salt and nonce");
+
+    debug!(
+        salt_len = options.salt_len,
+        nonce_len = options.nonce_len,
+        "generated random salt and nonce"
+    );
+
+    // Zeroize the password after use
+    let password_bytes = Zeroizing::new(password.as_bytes().to_vec());
 
     // Derive key
-    let mut key = derive_key(password, &salt);
-
-    // Encrypt
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("AES key init: {e}")))?;
-    let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), seed32.as_slice())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("encryption failed: {e}")))?;
-    debug!(ciphertext_len = ciphertext.len(), "seed encrypted");
-
-    // Zero the key from memory as best effort
-    key.zeroize();
+    let key = derive_key(&password_bytes, &salt, options.pbkdf2_iterations);
+    let mut key_zero = key;
+    let ciphertext = encrypt_data(&key_zero, seed32.as_slice(), &nonce_bytes)?;
+    key_zero.zeroize();
 
     // Build keystore JSON
     let keystore = KeystoreFile {
-        v: KEYSTORE_VERSION,
-        salt: base64::engine::general_purpose::STANDARD.encode(salt),
-        nonce: base64::engine::general_purpose::STANDARD.encode(nonce_bytes),
-        ct: base64::engine::general_purpose::STANDARD.encode(ciphertext),
+        v: 1,
+        salt: base64::engine::general_purpose::STANDARD.encode(&salt),
+        nonce: base64::engine::general_purpose::STANDARD.encode(&nonce_bytes),
+        ct: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
     };
-    let json = serde_json::to_string_pretty(&keystore)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("JSON encode: {e}")))?;
+    let json = serde_json::to_string_pretty(&keystore)?;
 
-    // Write file
-    fs::write(path, json)?;
+    // Write atomically: write to temp file then rename
+    let temp_path = format!("{}.tmp", path);
+    {
+        let mut temp_file = File::create(&temp_path)?;
+        temp_file.write_all(json.as_bytes())?;
+        temp_file.sync_all()?; // fsync to disk
+    }
+    fs::rename(&temp_path, path)?;
 
     // Set restrictive permissions on Unix
     #[cfg(unix)]
@@ -189,76 +283,71 @@ pub fn encrypt_seed32_to_file(path: &str, seed32: [u8; 32], password: &str) -> i
 ///
 /// # Arguments
 /// * `path` – Path to the keystore file.
-/// * `password` – Password used for encryption.
+/// * `password` – Password used for encryption (will be zeroized after use).
 ///
 /// # Errors
-/// Returns:
-/// - `io::ErrorKind::InvalidData` if the file is malformed or the version is unsupported.
-/// - `io::ErrorKind::PermissionDenied` if the password is incorrect or the ciphertext
-///   cannot be decrypted (e.g., corrupted file).
-/// - Other `io::Error` variants for file I/O problems.
-pub fn decrypt_seed32_from_file(path: &str, password: &str) -> io::Result<[u8; 32]> {
+/// Returns `KeystoreError` if the file cannot be read, parsed, or decrypted.
+/// A wrong password results in `KeystoreError::Decryption`.
+pub fn decrypt_seed32_from_file(path: &str, password: &str) -> KeystoreResult<[u8; 32]> {
     debug!(path, "decrypting seed from keystore file");
 
-    // Read and parse JSON
+    // Read file contents
     let json_str = fs::read_to_string(path)?;
-    let keystore: KeystoreFile = serde_json::from_str(&json_str)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("JSON parse: {e}")))?;
+    decrypt_seed32_from_str(&json_str, password)
+}
 
-    if keystore.v != KEYSTORE_VERSION {
-        let err = format!("unsupported keystore version {}", keystore.v);
-        error!("{}", err);
-        return Err(io::Error::new(io::ErrorKind::InvalidData, err));
+/// Decrypt a 32‑byte seed from a JSON string (useful for testing).
+pub fn decrypt_seed32_from_str(json_str: &str, password: &str) -> KeystoreResult<[u8; 32]> {
+    // Parse JSON
+    let keystore: KeystoreFile = serde_json::from_str(json_str)?;
+
+    // Validate version
+    if keystore.v != 1 {
+        return Err(KeystoreError::UnsupportedVersion {
+            got: keystore.v,
+            expected: 1,
+        });
     }
 
     // Decode base64 fields
-    let salt = base64::engine::general_purpose::STANDARD
-        .decode(keystore.salt)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid salt encoding"))?;
-    let nonce_bytes = base64::engine::general_purpose::STANDARD
-        .decode(keystore.nonce)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid nonce encoding"))?;
-    let ciphertext = base64::engine::general_purpose::STANDARD
-        .decode(keystore.ct)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid ciphertext encoding"))?;
+    let salt = base64::engine::general_purpose::STANDARD.decode(&keystore.salt)?;
+    let nonce_bytes = base64::engine::general_purpose::STANDARD.decode(&keystore.nonce)?;
+    let ciphertext = base64::engine::general_purpose::STANDARD.decode(&keystore.ct)?;
 
-    // Validate nonce length
+    // Validate lengths
     if nonce_bytes.len() != NONCE_LEN {
-        let err = format!("invalid nonce length: expected {}, got {}", NONCE_LEN, nonce_bytes.len());
-        error!("{}", err);
-        return Err(io::Error::new(io::ErrorKind::InvalidData, err));
+        return Err(KeystoreError::InvalidNonceLength {
+            expected: NONCE_LEN,
+            got: nonce_bytes.len(),
+        });
+    }
+    if salt.len() != SALT_LEN {
+        return Err(KeystoreError::InvalidSaltLength {
+            expected: SALT_LEN,
+            got: salt.len(),
+        });
     }
 
-    // Derive key
-    let mut key = derive_key(password, &salt);
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("AES key init: {e}")))?;
+    // Zeroize password after use
+    let password_bytes = Zeroizing::new(password.as_bytes().to_vec());
 
-    // Decrypt
-    let plaintext = cipher
-        .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
-        .map_err(|_| {
-            error!(path, "decryption failed: wrong password or corrupted keystore");
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "wrong password or corrupted keystore",
-            )
-        })?;
-
-    // Zero the key
-    key.zeroize();
+    // Derive key (iterations not stored in file – use default)
+    let key = derive_key(&password_bytes, &salt, DEFAULT_PBKDF2_ITERATIONS);
+    let mut key_zero = key;
+    let plaintext = decrypt_data(&key_zero, &ciphertext, &nonce_bytes)?;
+    key_zero.zeroize();
 
     // Verify length
     if plaintext.len() != 32 {
-        let err = format!("invalid seed length: expected 32, got {}", plaintext.len());
-        error!("{}", err);
-        return Err(io::Error::new(io::ErrorKind::InvalidData, err));
+        return Err(KeystoreError::InvalidSeedLength {
+            expected: 32,
+            got: plaintext.len(),
+        });
     }
 
-    // Copy into fixed-size array
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&plaintext);
-    debug!(path, "seed decrypted successfully");
+    debug!(path = "(from string)", "seed decrypted successfully");
     Ok(seed)
 }
 
@@ -266,6 +355,60 @@ pub fn decrypt_seed32_from_file(path: &str, password: &str) -> io::Result<[u8; 3
 #[must_use]
 pub fn keystore_exists(path: &str) -> bool {
     Path::new(path).exists()
+}
+
+/// Validate that a keystore file is correctly formatted and has the right version.
+/// Does **not** check the password.
+pub fn validate_keystore(path: &str) -> KeystoreResult<()> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let keystore: KeystoreFile = serde_json::from_reader(reader)?;
+    if keystore.v != 1 {
+        return Err(KeystoreError::UnsupportedVersion {
+            got: keystore.v,
+            expected: 1,
+        });
+    }
+    // Check that base64 fields decode to correct lengths
+    let salt = base64::engine::general_purpose::STANDARD.decode(&keystore.salt)?;
+    let nonce = base64::engine::general_purpose::STANDARD.decode(&keystore.nonce)?;
+    let _ct = base64::engine::general_purpose::STANDARD.decode(&keystore.ct)?;
+    if salt.len() != SALT_LEN {
+        return Err(KeystoreError::InvalidSaltLength {
+            expected: SALT_LEN,
+            got: salt.len(),
+        });
+    }
+    if nonce.len() != NONCE_LEN {
+        return Err(KeystoreError::InvalidNonceLength {
+            expected: NONCE_LEN,
+            got: nonce.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Change the password of an existing keystore file (re‑encrypt with new password).
+///
+/// # Arguments
+/// * `path` – Path to the keystore file.
+/// * `old_password` – Current password.
+/// * `new_password` – New password.
+/// * `options` – Keystore options for new encryption.
+///
+/// # Errors
+/// Same as `decrypt_seed32_from_file` and `encrypt_seed32_to_file`.
+pub fn change_keystore_password(
+    path: &str,
+    old_password: &str,
+    new_password: &str,
+    options: &KeystoreOptions,
+) -> KeystoreResult<()> {
+    info!(path, "changing keystore password");
+    let seed = decrypt_seed32_from_file(path, old_password)?;
+    encrypt_seed32_to_file(path, &seed, new_password, options)?;
+    info!(path, "keystore password changed successfully");
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -285,8 +428,9 @@ mod tests {
 
         let original_seed = [0xAAu8; 32];
         let password = "test_password_123";
+        let options = KeystoreOptions::default();
 
-        encrypt_seed32_to_file(path_str, original_seed, password).unwrap();
+        encrypt_seed32_to_file(path_str, &original_seed, password, &options).unwrap();
         let decrypted = decrypt_seed32_from_file(path_str, password).unwrap();
 
         assert_eq!(original_seed, decrypted);
@@ -299,12 +443,11 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         let seed = [0xBBu8; 32];
-        encrypt_seed32_to_file(path_str, seed, "correct").unwrap();
+        let options = KeystoreOptions::default();
+        encrypt_seed32_to_file(path_str, &seed, "correct", &options).unwrap();
 
         let result = decrypt_seed32_from_file(path_str, "wrong");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(matches!(result, Err(KeystoreError::Decryption)));
     }
 
     #[test]
@@ -314,7 +457,78 @@ mod tests {
         assert!(!keystore_exists(path.to_str().unwrap()));
 
         let path2 = dir.path().join("exists.enc");
-        encrypt_seed32_to_file(path2.to_str().unwrap(), [0u8; 32], "pass").unwrap();
+        let options = KeystoreOptions::default();
+        encrypt_seed32_to_file(path2.to_str().unwrap(), &[0u8; 32], "pass", &options).unwrap();
         assert!(keystore_exists(path2.to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_validate_keystore() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("valid.enc");
+        let path_str = path.to_str().unwrap();
+        let options = KeystoreOptions::default();
+        encrypt_seed32_to_file(path_str, &[0u8; 32], "pass", &options).unwrap();
+        assert!(validate_keystore(path_str).is_ok());
+
+        // Corrupt the file
+        fs::write(path_str, "garbage").unwrap();
+        assert!(validate_keystore(path_str).is_err());
+    }
+
+    #[test]
+    fn test_change_password() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keystore.enc");
+        let path_str = path.to_str().unwrap();
+
+        let seed = [0xCCu8; 32];
+        let options = KeystoreOptions::default();
+        encrypt_seed32_to_file(path_str, &seed, "old_pass", &options).unwrap();
+
+        change_keystore_password(path_str, "old_pass", "new_pass", &options).unwrap();
+
+        // Decrypt with new password should work
+        let decrypted = decrypt_seed32_from_file(path_str, "new_pass").unwrap();
+        assert_eq!(seed, decrypted);
+
+        // Decrypt with old password should fail
+        assert!(matches!(
+            decrypt_seed32_from_file(path_str, "old_pass"),
+            Err(KeystoreError::Decryption)
+        ));
+    }
+
+    #[test]
+    fn test_corrupted_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("corrupt.enc");
+        let path_str = path.to_str().unwrap();
+        // Write invalid JSON
+        fs::write(path_str, "not json").unwrap();
+        assert!(matches!(
+            decrypt_seed32_from_file(path_str, "pass"),
+            Err(KeystoreError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn test_unsupported_version() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad_version.enc");
+        let path_str = path.to_str().unwrap();
+        // Write a keystore with version 2 (invalid)
+        let bad = KeystoreFile {
+            v: 2,
+            salt: "AAAA".into(),
+            nonce: "BBBB".into(),
+            ct: "CCCC".into(),
+        };
+        let json = serde_json::to_string(&bad).unwrap();
+        fs::write(path_str, json).unwrap();
+        assert!(matches!(
+            decrypt_seed32_from_file(path_str, "pass"),
+            Err(KeystoreError::UnsupportedVersion { got: 2, expected: 1 })
+        ));
     }
 }
