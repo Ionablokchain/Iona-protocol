@@ -24,14 +24,21 @@
 use crate::execution::{execute_block, KvState};
 use crate::replay::nondeterminism::NdLogger;
 use crate::types::{Block, Hash32, Height};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use thiserror::Error;
+use tracing::{debug, info, warn};
 
 // -----------------------------------------------------------------------------
 // Errors
 // -----------------------------------------------------------------------------
 
-/// Errors that can occur during replay.
+/// Errors that can occur during replay operations.
 #[derive(Debug, Error)]
 pub enum ReplayError {
     /// The `from` height is greater than the `to` height.
@@ -49,6 +56,18 @@ pub enum ReplayError {
     /// Block execution failed at a specific height.
     #[error("block execution failed at height {height}: {reason}")]
     ExecutionFailed { height: Height, reason: String },
+
+    /// I/O error.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Serialisation error.
+    #[error("serialisation error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    /// No blocks found in the given range.
+    #[error("no blocks in range {from}..{to}")]
+    NoBlocksInRange { from: Height, to: Height },
 }
 
 pub type ReplayResult<T> = Result<T, ReplayError>;
@@ -58,7 +77,7 @@ pub type ReplayResult<T> = Result<T, ReplayError>;
 // -----------------------------------------------------------------------------
 
 /// Options for the replay command.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayOpts {
     /// Starting block height (inclusive).
     pub from: Height,
@@ -72,6 +91,8 @@ pub struct ReplayOpts {
     pub determinism_check: usize,
     /// Base fee per gas for all executed blocks (simplified).
     pub base_fee_per_gas: u64,
+    /// Log progress every N blocks (0 = disabled).
+    pub progress_interval: usize,
 }
 
 impl Default for ReplayOpts {
@@ -83,6 +104,7 @@ impl Default for ReplayOpts {
             log_roots: true,
             determinism_check: 0,
             base_fee_per_gas: 1,
+            progress_interval: 1000,
         }
     }
 }
@@ -101,14 +123,39 @@ impl ReplayOpts {
         }
         Ok(())
     }
+
+    /// Create options for a full chain replay.
+    #[must_use]
+    pub fn full_chain() -> Self {
+        Self {
+            from: 1,
+            to: u64::MAX,
+            verify_root: true,
+            log_roots: true,
+            determinism_check: 0,
+            base_fee_per_gas: 1,
+            progress_interval: 1000,
+        }
+    }
+
+    /// Create options for a quick replay without verification.
+    #[must_use]
+    pub fn quick() -> Self {
+        Self {
+            verify_root: false,
+            log_roots: false,
+            determinism_check: 0,
+            ..Default::default()
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
 // Result types
 // -----------------------------------------------------------------------------
 
-/// Per‑block replay result with state root logging (STEP 5).
-#[derive(Debug, Clone)]
+/// Per‑block replay result with state root logging.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockReplayEntry {
     /// Block height.
     pub height: Height,
@@ -122,10 +169,12 @@ pub struct BlockReplayEntry {
     pub gas_used: u64,
     /// Whether multiple executions produced the same result.
     pub deterministic: bool,
+    /// Replay time in milliseconds.
+    pub replay_time_ms: u64,
 }
 
-impl std::fmt::Display for BlockReplayEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for BlockReplayEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let status = if self.root_match { "OK" } else { "MISMATCH" };
         let det = if self.deterministic {
             ""
@@ -134,19 +183,20 @@ impl std::fmt::Display for BlockReplayEntry {
         };
         write!(
             f,
-            "height={} root=0x{} expected=0x{} status={}{} gas={}",
+            "height={} root=0x{} expected=0x{} status={}{} gas={} time={}ms",
             self.height,
             hex::encode(&self.state_root.0[..8]),
             hex::encode(&self.expected_root.0[..8]),
             status,
             det,
             self.gas_used,
+            self.replay_time_ms
         )
     }
 }
 
 /// Full replay result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayResult {
     /// Per‑block entries.
     pub entries: Vec<BlockReplayEntry>,
@@ -160,24 +210,38 @@ pub struct ReplayResult {
     pub first_mismatch: Option<Height>,
     /// First height where nondeterminism was detected.
     pub first_nondeterministic: Option<Height>,
+    /// Total replay time in milliseconds.
+    pub total_time_ms: u64,
+    /// Blocks per second.
+    pub blocks_per_second: f64,
+    /// Gas per second.
+    pub gas_per_second: f64,
 }
 
-impl std::fmt::Display for ReplayResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ReplayResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let status = if self.success { "PASS" } else { "FAIL" };
         writeln!(
             f,
-            "Replay Result: {} ({} blocks, {} gas)",
-            status, self.total_blocks, self.total_gas
+            "Replay Result: {} ({} blocks, {} gas, {}ms)",
+            status, self.total_blocks, self.total_gas, self.total_time_ms
         )?;
         if let Some(h) = self.first_mismatch {
-            writeln!(f, "  FIRST MISMATCH at height {h}")?;
+            writeln!(f, "  FIRST MISMATCH at height {}", h)?;
         }
         if let Some(h) = self.first_nondeterministic {
-            writeln!(f, "  FIRST NONDETERMINISM at height {h}")?;
+            writeln!(f, "  FIRST NONDETERMINISM at height {}", h)?;
         }
-        for entry in &self.entries {
-            writeln!(f, "  {entry}")?;
+        writeln!(
+            f,
+            "  Performance: {:.2} blocks/s, {:.2} gas/s",
+            self.blocks_per_second, self.gas_per_second
+        )?;
+        if !self.entries.is_empty() {
+            writeln!(f, "  Entries:")?;
+            for entry in &self.entries {
+                writeln!(f, "    {}", entry)?;
+            }
         }
         Ok(())
     }
@@ -204,16 +268,31 @@ pub fn replay(
 ) -> ReplayResult<ReplayResult> {
     opts.validate()?;
 
+    let start_time = Instant::now();
     let mut state = initial_state.clone();
     let mut entries = Vec::with_capacity(blocks.len());
     let mut total_gas = 0u64;
     let mut first_mismatch = None;
     let mut first_nondeterministic = None;
 
+    info!(
+        from = opts.from,
+        to = opts.to,
+        verify_root = opts.verify_root,
+        determinism_check = opts.determinism_check,
+        "starting replay"
+    );
+
+    let mut count = 0;
     for block in blocks {
         let h = block.header.height;
         if h < opts.from || h > opts.to {
             continue;
+        }
+
+        count += 1;
+        if opts.progress_interval > 0 && count % opts.progress_interval == 0 {
+            info!(height = h, count, "replay progress");
         }
 
         // Log the current height for nondeterminism tracking.
@@ -227,9 +306,13 @@ pub fn replay(
             crate::crypto::tx::derive_address(&block.header.proposer_pk)
         };
 
+        let block_start = Instant::now();
+
         // Execute the block.
         let (new_state, gas_used, _receipts) =
             execute_block(&state, &block.txs, opts.base_fee_per_gas, &proposer_addr);
+
+        let replay_time_ms = block_start.elapsed().as_millis() as u64;
 
         let state_root = new_state.root();
         let expected_root = block.header.state_root;
@@ -242,21 +325,30 @@ pub fn replay(
         // Determinism check: run the same block multiple times and compare roots.
         let mut deterministic = true;
         if opts.determinism_check > 0 {
-            for _ in 0..opts.determinism_check {
-                let (check_state, _, _) =
-                    execute_block(&state, &block.txs, opts.base_fee_per_gas, &proposer_addr);
-                if check_state.root() != state_root {
+            let mut check_state = state.clone();
+            for i in 0..opts.determinism_check {
+                let (check_new_state, _, _) =
+                    execute_block(&check_state, &block.txs, opts.base_fee_per_gas, &proposer_addr);
+                if check_new_state.root() != state_root {
                     deterministic = false;
+                    debug!(
+                        height = h,
+                        attempt = i + 1,
+                        "nondeterministic execution detected"
+                    );
                     break;
                 }
+                check_state = check_new_state;
             }
         }
 
         if !root_match && first_mismatch.is_none() {
             first_mismatch = Some(h);
+            warn!(height = h, "state root mismatch");
         }
         if !deterministic && first_nondeterministic.is_none() {
             first_nondeterministic = Some(h);
+            warn!(height = h, "nondeterminism detected");
         }
 
         total_gas += gas_used;
@@ -267,13 +359,41 @@ pub fn replay(
             root_match,
             gas_used,
             deterministic,
+            replay_time_ms,
         });
 
         state = new_state;
     }
 
+    if count == 0 {
+        return Err(ReplayError::NoBlocksInRange {
+            from: opts.from,
+            to: opts.to,
+        });
+    }
+
+    let total_time_ms = start_time.elapsed().as_millis() as u64;
     let success = first_mismatch.is_none() && first_nondeterministic.is_none();
     let total_blocks = entries.len();
+
+    let blocks_per_second = if total_time_ms > 0 {
+        (total_blocks as f64) / (total_time_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    let gas_per_second = if total_time_ms > 0 {
+        (total_gas as f64) / (total_time_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+
+    info!(
+        total_blocks,
+        total_gas,
+        total_time_ms,
+        success,
+        "replay completed"
+    );
 
     Ok(ReplayResult {
         entries,
@@ -282,6 +402,9 @@ pub fn replay(
         total_gas,
         first_mismatch,
         first_nondeterministic,
+        total_time_ms,
+        blocks_per_second,
+        gas_per_second,
     })
 }
 
@@ -290,7 +413,7 @@ pub fn replay(
 // -----------------------------------------------------------------------------
 
 /// A state root mismatch between two nodes at a given height.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RootMismatch {
     pub height: Height,
     pub root_a: Hash32,
@@ -298,7 +421,7 @@ pub struct RootMismatch {
 }
 
 /// Result of cross‑node comparison.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompareResult {
     /// Identifier of the first node.
     pub node_a: String,
@@ -316,8 +439,8 @@ pub struct CompareResult {
     pub agree: bool,
 }
 
-impl std::fmt::Display for CompareResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for CompareResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let status = if self.agree { "AGREE" } else { "DIVERGENCE" };
         writeln!(
             f,
@@ -403,6 +526,39 @@ pub fn compare_nodes(
 }
 
 // -----------------------------------------------------------------------------
+// File I/O helpers
+// -----------------------------------------------------------------------------
+
+/// Load blocks from a JSON Lines file (one block per line).
+pub fn load_blocks(path: &Path) -> ReplayResult<Vec<Block>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut blocks = Vec::new();
+    for line in std::io::BufRead::lines(reader) {
+        let line = line?;
+        let block: Block = serde_json::from_str(&line)?;
+        blocks.push(block);
+    }
+    Ok(blocks)
+}
+
+/// Save replay result to a JSON file.
+pub fn save_result(result: &ReplayResult, path: &Path) -> ReplayResult<()> {
+    let file = File::create(path)?;
+    let writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(writer, result)?;
+    Ok(())
+}
+
+/// Load replay result from a JSON file.
+pub fn load_result(path: &Path) -> ReplayResult<ReplayResult> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let result: ReplayResult = serde_json::from_reader(reader)?;
+    Ok(result)
+}
+
+// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
@@ -471,6 +627,7 @@ mod tests {
             log_roots: true,
             determinism_check: 0,
             base_fee_per_gas: 1,
+            progress_interval: 0,
         };
 
         let result = replay(&blocks, &state, &opts, None)?;
@@ -572,5 +729,40 @@ mod tests {
         assert!(!result.agree);
         assert_eq!(result.mismatches.len(), 1);
         assert_eq!(result.mismatches[0].height, 2);
+    }
+
+    #[test]
+    fn test_no_blocks_in_range() -> ReplayResult<()> {
+        let state = KvState::default();
+        let root = state.root();
+        let blocks = vec![empty_block(1, root.clone())];
+
+        let opts = ReplayOpts {
+            from: 10,
+            to: 20,
+            ..Default::default()
+        };
+
+        let result = replay(&blocks, &state, &opts, None);
+        assert!(matches!(result, Err(ReplayError::NoBlocksInRange { from: 10, to: 20 })));
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_io_roundtrip() -> ReplayResult<()> {
+        let state = KvState::default();
+        let root = state.root();
+        let blocks = vec![empty_block(1, root.clone()), empty_block(2, root.clone())];
+        let opts = ReplayOpts::default();
+        let result = replay(&blocks, &state, &opts, None)?;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("result.json");
+        save_result(&result, &path)?;
+        let loaded = load_result(&path)?;
+        assert_eq!(loaded.total_blocks, result.total_blocks);
+        assert_eq!(loaded.total_gas, result.total_gas);
+        assert_eq!(loaded.success, result.success);
+        Ok(())
     }
 }
