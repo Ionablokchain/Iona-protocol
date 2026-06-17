@@ -38,6 +38,7 @@ use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 // -----------------------------------------------------------------------------
@@ -66,6 +67,9 @@ pub enum NdLoggerError {
         #[source]
         source: serde_json::Error,
     },
+    /// The logger is disabled (no operations allowed).
+    #[error("logger is disabled")]
+    Disabled,
 }
 
 pub type NdLoggerResult<T> = Result<T, NdLoggerError>;
@@ -182,17 +186,26 @@ pub struct NdLogger {
     enabled: bool,
     /// Optional file writer for persistent logging.
     file_writer: Mutex<Option<BufWriter<std::fs::File>>>,
+    /// Monotonic event counter for logged_at_ns.
+    event_counter: Mutex<u64>,
 }
 
 impl NdLogger {
-    /// Create a new logger without file output.
+    /// Create a new logger without file output, enabled by default.
     #[must_use]
-    pub fn new(enabled: bool) -> Self {
+    pub fn new() -> Self {
+        Self::with_enabled(true)
+    }
+
+    /// Create a logger with explicit enabled flag.
+    #[must_use]
+    pub fn with_enabled(enabled: bool) -> Self {
         Self {
             events: Mutex::new(Vec::new()),
             current_height: Mutex::new(0),
             enabled,
             file_writer: Mutex::new(None),
+            event_counter: Mutex::new(0),
         }
     }
 
@@ -212,7 +225,17 @@ impl NdLogger {
             current_height: Mutex::new(0),
             enabled,
             file_writer: Mutex::new(Some(writer)),
+            event_counter: Mutex::new(0),
         })
+    }
+
+    /// Create a logger enabled by environment variable `IONA_ND_LOG=1`.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let enabled = std::env::var("IONA_ND_LOG")
+            .map(|v| v == "1" || v == "true" || v == "yes")
+            .unwrap_or(false);
+        Self::with_enabled(enabled)
     }
 
     /// Set the current block height (call at the start of block execution).
@@ -222,7 +245,7 @@ impl NdLogger {
         }
     }
 
-    /// Internal helper to log an event.
+    /// Internal helper to log an event with a timestamp.
     fn log_internal(
         &self,
         source: NdSource,
@@ -235,6 +258,11 @@ impl NdLogger {
             return;
         }
         let height = self.current_height.lock().map(|h| *h).unwrap_or(0);
+        let counter = self.event_counter.lock().map(|c| { let v = *c; *c += 1; v }).unwrap_or(0);
+        // Use a monotonic counter as a timestamp substitute (actual clock could be non‑deterministic).
+        // In production, you could use a real monotonic clock if available.
+        let logged_at_ns = counter;
+
         let event = NdEvent {
             source,
             severity,
@@ -242,7 +270,7 @@ impl NdLogger {
             description,
             observed_value: observed,
             deterministic_alternative: alternative,
-            logged_at_ns: 0, // Placeholder; could be filled with a real timestamp.
+            logged_at_ns,
         };
 
         // Store in memory.
@@ -259,6 +287,24 @@ impl NdLogger {
                 }
             }
         }
+    }
+
+    /// Log a generic event.
+    pub fn log_event(
+        &self,
+        source: NdSource,
+        severity: NdSeverity,
+        description: &str,
+        observed: &str,
+        alternative: Option<&str>,
+    ) {
+        self.log_internal(
+            source,
+            severity,
+            description.to_string(),
+            observed.to_string(),
+            alternative.map(|s| s.to_string()),
+        );
     }
 
     /// Log a timestamp usage (wall clock vs block timestamp).
@@ -327,6 +373,11 @@ impl NdLogger {
         );
     }
 
+    /// Log a custom event with explicit source and severity.
+    pub fn log_custom(&self, source: NdSource, severity: NdSeverity, description: &str, observed: &str) {
+        self.log_event(source, severity, description, observed, None);
+    }
+
     /// Get all logged events.
     #[must_use]
     pub fn events(&self) -> Vec<NdEvent> {
@@ -392,6 +443,23 @@ impl NdLogger {
             clean: critical_count == 0,
         }
     }
+
+    /// Dump in‑memory events to the configured file (if any).
+    /// This is useful for flushing after a block is processed.
+    pub fn flush(&self) -> NdLoggerResult<()> {
+        if let Ok(mut writer) = self.file_writer.lock() {
+            if let Some(w) = writer.as_mut() {
+                w.flush().map_err(|e| NdLoggerError::WriteFile { source: e })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for NdLogger {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -403,6 +471,7 @@ impl NdLogger {
 pub struct NdLoggerBuilder {
     enabled: bool,
     file_path: Option<PathBuf>,
+    from_env: bool,
 }
 
 impl NdLoggerBuilder {
@@ -412,6 +481,7 @@ impl NdLoggerBuilder {
         Self {
             enabled: true,
             file_path: None,
+            from_env: false,
         }
     }
 
@@ -429,11 +499,26 @@ impl NdLoggerBuilder {
         self
     }
 
+    /// Enable logging based on environment variable `IONA_ND_LOG=1`.
+    #[must_use]
+    pub fn from_env(mut self) -> Self {
+        self.from_env = true;
+        self
+    }
+
     /// Build the logger.
     pub fn build(self) -> NdLoggerResult<NdLogger> {
+        let enabled = if self.from_env {
+            std::env::var("IONA_ND_LOG")
+                .map(|v| v == "1" || v == "true" || v == "yes")
+                .unwrap_or(false)
+        } else {
+            self.enabled
+        };
+
         match self.file_path {
-            Some(path) => NdLogger::with_file(self.enabled, path),
-            None => Ok(NdLogger::new(self.enabled)),
+            Some(path) => NdLogger::with_file(enabled, path),
+            None => Ok(NdLogger::with_enabled(enabled)),
         }
     }
 }
@@ -522,6 +607,40 @@ pub fn check_code_snippet(code: &str) -> Vec<(String, NdSeverity)> {
 }
 
 // -----------------------------------------------------------------------------
+// Global singleton (optional)
+// -----------------------------------------------------------------------------
+
+static GLOBAL_LOGGER: once_cell::sync::OnceCell<NdLogger> = once_cell::sync::OnceCell::new();
+
+/// Initialise the global logger. Must be called before use.
+/// If not initialised, all logging calls will be no‑ops.
+pub fn init_global(logger: NdLogger) {
+    let _ = GLOBAL_LOGGER.set(logger);
+}
+
+/// Get a reference to the global logger, or `None` if not initialised.
+#[must_use]
+pub fn global_logger() -> Option<&'static NdLogger> {
+    GLOBAL_LOGGER.get()
+}
+
+/// Convenience macro to log using the global logger if available.
+/// Otherwise, does nothing.
+#[macro_export]
+macro_rules! nd_log {
+    ($source:expr, $severity:expr, $desc:expr, $observed:expr) => {
+        if let Some(logger) = $crate::replay::nondeterminism::global_logger() {
+            logger.log_event($source, $severity, $desc, $observed, None);
+        }
+    };
+    ($source:expr, $severity:expr, $desc:expr, $observed:expr, $alt:expr) => {
+        if let Some(logger) = $crate::replay::nondeterminism::global_logger() {
+            logger.log_event($source, $severity, $desc, $observed, Some($alt));
+        }
+    };
+}
+
+// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
@@ -532,7 +651,7 @@ mod tests {
 
     #[test]
     fn test_logger_basic() {
-        let logger = NdLogger::new(true);
+        let logger = NdLogger::new();
         logger.set_height(100);
         logger.log_timestamp(1234567890, 1234567000);
 
@@ -545,7 +664,7 @@ mod tests {
 
     #[test]
     fn test_logger_disabled() {
-        let logger = NdLogger::new(false);
+        let logger = NdLogger::with_enabled(false);
         logger.log_timestamp(123, 456);
         assert!(logger.events().is_empty());
     }
@@ -579,7 +698,7 @@ mod tests {
 
     #[test]
     fn test_filter_by_severity() {
-        let logger = NdLogger::new(true);
+        let logger = NdLogger::new();
         logger.log_timestamp(1, 2);
         logger.log_hashmap_usage("test");
         logger.log_platform("test", "x86");
@@ -592,7 +711,7 @@ mod tests {
 
     #[test]
     fn test_has_critical() {
-        let logger = NdLogger::new(true);
+        let logger = NdLogger::new();
         assert!(!logger.has_critical());
         logger.log_hashmap_usage("test");
         assert!(!logger.has_critical());
@@ -602,7 +721,7 @@ mod tests {
 
     #[test]
     fn test_report() {
-        let logger = NdLogger::new(true);
+        let logger = NdLogger::new();
         logger.log_timestamp(1, 2);
         logger.log_hashmap_usage("test");
         let report = logger.report();
@@ -619,5 +738,44 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].0, "HashMap");
         assert_eq!(findings[0].1, NdSeverity::Warning);
+    }
+
+    #[test]
+    fn test_log_event_generic() {
+        let logger = NdLogger::new();
+        logger.log_event(
+            NdSource::Other("custom".to_string()),
+            NdSeverity::Info,
+            "test description",
+            "observed value",
+            Some("alternative"),
+        );
+        let events = logger.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, NdSource::Other("custom".to_string()));
+    }
+
+    #[test]
+    fn test_flush() -> NdLoggerResult<()> {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let logger = NdLogger::with_file(true, &path)?;
+        logger.set_height(1);
+        logger.log_timestamp(100, 200);
+        logger.flush()?;
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_global_logger() {
+        let logger = NdLogger::new();
+        init_global(logger);
+        assert!(global_logger().is_some());
+        // Test macro
+        nd_log!(NdSource::Rng, NdSeverity::Critical, "test", "123");
+        let events = global_logger().unwrap().events();
+        assert_eq!(events.len(), 1);
     }
 }
