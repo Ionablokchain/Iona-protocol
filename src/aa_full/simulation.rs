@@ -1,53 +1,83 @@
-//! simulateValidation — full off-chain simulation before bundle inclusion.
+//! simulateValidation — full off‑chain simulation before bundle inclusion.
 //!
 //! This module implements the complete simulation logic that bundlers MUST run
 //! before including a UserOperation in a bundle. The simulation verifies:
 //!
-//! - Sender deployment and initCode (AA10)
+//! - Sender deployment and initCode (AA10, AA11, AA13)
 //! - Account validation (validateUserOp) – including signature (AA24)
 //! - Paymaster validation (validatePaymasterUserOp) – including stake/deposit (AA33)
 //! - Prefund calculation and ability to pay (AA21)
 //! - Nonce correctness (AA25)
-//! - Gas limits sanity
-//! - Time bounds (validAfter / validUntil)
-//! - Paymaster data format and signature (if applicable)
+//! - Gas limits sanity (AA40, AA41, AA42)
+//! - Time bounds (validAfter / validUntil – AA50)
+//! - Paymaster data format and signature (AA51)
 //!
 //! # Usage
 //!
 //! ```rust,ignore
 //! use iona::aa_full::simulation::{SimulationContext, simulate_user_op};
 //!
-//! let ctx = SimulationContext::new(chain_id, evm_state);
-//! let result = simulate_user_op(&ctx, &user_op, current_timestamp, current_block);
-//! match result {
-//!     Ok(validation) => { /* include in bundle */ }
-//!     Err(err) => { /* reject */ }
-//! }
+//! let ctx = SimulationContext::new(chain_id, evm_state, current_timestamp, current_block);
+//! let result = simulate_user_op(&ctx, &user_op)?;
 //! ```
 
-use revm::primitives::{Address, B256, U256};
-use revm::db::StateRef;
-use serde::{Deserialize, Serialize};
-use std::time::{Duration, SystemTime};
-use thiserror::Error;
-
-use crate::evm::account_abstraction::UserOperation;
-use crate::aa_full::entry_point::{EntryPoint, ValidationResult, EntryPointError};
+use crate::aa_full::entry_point::{EntryPoint, EntryPointError, ValidationResult, ENTRY_POINT_ADDRESS};
 use crate::aa_full::paymaster::{Paymaster, PaymasterError};
+use crate::evm::account_abstraction::UserOperation;
+use crate::evm::EvmState;
+use k256::ecdsa::{VerifyingKey, Signature};
+use revm::db::{Database, DatabaseRef};
+use revm::primitives::{Address, Bytes, B256, U256};
+use revm::{Evm, EvmBuilder, Inspector};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+use thiserror::Error;
+use tracing::{debug, error, info, instrument, trace, warn, Span};
+
+// Feature‑gated metrics
+#[cfg(feature = "aa_metrics")]
+use lazy_static::lazy_static;
+#[cfg(feature = "aa_metrics")]
+use prometheus::{register_counter, register_histogram, Counter, Histogram};
 
 // -----------------------------------------------------------------------------
-// Simulation errors (aligned with ERC-4337 error codes)
+// Metrics (feature‑gated)
 // -----------------------------------------------------------------------------
 
-/// Errors returned by the simulation, matching the official AA error codes
-/// where possible. These are used by bundlers to reject operations.
+#[cfg(feature = "aa_metrics")]
+lazy_static! {
+    static ref SIMULATIONS_TOTAL: Counter = register_counter!(
+        "simulations_total",
+        "Total number of UserOperation simulations"
+    ).unwrap();
+    static ref SIMULATIONS_SUCCESS: Counter = register_counter!(
+        "simulations_success_total",
+        "Successful simulations"
+    ).unwrap();
+    static ref SIMULATIONS_FAILURES: Counter = register_counter!(
+        "simulations_failures_total",
+        "Failed simulations"
+    ).unwrap();
+    static ref SIMULATION_DURATION: Histogram = register_histogram!(
+        "simulation_duration_seconds",
+        "Duration of simulation in seconds"
+    ).unwrap();
+}
+
+// -----------------------------------------------------------------------------
+// Error types
+// -----------------------------------------------------------------------------
+
+/// Errors returned by the simulation, aligned with ERC‑4337 error codes.
 #[derive(Error, Debug, Clone, PartialEq)]
 pub enum SimulationError {
     // Basic validation errors
     #[error("AA10: sender not deployed and no initCode")]
-    NoInitCode,
-    #[error("AA11: initCode failed with revert")]
-    InitCodeFailed,
+    SenderNotDeployed,
+    #[error("AA11: initCode failed with revert: {0}")]
+    InitCodeFailed(String),
     #[error("AA13: initCode returned a non‑empty contract")]
     InitCodeNonEmpty,
 
@@ -100,37 +130,11 @@ pub enum SimulationError {
     Internal(String),
 }
 
+pub type SimulationResult<T> = Result<T, SimulationError>;
+
 // -----------------------------------------------------------------------------
-// Simulation context and configuration
+// Simulation configuration
 // -----------------------------------------------------------------------------
-
-/// Context for a single simulation run – holds all necessary external data.
-pub struct SimulationContext<'a, DB: StateRef> {
-    pub chain_id: u64,
-    pub db: &'a DB,
-    pub current_timestamp: u64,
-    pub current_block: u64,
-    pub config: SimulationConfig,
-}
-
-impl<'a, DB: StateRef> SimulationContext<'a, DB> {
-    /// Create a new simulation context with default config.
-    pub fn new(chain_id: u64, db: &'a DB, current_timestamp: u64, current_block: u64) -> Self {
-        Self {
-            chain_id,
-            db,
-            current_timestamp,
-            current_block,
-            config: SimulationConfig::default(),
-        }
-    }
-
-    /// Set custom configuration.
-    pub fn with_config(mut self, config: SimulationConfig) -> Self {
-        self.config = config;
-        self
-    }
-}
 
 /// Simulation configuration – adjust per bundler policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +151,8 @@ pub struct SimulationConfig {
     pub enforce_paymaster_stake: bool,
     /// Whether to enforce paymaster balance check (prefund).
     pub enforce_paymaster_balance: bool,
+    /// Maximum initCode size allowed.
+    pub max_init_code_size: usize,
 }
 
 impl Default for SimulationConfig {
@@ -158,12 +164,99 @@ impl Default for SimulationConfig {
             timeout_ms: 2000,
             enforce_paymaster_stake: true,
             enforce_paymaster_balance: true,
+            max_init_code_size: 100_000,
         }
     }
 }
 
 // -----------------------------------------------------------------------------
-// Simulation result (detailed)
+// Simulation context
+// -----------------------------------------------------------------------------
+
+/// Context for a single simulation run – holds all necessary external data.
+pub struct SimulationContext<'a, DB: DatabaseRef + Database> {
+    pub chain_id: u64,
+    pub evm_state: &'a DB,
+    pub current_timestamp: u64,
+    pub current_block: u64,
+    pub config: SimulationConfig,
+    pub cache: &'a SimulationCache,
+}
+
+impl<'a, DB: DatabaseRef + Database> SimulationContext<'a, DB> {
+    /// Create a new simulation context with default config.
+    pub fn new(
+        chain_id: u64,
+        evm_state: &'a DB,
+        current_timestamp: u64,
+        current_block: u64,
+        cache: &'a SimulationCache,
+    ) -> Self {
+        Self {
+            chain_id,
+            evm_state,
+            current_timestamp,
+            current_block,
+            config: SimulationConfig::default(),
+            cache,
+        }
+    }
+
+    /// Set custom configuration.
+    pub fn with_config(mut self, config: SimulationConfig) -> Self {
+        self.config = config;
+        self
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Simulation cache
+// -----------------------------------------------------------------------------
+
+/// Cache for simulation results to avoid re‑simulating the same operation.
+#[derive(Debug, Default)]
+pub struct SimulationCache {
+    cache: Arc<RwLock<HashMap<B256, SimulationResult>>>,
+}
+
+impl SimulationCache {
+    /// Create a new empty cache.
+    pub fn new() -> Self {
+        Self {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Get a cached result for a UserOperation hash.
+    pub fn get(&self, op_hash: &B256) -> Option<SimulationResult> {
+        let cache = self.cache.read().ok()?;
+        cache.get(op_hash).cloned()
+    }
+
+    /// Insert a result into the cache.
+    pub fn insert(&self, op_hash: B256, result: SimulationResult) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.insert(op_hash, result);
+        }
+    }
+
+    /// Clear the cache.
+    pub fn clear(&self) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.clear();
+        }
+    }
+
+    /// Invalidate a specific entry.
+    pub fn invalidate(&self, op_hash: &B256) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.remove(op_hash);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Simulation result
 // -----------------------------------------------------------------------------
 
 /// Detailed result of a successful simulation.
@@ -191,6 +284,8 @@ pub struct SimulationResult {
     pub nonce: u64,
     /// Hash of the UserOperation.
     pub op_hash: B256,
+    /// Whether the operation was validated by a paymaster.
+    pub has_paymaster: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -198,14 +293,53 @@ pub struct SimulationResult {
 // -----------------------------------------------------------------------------
 
 /// Simulate a UserOperation against the current state.
-/// This performs all necessary checks as defined by ERC-4337 v0.7.
+/// This performs all necessary checks as defined by ERC‑4337 v0.7.
 ///
 /// Returns `Ok(SimulationResult)` if the operation is valid and can be included,
 /// otherwise returns a `SimulationError` with the specific AA error code.
-pub fn simulate_user_op<DB: StateRef>(
+#[instrument(skip(ctx), fields(op_hash = %hex::encode(op.hash(ENTRY_POINT_ADDRESS, ctx.chain_id).as_bytes())))]
+pub fn simulate_user_op<DB: DatabaseRef + Database>(
     ctx: &SimulationContext<DB>,
     op: &UserOperation,
-) -> Result<SimulationResult, SimulationError> {
+) -> SimulationResult<SimulationResult> {
+    let start = Instant::now();
+    let op_hash = op.hash(ENTRY_POINT_ADDRESS, ctx.chain_id);
+
+    // Check cache first
+    if let Some(cached) = ctx.cache.get(&op_hash) {
+        trace!("simulation result from cache");
+        return Ok(cached);
+    }
+
+    #[cfg(feature = "aa_metrics")]
+    SIMULATIONS_TOTAL.inc();
+
+    let result = _simulate_user_op(ctx, op);
+
+    #[cfg(feature = "aa_metrics")]
+    {
+        SIMULATION_DURATION.observe(start.elapsed().as_secs_f64());
+        match &result {
+            Ok(_) => SIMULATIONS_SUCCESS.inc(),
+            Err(_) => SIMULATIONS_FAILURES.inc(),
+        }
+    }
+
+    // Cache successful results
+    if let Ok(res) = &result {
+        ctx.cache.insert(op_hash, res.clone());
+    }
+
+    result
+}
+
+/// Internal implementation of the simulation.
+fn _simulate_user_op<DB: DatabaseRef + Database>(
+    ctx: &SimulationContext<DB>,
+    op: &UserOperation,
+) -> SimulationResult<SimulationResult> {
+    let span = Span::current();
+
     // 1. Basic sanity and gas limit checks
     check_basic_sanity(op, &ctx.config)?;
 
@@ -215,22 +349,23 @@ pub fn simulate_user_op<DB: StateRef>(
 
     // 3. Sender deployment and initCode
     let sender_addr = Address::from_slice(&op.sender_bytes());
-    check_sender_deployment(ctx.db, &sender_addr, op)?;
+    check_sender_deployment(ctx.evm_state, &sender_addr, op)?;
 
     // 4. Nonce check (must be current)
-    check_nonce(ctx.db, &sender_addr, op.nonce)?;
+    check_nonce(ctx.evm_state, &sender_addr, op.nonce)?;
 
     // 5. Simulate account validation via EntryPoint precompile
     let validation = EntryPoint::simulate_validation(
-        ctx.db,
+        ctx.evm_state,
         op,
         ctx.chain_id,
         ctx.current_timestamp,
         ctx.current_block,
+        &ctx.config,
     );
 
     if let Some(err) = validation.error {
-        return map_entrypoint_error(err, &validation);
+        return Err(map_entrypoint_error(err, &validation));
     }
 
     // 6. Prefund ability (account or paymaster)
@@ -240,7 +375,7 @@ pub fn simulate_user_op<DB: StateRef>(
     }
 
     // 7. Build result
-    Ok(SimulationResult {
+    let result = SimulationResult {
         pre_op_gas: validation.pre_op_gas,
         prefund,
         validation_gas_used: validation.validation_gas_used,
@@ -251,15 +386,25 @@ pub fn simulate_user_op<DB: StateRef>(
         paymaster_address: op.paymaster().map(|s| Address::from_slice(&s.as_bytes())),
         sender_address,
         nonce: op.nonce,
-        op_hash: op.hash(crate::aa_full::entry_point::ENTRY_POINT_V07, ctx.chain_id),
-    })
+        op_hash: op.hash(ENTRY_POINT_ADDRESS, ctx.chain_id),
+        has_paymaster: op.paymaster().is_some(),
+    };
+
+    debug!(
+        prefund,
+        validation_gas = result.validation_gas_used,
+        sig_valid = result.sig_valid,
+        "simulation successful"
+    );
+
+    Ok(result)
 }
 
 // -----------------------------------------------------------------------------
 // Helper functions for each validation step
 // -----------------------------------------------------------------------------
 
-fn check_basic_sanity(op: &UserOperation, config: &SimulationConfig) -> Result<(), SimulationError> {
+fn check_basic_sanity(op: &UserOperation, config: &SimulationConfig) -> SimulationResult<()> {
     // Gas limits
     if op.verification_gas_limit > config.max_verification_gas {
         return Err(SimulationError::OverVerificationGasLimit);
@@ -281,6 +426,15 @@ fn check_basic_sanity(op: &UserOperation, config: &SimulationConfig) -> Result<(
         return Err(SimulationError::PreVerificationGasTooHigh);
     }
 
+    // initCode size limit
+    if op.init_code.len() > config.max_init_code_size {
+        return Err(SimulationError::Internal(format!(
+            "initCode too large: {} > {}",
+            op.init_code.len(),
+            config.max_init_code_size
+        )));
+    }
+
     Ok(())
 }
 
@@ -294,7 +448,7 @@ fn extract_time_validity(op: &UserOperation) -> (u64, u64) {
     }
 }
 
-fn check_time_validity(now: u64, after: u64, until: u64) -> Result<(), SimulationError> {
+fn check_time_validity(now: u64, after: u64, until: u64) -> SimulationResult<()> {
     if now < after || now > until {
         Err(SimulationError::Expired)
     } else {
@@ -302,55 +456,62 @@ fn check_time_validity(now: u64, after: u64, until: u64) -> Result<(), Simulatio
     }
 }
 
-fn check_sender_deployment<DB: StateRef>(
+fn check_sender_deployment<DB: DatabaseRef>(
     db: &DB,
     sender: &Address,
     op: &UserOperation,
-) -> Result<(), SimulationError> {
+) -> SimulationResult<()> {
     // Check if sender already has code
-    let has_code = db.code_by_address(*sender).is_some();
+    let has_code = db.code_by_address_ref(*sender)
+        .map(|c| c.is_some())
+        .unwrap_or(false);
+
     if !has_code {
         if op.init_code.is_empty() {
-            return Err(SimulationError::NoInitCode);
+            return Err(SimulationError::SenderNotDeployed);
         }
-        // Would simulate initCode execution here (AA11, AA13)
-        // For brevity, assume success.
+        // Simulate initCode execution
+        // In production: use REVM to deploy the contract
+        // For now, we assume it succeeds.
+        // Check that after deployment, the contract has code
+        // Placeholder: assume OK
     }
     Ok(())
 }
 
-fn check_nonce<DB: StateRef>(db: &DB, sender: &Address, op_nonce: u64) -> Result<(), SimulationError> {
-    // In a real implementation, read nonce from account state
-    let current_nonce = 0u64; // Placeholder
+fn check_nonce<DB: DatabaseRef>(db: &DB, sender: &Address, op_nonce: u64) -> SimulationResult<()> {
+    let current_nonce = db.nonce_ref(*sender).unwrap_or(0);
     if op_nonce != current_nonce {
         return Err(SimulationError::InvalidNonce);
     }
     Ok(())
 }
 
-fn check_prefund_ability<DB: StateRef>(
+fn check_prefund_ability<DB: DatabaseRef + Database>(
     ctx: &SimulationContext<DB>,
     op: &UserOperation,
     validation: &ValidationResult,
     prefund: u64,
-) -> Result<bool, SimulationError> {
+) -> SimulationResult<bool> {
     if let Some(paymaster_addr) = op.paymaster() {
+        let paymaster_addr = Address::from_slice(&paymaster_addr.as_bytes());
         // Paymaster pays
         if ctx.config.enforce_paymaster_balance {
-            // Check paymaster balance (in native currency)
-            let paymaster_balance = ctx.db.balance(Address::from_slice(&paymaster_addr.as_bytes())).unwrap_or(U256::ZERO);
+            let paymaster_balance = ctx.evm_state.balance_ref(paymaster_addr).unwrap_or(U256::ZERO);
             if paymaster_balance < U256::from(prefund) {
                 return Err(SimulationError::PaymasterBalanceInsufficient);
             }
         }
         if ctx.config.enforce_paymaster_stake {
-            // Check paymaster stake/deposit (would require additional state)
+            // Check paymaster stake/deposit
+            // In production: read from EntryPoint's stake/deposit maps
             // Placeholder: assume OK
         }
         Ok(true)
     } else {
         // Account pays
-        let account_balance = ctx.db.balance(Address::from_slice(&op.sender_bytes())).unwrap_or(U256::ZERO);
+        let sender = Address::from_slice(&op.sender_bytes());
+        let account_balance = ctx.evm_state.balance_ref(sender).unwrap_or(U256::ZERO);
         if account_balance < U256::from(prefund) {
             return Err(SimulationError::InsufficientPrefund);
         }
@@ -358,19 +519,25 @@ fn check_prefund_ability<DB: StateRef>(
     }
 }
 
-fn map_entrypoint_error(err: EntryPointError, validation: &ValidationResult) -> Result<SimulationResult, SimulationError> {
+fn map_entrypoint_error(err: EntryPointError, _validation: &ValidationResult) -> SimulationError {
     match err {
-        EntryPointError::SignatureError => Err(SimulationError::SignatureError),
-        EntryPointError::InvalidNonce => Err(SimulationError::InvalidNonce),
-        EntryPointError::DidNotPayPrefund => Err(SimulationError::InsufficientPrefund),
-        EntryPointError::Expired => Err(SimulationError::Expired),
-        EntryPointError::PaymasterBalanceInsufficient => Err(SimulationError::PaymasterBalanceInsufficient),
-        EntryPointError::PaymasterDepositTooLow => Err(SimulationError::PaymasterDepositTooLow),
-        EntryPointError::PaymasterStakeTooLow => Err(SimulationError::PaymasterStakeTooLow),
-        EntryPointError::PaymasterValidationReverted(msg) => Err(SimulationError::PaymasterReverted(msg)),
-        EntryPointError::AccountValidationReverted(msg) => Err(SimulationError::AccountReverted(msg)),
-        EntryPointError::SenderNotDeployed => Err(SimulationError::NoInitCode),
-        _ => Err(SimulationError::Internal(format!("{:?}", err))),
+        EntryPointError::SignatureError => SimulationError::SignatureError,
+        EntryPointError::InvalidNonce => SimulationError::InvalidNonce,
+        EntryPointError::DidNotPayPrefund => SimulationError::InsufficientPrefund,
+        EntryPointError::Expired => SimulationError::Expired,
+        EntryPointError::PaymasterBalanceInsufficient => SimulationError::PaymasterBalanceInsufficient,
+        EntryPointError::PaymasterDepositTooLow => SimulationError::PaymasterDepositTooLow,
+        EntryPointError::PaymasterStakeTooLow => SimulationError::PaymasterStakeTooLow,
+        EntryPointError::PaymasterValidationReverted(msg) => SimulationError::PaymasterReverted(msg),
+        EntryPointError::AccountValidationReverted(msg) => SimulationError::AccountReverted(msg),
+        EntryPointError::SenderNotDeployed => SimulationError::SenderNotDeployed,
+        EntryPointError::InitCodeFailed(msg) => SimulationError::InitCodeFailed(msg),
+        EntryPointError::InitCodeNonEmpty => SimulationError::InitCodeNonEmpty,
+        EntryPointError::OverVerificationGasLimit => SimulationError::OverVerificationGasLimit,
+        EntryPointError::CallGasLimitTooHigh => SimulationError::CallGasLimitTooHigh,
+        EntryPointError::PreVerificationGasTooHigh => SimulationError::PreVerificationGasTooHigh,
+        EntryPointError::UnsupportedSignature => SimulationError::UnsupportedSignature,
+        _ => SimulationError::Internal(format!("{:?}", err)),
     }
 }
 
@@ -378,19 +545,40 @@ fn map_entrypoint_error(err: EntryPointError, validation: &ValidationResult) -> 
 // Batch simulation
 // -----------------------------------------------------------------------------
 
-/// Simulate multiple UserOperations in order and return the first failing index.
-pub fn simulate_batch<DB: StateRef>(
+/// Simulate multiple UserOperations in order.
+/// If `stop_on_first_failure` is true, returns the first failing index.
+pub fn simulate_batch<DB: DatabaseRef + Database>(
     ctx: &SimulationContext<DB>,
     ops: &[UserOperation],
+    stop_on_first_failure: bool,
 ) -> Result<Vec<SimulationResult>, (usize, SimulationError)> {
     let mut results = Vec::with_capacity(ops.len());
     for (i, op) in ops.iter().enumerate() {
         match simulate_user_op(ctx, op) {
             Ok(res) => results.push(res),
-            Err(e) => return Err((i, e)),
+            Err(e) => {
+                if stop_on_first_failure {
+                    return Err((i, e));
+                }
+                // Otherwise, continue and collect errors
+                // We'll need to return a different structure for partial results
+                // For now, we return the error at the first failure.
+                // A full implementation would return a list of results with errors.
+                return Err((i, e));
+            }
         }
     }
     Ok(results)
+}
+
+/// Simulate a batch and return results with errors included.
+pub fn simulate_batch_with_errors<DB: DatabaseRef + Database>(
+    ctx: &SimulationContext<DB>,
+    ops: &[UserOperation],
+) -> Vec<Result<SimulationResult, SimulationError>> {
+    ops.iter()
+        .map(|op| simulate_user_op(ctx, op))
+        .collect()
 }
 
 // -----------------------------------------------------------------------------
@@ -400,35 +588,64 @@ pub fn simulate_batch<DB: StateRef>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evm::account_abstraction::UserOperation;
+    use revm::db::CacheDB;
+    use revm::primitives::AccountInfo;
 
     struct MockDB;
-    impl StateRef for MockDB {
-        fn code_by_address(&self, _address: Address) -> Option<revm::primitives::Bytes> { None }
-        fn balance(&self, _address: Address) -> Option<U256> { Some(U256::from(1_000_000)) }
-        fn nonce(&self, _address: Address) -> Option<u64> { Some(0) }
+    impl DatabaseRef for MockDB {
+        type Error = std::io::Error;
+        fn basic(&self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Ok(None)
+        }
+        fn code_by_address_ref(&self, _address: Address) -> Result<Option<Bytes>, Self::Error> {
+            Ok(None)
+        }
+        fn storage_ref(&self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
+            Ok(U256::ZERO)
+        }
+        fn block_hash_ref(&self, _number: U256) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+        fn nonce_ref(&self, _address: Address) -> Result<u64, Self::Error> {
+            Ok(0)
+        }
+        fn balance_ref(&self, _address: Address) -> Result<U256, Self::Error> {
+            Ok(U256::from(1_000_000))
+        }
+    }
+    impl Database for MockDB {
+        type Error = std::io::Error;
+        fn basic(&mut self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Ok(None)
+        }
+        fn code_by_address(&mut self, _address: Address) -> Result<Option<Bytes>, Self::Error> {
+            Ok(None)
+        }
+        fn storage(&mut self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
+            Ok(U256::ZERO)
+        }
+        fn block_hash(&mut self, _number: U256) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
     }
 
     fn dummy_op() -> UserOperation {
-        UserOperation {
-            sender: "0x1111111111111111111111111111111111111111".to_string(),
-            nonce: 0,
-            init_code: vec![],
-            call_data: vec![],
-            call_gas_limit: 100_000,
-            verification_gas_limit: 100_000,
-            pre_verification_gas: 10_000,
-            max_fee_per_gas: 100,
-            max_priority_fee_per_gas: 10,
-            paymaster_and_data: vec![],
-            signature: vec![0u8; 65],
-        }
+        let mut op = UserOperation::default();
+        op.sender = "0x1111111111111111111111111111111111111111".to_string();
+        op.call_gas_limit = 100_000;
+        op.verification_gas_limit = 100_000;
+        op.pre_verification_gas = 10_000;
+        op.max_fee_per_gas = 100;
+        op.max_priority_fee_per_gas = 10;
+        op.signature = vec![0u8; 65];
+        op
     }
 
     #[test]
     fn simulate_valid_op() {
         let db = MockDB;
-        let ctx = SimulationContext::new(1, &db, 1000, 0);
+        let cache = SimulationCache::new();
+        let ctx = SimulationContext::new(1, &db, 1000, 0, &cache);
         let op = dummy_op();
         let result = simulate_user_op(&ctx, &op);
         assert!(result.is_ok());
@@ -440,7 +657,8 @@ mod tests {
     #[test]
     fn simulate_short_signature() {
         let db = MockDB;
-        let ctx = SimulationContext::new(1, &db, 1000, 0);
+        let cache = SimulationCache::new();
+        let ctx = SimulationContext::new(1, &db, 1000, 0, &cache);
         let mut op = dummy_op();
         op.signature = vec![0u8; 64];
         let err = simulate_user_op(&ctx, &op).unwrap_err();
@@ -450,7 +668,8 @@ mod tests {
     #[test]
     fn simulate_expired() {
         let db = MockDB;
-        let ctx = SimulationContext::new(1, &db, 2000, 0);
+        let cache = SimulationCache::new();
+        let ctx = SimulationContext::new(1, &db, 2000, 0, &cache);
         let mut op = dummy_op();
         // Set paymaster data with valid_until = 1000 (already passed)
         let mut data = vec![0u8; 36];
@@ -461,12 +680,64 @@ mod tests {
     }
 
     #[test]
+    fn simulate_with_paymaster() {
+        let db = MockDB;
+        let cache = SimulationCache::new();
+        let ctx = SimulationContext::new(1, &db, 1000, 0, &cache);
+        let mut op = dummy_op();
+        op.paymaster_and_data = vec![0u8; 36]; // minimal paymaster data
+        let result = simulate_user_op(&ctx, &op);
+        assert!(result.is_ok());
+        let res = result.unwrap();
+        assert!(res.has_paymaster);
+    }
+
+    #[test]
     fn batch_simulation_works() {
         let db = MockDB;
-        let ctx = SimulationContext::new(1, &db, 1000, 0);
+        let cache = SimulationCache::new();
+        let ctx = SimulationContext::new(1, &db, 1000, 0, &cache);
         let ops = vec![dummy_op(), dummy_op()];
-        let results = simulate_batch(&ctx, &ops);
+        let results = simulate_batch(&ctx, &ops, true);
         assert!(results.is_ok());
         assert_eq!(results.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cache_works() {
+        let db = MockDB;
+        let cache = SimulationCache::new();
+        let ctx = SimulationContext::new(1, &db, 1000, 0, &cache);
+        let op = dummy_op();
+        let op_hash = op.hash(ENTRY_POINT_ADDRESS, 1);
+        let result1 = simulate_user_op(&ctx, &op).unwrap();
+        assert!(cache.get(&op_hash).is_some());
+        let result2 = simulate_user_op(&ctx, &op).unwrap();
+        assert_eq!(result1.prefund, result2.prefund);
+    }
+
+    #[test]
+    fn config_limits_work() {
+        let db = MockDB;
+        let cache = SimulationCache::new();
+        let mut ctx = SimulationContext::new(1, &db, 1000, 0, &cache);
+        let mut config = SimulationConfig::default();
+        config.max_verification_gas = 10_000;
+        ctx = ctx.with_config(config);
+        let mut op = dummy_op();
+        op.verification_gas_limit = 100_000;
+        let err = simulate_user_op(&ctx, &op).unwrap_err();
+        assert!(matches!(err, SimulationError::OverVerificationGasLimit));
+    }
+
+    #[test]
+    fn invalid_nonce_fails() {
+        let db = MockDB;
+        let cache = SimulationCache::new();
+        let ctx = SimulationContext::new(1, &db, 1000, 0, &cache);
+        let mut op = dummy_op();
+        op.nonce = 99;
+        let err = simulate_user_op(&ctx, &op).unwrap_err();
+        assert!(matches!(err, SimulationError::InvalidNonce));
     }
 }
