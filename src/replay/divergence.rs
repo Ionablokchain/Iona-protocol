@@ -13,10 +13,21 @@
 //! | Library version     | Updated crypto lib with different output    |
 //! | Nondeterminism      | HashMap iteration order, timestamps         |
 //! | Bug                 | Off-by-one in gas calculation               |
+//!
+//! # Serialisation
+//!
+//! Snapshots and divergence reports can be serialised to JSON or bincode
+//! for storage, sharing, and later analysis.
 
 use crate::types::{Hash32, Height};
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
+use std::fmt;
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
+use std::path::Path;
 use thiserror::Error;
+use tracing::{debug, info, warn};
 
 // -----------------------------------------------------------------------------
 // Errors
@@ -31,6 +42,14 @@ pub enum ReplayError {
     MissingSnapshot(String, Height),
     #[error("inconsistent snapshot data: {0}")]
     InconsistentData(String),
+    #[error("I/O error: {0}")]
+    Io(String),
+    #[error("serialisation error: {0}")]
+    Serialisation(String),
+    #[error("invalid snapshot format: {0}")]
+    InvalidFormat(String),
+    #[error("divergence already detected: {0}")]
+    AlreadyDiverged(String),
 }
 
 pub type ReplayResult<T> = Result<T, ReplayError>;
@@ -40,7 +59,7 @@ pub type ReplayResult<T> = Result<T, ReplayError>;
 // -----------------------------------------------------------------------------
 
 /// A snapshot of a node's state at a given height.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeSnapshot {
     /// Identifier for this node/environment (e.g. "node-1-linux-x86").
     pub node_id: String,
@@ -54,10 +73,22 @@ pub struct NodeSnapshot {
     pub nonces: Option<BTreeMap<String, u64>>,
     /// Optional: KV store snapshot.
     pub kv: Option<BTreeMap<String, String>>,
+    /// Optional: account code hashes (for smart contract divergence).
+    pub code_hashes: Option<BTreeMap<String, Hash32>>,
+    /// Optional: storage entries (by account and slot).
+    pub storage: Option<BTreeMap<(String, String), String>>,
+    /// Optional: recent transaction receipts (for execution divergence).
+    pub receipts: Option<Vec<String>>,
+    /// Optional: recent logs.
+    pub logs: Option<Vec<String>>,
+    /// Optional: timestamp when snapshot was taken.
+    pub snapshot_time: Option<u64>,
+    /// Optional: node version.
+    pub node_version: Option<String>,
 }
 
 /// A detected divergence between two nodes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Divergence {
     /// Height where divergence was first detected.
     pub height: Height,
@@ -71,10 +102,12 @@ pub struct Divergence {
     pub root_b: Hash32,
     /// Detailed differences (if snapshots include account data).
     pub details: Vec<DivergenceDetail>,
+    /// Optional: timestamp when divergence was detected.
+    pub detection_time: Option<u64>,
 }
 
 /// A specific difference between two node states.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DivergenceDetail {
     /// Balance differs for an account.
     BalanceDiff {
@@ -95,11 +128,39 @@ pub enum DivergenceDetail {
         value_b: Option<String>,
     },
     /// Account exists in one snapshot but not the other.
-    AccountMissing { account: String, present_in: String },
+    AccountMissing {
+        account: String,
+        present_in: String,
+    },
+    /// Code hash differs for an account.
+    CodeHashDiff {
+        account: String,
+        hash_a: Option<Hash32>,
+        hash_b: Option<Hash32>,
+    },
+    /// Storage value differs for an account+slot.
+    StorageDiff {
+        account: String,
+        slot: String,
+        value_a: Option<String>,
+        value_b: Option<String>,
+    },
+    /// Receipt differs (by index or hash).
+    ReceiptDiff {
+        index: usize,
+        receipt_a: String,
+        receipt_b: String,
+    },
+    /// Log differs.
+    LogDiff {
+        index: usize,
+        log_a: String,
+        log_b: String,
+    },
 }
 
-impl std::fmt::Display for DivergenceDetail {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for DivergenceDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BalanceDiff {
                 account,
@@ -120,12 +181,42 @@ impl std::fmt::Display for DivergenceDetail {
                 account,
                 present_in,
             } => write!(f, "account {account} only in {present_in}"),
+            Self::CodeHashDiff {
+                account,
+                hash_a,
+                hash_b,
+            } => write!(
+                f,
+                "code_hash({account}): {:?} vs {:?}",
+                hash_a.as_ref().map(|h| hex::encode(&h.0[..4])),
+                hash_b.as_ref().map(|h| hex::encode(&h.0[..4]))
+            ),
+            Self::StorageDiff {
+                account,
+                slot,
+                value_a,
+                value_b,
+            } => write!(
+                f,
+                "storage({account}, {slot}): {:?} vs {:?}",
+                value_a, value_b
+            ),
+            Self::ReceiptDiff {
+                index,
+                receipt_a,
+                receipt_b,
+            } => write!(f, "receipt[{index}]: {receipt_a} vs {receipt_b}"),
+            Self::LogDiff {
+                index,
+                log_a,
+                log_b,
+            } => write!(f, "log[{index}]: {log_a} vs {log_b}"),
         }
     }
 }
 
 /// Result of comparing two or more node snapshots.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DivergenceReport {
     /// All detected divergences.
     pub divergences: Vec<Divergence>,
@@ -135,10 +226,12 @@ pub struct DivergenceReport {
     pub node_count: usize,
     /// Heights checked.
     pub heights_checked: Vec<Height>,
+    /// Optional: time when report was generated.
+    pub report_time: Option<u64>,
 }
 
-impl std::fmt::Display for DivergenceReport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for DivergenceReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
             "Divergence Report: {}",
@@ -186,76 +279,27 @@ pub fn compare_snapshots(a: &NodeSnapshot, b: &NodeSnapshot) -> ReplayResult<Opt
     }
 
     if a.state_root == b.state_root {
-        return Ok(None);
+        // Quick path: if roots match, we can still check deeper (e.g., balances might differ
+        // but root could match due to same trie? In practice, if root matches, all state
+        // should match in a deterministic system, but we still allow deeper checks).
+        // We'll still check if there are any differences in optional data.
+        if snapshots_fully_equal(a, b) {
+            return Ok(None);
+        }
+        // Root matches but optional data differs – this is a consistency issue.
+        // We'll still report as divergence.
     }
 
     let mut details = Vec::new();
 
     // Compare balances if both are present.
-    match (&a.balances, &b.balances) {
-        (Some(bal_a), Some(bal_b)) => {
-            compare_btree_u64(bal_a, bal_b, &a.node_id, &b.node_id, &mut details, true);
-        }
-        (Some(_), None) => {
-            details.push(DivergenceDetail::KvDiff {
-                key: "balances".to_string(),
-                value_a: Some("present".to_string()),
-                value_b: None,
-            });
-        }
-        (None, Some(_)) => {
-            details.push(DivergenceDetail::KvDiff {
-                key: "balances".to_string(),
-                value_a: None,
-                value_b: Some("present".to_string()),
-            });
-        }
-        (None, None) => {}
-    }
-
-    // Compare nonces if both are present.
-    match (&a.nonces, &b.nonces) {
-        (Some(non_a), Some(non_b)) => {
-            compare_btree_u64(non_a, non_b, &a.node_id, &b.node_id, &mut details, false);
-        }
-        (Some(_), None) => {
-            details.push(DivergenceDetail::KvDiff {
-                key: "nonces".to_string(),
-                value_a: Some("present".to_string()),
-                value_b: None,
-            });
-        }
-        (None, Some(_)) => {
-            details.push(DivergenceDetail::KvDiff {
-                key: "nonces".to_string(),
-                value_a: None,
-                value_b: Some("present".to_string()),
-            });
-        }
-        (None, None) => {}
-    }
-
-    // Compare KV if both are present.
-    match (&a.kv, &b.kv) {
-        (Some(kv_a), Some(kv_b)) => {
-            compare_btree_str(kv_a, kv_b, &mut details);
-        }
-        (Some(_), None) => {
-            details.push(DivergenceDetail::KvDiff {
-                key: "kv".to_string(),
-                value_a: Some("present".to_string()),
-                value_b: None,
-            });
-        }
-        (None, Some(_)) => {
-            details.push(DivergenceDetail::KvDiff {
-                key: "kv".to_string(),
-                value_a: None,
-                value_b: Some("present".to_string()),
-            });
-        }
-        (None, None) => {}
-    }
+    compare_balances(a, b, &mut details);
+    compare_nonces(a, b, &mut details);
+    compare_kv(a, b, &mut details);
+    compare_code_hashes(a, b, &mut details);
+    compare_storage(a, b, &mut details);
+    compare_receipts(a, b, &mut details);
+    compare_logs(a, b, &mut details);
 
     Ok(Some(Divergence {
         height: a.height,
@@ -264,10 +308,258 @@ pub fn compare_snapshots(a: &NodeSnapshot, b: &NodeSnapshot) -> ReplayResult<Opt
         root_a: a.state_root,
         root_b: b.state_root,
         details,
+        detection_time: None,
     }))
 }
 
-/// Compare two maps of `String -> u64` and push differences.
+/// Helper: check if two snapshots are fully equal (all optional fields match).
+fn snapshots_fully_equal(a: &NodeSnapshot, b: &NodeSnapshot) -> bool {
+    if a.node_id != b.node_id || a.height != b.height || a.state_root != b.state_root {
+        return false;
+    }
+    if a.balances != b.balances
+        || a.nonces != b.nonces
+        || a.kv != b.kv
+        || a.code_hashes != b.code_hashes
+        || a.storage != b.storage
+        || a.receipts != b.receipts
+        || a.logs != b.logs
+        || a.node_version != b.node_version
+    {
+        return false;
+    }
+    true
+}
+
+fn compare_balances(a: &NodeSnapshot, b: &NodeSnapshot, details: &mut Vec<DivergenceDetail>) {
+    match (&a.balances, &b.balances) {
+        (Some(bal_a), Some(bal_b)) => {
+            compare_btree_u64(bal_a, bal_b, &a.node_id, &b.node_id, details, true);
+        }
+        (Some(_), None) => {
+            // One has balances, the other doesn't – we can't produce per‑account diffs.
+            // We'll add a marker.
+            details.push(DivergenceDetail::KvDiff {
+                key: "balances".to_string(),
+                value_a: Some("present".to_string()),
+                value_b: None,
+            });
+        }
+        (None, Some(_)) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "balances".to_string(),
+                value_a: None,
+                value_b: Some("present".to_string()),
+            });
+        }
+        (None, None) => {}
+    }
+}
+
+fn compare_nonces(a: &NodeSnapshot, b: &NodeSnapshot, details: &mut Vec<DivergenceDetail>) {
+    match (&a.nonces, &b.nonces) {
+        (Some(non_a), Some(non_b)) => {
+            compare_btree_u64(non_a, non_b, &a.node_id, &b.node_id, details, false);
+        }
+        (Some(_), None) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "nonces".to_string(),
+                value_a: Some("present".to_string()),
+                value_b: None,
+            });
+        }
+        (None, Some(_)) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "nonces".to_string(),
+                value_a: None,
+                value_b: Some("present".to_string()),
+            });
+        }
+        (None, None) => {}
+    }
+}
+
+fn compare_kv(a: &NodeSnapshot, b: &NodeSnapshot, details: &mut Vec<DivergenceDetail>) {
+    match (&a.kv, &b.kv) {
+        (Some(kv_a), Some(kv_b)) => {
+            compare_btree_str(kv_a, kv_b, details);
+        }
+        (Some(_), None) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "kv".to_string(),
+                value_a: Some("present".to_string()),
+                value_b: None,
+            });
+        }
+        (None, Some(_)) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "kv".to_string(),
+                value_a: None,
+                value_b: Some("present".to_string()),
+            });
+        }
+        (None, None) => {}
+    }
+}
+
+fn compare_code_hashes(a: &NodeSnapshot, b: &NodeSnapshot, details: &mut Vec<DivergenceDetail>) {
+    match (&a.code_hashes, &b.code_hashes) {
+        (Some(hash_a), Some(hash_b)) => {
+            let all_accounts: HashSet<String> =
+                hash_a.keys().chain(hash_b.keys()).cloned().collect();
+            for account in all_accounts {
+                let val_a = hash_a.get(&account);
+                let val_b = hash_b.get(&account);
+                if val_a != val_b {
+                    details.push(DivergenceDetail::CodeHashDiff {
+                        account,
+                        hash_a: val_a.cloned(),
+                        hash_b: val_b.cloned(),
+                    });
+                }
+            }
+        }
+        (Some(_), None) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "code_hashes".to_string(),
+                value_a: Some("present".to_string()),
+                value_b: None,
+            });
+        }
+        (None, Some(_)) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "code_hashes".to_string(),
+                value_a: None,
+                value_b: Some("present".to_string()),
+            });
+        }
+        (None, None) => {}
+    }
+}
+
+fn compare_storage(a: &NodeSnapshot, b: &NodeSnapshot, details: &mut Vec<DivergenceDetail>) {
+    match (&a.storage, &b.storage) {
+        (Some(st_a), Some(st_b)) => {
+            let all_keys: HashSet<(String, String)> =
+                st_a.keys().chain(st_b.keys()).cloned().collect();
+            for key in all_keys {
+                let val_a = st_a.get(&key);
+                let val_b = st_b.get(&key);
+                if val_a != val_b {
+                    let (account, slot) = key;
+                    details.push(DivergenceDetail::StorageDiff {
+                        account,
+                        slot,
+                        value_a: val_a.cloned(),
+                        value_b: val_b.cloned(),
+                    });
+                }
+            }
+        }
+        (Some(_), None) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "storage".to_string(),
+                value_a: Some("present".to_string()),
+                value_b: None,
+            });
+        }
+        (None, Some(_)) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "storage".to_string(),
+                value_a: None,
+                value_b: Some("present".to_string()),
+            });
+        }
+        (None, None) => {}
+    }
+}
+
+fn compare_receipts(a: &NodeSnapshot, b: &NodeSnapshot, details: &mut Vec<DivergenceDetail>) {
+    match (&a.receipts, &b.receipts) {
+        (Some(rec_a), Some(rec_b)) => {
+            let max_len = rec_a.len().max(rec_b.len());
+            for i in 0..max_len {
+                let r_a = rec_a.get(i);
+                let r_b = rec_b.get(i);
+                if r_a != r_b {
+                    let idx = i;
+                    let (a_str, b_str) = match (r_a, r_b) {
+                        (Some(a), Some(b)) => (a.clone(), b.clone()),
+                        (Some(a), None) => (a.clone(), "[missing]".into()),
+                        (None, Some(b)) => ("[missing]".into(), b.clone()),
+                        (None, None) => continue,
+                    };
+                    details.push(DivergenceDetail::ReceiptDiff {
+                        index: idx,
+                        receipt_a: a_str,
+                        receipt_b: b_str,
+                    });
+                }
+            }
+        }
+        (Some(_), None) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "receipts".to_string(),
+                value_a: Some("present".to_string()),
+                value_b: None,
+            });
+        }
+        (None, Some(_)) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "receipts".to_string(),
+                value_a: None,
+                value_b: Some("present".to_string()),
+            });
+        }
+        (None, None) => {}
+    }
+}
+
+fn compare_logs(a: &NodeSnapshot, b: &NodeSnapshot, details: &mut Vec<DivergenceDetail>) {
+    match (&a.logs, &b.logs) {
+        (Some(log_a), Some(log_b)) => {
+            let max_len = log_a.len().max(log_b.len());
+            for i in 0..max_len {
+                let l_a = log_a.get(i);
+                let l_b = log_b.get(i);
+                if l_a != l_b {
+                    let idx = i;
+                    let (a_str, b_str) = match (l_a, l_b) {
+                        (Some(a), Some(b)) => (a.clone(), b.clone()),
+                        (Some(a), None) => (a.clone(), "[missing]".into()),
+                        (None, Some(b)) => ("[missing]".into(), b.clone()),
+                        (None, None) => continue,
+                    };
+                    details.push(DivergenceDetail::LogDiff {
+                        index: idx,
+                        log_a: a_str,
+                        log_b: b_str,
+                    });
+                }
+            }
+        }
+        (Some(_), None) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "logs".to_string(),
+                value_a: Some("present".to_string()),
+                value_b: None,
+            });
+        }
+        (None, Some(_)) => {
+            details.push(DivergenceDetail::KvDiff {
+                key: "logs".to_string(),
+                value_a: None,
+                value_b: Some("present".to_string()),
+            });
+        }
+        (None, None) => {}
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Internal comparison helpers
+// -----------------------------------------------------------------------------
+
 fn compare_btree_u64(
     a: &BTreeMap<String, u64>,
     b: &BTreeMap<String, u64>,
@@ -276,81 +568,65 @@ fn compare_btree_u64(
     details: &mut Vec<DivergenceDetail>,
     is_balance: bool,
 ) {
-    // Keys only in A
-    for key in a.keys() {
-        if !b.contains_key(key) {
-            details.push(DivergenceDetail::AccountMissing {
-                account: key.clone(),
-                present_in: node_a_id.to_string(),
-            });
-        }
-    }
-    // Keys only in B
-    for key in b.keys() {
-        if !a.contains_key(key) {
-            details.push(DivergenceDetail::AccountMissing {
-                account: key.clone(),
-                present_in: node_b_id.to_string(),
-            });
-        }
-    }
-    // Keys in both with different values
-    for (key, &val_a) in a {
-        if let Some(&val_b) = b.get(key) {
-            if val_a != val_b {
+    let all_keys: HashSet<String> = a.keys().chain(b.keys()).cloned().collect();
+    for key in all_keys {
+        let val_a = a.get(&key);
+        let val_b = b.get(&key);
+        match (val_a, val_b) {
+            (Some(&v_a), Some(&v_b)) if v_a != v_b => {
                 if is_balance {
                     details.push(DivergenceDetail::BalanceDiff {
                         account: key.clone(),
-                        value_a: val_a,
-                        value_b: val_b,
+                        value_a: v_a,
+                        value_b: v_b,
                     });
                 } else {
                     details.push(DivergenceDetail::NonceDiff {
                         account: key.clone(),
-                        value_a: val_a,
-                        value_b: val_b,
+                        value_a: v_a,
+                        value_b: v_b,
                     });
                 }
             }
-        }
-    }
-}
-
-/// Compare two maps of `String -> String` and push differences.
-fn compare_btree_str(
-    a: &BTreeMap<String, String>,
-    b: &BTreeMap<String, String>,
-    details: &mut Vec<DivergenceDetail>,
-) {
-    for (key, val_a) in a {
-        match b.get(key) {
-            Some(val_b) if val_a != val_b => {
-                details.push(DivergenceDetail::KvDiff {
-                    key: key.clone(),
-                    value_a: Some(val_a.clone()),
-                    value_b: Some(val_b.clone()),
+            (Some(_), None) => {
+                details.push(DivergenceDetail::AccountMissing {
+                    account: key.clone(),
+                    present_in: node_a_id.to_string(),
                 });
             }
-            None => {
-                details.push(DivergenceDetail::KvDiff {
-                    key: key.clone(),
-                    value_a: Some(val_a.clone()),
-                    value_b: None,
+            (None, Some(_)) => {
+                details.push(DivergenceDetail::AccountMissing {
+                    account: key.clone(),
+                    present_in: node_b_id.to_string(),
                 });
             }
             _ => {}
         }
     }
-    for (key, val_b) in b {
-        if !a.contains_key(key) {
+}
+
+fn compare_btree_str(
+    a: &BTreeMap<String, String>,
+    b: &BTreeMap<String, String>,
+    details: &mut Vec<DivergenceDetail>,
+) {
+    let all_keys: HashSet<String> = a.keys().chain(b.keys()).cloned().collect();
+    for key in all_keys {
+        let val_a = a.get(&key);
+        let val_b = b.get(&key);
+        if val_a != val_b {
             details.push(DivergenceDetail::KvDiff {
                 key: key.clone(),
-                value_a: None,
-                value_b: Some(val_b.clone()),
+                value_a: val_a.cloned(),
+                value_b: val_b.cloned(),
             });
         }
     }
 }
+
+// -----------------------------------------------------------------------------
+// Multi‑node comparison
+// -----------------------------------------------------------------------------
 
 /// Compare multiple node snapshots at the same height.
 ///
@@ -363,10 +639,10 @@ pub fn detect_divergence(snapshots: &[NodeSnapshot]) -> ReplayResult<DivergenceR
             all_agree: true,
             node_count: 0,
             heights_checked: vec![],
+            report_time: None,
         });
     }
 
-    // Ensure all snapshots have the same height.
     let first_height = snapshots[0].height;
     for s in snapshots {
         if s.height != first_height {
@@ -389,6 +665,7 @@ pub fn detect_divergence(snapshots: &[NodeSnapshot]) -> ReplayResult<DivergenceR
         all_agree,
         node_count: snapshots.len(),
         heights_checked: vec![first_height],
+        report_time: None,
     })
 }
 
@@ -403,7 +680,6 @@ pub fn detect_divergence_range(
     let mut all_divergences = Vec::new();
     let mut heights_checked = Vec::new();
 
-    // Collect all unique heights across all nodes.
     let mut all_heights = std::collections::BTreeSet::new();
     for snapshots in node_snapshots.values() {
         for s in snapshots {
@@ -414,7 +690,6 @@ pub fn detect_divergence_range(
     for &height in &all_heights {
         heights_checked.push(height);
 
-        // Gather snapshots at this height from all nodes.
         let mut at_height = Vec::new();
         for (node_id, snapshots) in node_snapshots {
             match snapshots.iter().find(|s| s.height == height) {
@@ -425,7 +700,6 @@ pub fn detect_divergence_range(
             }
         }
 
-        // Compare pairwise within this height.
         for i in 0..at_height.len() {
             for j in (i + 1)..at_height.len() {
                 if let Some(div) = compare_snapshots(at_height[i], at_height[j])? {
@@ -441,7 +715,48 @@ pub fn detect_divergence_range(
         all_agree,
         node_count: node_snapshots.len(),
         heights_checked,
+        report_time: None,
     })
+}
+
+// -----------------------------------------------------------------------------
+// File I/O helpers
+// -----------------------------------------------------------------------------
+
+/// Save a snapshot to a file (JSON format).
+pub fn save_snapshot_to_file(snapshot: &NodeSnapshot, path: &Path) -> ReplayResult<()> {
+    let file = File::create(path).map_err(|e| ReplayError::Io(e.to_string()))?;
+    let writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(writer, snapshot)
+        .map_err(|e| ReplayError::Serialisation(e.to_string()))?;
+    Ok(())
+}
+
+/// Load a snapshot from a JSON file.
+pub fn load_snapshot_from_file(path: &Path) -> ReplayResult<NodeSnapshot> {
+    let file = File::open(path).map_err(|e| ReplayError::Io(e.to_string()))?;
+    let reader = BufReader::new(file);
+    let snapshot: NodeSnapshot = serde_json::from_reader(reader)
+        .map_err(|e| ReplayError::Serialisation(e.to_string()))?;
+    Ok(snapshot)
+}
+
+/// Save a divergence report to a file (JSON format).
+pub fn save_report_to_file(report: &DivergenceReport, path: &Path) -> ReplayResult<()> {
+    let file = File::create(path).map_err(|e| ReplayError::Io(e.to_string()))?;
+    let writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(writer, report)
+        .map_err(|e| ReplayError::Serialisation(e.to_string()))?;
+    Ok(())
+}
+
+/// Load a divergence report from a JSON file.
+pub fn load_report_from_file(path: &Path) -> ReplayResult<DivergenceReport> {
+    let file = File::open(path).map_err(|e| ReplayError::Io(e.to_string()))?;
+    let reader = BufReader::new(file);
+    let report: DivergenceReport = serde_json::from_reader(reader)
+        .map_err(|e| ReplayError::Serialisation(e.to_string()))?;
+    Ok(report)
 }
 
 // -----------------------------------------------------------------------------
@@ -460,6 +775,12 @@ mod tests {
             balances: None,
             nonces: None,
             kv: None,
+            code_hashes: None,
+            storage: None,
+            receipts: None,
+            logs: None,
+            snapshot_time: None,
+            node_version: None,
         }
     }
 
@@ -476,6 +797,12 @@ mod tests {
             balances: Some(balances),
             nonces: None,
             kv: None,
+            code_hashes: None,
+            storage: None,
+            receipts: None,
+            logs: None,
+            snapshot_time: None,
+            node_version: None,
         }
     }
 
@@ -515,7 +842,7 @@ mod tests {
         bal_a.insert("bob".into(), 500u64);
 
         let mut bal_b = BTreeMap::new();
-        bal_b.insert("alice".into(), 999u64); // Different!
+        bal_b.insert("alice".into(), 999u64);
         bal_b.insert("bob".into(), 500u64);
 
         let snapshots = vec![
@@ -541,7 +868,6 @@ mod tests {
 
         let mut bal_b = BTreeMap::new();
         bal_b.insert("alice".into(), 1000u64);
-        // charlie missing
 
         let snapshots = vec![
             snap_with_balances("node-1", 100, [1u8; 32], bal_a),
@@ -615,7 +941,7 @@ mod tests {
             "node-1".into(),
             vec![snap("node-1", 1, [1u8; 32]), snap("node-1", 2, [2u8; 32])],
         );
-        node_snaps.insert("node-2".into(), vec![snap("node-2", 1, [1u8; 32])]); // missing height 2
+        node_snaps.insert("node-2".into(), vec![snap("node-2", 1, [1u8; 32])]);
 
         let result = detect_divergence_range(&node_snaps);
         assert!(matches!(
@@ -640,6 +966,12 @@ mod tests {
             balances: None,
             nonces: None,
             kv: Some(kv_a),
+            code_hashes: None,
+            storage: None,
+            receipts: None,
+            logs: None,
+            snapshot_time: None,
+            node_version: None,
         };
         let b = NodeSnapshot {
             node_id: "node-2".into(),
@@ -648,6 +980,12 @@ mod tests {
             balances: None,
             nonces: None,
             kv: Some(kv_b),
+            code_hashes: None,
+            storage: None,
+            receipts: None,
+            logs: None,
+            snapshot_time: None,
+            node_version: None,
         };
 
         let div = compare_snapshots(&a, &b)?.expect("should have divergence");
@@ -667,5 +1005,50 @@ mod tests {
         let s = format!("{d}");
         assert!(s.contains("balance(alice)"));
         assert!(s.contains("100 vs 200"));
+    }
+
+    #[test]
+    fn test_code_hash_divergence() -> ReplayResult<()> {
+        let mut hash_a = BTreeMap::new();
+        hash_a.insert("0x123".into(), Hash32([1u8; 32]));
+
+        let mut hash_b = BTreeMap::new();
+        hash_b.insert("0x123".into(), Hash32([2u8; 32]));
+
+        let a = NodeSnapshot {
+            node_id: "node-1".into(),
+            height: 10,
+            state_root: Hash32([1u8; 32]),
+            balances: None,
+            nonces: None,
+            kv: None,
+            code_hashes: Some(hash_a),
+            storage: None,
+            receipts: None,
+            logs: None,
+            snapshot_time: None,
+            node_version: None,
+        };
+        let b = NodeSnapshot {
+            node_id: "node-2".into(),
+            height: 10,
+            state_root: Hash32([2u8; 32]),
+            balances: None,
+            nonces: None,
+            kv: None,
+            code_hashes: Some(hash_b),
+            storage: None,
+            receipts: None,
+            logs: None,
+            snapshot_time: None,
+            node_version: None,
+        };
+
+        let div = compare_snapshots(&a, &b)?.expect("should have divergence");
+        assert!(div.details.iter().any(|d| matches!(d,
+            DivergenceDetail::CodeHashDiff { account, .. }
+            if account == "0x123"
+        )));
+        Ok(())
     }
 }
