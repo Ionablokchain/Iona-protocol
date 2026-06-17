@@ -4,163 +4,109 @@ info:
   description: |
     Complete API documentation for the IONA blockchain node.
     
-    The node exposes two main interfaces:
-    - **JSON-RPC** (Ethereum-compatible): Standard `eth_*` methods via `POST /rpc`
-    - **REST endpoints**: Health, status, metrics, VM operations
+    The node exposes:
+    - **JSON‑RPC** (Ethereum‑compatible) at `POST /rpc`
+    - **REST APIs** for node management, administration, and auxiliary services
+    - **WebSocket** for real‑time subscriptions (via `ws://` or `wss://`)
+    
+    ## Security
+    - Public endpoints (`/health`, `/status`, `/metrics`) are unauthenticated.
+    - Admin endpoints (`/admin/*`) require mTLS (client certificate) and RBAC.
+    - Some endpoints (`/faucet`) may be rate‑limited.
     
     ## Rate Limiting
-    Built-in rate limiting applies to P2P connections. RPC rate limiting should be
-    configured via a reverse proxy (nginx/caddy).
+    RPC rate limiting should be configured via a reverse proxy. The node itself applies peer‑level rate limits for P2P.
     
-    ## Error Codes
-    Standard JSON-RPC error codes are used:
-    - `-32700`: Parse error
-    - `-32600`: Invalid request
-    - `-32601`: Method not found
-    - `-32602`: Invalid params
-    - `-32000` to `-32099`: Server errors (e.g., execution reverted)
-  version: 27.0.0
+    ## Error Responses
+    All non‑JSON‑RPC errors follow the Problem Details format (RFC 7807).
+  version: 28.0.0
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT
 
 servers:
   - url: http://127.0.0.1:8080
-    description: Local node (default)
+    description: Local development node
   - url: https://your-node.example.com
-    description: Remote node (example)
+    description: Production node (use TLS)
 
 tags:
   - name: JSON-RPC
-    description: Ethereum-compatible JSON-RPC methods
+    description: Ethereum‑compatible JSON‑RPC methods
   - name: Node
-    description: Node status and health endpoints
+    description: Node status, health, and network information
+  - name: Admin
+    description: Administrative operations (mTLS required)
+  - name: Staking
+    description: Proof‑of‑stake operations
+  - name: Governance
+    description: On‑chain governance proposals and voting
+  - name: Mempool
+    description: Pending transaction pool inspection
   - name: VM
-    description: IONA VM contract operations
+    description: IONA VM contract interaction
+  - name: Audit
+    description: Audit log queries and verification
+  - name: Faucet
+    description: Testnet faucet (dev/test environments only)
   - name: Metrics
-    description: Prometheus metrics and observability
+    description: Prometheus metrics and monitoring
 
 paths:
+  # ── JSON‑RPC ────────────────────────────────────────────────────────────────
   /rpc:
     post:
       tags: [JSON-RPC]
-      summary: JSON-RPC endpoint (eth_* methods)
+      summary: JSON‑RPC endpoint
       description: |
-        Standard Ethereum JSON-RPC endpoint supporting:
+        Standard Ethereum JSON‑RPC endpoint supporting all `eth_*`, `net_*`, and `web3_*` methods.
         
-        **Chain State:**
-        `eth_chainId`, `eth_blockNumber`, `eth_getBalance`, `eth_getCode`,
-        `eth_getStorageAt`, `eth_getTransactionCount`, `eth_getProof`
+        **Common methods:**
+        - `eth_blockNumber`, `eth_chainId`, `eth_getBalance`, `eth_getCode`
+        - `eth_getStorageAt`, `eth_getTransactionCount`, `eth_getProof`
+        - `eth_sendRawTransaction`, `eth_getTransactionByHash`
+        - `eth_getTransactionReceipt`, `eth_call`, `eth_estimateGas`
+        - `eth_getBlockByNumber`, `eth_getBlockByHash`
+        - `eth_getLogs`, `eth_newFilter`, `eth_getFilterChanges`
+        - `eth_gasPrice`, `eth_maxPriorityFeePerGas`
+        - `net_version`, `net_listening`, `net_peerCount`
+        - `web3_clientVersion`
         
-        **Transactions:**
-        `eth_sendRawTransaction`, `eth_getTransactionByHash`,
-        `eth_getTransactionReceipt`, `eth_call`, `eth_estimateGas`
-        
-        **Blocks:**
-        `eth_getBlockByNumber`, `eth_getBlockByHash`,
-        `eth_getBlockTransactionCountByNumber`, `eth_getBlockTransactionCountByHash`,
-        `eth_getTransactionByBlockHashAndIndex`, `eth_getTransactionByBlockNumberAndIndex`
-        
-        **Logs & Filters:**
-        `eth_getLogs`, `eth_newFilter`, `eth_newBlockFilter`,
-        `eth_newPendingTransactionFilter`, `eth_getFilterChanges`, `eth_uninstallFilter`
-        
-        **Network:**
-        `net_version`, `net_listening`, `net_peerCount`, `web3_clientVersion`
-        
-        **Gas:**
-        `eth_gasPrice`, `eth_maxPriorityFeePerGas`
-        
-        **IONA-specific:**
-        `iona_mine` (mine pending transactions in dev mode)
-        
-        **Misc:**
-        `eth_syncing`, `eth_mining`, `eth_accounts`, `eth_protocolVersion`,
-        `eth_hashrate`, `eth_getUncleCountByBlockHash`, `eth_getUncleCountByBlockNumber`
+        **IONA‑specific:**
+        - `iona_mine` – force mining of pending transactions (dev mode)
+      operationId: rpc
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/JsonRpcRequest'
-            examples:
-              eth_blockNumber:
-                summary: Get latest block number
-                value:
-                  jsonrpc: "2.0"
-                  method: "eth_blockNumber"
-                  params: []
-                  id: 1
-              eth_getBalance:
-                summary: Get account balance
-                value:
-                  jsonrpc: "2.0"
-                  method: "eth_getBalance"
-                  params: ["0x742d35Cc6634C0532925a3b844Bc9e7595f2bD28", "latest"]
-                  id: 1
-              eth_sendRawTransaction:
-                summary: Send signed transaction
-                value:
-                  jsonrpc: "2.0"
-                  method: "eth_sendRawTransaction"
-                  params: ["0xf86c...signed_tx_hex"]
-                  id: 1
-              eth_call:
-                summary: Execute read‑only call
-                value:
-                  jsonrpc: "2.0"
-                  method: "eth_call"
-                  params:
-                    - to: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD28"
-                      data: "0x70a08231000000000000000000000000..."
-                    - "latest"
-                  id: 1
-              eth_getLogs:
-                summary: Get filtered logs
-                value:
-                  jsonrpc: "2.0"
-                  method: "eth_getLogs"
-                  params:
-                    - fromBlock: "0x1"
-                      toBlock: "latest"
-                      address: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD28"
-                      topics: [null]
-                  id: 1
-              eth_getProof:
-                summary: Get Merkle proof for account
-                value:
-                  jsonrpc: "2.0"
-                  method: "eth_getProof"
-                  params: ["0x742d35Cc6634C0532925a3b844Bc9e7595f2bD28", ["0x0"], "latest"]
-                  id: 1
       responses:
         '200':
-          description: JSON-RPC response
+          description: Successful JSON‑RPC response
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/JsonRpcResponse'
-              examples:
-                blockNumber:
-                  summary: Block number response
-                  value:
-                    jsonrpc: "2.0"
-                    result: "0xa"
-                    id: 1
-                error:
-                  summary: Error response
-                  value:
-                    jsonrpc: "2.0"
-                    error:
-                      code: -32601
-                      message: "Method not found: eth_unsupported"
-                    id: 1
+        '400':
+          description: Invalid request (parse error or invalid params)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JsonRpcResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JsonRpcResponse'
 
+  # ── Node endpoints ──────────────────────────────────────────────────────────
   /health:
     get:
       tags: [Node]
       summary: Health check
-      description: Returns HTTP 200 if the node is running and healthy.
+      description: Returns HTTP 200 if the node is operational.
       responses:
         '200':
           description: Node is healthy
@@ -168,18 +114,16 @@ paths:
             text/plain:
               schema:
                 type: string
-                example: "ok"
+                example: ok
 
   /status:
     get:
       tags: [Node]
       summary: Node status
-      description: |
-        Returns detailed node status including current block height,
-        finalized height, peer count, protocol/schema versions, and sync status.
+      description: Detailed node status including height, peers, and version.
       responses:
         '200':
-          description: Node status
+          description: Status object
           content:
             application/json:
               schema:
@@ -190,22 +134,444 @@ paths:
                 peers: 5
                 protocol_version: 1
                 schema_version: 4
-                node_version: "27.0.0"
+                node_version: "28.0.0"
                 syncing: false
                 chain_id: 1
+                uptime_secs: 86400
+        '503':
+          description: Node not ready (e.g., syncing)
 
+  /status/peers:
+    get:
+      tags: [Node]
+      summary: Connected peers
+      description: List of currently connected peers with their addresses and scores.
+      responses:
+        '200':
+          description: Peers list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  peers:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PeerInfo'
+
+  /version:
+    get:
+      tags: [Node]
+      summary: Node version
+      description: Returns the semantic version of the node software.
+      responses:
+        '200':
+          description: Version string
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: string
+                    example: "28.0.0"
+
+  # ── Admin endpoints (mTLS required) ────────────────────────────────────────
+  /admin/cert/reload:
+    post:
+      tags: [Admin]
+      summary: Reload TLS certificate
+      description: Hot‑reload the server certificate without restarting the node. Requires mTLS.
+      security:
+        - mTLS: []
+      responses:
+        '200':
+          description: Certificate reloaded successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  new_subject:
+                    type: string
+                  new_fingerprint:
+                    type: string
+                  expires_in_s:
+                    type: integer
+                  overlap_active:
+                    type: boolean
+                  rotation_count:
+                    type: integer
+        '401':
+          description: Unauthorized (invalid client certificate)
+        '403':
+          description: Forbidden (client not allowed)
+
+  /admin/cert/status:
+    get:
+      tags: [Admin]
+      summary: Certificate status
+      description: Returns details of the currently active server certificate.
+      security:
+        - mTLS: []
+      responses:
+        '200':
+          description: Certificate details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CertificateStatus'
+
+  /admin/rbac/check:
+    get:
+      tags: [Admin]
+      summary: Check RBAC permission
+      description: Verify whether an identity is allowed on a given endpoint.
+      parameters:
+        - name: identity
+          in: query
+          required: true
+          schema:
+            type: string
+          example: "admin@example.com"
+        - name: endpoint
+          in: query
+          required: true
+          schema:
+            type: string
+          example: "/admin/cert/reload"
+      responses:
+        '200':
+          description: Access allowed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  allowed:
+                    type: boolean
+        '403':
+          description: Access denied
+
+  /admin/rbac/policy:
+    get:
+      tags: [Admin]
+      summary: Export RBAC policy
+      description: Returns the current RBAC policy in TOML format.
+      security:
+        - mTLS: []
+      responses:
+        '200':
+          description: RBAC policy (TOML)
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  # ── Mempool ──────────────────────────────────────────────────────────────────
+  /mempool:
+    get:
+      tags: [Mempool]
+      summary: Mempool status
+      description: Returns statistics about the pending transaction pool.
+      responses:
+        '200':
+          description: Mempool statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MempoolStatus'
+
+  /mempool/txs:
+    get:
+      tags: [Mempool]
+      summary: List pending transactions
+      description: Returns a list of pending transaction hashes (limit 100).
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+            maximum: 1000
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: List of transaction hashes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+                  example: "0x..."
+
+  # ── Staking ──────────────────────────────────────────────────────────────────
+  /staking/validators:
+    get:
+      tags: [Staking]
+      summary: List validators
+      description: Returns the current set of validators with their stake and status.
+      responses:
+        '200':
+          description: Validator list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  validators:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ValidatorInfo'
+
+  /staking/validator/{operator}:
+    get:
+      tags: [Staking]
+      summary: Get validator details
+      parameters:
+        - name: operator
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "iona1..."
+      responses:
+        '200':
+          description: Validator details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidatorInfo'
+        '404':
+          description: Validator not found
+
+  /staking/delegation/{delegator}/{validator}:
+    get:
+      tags: [Staking]
+      summary: Get delegation amount
+      parameters:
+        - name: delegator
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: validator
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Delegation amount
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  amount:
+                    type: integer
+                    example: 100000
+
+  # ── Governance ───────────────────────────────────────────────────────────────
+  /governance/proposals:
+    get:
+      tags: [Governance]
+      summary: List governance proposals
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [active, passed, rejected, executed]
+      responses:
+        '200':
+          description: Proposals list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  proposals:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Proposal'
+
+  /governance/proposal/{id}:
+    get:
+      tags: [Governance]
+      summary: Get proposal details
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Proposal details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Proposal'
+
+  # ── VM ───────────────────────────────────────────────────────────────────────
+  /vm/state:
+    get:
+      tags: [VM]
+      summary: VM state
+      description: Returns list of deployed contracts and their code hashes.
+      responses:
+        '200':
+          description: VM state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  contracts:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        code_hash:
+                          type: string
+                        balance:
+                          type: string
+
+  /vm/call:
+    post:
+      tags: [VM]
+      summary: Read‑only contract call
+      description: Executes a view/pure function on a deployed contract without modifying state.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VmCallRequest'
+      responses:
+        '200':
+          description: Call result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VmCallResponse'
+
+  # ── Audit ────────────────────────────────────────────────────────────────────
+  /audit/verify:
+    post:
+      tags: [Audit]
+      summary: Verify audit hashchain
+      description: Verifies the tamper‑evident integrity of the audit log.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                path:
+                  type: string
+                  example: "./data/audit.log"
+      responses:
+        '200':
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  valid:
+                    type: boolean
+                  message:
+                    type: string
+                  broken_at:
+                    type: integer
+
+  /audit/export:
+    get:
+      tags: [Audit]
+      summary: Export audit log entries
+      parameters:
+        - name: last
+          in: query
+          schema:
+            type: integer
+            default: 100
+            maximum: 10000
+        - name: from
+          in: query
+          schema:
+            type: integer
+            description: Unix timestamp (start)
+        - name: to
+          in: query
+          schema:
+            type: integer
+            description: Unix timestamp (end)
+      responses:
+        '200':
+          description: Audit log entries (JSON Lines)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AuditEntry'
+
+  # ── Faucet ───────────────────────────────────────────────────────────────────
+  /faucet/{address}/{amount}:
+    get:
+      tags: [Faucet]
+      summary: Request test tokens
+      description: |
+        Only available on testnet/devnet nodes. Disabled in production.
+        Rate‑limited to one request per IP per hour.
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "iona1..."
+        - name: amount
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+          example: 1000
+      responses:
+        '200':
+          description: Tokens sent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tx_hash:
+                    type: string
+        '429':
+          description: Rate limit exceeded
+        '503':
+          description: Faucet disabled (production mode)
+
+  # ── Metrics ──────────────────────────────────────────────────────────────────
   /metrics:
     get:
       tags: [Metrics]
       summary: Prometheus metrics
-      description: |
-        Returns all node metrics in Prometheus text exposition format.
-        
-        Categories: consensus, finality, network, mempool, RPC, storage,
-        protocol, migrations, snapshots, audit (70+ metrics total).
+      description: Exposes all node metrics in Prometheus text format (70+ metrics).
       responses:
         '200':
-          description: Prometheus metrics (text exposition format)
+          description: Metrics text
           content:
             text/plain:
               schema:
@@ -217,127 +583,13 @@ paths:
                 # HELP peers_connected Number of connected peers
                 # TYPE peers_connected gauge
                 peers_connected 5
-                # HELP finality_latency_ms Time to finality in milliseconds
-                # TYPE finality_latency_ms histogram
-                finality_latency_ms_bucket{le="100"} 10
-                finality_latency_ms_bucket{le="1000"} 42
-                finality_latency_ms_bucket{le="+Inf"} 42
-
-  /vm/deploy:
-    post:
-      tags: [VM]
-      summary: Deploy IONA VM contract
-      description: Deploy a new smart contract on the IONA VM.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [bytecode]
-              properties:
-                bytecode:
-                  type: string
-                  description: Hex-encoded contract bytecode
-                  example: "0x6080604052..."
-                constructor_args:
-                  type: array
-                  items:
-                    type: string
-      responses:
-        '200':
-          description: Contract deployed
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  address:
-                    type: string
-                    example: "0x1234567890abcdef1234567890abcdef12345678"
-                  tx_hash:
-                    type: string
-                    example: "0xabc..."
-
-  /vm/call:
-    post:
-      tags: [VM]
-      summary: Call IONA VM contract
-      description: Execute a read-only call on a deployed contract.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [to, data]
-              properties:
-                to:
-                  type: string
-                  description: Contract address
-                  example: "0x1234567890abcdef1234567890abcdef12345678"
-                data:
-                  type: string
-                  description: Hex-encoded call data
-                  example: "0x70a08231..."
-                from:
-                  type: string
-                  description: Caller address (optional)
-      responses:
-        '200':
-          description: Call result
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  result:
-                    type: string
-                    example: "0x0000000000000000000000000000000000000000000000000000000000000001"
-                  gas_used:
-                    type: integer
-                    example: 21000
-
-  /tx:
-    post:
-      tags: [JSON-RPC]
-      summary: Submit transaction (IONA native format)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [from, to, value]
-              properties:
-                from:
-                  type: string
-                  example: "0xabc..."
-                to:
-                  type: string
-                  example: "0xdef..."
-                value:
-                  type: integer
-                  example: 1000000
-                data:
-                  type: string
-                  example: "0x"
-                nonce:
-                  type: integer
-                  example: 0
-      responses:
-        '200':
-          description: Transaction accepted
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  tx_hash:
-                    type: string
-                    example: "0x..."
 
 components:
+  securitySchemes:
+    mTLS:
+      description: Mutual TLS with client certificate authentication.
+      type: mtls
+
   schemas:
     JsonRpcRequest:
       type: object
@@ -346,9 +598,9 @@ components:
         jsonrpc:
           type: string
           enum: ["2.0"]
+          example: "2.0"
         method:
           type: string
-          description: RPC method name
           example: "eth_blockNumber"
         params:
           type: array
@@ -367,8 +619,7 @@ components:
         jsonrpc:
           type: string
           enum: ["2.0"]
-        result:
-          description: Successful result (absent on error)
+        result: {}
         error:
           $ref: '#/components/schemas/JsonRpcError'
         id:
@@ -382,12 +633,10 @@ components:
       properties:
         code:
           type: integer
-          example: -32601
+          enum: [-32700, -32600, -32601, -32602, -32000, -32001, -32002, -32003, -32004]
         message:
           type: string
-          example: "Method not found"
         data:
-          description: Optional additional data (e.g., revert reason)
           type: object
 
     NodeStatus:
@@ -395,90 +644,211 @@ components:
       properties:
         height:
           type: integer
-          example: 1000
         finalized_height:
           type: integer
-          example: 998
         peers:
           type: integer
-          example: 5
         protocol_version:
           type: integer
-          example: 1
         schema_version:
           type: integer
-          example: 4
         node_version:
           type: string
-          example: "27.0.0"
         syncing:
           type: boolean
-          example: false
         chain_id:
           type: integer
-          example: 1
+        uptime_secs:
+          type: integer
+
+    PeerInfo:
+      type: object
+      properties:
+        address:
+          type: string
+        peer_id:
+          type: string
+        score:
+          type: integer
+        direction:
+          type: string
+          enum: [inbound, outbound]
+        connection_time_secs:
+          type: integer
+
+    MempoolStatus:
+      type: object
+      properties:
+        pending_count:
+          type: integer
+        max_capacity:
+          type: integer
+        min_gas_price:
+          type: integer
+        max_gas_price:
+          type: integer
+        average_gas_price:
+          type: integer
+
+    ValidatorInfo:
+      type: object
+      properties:
+        operator:
+          type: string
+        self_stake:
+          type: integer
+        total_stake:
+          type: integer
+        jailed:
+          type: boolean
+        commission_bps:
+          type: integer
+        status:
+          type: string
+          enum: [active, jailed, tombstoned]
+        power:
+          type: integer
+        uptime_percent:
+          type: number
+
+    Proposal:
+      type: object
+      properties:
+        id:
+          type: integer
+        title:
+          type: string
+        description:
+          type: string
+        status:
+          type: string
+          enum: [draft, active, passed, rejected, executed]
+        proposer:
+          type: string
+        deposit:
+          type: integer
+        votes_yes:
+          type: integer
+        votes_no:
+          type: integer
+        start_epoch:
+          type: integer
+        end_epoch:
+          type: integer
+
+    VmCallRequest:
+      type: object
+      required: [to, data]
+      properties:
+        to:
+          type: string
+          description: Contract address
+          example: "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD28"
+        data:
+          type: string
+          description: Hex‑encoded call data (with 0x prefix)
+          example: "0x70a08231000000000000000000000000..."
+        from:
+          type: string
+          description: Caller address (optional, used for access control)
+        gas_limit:
+          type: integer
+          default: 500000
+
+    VmCallResponse:
+      type: object
+      properties:
+        result:
+          type: string
+          description: Hex‑encoded return value
+          example: "0x0000000000000000000000000000000000000000000000000000000000000001"
+        gas_used:
+          type: integer
+          example: 21000
+
+    AuditEntry:
+      type: object
+      properties:
+        ts_unix_s:
+          type: integer
+        request_id:
+          type: string
+        client_fp_sha256:
+          type: string
+        remote_addr:
+          type: string
+        msg_blake3_hex:
+          type: string
+        ok:
+          type: boolean
+        reason:
+          type: string
+
+    CertificateStatus:
+      type: object
+      properties:
+        subject_cn:
+          type: string
+        fingerprint:
+          type: string
+        expires_in_s:
+          type: integer
+        not_after_unix:
+          type: integer
+        rotation_count:
+          type: integer
+        overlap_active:
+          type: boolean
+        overlap_seconds:
+          type: integer
+        watch_active:
+          type: boolean
 
     Block:
       type: object
       properties:
         number:
           type: integer
-          example: 100
         hash:
           type: string
-          example: "0xabc..."
         parent_hash:
           type: string
-          example: "0xdef..."
         timestamp:
           type: integer
-          example: 1700000000
         state_root:
           type: string
-          example: "0x..."
         transactions_root:
           type: string
-          example: "0x..."
         receipts_root:
           type: string
-          example: "0x..."
         gas_used:
           type: integer
-          example: 210000
         gas_limit:
           type: integer
-          example: 30000000
         transactions:
           type: array
           items:
             type: string
-          example: ["0x..."]
 
     Transaction:
       type: object
       properties:
         hash:
           type: string
-          example: "0xabc..."
         from:
           type: string
         to:
           type: string
         value:
           type: string
-          description: Transfer value in wei (hex)
-          example: "0xde0b6b3a7640000"
         nonce:
           type: integer
         gas:
           type: integer
-          example: 21000
         gas_price:
           type: string
-          example: "0x3b9aca00"
         input:
           type: string
-          example: "0x"
         block_hash:
           type: string
         block_number:
@@ -491,18 +861,15 @@ components:
       properties:
         transaction_hash:
           type: string
-          example: "0xabc..."
         block_hash:
           type: string
         block_number:
           type: integer
         status:
           type: integer
-          description: "1 = success, 0 = failure"
-          example: 1
+          description: 1 = success, 0 = failure
         gas_used:
           type: integer
-          example: 21000
         cumulative_gas_used:
           type: integer
         logs:
@@ -515,15 +882,12 @@ components:
       properties:
         address:
           type: string
-          example: "0x..."
         topics:
           type: array
           items:
             type: string
-          example: ["0xddf252ad..."]
         data:
           type: string
-          example: "0x..."
         block_number:
           type: integer
         transaction_hash:
