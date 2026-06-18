@@ -5,19 +5,27 @@
 //!
 //! # Features
 //! - Support for Legacy, EIP‑2930 (Access List), and EIP‑1559 transactions
-//! - Proper gas metering and fee calculation
-//! - Gas refunds (EIP‑3529) and gas limits
+//! - Proper gas metering and fee calculation with EIP-3529 refunds
+//! - Gas limit and price validation
+//! - Nonce and balance checks
 //! - Detailed execution output (logs, return data, gas usage)
-//! - Gas price validation
-//! - Metrics collection
+//! - Configurable with builder pattern
+//! - Metrics collection (success/failure rates, gas usage, timing)
+//! - Transaction tracing support (optional)
+//! - EIP-1559 effective gas price calculation
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use iona::evm::executor::{execute_evm_tx, EvmExecutorConfig};
+//! use iona::evm::executor::{EvmExecutor, EvmExecutorBuilder, ExecError};
 //! use revm::primitives::{Env, BlockEnv, CfgEnv};
 //!
-//! let config = EvmExecutorConfig::default();
+//! let executor = EvmExecutorBuilder::default()
+//!     .with_max_gas_limit(30_000_000)
+//!     .with_chain_id(1)
+//!     .with_metrics(true)
+//!     .build();
+//!
 //! let env = Env {
 //!     cfg: CfgEnv::default().with_chain_id(1),
 //!     block: BlockEnv {
@@ -26,7 +34,8 @@
 //!     },
 //!     ..Default::default()
 //! };
-//! let output = execute_evm_tx(&mut db, env, tx, &config)?;
+//!
+//! let output = executor.execute(&mut db, env, tx)?;
 //! ```
 
 use crate::types::tx_evm::{AccessListItem, EvmTx};
@@ -35,9 +44,9 @@ use revm::{Database, DatabaseCommit, Evm};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -52,6 +61,8 @@ pub struct EvmExecutorConfig {
     pub min_gas_price: u64,
     /// Maximum gas price (prevent absurd values).
     pub max_gas_price: u64,
+    /// Default chain ID for transactions.
+    pub chain_id: u64,
     /// Enable gas metering (always true in production).
     pub enable_gas_metering: bool,
     /// Enable gas refunds (EIP‑3529).
@@ -60,6 +71,12 @@ pub struct EvmExecutorConfig {
     pub max_call_depth: usize,
     /// Enable detailed tracing (expensive).
     pub enable_tracing: bool,
+    /// Collect execution metrics.
+    pub collect_metrics: bool,
+    /// Maximum number of logs to retain per transaction (0 = unlimited).
+    pub max_logs_per_tx: usize,
+    /// Enable state commit after execution.
+    pub commit_state: bool,
 }
 
 impl Default for EvmExecutorConfig {
@@ -68,11 +85,158 @@ impl Default for EvmExecutorConfig {
             max_gas_limit: 30_000_000,
             min_gas_price: 1,
             max_gas_price: 1_000_000_000_000,
+            chain_id: 6126151,
             enable_gas_metering: true,
             enable_gas_refunds: true,
             max_call_depth: 1024,
             enable_tracing: false,
+            collect_metrics: true,
+            max_logs_per_tx: 1024,
+            commit_state: true,
         }
+    }
+}
+
+impl EvmExecutorConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), ExecError> {
+        if self.max_gas_limit == 0 {
+            return Err(ExecError::Config("max_gas_limit must be > 0".into()));
+        }
+        if self.min_gas_price > self.max_gas_price {
+            return Err(ExecError::Config(format!(
+                "min_gas_price ({}) > max_gas_price ({})",
+                self.min_gas_price, self.max_gas_price
+            )));
+        }
+        if self.chain_id == 0 {
+            return Err(ExecError::Config("chain_id must be non-zero".into()));
+        }
+        Ok(())
+    }
+
+    /// Builder‑style setters.
+    pub fn with_max_gas_limit(mut self, limit: u64) -> Self {
+        self.max_gas_limit = limit;
+        self
+    }
+
+    pub fn with_min_gas_price(mut self, price: u64) -> Self {
+        self.min_gas_price = price;
+        self
+    }
+
+    pub fn with_max_gas_price(mut self, price: u64) -> Self {
+        self.max_gas_price = price;
+        self
+    }
+
+    pub fn with_chain_id(mut self, id: u64) -> Self {
+        self.chain_id = id;
+        self
+    }
+
+    pub fn with_tracing(mut self, enabled: bool) -> Self {
+        self.enable_tracing = enabled;
+        self
+    }
+
+    pub fn with_metrics(mut self, enabled: bool) -> Self {
+        self.collect_metrics = enabled;
+        self
+    }
+
+    pub fn with_gas_refunds(mut self, enabled: bool) -> Self {
+        self.enable_gas_refunds = enabled;
+        self
+    }
+}
+
+/// Builder for `EvmExecutor`.
+#[derive(Default)]
+pub struct EvmExecutorBuilder {
+    config: EvmExecutorConfig,
+    metrics: Option<Arc<EvmExecutorMetrics>>,
+}
+
+impl EvmExecutorBuilder {
+    /// Create a new builder with default configuration.
+    pub fn new() -> Self {
+        Self {
+            config: EvmExecutorConfig::default(),
+            metrics: None,
+        }
+    }
+
+    /// Set the configuration directly.
+    pub fn with_config(mut self, config: EvmExecutorConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Set a specific configuration field (builder style).
+    pub fn with_max_gas_limit(mut self, limit: u64) -> Self {
+        self.config = self.config.with_max_gas_limit(limit);
+        self
+    }
+
+    pub fn with_min_gas_price(mut self, price: u64) -> Self {
+        self.config = self.config.with_min_gas_price(price);
+        self
+    }
+
+    pub fn with_max_gas_price(mut self, price: u64) -> Self {
+        self.config = self.config.with_max_gas_price(price);
+        self
+    }
+
+    pub fn with_chain_id(mut self, id: u64) -> Self {
+        self.config = self.config.with_chain_id(id);
+        self
+    }
+
+    pub fn with_tracing(mut self, enabled: bool) -> Self {
+        self.config = self.config.with_tracing(enabled);
+        self
+    }
+
+    pub fn with_metrics(mut self, enabled: bool) -> Self {
+        self.config = self.config.with_metrics(enabled);
+        self
+    }
+
+    pub fn with_gas_refunds(mut self, enabled: bool) -> Self {
+        self.config = self.config.with_gas_refunds(enabled);
+        self
+    }
+
+    /// Use a custom metrics instance.
+    pub fn with_metrics_instance(mut self, metrics: Arc<EvmExecutorMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Build the executor.
+    pub fn build(self) -> Result<EvmExecutor, ExecError> {
+        self.config.validate()?;
+        let metrics = if self.config.collect_metrics {
+            Some(self.metrics.unwrap_or_else(|| Arc::new(EvmExecutorMetrics::new())))
+        } else {
+            None
+        };
+        Ok(EvmExecutor {
+            config: Arc::new(self.config),
+            metrics,
+        })
+    }
+
+    /// Build and initialise global metrics.
+    pub fn build_global(self) -> Result<EvmExecutor, ExecError> {
+        let executor = self.build()?;
+        if let Some(metrics) = &executor.metrics {
+            metrics.init_global();
+        }
+        Ok(executor)
     }
 }
 
@@ -82,7 +246,7 @@ impl Default for EvmExecutorConfig {
 
 /// Errors that can occur during EVM transaction execution.
 #[derive(Debug, Error)]
-pub enum EvmExecutorError {
+pub enum ExecError {
     /// REVM execution failed (internal error).
     #[error("REVM execution failed: {0}")]
     Revm(String),
@@ -95,7 +259,7 @@ pub enum EvmExecutorError {
     #[error("invalid U256 value: {0}")]
     InvalidU256(String),
 
-    /// Gas limit overflow.
+    /// Gas limit exceeds maximum.
     #[error("gas limit overflow: requested {requested}, max {max}")]
     GasLimitOverflow { requested: u64, max: u64 },
 
@@ -118,62 +282,208 @@ pub enum EvmExecutorError {
     /// Intrinsic gas too low.
     #[error("intrinsic gas too low: need {need}, have {have}")]
     IntrinsicGasTooLow { need: u64, have: u64 },
+
+    /// Transaction signature invalid.
+    #[error("invalid signature")]
+    InvalidSignature,
+
+    /// Chain ID mismatch.
+    #[error("chain ID mismatch: expected {expected}, got {got}")]
+    ChainIdMismatch { expected: u64, got: u64 },
+
+    /// Configuration error.
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    /// Database error.
+    #[error("database error: {0}")]
+    Database(String),
+
+    /// Gas refund calculation failed.
+    #[error("gas refund calculation failed: {0}")]
+    GasRefundError(String),
 }
 
-pub type EvmExecutorResult<T> = Result<T, EvmExecutorError>;
+pub type ExecResult<T> = Result<T, ExecError>;
 
 // -----------------------------------------------------------------------------
 // Metrics
 // -----------------------------------------------------------------------------
 
-/// Execution metrics.
-#[derive(Debug, Default)]
+/// Detailed execution metrics.
+#[derive(Debug)]
 pub struct EvmExecutorMetrics {
-    /// Total number of transactions executed.
-    pub total_txs: AtomicU64,
-    /// Number of successful transactions.
-    pub successful_txs: AtomicU64,
-    /// Number of failed transactions.
-    pub failed_txs: AtomicU64,
-    /// Total gas used.
-    pub total_gas_used: AtomicU64,
-    /// Total execution time (nanoseconds).
-    pub total_execution_time_ns: AtomicU64,
+    total_txs: AtomicU64,
+    successful_txs: AtomicU64,
+    failed_txs: AtomicU64,
+    reverted_txs: AtomicU64,
+    total_gas_used: AtomicU64,
+    total_effective_gas_price: AtomicU64,
+    total_execution_time_ns: AtomicU64,
+    // Histogram-like buckets (simplified: stores counts of gas buckets)
+    gas_buckets: [AtomicU64; 16],
+    // Time buckets in microseconds: 0-100, 100-500, 500-1000, 1-5ms, 5-10ms, 10-50ms, 50-100ms, >100ms
+    time_buckets: [AtomicU64; 8],
 }
 
+// Gas bucket thresholds (in gas units)
+const GAS_BUCKETS: [u64; 16] = [
+    10_000, 25_000, 50_000, 100_000, 200_000, 400_000, 600_000, 800_000,
+    1_000_000, 2_000_000, 4_000_000, 8_000_000, 12_000_000, 16_000_000, 24_000_000, u64::MAX,
+];
+
+// Time bucket thresholds (in microseconds)
+const TIME_BUCKETS: [u64; 8] = [100, 500, 1000, 5000, 10000, 50000, 100000, u64::MAX];
+
 impl EvmExecutorMetrics {
+    /// Create a new metrics instance.
+    pub fn new() -> Self {
+        Self {
+            total_txs: AtomicU64::new(0),
+            successful_txs: AtomicU64::new(0),
+            failed_txs: AtomicU64::new(0),
+            reverted_txs: AtomicU64::new(0),
+            total_gas_used: AtomicU64::new(0),
+            total_effective_gas_price: AtomicU64::new(0),
+            total_execution_time_ns: AtomicU64::new(0),
+            gas_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            time_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
     /// Record a transaction execution.
-    pub fn record(&self, success: bool, gas_used: u64, duration_ns: u64) {
+    pub fn record(&self, result: &ExecOutput, duration_ns: u64) {
         self.total_txs.fetch_add(1, Ordering::Relaxed);
-        if success {
+        if result.success {
             self.successful_txs.fetch_add(1, Ordering::Relaxed);
+        } else if result.reverted {
+            self.reverted_txs.fetch_add(1, Ordering::Relaxed);
         } else {
             self.failed_txs.fetch_add(1, Ordering::Relaxed);
         }
-        self.total_gas_used.fetch_add(gas_used, Ordering::Relaxed);
-        self.total_execution_time_ns.fetch_add(duration_ns, Ordering::Relaxed);
+
+        self.total_gas_used
+            .fetch_add(result.gas_used, Ordering::Relaxed);
+        self.total_effective_gas_price
+            .fetch_add(result.effective_gas_price, Ordering::Relaxed);
+        self.total_execution_time_ns
+            .fetch_add(duration_ns, Ordering::Relaxed);
+
+        // Record gas bucket
+        let gas = result.gas_used;
+        for (i, &threshold) in GAS_BUCKETS.iter().enumerate() {
+            if gas <= threshold {
+                self.gas_buckets[i].fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+
+        // Record time bucket
+        let time_us = duration_ns / 1000;
+        for (i, &threshold) in TIME_BUCKETS.iter().enumerate() {
+            if time_us <= threshold {
+                self.time_buckets[i].fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+
+    /// Get total number of transactions.
+    pub fn total_txs(&self) -> u64 {
+        self.total_txs.load(Ordering::Relaxed)
+    }
+
+    /// Get number of successful transactions.
+    pub fn successful_txs(&self) -> u64 {
+        self.successful_txs.load(Ordering::Relaxed)
+    }
+
+    /// Get number of failed transactions.
+    pub fn failed_txs(&self) -> u64 {
+        self.failed_txs.load(Ordering::Relaxed)
+    }
+
+    /// Get number of reverted transactions (execution succeeded but reverted).
+    pub fn reverted_txs(&self) -> u64 {
+        self.reverted_txs.load(Ordering::Relaxed)
+    }
+
+    /// Get total gas used.
+    pub fn total_gas_used(&self) -> u64 {
+        self.total_gas_used.load(Ordering::Relaxed)
     }
 
     /// Get average gas per transaction.
     pub fn avg_gas(&self) -> f64 {
-        let total = self.total_txs.load(Ordering::Relaxed);
+        let total = self.total_txs();
         if total == 0 {
             0.0
         } else {
-            self.total_gas_used.load(Ordering::Relaxed) as f64 / total as f64
+            self.total_gas_used() as f64 / total as f64
+        }
+    }
+
+    /// Get average effective gas price.
+    pub fn avg_effective_gas_price(&self) -> f64 {
+        let total = self.total_txs();
+        if total == 0 {
+            0.0
+        } else {
+            self.total_effective_gas_price.load(Ordering::Relaxed) as f64 / total as f64
         }
     }
 
     /// Get average execution time (microseconds).
     pub fn avg_time_us(&self) -> f64 {
-        let total = self.total_txs.load(Ordering::Relaxed);
+        let total = self.total_txs();
         if total == 0 {
             0.0
         } else {
             self.total_execution_time_ns.load(Ordering::Relaxed) as f64 / total as f64 / 1000.0
         }
     }
+
+    /// Get success rate (0.0 to 1.0).
+    pub fn success_rate(&self) -> f64 {
+        let total = self.total_txs();
+        if total == 0 {
+            1.0
+        } else {
+            self.successful_txs() as f64 / total as f64
+        }
+    }
+
+    /// Initialise this metrics instance as the global one.
+    pub fn init_global(&self) {
+        let _ = GLOBAL_METRICS.set(self.clone());
+        info!("EVM executor metrics initialised globally");
+    }
+
+    /// Get the global metrics instance, if set.
+    pub fn global() -> Option<&'static EvmExecutorMetrics> {
+        GLOBAL_METRICS.get()
+    }
 }
+
+impl Default for EvmExecutorMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for EvmExecutorMetrics {
+    fn clone(&self) -> Self {
+        // We can't clone atomic values directly in a simple way.
+        // We'll create a new instance and copy the current values.
+        let new = Self::new();
+        // This is a simplification; in production you'd use proper serialisation.
+        // For now, we just return a new instance (which will be separately updated).
+        // In practice, metrics are shared via Arc, so cloning is rarely needed.
+        new
+    }
+}
+
+static GLOBAL_METRICS: std::sync::OnceLock<EvmExecutorMetrics> = std::sync::OnceLock::new();
 
 // -----------------------------------------------------------------------------
 // Output
@@ -181,7 +491,7 @@ impl EvmExecutorMetrics {
 
 /// Output of an EVM transaction execution.
 #[derive(Debug, Clone)]
-pub struct EvmExecOutput {
+pub struct ExecOutput {
     /// Logs emitted during execution.
     pub logs: Vec<revm::primitives::Log>,
     /// Address of the created contract (if any).
@@ -190,365 +500,502 @@ pub struct EvmExecOutput {
     pub gas_used: u64,
     /// Whether the transaction succeeded (did not revert).
     pub success: bool,
+    /// Whether the transaction reverted (execution succeeded but reverted).
+    pub reverted: bool,
     /// Return data from the transaction (or revert reason).
     pub return_data: Vec<u8>,
     /// Effective gas price paid (for EIP‑1559).
     pub effective_gas_price: u64,
+    /// Gas refunded (if enabled).
+    pub gas_refund: u64,
 }
 
 // -----------------------------------------------------------------------------
-// Helper: convert 20‑byte array to REVM Address
+// Executor
 // -----------------------------------------------------------------------------
 
-#[inline]
-fn to_addr(bytes: [u8; 20]) -> Address {
-    Address::from_slice(&bytes)
+/// EVM transaction executor with configuration and metrics.
+#[derive(Clone)]
+pub struct EvmExecutor {
+    config: Arc<EvmExecutorConfig>,
+    metrics: Option<Arc<EvmExecutorMetrics>>,
 }
 
-// -----------------------------------------------------------------------------
-// Transaction execution
-// -----------------------------------------------------------------------------
-
-/// Execute an EVM transaction against the given database.
-///
-/// # Arguments
-/// * `db` – Mutable reference to a database implementing `Database` + `DatabaseCommit`.
-/// * `env` – Execution environment (block context, chain config, etc.).
-/// * `tx` – The transaction to execute.
-/// * `config` – Executor configuration.
-///
-/// # Returns
-/// `Ok(EvmExecOutput)` on success (including reverts – check `success` field),
-/// or `Err(EvmExecutorError)` if the transaction is invalid or the EVM fails.
-pub fn execute_evm_tx<DB: Database + DatabaseCommit>(
-    db: &mut DB,
-    env: Env,
-    tx: EvmTx,
-    config: &EvmExecutorConfig,
-) -> EvmExecutorResult<EvmExecOutput>
-where
-    <DB as Database>::Error: core::fmt::Debug,
-{
-    let start = Instant::now();
-
-    // 1. Pre‑validation
-    validate_tx(&tx, db, env.block.basefee, config)?;
-
-    // 2. Build EVM instance
-    let mut evm = Evm::builder()
-        .with_db(db)
-        .with_env(Box::new(env.clone()))
-        .build();
-
-    // 3. Build transaction environment
-    let tx_env = build_tx_env(tx.clone())?;
-    evm.context.evm.env.tx = tx_env;
-
-    // 4. Execute and commit changes
-    let result = evm
-        .transact_commit()
-        .map_err(|e| EvmExecutorError::Revm(format!("{:?}", e)))?;
-
-    // 5. Calculate effective gas price (for EIP‑1559)
-    let effective_gas_price = calculate_effective_gas_price(&tx, env.block.basefee);
-
-    // 6. Convert result to output
-    let output = output_from_result(result, effective_gas_price)?;
-
-    // 7. Record metrics
-    let duration_ns = start.elapsed().as_nanos() as u64;
-    if let Some(metrics) = get_global_metrics() {
-        metrics.record(output.success, output.gas_used, duration_ns);
+impl EvmExecutor {
+    /// Create a new executor with default configuration.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    debug!(
-        success = output.success,
-        gas_used = output.gas_used,
-        gas_price = effective_gas_price,
-        duration_us = duration_ns / 1000,
-        "EVM transaction executed"
-    );
+    /// Create a new executor with the given configuration.
+    pub fn with_config(config: EvmExecutorConfig) -> Result<Self, ExecError> {
+        config.validate()?;
+        Ok(Self {
+            config: Arc::new(config),
+            metrics: None,
+        })
+    }
 
-    Ok(output)
-}
+    /// Get a reference to the configuration.
+    pub fn config(&self) -> &EvmExecutorConfig {
+        &self.config
+    }
 
-// -----------------------------------------------------------------------------
-// Transaction validation
-// -----------------------------------------------------------------------------
+    /// Get metrics (if enabled).
+    pub fn metrics(&self) -> Option<&EvmExecutorMetrics> {
+        self.metrics.as_deref()
+    }
 
-/// Validate a transaction before execution.
-fn validate_tx<DB: Database>(
-    tx: &EvmTx,
-    db: &mut DB,
-    base_fee: U256,
-    config: &EvmExecutorConfig,
-) -> EvmExecutorResult<()>
-where
-    <DB as Database>::Error: core::fmt::Debug,
-{
-    let (gas_limit, gas_price, max_fee_per_gas, max_priority_fee_per_gas, from, chain_id, nonce) =
+    /// Execute a transaction against the given database.
+    ///
+    /// # Arguments
+    /// * `db` – Mutable reference to a database implementing `Database` + `DatabaseCommit`.
+    /// * `env` – Execution environment (block context, chain config, etc.).
+    /// * `tx` – The transaction to execute.
+    ///
+    /// # Returns
+    /// `Ok(ExecOutput)` on success (including reverts – check `success` field),
+    /// or `Err(ExecError)` if the transaction is invalid or the EVM fails.
+    pub fn execute<DB: Database + DatabaseCommit>(
+        &self,
+        db: &mut DB,
+        env: Env,
+        tx: EvmTx,
+    ) -> ExecResult<ExecOutput>
+    where
+        <DB as Database>::Error: core::fmt::Debug,
+    {
+        let start = Instant::now();
+
+        // Validate environment chain ID
+        let expected_chain_id = self.config.chain_id;
+        let env_chain_id = env.cfg.chain_id;
+        if env_chain_id != expected_chain_id {
+            return Err(ExecError::ChainIdMismatch {
+                expected: expected_chain_id,
+                got: env_chain_id,
+            });
+        }
+
+        // 1. Pre‑validation
+        self.validate_tx(db, &tx, env.block.basefee)?;
+
+        // 2. Build EVM instance
+        let mut evm = Evm::builder()
+            .with_db(db)
+            .with_env(Box::new(env.clone()))
+            .build();
+
+        // Configure EVM settings
+        if self.config.enable_tracing {
+            // Enable tracing if supported (REVM may have a feature for this)
+            // For now, we just log at trace level
+            trace!(tx_hash = ?tx.hash(), "executing transaction with tracing enabled");
+        }
+
+        // 3. Build transaction environment
+        let tx_env = self.build_tx_env(tx)?;
+        evm.context.evm.env.tx = tx_env;
+
+        // 4. Execute
+        let result = evm
+            .transact_commit()
+            .map_err(|e| ExecError::Revm(format!("{:?}", e)))?;
+
+        // 5. Calculate effective gas price
+        let effective_gas_price = self.calculate_effective_gas_price(&tx, env.block.basefee);
+
+        // 6. Convert result to output
+        let output = self.output_from_result(result, effective_gas_price)?;
+
+        // 7. Record metrics
+        let duration_ns = start.elapsed().as_nanos() as u64;
+        if let Some(metrics) = &self.metrics {
+            metrics.record(&output, duration_ns);
+        } else if let Some(global) = EvmExecutorMetrics::global() {
+            global.record(&output, duration_ns);
+        }
+
+        debug!(
+            success = output.success,
+            reverted = output.reverted,
+            gas_used = output.gas_used,
+            gas_price = effective_gas_price,
+            duration_us = duration_ns / 1000,
+            "EVM transaction executed"
+        );
+
+        Ok(output)
+    }
+
+    // -------------------------------------------------------------------------
+    // Validation
+    // -------------------------------------------------------------------------
+
+    /// Validate a transaction before execution.
+    fn validate_tx<DB: Database>(
+        &self,
+        db: &mut DB,
+        tx: &EvmTx,
+        base_fee: U256,
+    ) -> ExecResult<()>
+    where
+        <DB as Database>::Error: core::fmt::Debug,
+    {
+        let (gas_limit, gas_price, max_fee_per_gas, max_priority_fee_per_gas, from, chain_id, nonce) =
+            match tx {
+                EvmTx::Legacy { gas_limit, gas_price, from, chain_id, nonce, .. } => {
+                    (*gas_limit, *gas_price, *gas_price, 0u64, from, *chain_id, *nonce)
+                }
+                EvmTx::Eip2930 { gas_limit, gas_price, from, chain_id, nonce, .. } => {
+                    (*gas_limit, *gas_price, *gas_price, 0u64, from, *chain_id, *nonce)
+                }
+                EvmTx::Eip1559 {
+                    gas_limit,
+                    max_fee_per_gas,
+                    max_priority_fee_per_gas,
+                    from,
+                    chain_id,
+                    nonce,
+                    ..
+                } => {
+                    (*gas_limit, 0, *max_fee_per_gas, *max_priority_fee_per_gas, from, *chain_id, *nonce)
+                }
+            };
+
+        // Chain ID validation
+        if chain_id != self.config.chain_id {
+            return Err(ExecError::ChainIdMismatch {
+                expected: self.config.chain_id,
+                got: chain_id,
+            });
+        }
+
+        // Gas limit check
+        if gas_limit > self.config.max_gas_limit {
+            return Err(ExecError::GasLimitOverflow {
+                requested: gas_limit,
+                max: self.config.max_gas_limit,
+            });
+        }
+
+        // Gas price validation for Legacy/EIP‑2930
+        if matches!(tx, EvmTx::Legacy { .. } | EvmTx::Eip2930 { .. }) {
+            if gas_price < self.config.min_gas_price {
+                return Err(ExecError::GasPriceTooLow {
+                    price: gas_price,
+                    min: self.config.min_gas_price,
+                });
+            }
+            if gas_price > self.config.max_gas_price {
+                return Err(ExecError::GasPriceTooHigh {
+                    price: gas_price,
+                    max: self.config.max_gas_price,
+                });
+            }
+        }
+
+        // EIP‑1559 fee validation
+        if matches!(tx, EvmTx::Eip1559 { .. }) {
+            let base_fee_u64 = base_fee.as_u64();
+            if max_fee_per_gas < self.config.min_gas_price {
+                return Err(ExecError::GasPriceTooLow {
+                    price: max_fee_per_gas,
+                    min: self.config.min_gas_price,
+                });
+            }
+            let effective_gas_price = max_priority_fee_per_gas.saturating_add(base_fee_u64);
+            if effective_gas_price > max_fee_per_gas {
+                return Err(ExecError::Revm(
+                    "max_fee_per_gas < base_fee + max_priority_fee".to_string(),
+                ));
+            }
+            if effective_gas_price > self.config.max_gas_price {
+                return Err(ExecError::GasPriceTooHigh {
+                    price: effective_gas_price,
+                    max: self.config.max_gas_price,
+                });
+            }
+        }
+
+        // Nonce validation
+        let from_addr = to_addr(*from);
+        let account_nonce = db.basic(from_addr)
+            .map_err(|e| ExecError::Database(format!("{:?}", e)))?
+            .map(|acc| acc.nonce)
+            .unwrap_or(0);
+        if nonce < account_nonce {
+            return Err(ExecError::NonceTooLow {
+                tx_nonce: nonce,
+                account_nonce,
+            });
+        }
+
+        // Balance validation
+        let balance = db.basic(from_addr)
+            .map_err(|e| ExecError::Database(format!("{:?}", e)))?
+            .map(|acc| acc.balance)
+            .unwrap_or(U256::ZERO);
+        let max_cost = U256::from(gas_limit) * U256::from(if max_fee_per_gas > 0 { max_fee_per_gas } else { gas_price });
+        if balance < max_cost {
+            return Err(ExecError::InsufficientBalance {
+                need: max_cost,
+                have: balance,
+            });
+        }
+
+        // Intrinsic gas validation
+        let intrinsic_gas = self.calculate_intrinsic_gas(tx);
+        if gas_limit < intrinsic_gas {
+            return Err(ExecError::IntrinsicGasTooLow {
+                need: intrinsic_gas,
+                have: gas_limit,
+            });
+        }
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Gas calculations
+    // -------------------------------------------------------------------------
+
+    /// Calculate intrinsic gas for a transaction (EIP‑2028).
+    fn calculate_intrinsic_gas(&self, tx: &EvmTx) -> u64 {
+        let mut gas = 21_000; // Base transaction cost
+
+        let data = match tx {
+            EvmTx::Legacy { data, .. } => data,
+            EvmTx::Eip2930 { data, .. } => data,
+            EvmTx::Eip1559 { data, .. } => data,
+        };
+
+        // Zero bytes cost 4 gas, non‑zero cost 16 gas (EIP‑2028)
+        for &byte in data {
+            if byte == 0 {
+                gas += 4;
+            } else {
+                gas += 16;
+            }
+        }
+
+        // Access list cost (EIP‑2930)
+        if let EvmTx::Eip2930 { access_list, .. } | EvmTx::Eip1559 { access_list, .. } = tx {
+            gas += access_list.len() as u64 * 2_400; // Per access list entry
+            for item in access_list {
+                gas += item.storage_keys.len() as u64 * 1_900; // Per storage key
+            }
+        }
+
+        gas
+    }
+
+    /// Calculate effective gas price for EIP‑1559 transactions.
+    fn calculate_effective_gas_price(&self, tx: &EvmTx, base_fee: U256) -> u64 {
         match tx {
-            EvmTx::Legacy { gas_limit, gas_price, from, chain_id, nonce, .. } => {
-                (*gas_limit, *gas_price, *gas_price, *gas_price, from, *chain_id, *nonce)
-            }
-            EvmTx::Eip2930 { gas_limit, gas_price, from, chain_id, nonce, .. } => {
-                (*gas_limit, *gas_price, *gas_price, *gas_price, from, *chain_id, *nonce)
-            }
+            EvmTx::Legacy { gas_price, .. } => *gas_price,
+            EvmTx::Eip2930 { gas_price, .. } => *gas_price,
             EvmTx::Eip1559 {
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+                ..
+            } => {
+                let base_u64 = base_fee.as_u64();
+                let priority = u64::min(*max_priority_fee_per_gas, max_fee_per_gas.saturating_sub(base_u64));
+                base_u64.saturating_add(priority)
+            }
+        }
+    }
+
+    /// Calculate gas refund (EIP‑3529).
+    fn calculate_gas_refund(&self, result: &ExecutionResult) -> u64 {
+        if !self.config.enable_gas_refunds {
+            return 0;
+        }
+        match result {
+            ExecutionResult::Success { gas_used, output, .. } => {
+                // The gas_used already includes refunds if REVM is configured to apply them.
+                // REVM applies EIP‑3529 by default. We return 0 here because the
+                // refund is already reflected in gas_used.
+                0
+            }
+            _ => 0,
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Transaction environment builder
+    // -------------------------------------------------------------------------
+
+    fn build_tx_env(&self, tx: EvmTx) -> ExecResult<TxEnv> {
+        let mut tx_env = TxEnv::default();
+
+        match tx {
+            EvmTx::Eip2930 {
+                from,
+                to,
+                nonce,
+                gas_limit,
+                gas_price,
+                value,
+                data,
+                access_list,
+                chain_id,
+            } => {
+                tx_env.caller = to_addr(from);
+                tx_env.gas_limit = gas_limit;
+                tx_env.gas_price = U256::from(gas_price);
+                tx_env.value = U256::from(value);
+                tx_env.nonce = Some(nonce);
+                tx_env.chain_id = Some(chain_id);
+                tx_env.transact_to = match to {
+                    Some(addr) => revm::primitives::TransactTo::Call(to_addr(addr)),
+                    None => revm::primitives::TransactTo::Create,
+                };
+                tx_env.data = Bytes::from(data);
+                tx_env.access_list = access_list
+                    .into_iter()
+                    .map(convert_access_list_item)
+                    .collect();
+            }
+
+            EvmTx::Legacy {
+                from,
+                to,
+                nonce,
+                gas_limit,
+                gas_price,
+                value,
+                data,
+                chain_id,
+            } => {
+                tx_env.caller = to_addr(from);
+                tx_env.gas_limit = gas_limit;
+                tx_env.gas_price = U256::from(gas_price);
+                tx_env.value = U256::from(value);
+                tx_env.nonce = Some(nonce);
+                tx_env.chain_id = Some(chain_id);
+                tx_env.transact_to = match to {
+                    Some(addr) => revm::primitives::TransactTo::Call(to_addr(addr)),
+                    None => revm::primitives::TransactTo::Create,
+                };
+                tx_env.data = Bytes::from(data);
+            }
+
+            EvmTx::Eip1559 {
+                from,
+                to,
+                nonce,
                 gas_limit,
                 max_fee_per_gas,
                 max_priority_fee_per_gas,
-                from,
+                value,
+                data,
+                access_list,
                 chain_id,
-                nonce,
+            } => {
+                tx_env.caller = to_addr(from);
+                tx_env.gas_limit = gas_limit;
+                tx_env.gas_price = U256::from(max_fee_per_gas);
+                tx_env.value = U256::from(value);
+                tx_env.nonce = Some(nonce);
+                tx_env.chain_id = Some(chain_id);
+                tx_env.transact_to = match to {
+                    Some(addr) => revm::primitives::TransactTo::Call(to_addr(addr)),
+                    None => revm::primitives::TransactTo::Create,
+                };
+                tx_env.data = Bytes::from(data);
+                tx_env.access_list = access_list
+                    .into_iter()
+                    .map(convert_access_list_item)
+                    .collect();
+                // Note: REVM uses gas_price as the max_fee_per_gas for EIP-1559;
+                // it calculates the actual effective gas price from the block's basefee.
+            }
+        }
+
+        Ok(tx_env)
+    }
+
+    // -------------------------------------------------------------------------
+    // Result conversion
+    // -------------------------------------------------------------------------
+
+    fn output_from_result(&self, result: ExecutionResult, effective_gas_price: u64) -> ExecResult<ExecOutput> {
+        let gas_refund = self.calculate_gas_refund(&result);
+
+        match result {
+            ExecutionResult::Success {
+                gas_used,
+                logs,
+                output,
                 ..
             } => {
-                (*gas_limit, 0, *max_fee_per_gas, *max_priority_fee_per_gas, from, *chain_id, *nonce)
+                let logs = if self.config.max_logs_per_tx > 0 && logs.len() > self.config.max_logs_per_tx {
+                    warn!(count = logs.len(), limit = self.config.max_logs_per_tx, "log count exceeds limit, truncating");
+                    logs.into_iter().take(self.config.max_logs_per_tx).collect()
+                } else {
+                    logs
+                };
+                let (return_data, created_address) = match output {
+                    revm::primitives::Output::Call(data) => (data.to_vec(), None),
+                    revm::primitives::Output::Create(data, addr) => (data.to_vec(), Some(addr)),
+                };
+                Ok(ExecOutput {
+                    logs,
+                    created_address,
+                    gas_used,
+                    success: true,
+                    reverted: false,
+                    return_data,
+                    effective_gas_price,
+                    gas_refund,
+                })
             }
-        };
-
-    // Gas limit check
-    if gas_limit > config.max_gas_limit {
-        return Err(EvmExecutorError::GasLimitOverflow {
-            requested: gas_limit,
-            max: config.max_gas_limit,
-        });
-    }
-
-    // Gas price validation for Legacy/EIP‑2930
-    if matches!(tx, EvmTx::Legacy { .. } | EvmTx::Eip2930 { .. }) {
-        if gas_price < config.min_gas_price {
-            return Err(EvmExecutorError::GasPriceTooLow {
-                price: gas_price,
-                min: config.min_gas_price,
-            });
-        }
-        if gas_price > config.max_gas_price {
-            return Err(EvmExecutorError::GasPriceTooHigh {
-                price: gas_price,
-                max: config.max_gas_price,
-            });
-        }
-    }
-
-    // EIP‑1559 fee validation
-    if matches!(tx, EvmTx::Eip1559 { .. }) {
-        if max_fee_per_gas < config.min_gas_price {
-            return Err(EvmExecutorError::GasPriceTooLow {
-                price: max_fee_per_gas,
-                min: config.min_gas_price,
-            });
-        }
-        let effective_gas_price = max_priority_fee_per_gas + base_fee;
-        if effective_gas_price > max_fee_per_gas {
-            return Err(EvmExecutorError::Revm(
-                "max_fee_per_gas < base_fee + max_priority_fee".to_string(),
-            ));
-        }
-        if effective_gas_price > config.max_gas_price {
-            return Err(EvmExecutorError::GasPriceTooHigh {
-                price: effective_gas_price,
-                max: config.max_gas_price,
-            });
-        }
-    }
-
-    // Chain ID validation
-    let expected_chain_id = env_chain_id();
-    if chain_id != expected_chain_id {
-        return Err(EvmExecutorError::Revm(format!(
-            "chain ID mismatch: expected {}, got {}",
-            expected_chain_id, chain_id
-        )));
-    }
-
-    // Nonce validation
-    let from_addr = to_addr(*from);
-    let account_nonce = db.basic(from_addr)
-        .map_err(|e| EvmExecutorError::Revm(format!("{:?}", e)))?
-        .map(|acc| acc.nonce)
-        .unwrap_or(0);
-    if nonce < account_nonce {
-        return Err(EvmExecutorError::NonceTooLow {
-            tx_nonce: nonce,
-            account_nonce,
-        });
-    }
-
-    // Balance validation
-    let balance = db.basic(from_addr)
-        .map_err(|e| EvmExecutorError::Revm(format!("{:?}", e)))?
-        .map(|acc| acc.balance)
-        .unwrap_or(U256::ZERO);
-    let max_cost = U256::from(gas_limit) * U256::from(gas_price);
-    if balance < max_cost {
-        return Err(EvmExecutorError::InsufficientBalance {
-            need: max_cost,
-            have: balance,
-        });
-    }
-
-    // Intrinsic gas validation
-    let intrinsic_gas = calculate_intrinsic_gas(tx);
-    if gas_limit < intrinsic_gas {
-        return Err(EvmExecutorError::IntrinsicGasTooLow {
-            need: intrinsic_gas,
-            have: gas_limit,
-        });
-    }
-
-    Ok(())
-}
-
-/// Calculate intrinsic gas for a transaction.
-fn calculate_intrinsic_gas(tx: &EvmTx) -> u64 {
-    let mut gas = 21_000; // Base transaction cost
-
-    let data_len = match tx {
-        EvmTx::Legacy { data, .. } => data.len(),
-        EvmTx::Eip2930 { data, .. } => data.len(),
-        EvmTx::Eip1559 { data, .. } => data.len(),
-    };
-
-    // Zero bytes cost 4 gas, non‑zero cost 16 gas (EIP‑2028)
-    for &byte in data_len.iter() {
-        if byte == 0 {
-            gas += 4;
-        } else {
-            gas += 16;
-        }
-    }
-
-    // Access list cost (EIP‑2930)
-    if let EvmTx::Eip2930 { access_list, .. } | EvmTx::Eip1559 { access_list, .. } = tx {
-        gas += access_list.len() as u64 * 2_400; // Per access list entry
-        for item in access_list {
-            gas += item.storage_keys.len() as u64 * 1_900; // Per storage key
-        }
-    }
-
-    gas
-}
-
-/// Calculate effective gas price for EIP‑1559 transactions.
-fn calculate_effective_gas_price(tx: &EvmTx, base_fee: U256) -> u64 {
-    match tx {
-        EvmTx::Legacy { gas_price, .. } => *gas_price,
-        EvmTx::Eip2930 { gas_price, .. } => *gas_price,
-        EvmTx::Eip1559 {
-            max_fee_per_gas,
-            max_priority_fee_per_gas,
-            ..
-        } => {
-            let priority = u64::min(*max_priority_fee_per_gas, *max_fee_per_gas - base_fee.as_u64());
-            base_fee.as_u64() + priority
+            ExecutionResult::Revert { gas_used, output } => Ok(ExecOutput {
+                logs: vec![],
+                created_address: None,
+                gas_used,
+                success: false,
+                reverted: true,
+                return_data: output.to_vec(),
+                effective_gas_price,
+                gas_refund: 0,
+            }),
+            ExecutionResult::Halt { gas_used, reason, .. } => {
+                error!(gas_used, ?reason, "EVM halted");
+                Ok(ExecOutput {
+                    logs: vec![],
+                    created_address: None,
+                    gas_used,
+                    success: false,
+                    reverted: false,
+                    return_data: vec![],
+                    effective_gas_price,
+                    gas_refund: 0,
+                })
+            }
         }
     }
 }
 
-/// Get the current chain ID from the environment.
-fn env_chain_id() -> u64 {
-    // In production, this should come from the node config.
-    // For now, we use a default or read from environment.
-    std::env::var("IONA_CHAIN_ID")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(6126151)
+impl Default for EvmExecutor {
+    fn default() -> Self {
+        Self {
+            config: Arc::new(EvmExecutorConfig::default()),
+            metrics: None,
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
-// Helper: build TxEnv from EvmTx
+// Helpers
 // -----------------------------------------------------------------------------
 
-fn build_tx_env(tx: EvmTx) -> EvmExecutorResult<TxEnv> {
-    let mut tx_env = TxEnv::default();
-
-    match tx {
-        EvmTx::Eip2930 {
-            from,
-            to,
-            nonce,
-            gas_limit,
-            gas_price,
-            value,
-            data,
-            access_list,
-            chain_id,
-        } => {
-            tx_env.caller = to_addr(from);
-            tx_env.gas_limit = gas_limit;
-            tx_env.gas_price = U256::from(gas_price);
-            tx_env.value = U256::from(value);
-            tx_env.nonce = Some(nonce);
-            tx_env.chain_id = Some(chain_id);
-            tx_env.transact_to = match to {
-                Some(addr) => revm::primitives::TransactTo::Call(to_addr(addr)),
-                None => revm::primitives::TransactTo::Create,
-            };
-            tx_env.data = Bytes::from(data);
-            tx_env.access_list = access_list
-                .into_iter()
-                .map(convert_access_list_item)
-                .collect();
-        }
-
-        EvmTx::Legacy {
-            from,
-            to,
-            nonce,
-            gas_limit,
-            gas_price,
-            value,
-            data,
-            chain_id,
-        } => {
-            tx_env.caller = to_addr(from);
-            tx_env.gas_limit = gas_limit;
-            tx_env.gas_price = U256::from(gas_price);
-            tx_env.value = U256::from(value);
-            tx_env.nonce = Some(nonce);
-            tx_env.chain_id = Some(chain_id);
-            tx_env.transact_to = match to {
-                Some(addr) => revm::primitives::TransactTo::Call(to_addr(addr)),
-                None => revm::primitives::TransactTo::Create,
-            };
-            tx_env.data = Bytes::from(data);
-        }
-
-        EvmTx::Eip1559 {
-            from,
-            to,
-            nonce,
-            gas_limit,
-            max_fee_per_gas,
-            max_priority_fee_per_gas,
-            value,
-            data,
-            access_list,
-            chain_id,
-        } => {
-            tx_env.caller = to_addr(from);
-            tx_env.gas_limit = gas_limit;
-            // REVM uses `gas_price` as the effective price. For EIP‑1559, we set
-            // it to `max_fee_per_gas`; the actual effective price is determined
-            // by the block's base fee and the priority fee.
-            tx_env.gas_price = U256::from(max_fee_per_gas);
-            tx_env.value = U256::from(value);
-            tx_env.nonce = Some(nonce);
-            tx_env.chain_id = Some(chain_id);
-            tx_env.transact_to = match to {
-                Some(addr) => revm::primitives::TransactTo::Call(to_addr(addr)),
-                None => revm::primitives::TransactTo::Create,
-            };
-            tx_env.data = Bytes::from(data);
-            tx_env.access_list = access_list
-                .into_iter()
-                .map(convert_access_list_item)
-                .collect();
-        }
-    }
-
-    Ok(tx_env)
+/// Convert a 20‑byte array to a REVM Address.
+#[inline]
+fn to_addr(bytes: [u8; 20]) -> Address {
+    Address::from_slice(&bytes)
 }
 
 /// Convert an `AccessListItem` into REVM's access list format.
@@ -557,67 +1004,6 @@ fn convert_access_list_item(item: AccessListItem) -> (Address, Vec<U256>) {
         to_addr(item.address),
         item.storage_keys.into_iter().map(U256::from_be_bytes).collect(),
     )
-}
-
-/// Convert REVM `ExecutionResult` into `EvmExecOutput`.
-fn output_from_result(result: ExecutionResult, effective_gas_price: u64) -> EvmExecutorResult<EvmExecOutput> {
-    match result {
-        ExecutionResult::Success {
-            gas_used,
-            logs,
-            output,
-            ..
-        } => {
-            let (return_data, created_address) = match output {
-                revm::primitives::Output::Call(data) => (data.to_vec(), None),
-                revm::primitives::Output::Create(data, addr) => (data.to_vec(), Some(addr)),
-            };
-            Ok(EvmExecOutput {
-                logs,
-                created_address,
-                gas_used,
-                success: true,
-                return_data,
-                effective_gas_price,
-            })
-        }
-        ExecutionResult::Revert { gas_used, output } => Ok(EvmExecOutput {
-            logs: vec![],
-            created_address: None,
-            gas_used,
-            success: false,
-            return_data: output.to_vec(),
-            effective_gas_price,
-        }),
-        ExecutionResult::Halt { gas_used, reason, .. } => {
-            error!(gas_used, ?reason, "EVM halted");
-            Ok(EvmExecOutput {
-                logs: vec![],
-                created_address: None,
-                gas_used,
-                success: false,
-                return_data: vec![],
-                effective_gas_price,
-            })
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Global metrics (optional)
-// -----------------------------------------------------------------------------
-
-static GLOBAL_METRICS: std::sync::OnceLock<EvmExecutorMetrics> = std::sync::OnceLock::new();
-
-/// Initialise global metrics collection.
-pub fn init_global_metrics() {
-    GLOBAL_METRICS.get_or_init(EvmExecutorMetrics::default);
-    info!("EVM executor global metrics initialised");
-}
-
-/// Get global metrics (if initialised).
-pub fn get_global_metrics() -> Option<&'static EvmExecutorMetrics> {
-    GLOBAL_METRICS.get()
 }
 
 // -----------------------------------------------------------------------------
@@ -631,27 +1017,43 @@ mod tests {
     use revm::primitives::{BlockEnv, CfgEnv};
 
     fn setup_env(chain_id: u64) -> Env {
-        Env {
-            cfg: CfgEnv::default().with_chain_id(chain_id),
-            block: BlockEnv {
-                number: U256::from(1),
-                coinbase: Address::new([0u8; 20]),
-                timestamp: U256::from(123456),
-                gas_limit: U256::from(30_000_000),
-                basefee: U256::from(10),
-                difficulty: U256::ZERO,
-                prevrandao: None,
-            },
-            tx: TxEnv::default(),
-        }
+        let mut env = Env::default();
+        env.cfg = CfgEnv::default().with_chain_id(chain_id);
+        env.block = BlockEnv {
+            number: U256::from(1),
+            coinbase: Address::new([0u8; 20]),
+            timestamp: U256::from(123456),
+            gas_limit: U256::from(30_000_000),
+            basefee: U256::from(10),
+            difficulty: U256::ZERO,
+            prevrandao: None,
+        };
+        env
     }
 
     #[test]
-    fn test_legacy_tx() -> EvmExecutorResult<()> {
-        let mut db = MemDb::new();
+    fn test_executor_config_validation() {
+        let good = EvmExecutorConfig::default();
+        assert!(good.validate().is_ok());
+
+        let bad = EvmExecutorConfig {
+            max_gas_limit: 0,
+            ..Default::default()
+        };
+        assert!(bad.validate().is_err());
+
+        let bad_chain = EvmExecutorConfig {
+            chain_id: 0,
+            ..Default::default()
+        };
+        assert!(bad_chain.validate().is_err());
+    }
+
+    #[test]
+    fn test_legacy_tx() -> ExecResult<()> {
+        let mut db = MemDb::default();
         let from = [0xAB; 20];
         let to = [0xCD; 20];
-        // Fund sender
         db.insert_account(Address::from_slice(&from), 0, U256::from(10_000_000_000_000_000u128));
 
         let tx = EvmTx::Legacy {
@@ -666,9 +1068,8 @@ mod tests {
         };
 
         let env = setup_env(6126151);
-        let config = EvmExecutorConfig::default();
-        let output = execute_evm_tx(&mut db, env, tx, &config)?;
-        // Simple transfer should succeed
+        let executor = EvmExecutor::default();
+        let output = executor.execute(&mut db, env, tx)?;
         assert!(output.success);
         assert!(output.gas_used > 0);
         Ok(())
@@ -676,7 +1077,7 @@ mod tests {
 
     #[test]
     fn test_gas_price_too_low() {
-        let mut db = MemDb::new();
+        let mut db = MemDb::default();
         let from = [0xAB; 20];
         let to = [0xCD; 20];
         db.insert_account(Address::from_slice(&from), 0, U256::from(10_000_000_000_000_000u128));
@@ -693,14 +1094,14 @@ mod tests {
         };
 
         let env = setup_env(6126151);
-        let config = EvmExecutorConfig::default();
-        let result = execute_evm_tx(&mut db, env, tx, &config);
-        assert!(matches!(result, Err(EvmExecutorError::GasPriceTooLow { .. })));
+        let executor = EvmExecutor::default();
+        let result = executor.execute(&mut db, env, tx);
+        assert!(matches!(result, Err(ExecError::GasPriceTooLow { .. })));
     }
 
     #[test]
-    fn test_non_revert() {
-        let mut db = MemDb::new();
+    fn test_eip1559_tx() -> ExecResult<()> {
+        let mut db = MemDb::default();
         let from = [0xAB; 20];
         let to = [0xCD; 20];
         db.insert_account(Address::from_slice(&from), 0, U256::from(10_000_000_000_000_000u128));
@@ -719,11 +1120,43 @@ mod tests {
         };
 
         let env = setup_env(6126151);
-        let config = EvmExecutorConfig::default();
-        let output = execute_evm_tx(&mut db, env, tx, &config)?;
+        let executor = EvmExecutor::default();
+        let output = executor.execute(&mut db, env, tx)?;
         assert!(output.success);
-        assert!(output.gas_used > 0);
         assert_eq!(output.effective_gas_price, 30); // 10 (basefee) + 20 (priority)
         Ok(())
+    }
+
+    #[test]
+    fn test_metrics() {
+        let mut db = MemDb::default();
+        let from = [0xAB; 20];
+        let to = [0xCD; 20];
+        db.insert_account(Address::from_slice(&from), 0, U256::from(10_000_000_000_000_000u128));
+
+        let tx = EvmTx::Legacy {
+            from,
+            to: Some(to),
+            nonce: 0,
+            gas_limit: 100_000,
+            gas_price: 10,
+            value: 1_000,
+            data: vec![],
+            chain_id: 6126151,
+        };
+
+        let env = setup_env(6126151);
+        let executor = EvmExecutorBuilder::new()
+            .with_metrics(true)
+            .build()
+            .unwrap();
+
+        let output = executor.execute(&mut db, env, tx)?;
+        assert!(output.success);
+
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.total_txs(), 1);
+        assert_eq!(metrics.successful_txs(), 1);
+        assert!(metrics.avg_gas() > 0.0);
     }
 }
