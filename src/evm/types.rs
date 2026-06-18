@@ -20,6 +20,7 @@
 
 use revm::primitives::{Address, Bytes, B256, U256};
 use std::str::FromStr;
+use thiserror::Error;
 
 // -----------------------------------------------------------------------------
 // Core re‑exports
@@ -34,7 +35,28 @@ pub use revm::primitives::{
     TransactTo,
     // Gas constants
     GAS_REFUND_DENOMINATOR, GAS_REFUND_NUMERATOR,
+    // EVM errors
+    EVMError, HaltReason, RevertReason,
 };
+
+// -----------------------------------------------------------------------------
+// Error types
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur when parsing or handling EVM primitive types.
+#[derive(Debug, Error)]
+pub enum AddressError {
+    #[error("invalid hex string: {0}")]
+    Hex(String),
+
+    #[error("invalid length: expected {expected} hex chars, got {got}")]
+    InvalidLength { expected: usize, got: usize },
+
+    #[error("invalid checksum (EIP-55) for address {address}")]
+    InvalidChecksum { address: String },
+}
+
+pub type AddressResult<T> = Result<T, AddressError>;
 
 // -----------------------------------------------------------------------------
 // Convenience constants
@@ -55,6 +77,25 @@ pub const U256_ONE: U256 = U256::from(1);
 /// Zero as U256.
 pub const U256_ZERO: U256 = U256::ZERO;
 
+/// Maximum gas limit per block (commonly used in Ethereum mainnet).
+pub const MAX_BLOCK_GAS_LIMIT: u64 = 30_000_000;
+
+/// Maximum gas limit for a single transaction (EIP-1559).
+pub const MAX_TX_GAS_LIMIT: u64 = 15_000_000;
+
+/// Precompile addresses (1..9) as defined in Ethereum Yellow Paper.
+pub const PRECOMPILE_ADDRESSES: [Address; 9] = [
+    Address::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
+    Address::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02]),
+    Address::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03]),
+    Address::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04]),
+    Address::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05]),
+    Address::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06]),
+    Address::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07]),
+    Address::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08]),
+    Address::new([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09]),
+];
+
 // -----------------------------------------------------------------------------
 // Helper functions
 // -----------------------------------------------------------------------------
@@ -66,7 +107,7 @@ pub const U256_ZERO: U256 = U256::ZERO;
 ///
 /// # Returns
 /// `Ok(Address)` if the string is valid and exactly 40 hex characters (20 bytes),
-/// otherwise `Err(String)`.
+/// otherwise `Err(AddressError)`.
 ///
 /// # Example
 /// ```
@@ -74,16 +115,19 @@ pub const U256_ZERO: U256 = U256::ZERO;
 ///
 /// let addr = hex_to_address("0x742d35Cc6634C0532925a3b844Bc9e7595f2bD28").unwrap();
 /// ```
-pub fn hex_to_address(s: &str) -> Result<Address, String> {
+pub fn hex_to_address(s: &str) -> AddressResult<Address> {
     let s = s.trim_start_matches("0x");
     if s.len() != 40 {
-        return Err(format!("invalid address length: expected 40 hex chars, got {}", s.len()));
+        return Err(AddressError::InvalidLength {
+            expected: 40,
+            got: s.len(),
+        });
     }
-    let bytes = hex::decode(s).map_err(|e| format!("invalid hex: {}", e))?;
+    let bytes = hex::decode(s).map_err(|e| AddressError::Hex(e.to_string()))?;
     Ok(Address::from_slice(&bytes))
 }
 
-/// Convert an `Address` to a hex string with `0x` prefix.
+/// Convert an `Address` to a hex string with `0x` prefix (all lowercase).
 ///
 /// # Example
 /// ```
@@ -95,6 +139,64 @@ pub fn hex_to_address(s: &str) -> Result<Address, String> {
 /// ```
 pub fn address_to_hex(addr: &Address) -> String {
     format!("0x{}", hex::encode(addr.as_slice()))
+}
+
+/// Convert an address to an EIP-55 checksummed hex string.
+///
+/// See [EIP-55](https://eips.ethereum.org/EIPS/eip-55) for details.
+///
+/// # Example
+/// ```
+/// use iona::evm::types::{Address, checksum_address};
+///
+/// let addr = Address::new([0xAB; 20]);
+/// let checksum = checksum_address(&addr);
+/// assert_eq!(checksum.len(), 42);
+/// ```
+pub fn checksum_address(addr: &Address) -> String {
+    let addr_hex = hex::encode(addr.as_slice());
+    let hash = hex::encode(keccak_hash(addr_hex.as_bytes()));
+    let mut result = String::with_capacity(42);
+    result.push_str("0x");
+    for (i, c) in addr_hex.chars().enumerate() {
+        if c.is_ascii_hexdigit() && (hash.chars().nth(i).unwrap_or('0') >= '8') {
+            result.push(c.to_ascii_uppercase());
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Compute Keccak-256 hash of a byte slice (convenience wrapper).
+fn keccak_hash(data: &[u8]) -> [u8; 32] {
+    use sha3::{Digest, Keccak256};
+    Keccak256::digest(data).into()
+}
+
+/// Verify that an address string has a valid EIP-55 checksum.
+///
+/// # Arguments
+/// * `s` – The address hex string (with or without `0x` prefix).
+///
+/// # Returns
+/// `Ok(())` if the checksum is valid, otherwise `Err(AddressError)`.
+pub fn verify_checksum(s: &str) -> AddressResult<()> {
+    let s = s.trim_start_matches("0x");
+    if s.len() != 40 {
+        return Err(AddressError::InvalidLength {
+            expected: 40,
+            got: s.len(),
+        });
+    }
+    let computed = checksum_address(&hex_to_address(s)?);
+    let provided = format!("0x{}", s);
+    if computed != provided {
+        return Err(AddressError::InvalidChecksum {
+            address: provided,
+        });
+    }
+    Ok(())
 }
 
 /// Convert a hex string (with or without `0x` prefix) to `B256` (32 bytes).
@@ -130,13 +232,37 @@ pub fn hex_to_u256(s: &str) -> Result<U256, String> {
 }
 
 /// Check if an address is zero.
+#[inline]
 pub fn is_zero_address(addr: &Address) -> bool {
     *addr == ZERO_ADDRESS
 }
 
 /// Check if a hash is zero.
+#[inline]
 pub fn is_zero_hash(hash: &B256) -> bool {
     *hash == ZERO_HASH
+}
+
+/// Check if an address is a known precompile.
+#[inline]
+pub fn is_precompile(addr: &Address) -> bool {
+    PRECOMPILE_ADDRESSES.contains(addr)
+}
+
+/// Get a human-readable label for a precompile address (if known).
+pub fn precompile_label(addr: &Address) -> Option<&'static str> {
+    match addr.as_slice()[19] {
+        1 => Some("ecrecover"),
+        2 => Some("sha256"),
+        3 => Some("ripemd160"),
+        4 => Some("identity"),
+        5 => Some("mod_exp"),
+        6 => Some("bn_add"),
+        7 => Some("bn_mul"),
+        8 => Some("bn_pairing"),
+        9 => Some("blake2f"),
+        _ => None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -207,7 +333,7 @@ mod tests {
 
     #[test]
     fn test_hex_to_address_invalid_length() {
-        assert!(hex_to_address("0x1234").is_err());
+        assert!(matches!(hex_to_address("0x1234"), Err(AddressError::InvalidLength { expected: 40, got: 4 })));
     }
 
     #[test]
@@ -238,5 +364,38 @@ mod tests {
         let fmt = fmt_hash(&hash);
         assert!(fmt.starts_with("0x"));
         assert!(fmt.len() <= 10);
+    }
+
+    #[test]
+    fn test_checksum_address() {
+        // Known test vectors from EIP-55
+        let addr = hex_to_address("0xfb6916095ca1df60bb79ce92ce3ea74c37c5d359").unwrap();
+        let checksum = checksum_address(&addr);
+        assert_eq!(checksum, "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359");
+
+        let addr2 = hex_to_address("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed").unwrap();
+        let checksum2 = checksum_address(&addr2);
+        assert_eq!(checksum2, "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed");
+    }
+
+    #[test]
+    fn test_verify_checksum_ok() {
+        let s = "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359";
+        assert!(verify_checksum(s).is_ok());
+    }
+
+    #[test]
+    fn test_verify_checksum_fail() {
+        let s = "0xfb6916095ca1df60bb79ce92ce3ea74c37c5d359"; // invalid checksum
+        assert!(matches!(verify_checksum(s), Err(AddressError::InvalidChecksum { .. })));
+    }
+
+    #[test]
+    fn test_precompile_constants() {
+        assert_eq!(PRECOMPILE_ADDRESSES.len(), 9);
+        assert_eq!(precompile_label(&Address::new([0u8; 20])), None);
+        assert_eq!(precompile_label(&Address::new([0x00; 19] + [1])), Some("ecrecover"));
+        assert!(is_precompile(&Address::new([0x00; 19] + [1])));
+        assert!(!is_precompile(&Address::new([0x01; 20])));
     }
 }
