@@ -3,6 +3,14 @@
 //! Provides helpers to create an `Env` with sensible defaults for IONA,
 //! as well as a flexible builder for custom configurations.
 //!
+//! Supports:
+//! - EIP-1559 (base fee)
+//! - EIP-4844 (blob transactions)
+//! - EIP-4399 (prevrandao)
+//! - EIP-155 chain ID validation
+//! - Custom coinbase, timestamp, gas limit
+//! - Fork simulation with real time
+//!
 //! # Example
 //!
 //! ```
@@ -30,17 +38,26 @@ use thiserror::Error;
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Default gas limit for the block.
+/// Default gas limit for the block (30 million).
 pub const DEFAULT_BLOCK_GAS_LIMIT: u64 = 30_000_000;
 
 /// Default chain ID for IONA testnet (can be overridden).
 pub const DEFAULT_CHAIN_ID: u64 = 6126151;
 
-/// Default base fee (1 gwei).
+/// Default base fee (1 gwei = 1_000_000_000 wei).
 pub const DEFAULT_BASE_FEE: u64 = 1_000_000_000;
 
-/// Default blob gas limit (EIP-4844).
+/// Default blob gas limit (EIP‑4844, 262,144).
 pub const DEFAULT_BLOB_GAS_LIMIT: u64 = 262_144;
+
+/// Maximum block gas limit (safety cap, 50 million).
+pub const MAX_BLOCK_GAS_LIMIT: u64 = 50_000_000;
+
+/// Minimum base fee (1 wei).
+pub const MIN_BASE_FEE: u64 = 1;
+
+/// Maximum base fee (1e12 wei = 1000 gwei).
+pub const MAX_BASE_FEE: u64 = 1_000_000_000_000;
 
 // -----------------------------------------------------------------------------
 // Errors
@@ -61,13 +78,25 @@ pub enum EnvError {
     #[error("timestamp overflow: {0}")]
     TimestampOverflow(u64),
 
-    /// Gas limit overflow.
-    #[error("gas limit overflow: {0}")]
-    GasLimitOverflow(u64),
+    /// Gas limit exceeds maximum allowed.
+    #[error("gas limit {0} exceeds maximum {MAX_BLOCK_GAS_LIMIT}")]
+    GasLimitTooHigh(u64),
 
-    /// Base fee overflow.
-    #[error("base fee overflow: {0}")]
-    BaseFeeOverflow(u64),
+    /// Gas limit is zero.
+    #[error("gas limit must be > 0, got {0}")]
+    GasLimitZero(u64),
+
+    /// Base fee exceeds maximum.
+    #[error("base fee {0} exceeds maximum {MAX_BASE_FEE}")]
+    BaseFeeTooHigh(u64),
+
+    /// Base fee is zero.
+    #[error("base fee must be > 0, got {0}")]
+    BaseFeeZero(u64),
+
+    /// Difficulty overflow.
+    #[error("difficulty overflow: {0}")]
+    DifficultyOverflow(u64),
 }
 
 pub type EnvResult<T> = Result<T, EnvError>;
@@ -77,6 +106,8 @@ pub type EnvResult<T> = Result<T, EnvError>;
 // -----------------------------------------------------------------------------
 
 /// Builder for creating custom EVM execution environments.
+///
+/// Supports all EIPs relevant to IONA (EIP‑1559, EIP‑4844, EIP‑4399).
 #[derive(Debug, Clone, Default)]
 pub struct EnvBuilder {
     chain_id: Option<u64>,
@@ -89,6 +120,9 @@ pub struct EnvBuilder {
     block_difficulty: Option<U256>,
     block_prevrandao: Option<U256>,
     enable_blob: bool,
+    // Performance options
+    perf_analyse_bytecode_accesses: bool,
+    perf_analyse_created_bytecodes: bool,
 }
 
 impl EnvBuilder {
@@ -128,7 +162,7 @@ impl EnvBuilder {
         self
     }
 
-    /// Set the base fee (per gas).
+    /// Set the base fee (per gas) in wei.
     pub fn base_fee(mut self, base_fee: u64) -> Self {
         self.block_base_fee = Some(base_fee);
         self
@@ -140,13 +174,13 @@ impl EnvBuilder {
         self
     }
 
-    /// Set the blob gas limit (EIP-4844).
+    /// Set the blob gas limit (EIP‑4844).
     pub fn blob_gas_limit(mut self, blob_gas_limit: u64) -> Self {
         self.block_blob_gas_limit = Some(blob_gas_limit);
         self
     }
 
-    /// Enable blob transactions (EIP-4844).
+    /// Enable blob transactions (EIP‑4844).
     pub fn enable_blob(mut self, enable: bool) -> Self {
         self.enable_blob = enable;
         self
@@ -158,28 +192,69 @@ impl EnvBuilder {
         self
     }
 
-    /// Set the prevrandao value (PoS randomness).
+    /// Set the prevrandao value (PoS randomness, EIP‑4399).
     pub fn prevrandao(mut self, prevrandao: U256) -> Self {
         self.block_prevrandao = Some(prevrandao);
         self
     }
 
-    /// Build the EVM environment.
-    pub fn build(self) -> EnvResult<Env> {
-        let chain_id = self.chain_id.ok_or(EnvError::ZeroChainId)?;
-        if chain_id == 0 {
+    /// Enable performance analysis of bytecode accesses.
+    pub fn analyse_bytecode_accesses(mut self, enable: bool) -> Self {
+        self.perf_analyse_bytecode_accesses = enable;
+        self
+    }
+
+    /// Enable performance analysis of created bytecodes.
+    pub fn analyse_created_bytecodes(mut self, enable: bool) -> Self {
+        self.perf_analyse_created_bytecodes = enable;
+        self
+    }
+
+    /// Validate the configuration.
+    fn validate(&self) -> EnvResult<()> {
+        if let Some(chain_id) = self.chain_id {
+            if chain_id == 0 {
+                return Err(EnvError::ZeroChainId);
+            }
+        } else {
             return Err(EnvError::ZeroChainId);
         }
 
+        if let Some(gas_limit) = self.block_gas_limit {
+            if gas_limit == 0 {
+                return Err(EnvError::GasLimitZero(gas_limit));
+            }
+            if gas_limit > MAX_BLOCK_GAS_LIMIT {
+                return Err(EnvError::GasLimitTooHigh(gas_limit));
+            }
+        }
+
+        if let Some(base_fee) = self.block_base_fee {
+            if base_fee == 0 {
+                return Err(EnvError::BaseFeeZero(base_fee));
+            }
+            if base_fee > MAX_BASE_FEE {
+                return Err(EnvError::BaseFeeTooHigh(base_fee));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Build the EVM environment.
+    pub fn build(self) -> EnvResult<Env> {
+        self.validate()?;
+
+        let chain_id = self.chain_id.unwrap();
         let mut env = Env::default();
 
-        // Configure chain
+        // Configure chain (CfgEnv)
         env.cfg = CfgEnv::default();
         env.cfg.chain_id = chain_id;
-        env.cfg.perf_analyse_created_bytecodes = false;
-        env.cfg.perf_analyse_bytecode_accesses = true;
+        env.cfg.perf_analyse_created_bytecodes = self.perf_analyse_created_bytecodes;
+        env.cfg.perf_analyse_bytecode_accesses = self.perf_analyse_bytecode_accesses;
 
-        // Configure block
+        // Configure block (BlockEnv)
         env.block = BlockEnv::default();
         env.block.number = U256::from(self.block_number.unwrap_or(0));
         env.block.timestamp = U256::from(self.block_timestamp.unwrap_or(0));
@@ -272,6 +347,7 @@ pub fn test_env(chain_id: u64, block_number: u64) -> EnvResult<Env> {
         .block_number(block_number)
         .block_timestamp(1_700_000_000)
         .base_fee(10)
+        .gas_limit(15_000_000)
         .build()
 }
 
@@ -281,6 +357,27 @@ pub fn fork_env(chain_id: u64, block_number: u64, base_fee: u64) -> EnvResult<En
         .block_number(block_number)
         .block_timestamp_now()
         .base_fee(base_fee)
+        .build()
+}
+
+/// Create an environment with EIP-4844 blob support enabled.
+pub fn env_with_blobs(chain_id: u64, block_number: u64, blob_gas_limit: u64) -> EnvResult<Env> {
+    EnvBuilder::new(chain_id)
+        .block_number(block_number)
+        .block_timestamp_now()
+        .enable_blob(true)
+        .blob_gas_limit(blob_gas_limit)
+        .build()
+}
+
+/// Create an environment for mainnet default values.
+pub fn mainnet_env(chain_id: u64) -> EnvResult<Env> {
+    EnvBuilder::new(chain_id)
+        .block_number(0)
+        .block_timestamp_now()
+        .base_fee(DEFAULT_BASE_FEE)
+        .gas_limit(DEFAULT_BLOCK_GAS_LIMIT)
+        .enable_blob(true)
         .build()
 }
 
@@ -301,6 +398,8 @@ impl Default for EnvBuilder {
             block_difficulty: Some(U256::ZERO),
             block_prevrandao: None,
             enable_blob: false,
+            perf_analyse_bytecode_accesses: true,
+            perf_analyse_created_bytecodes: false,
         }
     }
 }
@@ -356,10 +455,43 @@ mod tests {
     }
 
     #[test]
+    fn test_builder_validation_gas_limit_too_high() {
+        let builder = EnvBuilder::new(6126151)
+            .gas_limit(MAX_BLOCK_GAS_LIMIT + 1);
+        let err = builder.build().unwrap_err();
+        assert!(matches!(err, EnvError::GasLimitTooHigh(_)));
+    }
+
+    #[test]
+    fn test_builder_validation_gas_limit_zero() {
+        let builder = EnvBuilder::new(6126151)
+            .gas_limit(0);
+        let err = builder.build().unwrap_err();
+        assert!(matches!(err, EnvError::GasLimitZero(0)));
+    }
+
+    #[test]
+    fn test_builder_validation_base_fee_too_high() {
+        let builder = EnvBuilder::new(6126151)
+            .base_fee(MAX_BASE_FEE + 1);
+        let err = builder.build().unwrap_err();
+        assert!(matches!(err, EnvError::BaseFeeTooHigh(_)));
+    }
+
+    #[test]
+    fn test_builder_validation_base_fee_zero() {
+        let builder = EnvBuilder::new(6126151)
+            .base_fee(0);
+        let err = builder.build().unwrap_err();
+        assert!(matches!(err, EnvError::BaseFeeZero(0)));
+    }
+
+    #[test]
     fn test_test_env() -> EnvResult<()> {
         let env = test_env(6126151, 500)?;
         assert_eq!(env.block.number, U256::from(500));
         assert_eq!(env.block.basefee, U256::from(10));
+        assert_eq!(env.block.gas_limit, U256::from(15_000_000));
         Ok(())
     }
 
@@ -382,6 +514,35 @@ mod tests {
     fn test_env_with_current_time() -> EnvResult<()> {
         let env = env_with_current_time(6126151)?;
         assert!(env.block.timestamp > U256::from(1_700_000_000));
+        Ok(())
+    }
+
+    #[test]
+    fn test_mainnet_env() -> EnvResult<()> {
+        let env = mainnet_env(6126151)?;
+        assert_eq!(env.cfg.chain_id, 6126151);
+        assert_eq!(env.block.gas_limit, U256::from(DEFAULT_BLOCK_GAS_LIMIT));
+        assert_eq!(env.block.basefee, U256::from(DEFAULT_BASE_FEE));
+        assert!(env.block.blob_gas_limit.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn test_env_with_blobs() -> EnvResult<()> {
+        let env = env_with_blobs(6126151, 1000, 100_000)?;
+        assert_eq!(env.block.number, U256::from(1000));
+        assert_eq!(env.block.blob_gas_limit, Some(U256::from(100_000)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_builder_performance_options() -> EnvResult<()> {
+        let env = EnvBuilder::new(6126151)
+            .analyse_bytecode_accesses(true)
+            .analyse_created_bytecodes(true)
+            .build()?;
+        assert!(env.cfg.perf_analyse_bytecode_accesses);
+        assert!(env.cfg.perf_analyse_created_bytecodes);
         Ok(())
     }
 }
