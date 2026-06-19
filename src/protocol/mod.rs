@@ -32,18 +32,27 @@
 //! └─────────────────┴─────────────────┴─────────────────┴─────────────────────┘
 //! ```
 //!
-//! # Example
+//! # Quick Start
 //!
 //! ```rust,ignore
-//! use iona::protocol::prelude::*;
+//! use iona::protocol::{ProtocolConfig, init};
 //!
-//! let activations = default_activations();
-//! let checker = CompatChecker::new(activations);
-//! let report = checker.check_all();
-//! if !report.passed {
-//!     eprintln!("{}", report);
-//! }
+//! let config = ProtocolConfig::default();
+//! init(&config)?;
 //! ```
+//!
+//! # Error Handling
+//!
+//! All initialization and validation functions return `ProtocolResult<T>`,
+//! which uses `ProtocolError` for uniform error reporting.
+
+use std::time::Duration;
+use thiserror::Error;
+use tracing::{error, info, warn};
+
+// -----------------------------------------------------------------------------
+// Submodule declarations (each module is implemented in its own file)
+// -----------------------------------------------------------------------------
 
 pub mod activation_guarantees;
 pub mod compat;
@@ -120,57 +129,161 @@ pub use wire::{
 };
 
 // -----------------------------------------------------------------------------
+// Protocol error type
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during protocol initialisation or validation.
+#[derive(Debug, Error)]
+pub enum ProtocolError {
+    #[error("activation schedule validation failed: {0}")]
+    ActivationValidation(String),
+
+    #[error("compatibility check failed: {0}")]
+    Compatibility(String),
+
+    #[error("safety invariant violation: {0}")]
+    SafetyViolation(String),
+
+    #[error("state invariant violation: {0}")]
+    StateInvariant(String),
+
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Result type for protocol operations.
+pub type ProtocolResult<T> = Result<T, ProtocolError>;
+
+// -----------------------------------------------------------------------------
+// Protocol configuration
+// -----------------------------------------------------------------------------
+
+/// Configuration for the protocol subsystem.
+#[derive(Debug, Clone)]
+pub struct ProtocolConfig {
+    /// Protocol activation schedule.
+    pub activations: Vec<ProtocolActivation>,
+    /// Current block height (for validation).
+    pub current_height: u64,
+    /// Minimum lead blocks for pre‑activation signalling.
+    pub min_lead_blocks: u64,
+    /// Whether to enable shadow validation.
+    pub enable_shadow_validation: bool,
+    /// Shadow validation sample rate (0.0 = none, 1.0 = all).
+    pub shadow_sample_rate: f64,
+}
+
+impl Default for ProtocolConfig {
+    fn default() -> Self {
+        Self {
+            activations: default_activations(),
+            current_height: 0,
+            min_lead_blocks: DEFAULT_MIN_LEAD_BLOCKS,
+            enable_shadow_validation: true,
+            shadow_sample_rate: 0.1,
+        }
+    }
+}
+
+impl ProtocolConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> ProtocolResult<()> {
+        if self.min_lead_blocks == 0 {
+            return Err(ProtocolError::Config("min_lead_blocks must be > 0".into()));
+        }
+        if !(0.0..=1.0).contains(&self.shadow_sample_rate) {
+            return Err(ProtocolError::Config(format!(
+                "shadow_sample_rate must be between 0.0 and 1.0, got {}",
+                self.shadow_sample_rate
+            )));
+        }
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Initialisation
 // -----------------------------------------------------------------------------
 
-/// Initialise the protocol subsystem with the given activation schedule.
-/// Validates the schedule and sets up shadow validation if needed.
-pub fn init(activations: &[ProtocolActivation], current_height: u64) -> Result<(), Vec<String>> {
-    use tracing::info;
-
+/// Initialise the protocol subsystem with the given configuration.
+///
+/// This function:
+/// 1. Validates the activation schedule (AG‑1 to AG‑8).
+/// 2. Runs compatibility checks.
+/// 3. Sets up shadow validation if enabled.
+///
+/// # Errors
+/// Returns `ProtocolError` if any validation fails.
+pub fn init(config: &ProtocolConfig) -> ProtocolResult<()> {
+    let _span = tracing::info_span!("protocol::init").entered();
     info!("initialising protocol subsystem");
 
-    // Validate activation schedule
+    // Validate configuration.
+    config.validate()?;
+
+    // Validate activation schedule.
     let validation_result = activation_guarantees::validate_activation_schedule(
-        activations,
-        current_height,
-        DEFAULT_MIN_LEAD_BLOCKS,
+        &config.activations,
+        config.current_height,
+        config.min_lead_blocks,
     );
 
     if let Err(errors) = validation_result {
-        return Err(errors);
+        let msg = errors.join("; ");
+        error!("activation schedule validation failed: {}", msg);
+        return Err(ProtocolError::ActivationValidation(msg));
+    }
+
+    // Run compatibility checks.
+    let checker = CompatChecker::new(config.activations.clone());
+    let compat_report = checker.check_all();
+    if !compat_report.passed {
+        let failures: Vec<_> = compat_report.failures().iter().map(|r| r.detail.clone()).collect();
+        let msg = failures.join("; ");
+        error!("compatibility check failed: {}", msg);
+        return Err(ProtocolError::Compatibility(msg));
+    }
+
+    // Set up shadow validation if enabled.
+    if config.enable_shadow_validation {
+        let shadow_config = ShadowValidatorConfig {
+            enabled: true,
+            sample_rate: config.shadow_sample_rate,
+            ..Default::default()
+        };
+        match ShadowValidator::new(config.activations.clone(), shadow_config) {
+            Ok(_validator) => {
+                info!(
+                    sample_rate = config.shadow_sample_rate,
+                    "shadow validator initialised"
+                );
+                // In a real system, we would store this validator in a global state.
+            }
+            Err(e) => {
+                warn!("shadow validator initialisation failed: {}", e);
+            }
+        }
+    }
+
+    // Run safety invariants (S1–S5) at current height.
+    let safety_report = safety::check_safety_invariants(&config.activations, config.current_height);
+    if !safety_report.passed {
+        let failures: Vec<_> = safety_report.failures().iter().map(|c| c.detail.clone()).collect();
+        let msg = failures.join("; ");
+        error!("safety invariants violated: {}", msg);
+        return Err(ProtocolError::SafetyViolation(msg));
     }
 
     info!("protocol subsystem initialised successfully");
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-// Prelude: import commonly used items
-// -----------------------------------------------------------------------------
-
-/// A prelude module that re‑exports the most common types and functions
-/// from the protocol module.
-///
-/// # Example
-///
-/// ```
-/// use iona::protocol::prelude::*;
-/// ```
-pub mod prelude {
-    pub use super::{
-        version_for_height, ProtocolActivation,
-        CURRENT_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
-        default_activations, is_supported, version_string,
-        check_all_guarantees, check_hello_compat,
-        CompatChecker, CompatDomain, CompatLevel, CompatReport,
-        ShadowValidator, ShadowValidatorConfig, ShadowStats,
-        RollingUpgrade, RollingUpgradeStatus,
-        SafetyReport,
-        StateInvariantReport,
-        UpgradeConstraintReport,
-        Hello, handshake, HandshakeError, HandshakeResult,
-    };
+/// Shorthand for initialising with default configuration.
+pub fn init_default() -> ProtocolResult<()> {
+    init(&ProtocolConfig::default())
 }
 
 // -----------------------------------------------------------------------------
@@ -199,4 +312,77 @@ pub fn protocol_summary(activations: &[ProtocolActivation]) -> String {
         ));
     }
     summary
+}
+
+// -----------------------------------------------------------------------------
+// Prelude: import commonly used items
+// -----------------------------------------------------------------------------
+
+/// A prelude module that re‑exports the most common types and functions
+/// from the protocol module.
+///
+/// # Example
+///
+/// ```
+/// use iona::protocol::prelude::*;
+/// ```
+pub mod prelude {
+    pub use super::{
+        version_for_height, ProtocolActivation, ProtocolConfig, ProtocolError, ProtocolResult,
+        CURRENT_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+        default_activations, is_supported, version_string,
+        check_all_guarantees, check_hello_compat,
+        CompatChecker, CompatDomain, CompatLevel, CompatReport,
+        ShadowValidator, ShadowValidatorConfig, ShadowStats,
+        RollingUpgrade, RollingUpgradeStatus,
+        SafetyReport,
+        StateInvariantReport,
+        UpgradeConstraintReport,
+        Hello, handshake, HandshakeError, HandshakeResult,
+        init, init_default, protocol_version_string, protocol_summary,
+    };
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_init_default() {
+        let result = init_default();
+        assert!(result.is_ok(), "init_default failed: {:?}", result);
+    }
+
+    #[test]
+    fn test_protocol_config_validation() {
+        let mut config = ProtocolConfig::default();
+        config.min_lead_blocks = 0;
+        assert!(config.validate().is_err());
+
+        config.shadow_sample_rate = 1.5;
+        assert!(config.validate().is_err());
+
+        config.min_lead_blocks = 10;
+        config.shadow_sample_rate = 0.5;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_protocol_summary_contains_info() {
+        let activations = default_activations();
+        let summary = protocol_summary(&activations);
+        assert!(summary.contains("Current PV:"));
+        assert!(summary.contains("Activations:"));
+    }
+
+    #[test]
+    fn test_protocol_version_string() {
+        let s = protocol_version_string();
+        assert!(s.contains("protocol v"));
+        assert!(s.contains("schema v"));
+    }
 }
