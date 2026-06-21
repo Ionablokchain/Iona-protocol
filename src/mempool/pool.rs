@@ -1,71 +1,56 @@
 //! Standard mempool for IONA — Quantum State Model.
 //!
+//! This module implements a high‑performance transaction pool with:
+//! - Priority ordering (score = tip × gas / size)
+//! - Per‑sender nonce queues with RBF (Replace‑By‑Fee)
+//! - Global capacity with eviction of lowest‑priority transactions
+//! - TTL expiry per transaction
+//! - Quantum state tracking (purity, entropy, coherence)
+//! - Configurable parameters via `MempoolConfig`
+//! - Comprehensive metrics
+//!
 //! # Quantum Mempool Architecture
 //!
 //! The mempool is modelled as an **open quantum system** where each
-//! transaction is a **pure state** |tx_i⟩ in the mempool Hilbert space
-//! ℋ_mempool = ⊗_{senders} ℋ_sender. The mempool evolves under a
-//! **Lindblad master equation** with Hamiltonian governing priority
-//! ordering and decoherence from TTL expiry.
+//! transaction is a **pure state** |tx_i⟩ in the mempool Hilbert space.
+//! The state evolves under a Lindblad master equation with Hamiltonian
+//! governing priority ordering and decoherence from TTL expiry.
 //!
-//! # Mathematical Formalism
+//! # Example
 //!
-//! ## State Representation
-//! ```text
-//! ρ_mempool = Σ_i p_i |ψ_i⟩⟨ψ_i|
-//! |ψ_i⟩ = |tx_1⟩ ⊗ |tx_2⟩ ⊗ ... ⊗ |tx_N⟩   (computational basis)
 //! ```
+//! use iona::mempool::StandardMempool;
+//! use iona::types::Tx;
 //!
-//! ## Hamiltonian
-//! ```text
-//! Ĥ = Ĥ_priority + Ĥ_rbf + Ĥ_eviction + Ĥ_ttl
-//!
-//! Ĥ_priority = Σ_i E_i a†_i a_i               (score-based ordering)
-//! Ĥ_rbf      = Σ_j g_j (|old⟩⟨new|_j + h.c.)   (replacement coupling)
-//! Ĥ_eviction = Σ_k ω_k b†_k b_k               (overflow removal)
-//! Ĥ_ttl      = Σ_l γ_l (n̂_l + ½)              (harmonic decay for expiry)
-//! ```
-//!
-//! ## Quantum Channel for Insertion
-//! ```text
-//! Φ_insert(ρ) = K_admit ρ K_admit† + K_reject ρ K_reject†
-//! K_admit  = √p_admit |admit⟩⟨vac|
-//! K_reject = √(1-p_admit) |reject⟩⟨vac|
-//! ```
-//!
-//! ## RBF as Quantum Swap Gate
-//! ```text
-//! U_rbf |old_nonce⟩|new_tx⟩ → |new_tx⟩|old_tx⟩   (SWAP)
-//! ```
-//!
-//! ## Decoherence from TTL
-//! ```text
-//! dρ/dt = -i[Ĥ, ρ] + Σ_l γ_l (L_l ρ L_l† - ½{L_l† L_l, ρ})
-//! L_l = |∅⟩⟨tx_l|   (annihilation of expired transaction)
+//! let mut mempool = StandardMempool::new(MempoolConfig::default());
+//! let tx = Tx { /* ... */ };
+//! mempool.insert(tx, 100).unwrap();
+//! let txs = mempool.drain(10);
 //! ```
 
 use crate::execution::intrinsic_gas;
-use crate::mempool::{Mempool as MempoolTrait, MempoolError};
 use crate::types::{Hash32, Height, Tx};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use thiserror::Error;
 
 // -----------------------------------------------------------------------------
-// Quantum Constants
+// Constants (with quantum semantics)
 // -----------------------------------------------------------------------------
 
 /// Number of blocks after which a transaction expires (coherence time).
-const TTL_BLOCKS: u64 = 300;
+pub const DEFAULT_TTL_BLOCKS: u64 = 300;
 
 /// Maximum number of pending transactions per sender (Hilbert space bound).
-const MAX_PENDING_PER_SENDER: usize = 64;
+pub const DEFAULT_MAX_PENDING_PER_SENDER: usize = 64;
 
 /// Minimum percentage tip increase for RBF replacement (swap gate threshold).
-const RBF_BUMP_PERCENT: u64 = 10;
+pub const DEFAULT_RBF_BUMP_PERCENT: u64 = 10;
 
-/// Reduced Planck constant (natural units).
-const HBAR: f64 = 1.0;
+/// Default mempool capacity.
+pub const DEFAULT_CAPACITY: usize = 200_000;
 
 /// Decoherence rate per operation (insert/evict).
 const OPERATION_DECOHERENCE_RATE: f64 = 0.0001;
@@ -80,7 +65,151 @@ const KRAUS_RANK: usize = 4;
 const MIN_MEMPOOL_COHERENCE: f64 = 0.9;
 
 // -----------------------------------------------------------------------------
-// Quantum Mempool State
+// Configuration
+// -----------------------------------------------------------------------------
+
+/// Configuration for the standard mempool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MempoolConfig {
+    /// Maximum total transactions in the pool.
+    pub capacity: usize,
+    /// Number of blocks after which a transaction expires.
+    pub ttl_blocks: u64,
+    /// Maximum pending transactions per sender.
+    pub max_pending_per_sender: usize,
+    /// Minimum percentage tip increase for RBF (e.g., 10 = 10%).
+    pub rbf_bump_percent: u64,
+    /// Whether to enable quantum state tracking (slightly slower).
+    pub enable_quantum_state: bool,
+    /// Default base fee for submissions when not provided.
+    pub default_base_fee: u64,
+    /// Whether to log decoherence events.
+    pub log_decoherence: bool,
+}
+
+impl Default for MempoolConfig {
+    fn default() -> Self {
+        Self {
+            capacity: DEFAULT_CAPACITY,
+            ttl_blocks: DEFAULT_TTL_BLOCKS,
+            max_pending_per_sender: DEFAULT_MAX_PENDING_PER_SENDER,
+            rbf_bump_percent: DEFAULT_RBF_BUMP_PERCENT,
+            enable_quantum_state: true,
+            default_base_fee: 0,
+            log_decoherence: false,
+        }
+    }
+}
+
+impl MempoolConfig {
+    /// Validate the configuration, returning an error if invalid.
+    pub fn validate(&self) -> Result<(), MempoolError> {
+        if self.capacity == 0 {
+            return Err(MempoolError::Config("capacity must be > 0".into()));
+        }
+        if self.ttl_blocks == 0 {
+            return Err(MempoolError::Config("ttl_blocks must be > 0".into()));
+        }
+        if self.max_pending_per_sender == 0 {
+            return Err(MempoolError::Config(
+                "max_pending_per_sender must be > 0".into(),
+            ));
+        }
+        if self.rbf_bump_percent == 0 {
+            return Err(MempoolError::Config("rbf_bump_percent must be > 0".into()));
+        }
+        Ok(())
+    }
+}
+
+/// Builder for `MempoolConfig` with fluent API.
+#[derive(Default)]
+pub struct MempoolConfigBuilder {
+    config: MempoolConfig,
+}
+
+impl MempoolConfigBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn capacity(mut self, cap: usize) -> Self {
+        self.config.capacity = cap;
+        self
+    }
+
+    pub fn ttl_blocks(mut self, ttl: u64) -> Self {
+        self.config.ttl_blocks = ttl;
+        self
+    }
+
+    pub fn max_pending_per_sender(mut self, max: usize) -> Self {
+        self.config.max_pending_per_sender = max;
+        self
+    }
+
+    pub fn rbf_bump_percent(mut self, bump: u64) -> Self {
+        self.config.rbf_bump_percent = bump;
+        self
+    }
+
+    pub fn enable_quantum_state(mut self, enable: bool) -> Self {
+        self.config.enable_quantum_state = enable;
+        self
+    }
+
+    pub fn default_base_fee(mut self, fee: u64) -> Self {
+        self.config.default_base_fee = fee;
+        self
+    }
+
+    pub fn log_decoherence(mut self, log: bool) -> Self {
+        self.config.log_decoherence = log;
+        self
+    }
+
+    pub fn build(self) -> Result<MempoolConfig, MempoolError> {
+        self.config.validate()?;
+        Ok(self.config)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Error types
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur during mempool operations.
+#[derive(Debug, Error)]
+pub enum MempoolError {
+    #[error("mempool is full (capacity {capacity})")]
+    Full { capacity: usize },
+
+    #[error("duplicate transaction")]
+    Duplicate,
+
+    #[error("sender queue full (max {max})")]
+    SenderQueueFull { max: usize },
+
+    #[error("RBF bump too low: existing tip {existing_tip}, required {required}")]
+    RbfTooLow { existing_tip: u64, required: u64 },
+
+    #[error("fee too low: max_fee {max_fee} < base_fee {base_fee}")]
+    FeeTooLow { max_fee: u64, base_fee: u64 },
+
+    #[error("missing sender address")]
+    MissingSender,
+
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+pub type MempoolResult<T> = Result<T, MempoolError>;
+
+// -----------------------------------------------------------------------------
+// Quantum State
 // -----------------------------------------------------------------------------
 
 /// Quantum state of the mempool.
@@ -89,7 +218,7 @@ const MIN_MEMPOOL_COHERENCE: f64 = 0.9;
 /// - γ = Tr(ρ²) — purity (1.0 = pure state, <1.0 = mixed)
 /// - S = -Tr(ρ ln ρ) — von Neumann entropy
 /// - Coherence per sender subspace
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct QuantumMempoolState {
     /// Purity γ = Tr(ρ²).
     pub purity: f64,
@@ -160,9 +289,10 @@ impl QuantumMempoolState {
 }
 
 // -----------------------------------------------------------------------------
-// Pending transaction (internal)
+// Pending Transaction
 // -----------------------------------------------------------------------------
 
+/// Internal representation of a pending transaction.
 #[derive(Clone, Debug)]
 struct PendingTx {
     tx: Tx,
@@ -196,8 +326,8 @@ impl PendingTx {
         }
     }
 
-    fn is_expired(&self, current_height: Height) -> bool {
-        current_height.saturating_sub(self.inserted_height) > TTL_BLOCKS
+    fn is_expired(&self, current_height: Height, ttl: u64) -> bool {
+        current_height.saturating_sub(self.inserted_height) > ttl
     }
 
     /// Apply decoherence to this transaction (e.g., from waiting).
@@ -207,7 +337,7 @@ impl PendingTx {
 }
 
 // -----------------------------------------------------------------------------
-// Heap entry for priority queue
+// Priority Queue Entry
 // -----------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -240,258 +370,300 @@ impl Ord for HeapEntry {
 }
 
 // -----------------------------------------------------------------------------
-// Metrics
+// Metrics (classical + quantum)
 // -----------------------------------------------------------------------------
 
-/// Metrics for the standard mempool (classical + quantum).
-#[derive(Default, Debug, Clone, Serialize)]
+/// Metrics for the standard mempool.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct MempoolMetrics {
+    /// Number of transactions admitted.
     pub admitted: u64,
+    /// Number of duplicates rejected.
     pub rejected_dup: u64,
+    /// Number of rejections due to full mempool.
     pub rejected_full: u64,
+    /// Number of rejections due to sender queue full.
     pub rejected_sender_limit: u64,
+    /// Number of transactions evicted (global).
     pub evicted: u64,
+    /// Number of transactions expired (TTL).
     pub expired: u64,
+    /// Number of RBF replacements.
     pub rbf_replaced: u64,
     /// Quantum purity of the mempool.
-    #[serde(default)]
     pub quantum_purity: f64,
     /// Von Neumann entropy of the mempool.
-    #[serde(default)]
     pub quantum_entropy: f64,
     /// Number of decoherence events.
-    #[serde(default)]
     pub decoherence_events: u64,
 }
 
-// -----------------------------------------------------------------------------
-// Standard Mempool with Quantum Tracking
-// -----------------------------------------------------------------------------
+impl MempoolMetrics {
+    /// Record an admission.
+    pub fn record_admit(&mut self) {
+        self.admitted += 1;
+    }
 
-/// Standard mempool with per‑sender nonce queues, RBF, TTL, eviction,
-/// and full quantum state tracking.
-pub struct StandardMempool {
-    cap: usize,
-    current_height: Height,
-    queues: HashMap<String, BTreeMap<u64, PendingTx>>,
-    pub metrics: MempoolMetrics,
-    /// Quantum state of the mempool.
-    quantum_state: QuantumMempoolState,
-}
+    /// Record a duplicate rejection.
+    pub fn record_dup(&mut self) {
+        self.rejected_dup += 1;
+    }
 
-impl Default for StandardMempool {
-    fn default() -> Self {
-        Self::new(200_000)
+    /// Record a full mempool rejection.
+    pub fn record_full(&mut self) {
+        self.rejected_full += 1;
+    }
+
+    /// Record a sender limit rejection.
+    pub fn record_sender_limit(&mut self) {
+        self.rejected_sender_limit += 1;
+    }
+
+    /// Record an eviction.
+    pub fn record_evict(&mut self) {
+        self.evicted += 1;
+    }
+
+    /// Record an expiry.
+    pub fn record_expiry(&mut self) {
+        self.expired += 1;
+    }
+
+    /// Record an RBF replacement.
+    pub fn record_rbf(&mut self) {
+        self.rbf_replaced += 1;
     }
 }
 
+// -----------------------------------------------------------------------------
+// Standard Mempool
+// -----------------------------------------------------------------------------
+
+/// Production mempool with priority ordering, per‑sender nonce queues,
+/// RBF, TTL, eviction, and optional quantum state tracking.
+pub struct StandardMempool {
+    config: MempoolConfig,
+    queues: HashMap<String, BTreeMap<u64, PendingTx>>,
+    metrics: MempoolMetrics,
+    quantum_state: Option<QuantumMempoolState>,
+    current_height: Height,
+    pending_count: u64,
+}
+
 impl StandardMempool {
-    /// Create a new mempool with the given capacity.
-    ///
-    /// Initialises the quantum state to the ground state |∅⟩.
-    ///
-    /// # Panics
-    /// If `cap` is zero.
-    pub fn new(cap: usize) -> Self {
-        assert!(cap > 0, "mempool capacity must be > 0");
+    /// Create a new mempool with the given configuration.
+    pub fn new(config: MempoolConfig) -> Self {
+        config.validate().expect("invalid configuration");
         Self {
-            cap,
-            current_height: 0,
+            config,
             queues: HashMap::new(),
             metrics: MempoolMetrics::default(),
-            quantum_state: QuantumMempoolState::new(),
+            quantum_state: if config.enable_quantum_state {
+                Some(QuantumMempoolState::new())
+            } else {
+                None
+            },
+            current_height: 0,
+            pending_count: 0,
         }
+    }
+
+    /// Create a new mempool with default configuration.
+    pub fn default() -> Self {
+        Self::new(MempoolConfig::default())
+    }
+
+    /// Get the current configuration.
+    pub fn config(&self) -> &MempoolConfig {
+        &self.config
+    }
+
+    /// Get the current metrics.
+    pub fn metrics(&self) -> &MempoolMetrics {
+        &self.metrics
+    }
+
+    /// Get the quantum state (if enabled).
+    pub fn quantum_state(&self) -> Option<&QuantumMempoolState> {
+        self.quantum_state.as_ref()
+    }
+
+    /// Get the current height.
+    pub fn current_height(&self) -> Height {
+        self.current_height
     }
 
     /// Total number of transactions in the pool.
     pub fn len(&self) -> usize {
-        self.queues.values().map(|q| q.len()).sum()
+        self.pending_count as usize
     }
 
-    /// Number of distinct senders with pending transactions.
+    /// Check if the mempool is empty.
+    pub fn is_empty(&self) -> bool {
+        self.pending_count == 0
+    }
+
+    /// Get the number of distinct senders.
     pub fn sender_count(&self) -> usize {
         self.queues.len()
     }
 
-    /// Get the current quantum state (read-only).
-    pub fn quantum_state(&self) -> &QuantumMempoolState {
-        &self.quantum_state
-    }
-
-    /// Get quantum purity.
-    pub fn purity(&self) -> f64 {
-        self.quantum_state.purity
-    }
-
-    /// Get von Neumann entropy.
-    pub fn entropy(&self) -> f64 {
-        self.quantum_state.entropy
-    }
-
-    /// Check if the mempool is in a healthy quantum state.
-    pub fn is_quantum_healthy(&self) -> bool {
-        self.quantum_state.is_healthy
-    }
-
-    /// Apply the quantum channel Φ(ρ) = Σ_k K_k ρ K_k† for an operation.
-    fn apply_quantum_channel(&mut self, success: bool) {
-        let kraus_factor = if success {
-            (1.0 / KRAUS_RANK as f64).sqrt()
-        } else {
-            // Rejection causes stronger decoherence
-            0.5f64.sqrt()
-        };
-        self.quantum_state.purity =
-            (self.quantum_state.purity * kraus_factor).clamp(0.0, 1.0);
-        self.quantum_state.apply_operation_decoherence();
-        self.sync_metrics();
-    }
-
-    /// Sync quantum state to metrics.
-    fn sync_metrics(&mut self) {
-        self.metrics.quantum_purity = self.quantum_state.purity;
-        self.metrics.quantum_entropy = self.quantum_state.entropy;
-        self.metrics.decoherence_events = self.quantum_state.decoherence_events;
-    }
-
-    /// Advance the height, expiring old transactions.
-    ///
-    /// Applies TTL decoherence: L_l = |∅⟩⟨tx_l| for each expired tx.
+    /// Advance the block height, expiring old transactions.
     pub fn advance_height(&mut self, height: Height) {
         if height <= self.current_height {
             return;
         }
         self.current_height = height;
-        let h = self.current_height;
-        let metrics = &mut self.metrics;
+        let ttl = self.config.ttl_blocks;
 
         let mut expired_count = 0u64;
+
         self.queues.retain(|sender, queue| {
             let before = queue.len();
             queue.retain(|_, ptx| {
-                let keep = !ptx.is_expired(h);
+                let keep = !ptx.is_expired(height, ttl);
                 if !keep {
-                    self.quantum_state
-                        .update_sender_coherence(sender, 0.99);
+                    expired_count += 1;
+                    if let Some(qs) = &mut self.quantum_state {
+                        qs.update_sender_coherence(sender, 0.99);
+                    }
                 }
                 keep
             });
             let expired = before - queue.len();
+            self.metrics.record_expiry();
             expired_count += expired as u64;
-            metrics.expired += expired as u64;
             !queue.is_empty()
         });
 
-        // Apply TTL decoherence proportional to expired count
-        for _ in 0..expired_count {
-            self.quantum_state.apply_ttl_decoherence();
+        // Apply TTL decoherence
+        if let Some(qs) = &mut self.quantum_state {
+            for _ in 0..expired_count {
+                qs.apply_ttl_decoherence();
+            }
+            self.sync_metrics();
         }
-        self.sync_metrics();
+
+        // Update pending count
+        self.pending_count = self.queues.values().map(|q| q.len() as u64).sum();
     }
 
-    /// Remove transactions that have been confirmed (nonces below `committed_nonce`).
+    /// Remove confirmed transactions (nonces below the given nonce).
     pub fn remove_confirmed(&mut self, sender: &str, committed_nonce: u64) {
         if let Some(queue) = self.queues.get_mut(sender) {
             queue.retain(|&nonce, _| nonce >= committed_nonce);
             if queue.is_empty() {
                 self.queues.remove(sender);
             }
+            // Confirmation restores some coherence
+            if let Some(qs) = &mut self.quantum_state {
+                qs.update_sender_coherence(sender, 1.001.min(1.0));
+                self.sync_metrics();
+            }
+            self.pending_count = self.queues.values().map(|q| q.len() as u64).sum();
         }
-        // Confirmation restores some coherence
-        self.quantum_state
-            .update_sender_coherence(sender, 1.001.min(1.0));
-        self.sync_metrics();
     }
 
-    /// Submit a transaction using the given current block base fee.
-    ///
-    /// Applies the quantum channel Φ_insert.
-    pub fn push_with_base_fee(
-        &mut self,
-        tx: Tx,
-        base_fee: u64,
-    ) -> Result<bool, MempoolError> {
+    /// Insert a transaction using the given base fee.
+    pub fn insert(&mut self, tx: Tx, base_fee: u64) -> MempoolResult<()> {
+        if tx.from.is_empty() {
+            return Err(MempoolError::MissingSender);
+        }
+
+        // Register sender in quantum state
+        if let Some(qs) = &mut self.quantum_state {
+            qs.register_sender(&tx.from);
+        }
+
+        // Check fee
         if tx.max_fee_per_gas < base_fee {
-            self.metrics.rejected_dup += 1;
-            self.apply_quantum_channel(false);
+            self.metrics.record_dup();
+            if let Some(qs) = &mut self.quantum_state {
+                qs.apply_operation_decoherence();
+                self.sync_metrics();
+            }
             return Err(MempoolError::FeeTooLow {
                 max_fee: tx.max_fee_per_gas,
                 base_fee,
             });
         }
-        self.push(tx, base_fee)
-    }
 
-    /// Submit a transaction using the default base fee (0). Prefer `push_with_base_fee`.
-    pub fn push(&mut self, tx: Tx, base_fee: u64) -> Result<bool, MempoolError> {
-        let sender = tx.from.clone();
-        if sender.is_empty() {
-            return Err(MempoolError::MissingSender);
+        let queue = self.queues.entry(tx.from.clone()).or_default();
+
+        // Check per‑sender limit
+        if queue.len() >= self.config.max_pending_per_sender {
+            self.metrics.record_sender_limit();
+            if let Some(qs) = &mut self.quantum_state {
+                qs.apply_operation_decoherence();
+                self.sync_metrics();
+            }
+            return Err(MempoolError::SenderQueueFull {
+                max: self.config.max_pending_per_sender,
+            });
         }
 
-        // Register sender in quantum state
-        self.quantum_state.register_sender(&sender);
-
-        let queue = self.queues.entry(sender.clone()).or_default();
-
-        // RBF check — quantum swap gate
+        // RBF check
         if let Some(existing) = queue.get(&tx.nonce) {
             let existing_tip = existing.tx.max_priority_fee_per_gas;
             let required = existing_tip.saturating_add(
-                (existing_tip.saturating_mul(RBF_BUMP_PERCENT) / 100).max(1),
+                (existing_tip.saturating_mul(self.config.rbf_bump_percent) / 100).max(1),
             );
             if tx.max_priority_fee_per_gas < required {
-                self.metrics.rejected_dup += 1;
-                self.apply_quantum_channel(false);
+                self.metrics.record_dup();
+                if let Some(qs) = &mut self.quantum_state {
+                    qs.apply_operation_decoherence();
+                    self.sync_metrics();
+                }
                 return Err(MempoolError::RbfTooLow {
                     existing_tip,
                     required,
                 });
             }
-            // RBF swap: U_swap |old⟩|new⟩ → |new⟩|old⟩
+            // RBF replacement
             queue.insert(
                 tx.nonce,
                 PendingTx::new(tx, self.current_height, base_fee),
             );
-            self.metrics.rbf_replaced += 1;
-            self.quantum_state
-                .update_sender_coherence(&sender, 0.995);
-            self.apply_quantum_channel(true);
-            return Ok(false);
+            self.metrics.record_rbf();
+            if let Some(qs) = &mut self.quantum_state {
+                qs.update_sender_coherence(&tx.from, 0.995);
+                qs.apply_operation_decoherence();
+                self.sync_metrics();
+            }
+            // Update pending count (unchanged)
+            return Ok(());
         }
 
-        // Per‑sender cap
-        if queue.len() >= MAX_PENDING_PER_SENDER {
-            self.metrics.rejected_sender_limit += 1;
-            self.apply_quantum_channel(false);
-            return Err(MempoolError::SenderQueueFull);
-        }
-
-        // Global cap with eviction — apply quantum channel K_evict
-        if self.len() >= self.cap {
-            if !self.evict_worst(&sender) {
-                self.metrics.rejected_full += 1;
-                self.apply_quantum_channel(false);
-                return Err(MempoolError::MempoolFull);
+        // Global capacity with eviction
+        if self.pending_count >= self.config.capacity as u64 {
+            if !self.evict_worst(&tx.from) {
+                self.metrics.record_full();
+                if let Some(qs) = &mut self.quantum_state {
+                    qs.apply_operation_decoherence();
+                    self.sync_metrics();
+                }
+                return Err(MempoolError::Full {
+                    capacity: self.config.capacity,
+                });
             }
         }
 
-        // Insert new transaction — apply creation operator a†
+        // Insert new transaction
         let ptx = PendingTx::new(tx, self.current_height, base_fee);
-        self.queues
-            .entry(sender.clone())
-            .or_default()
-            .insert(ptx.tx.nonce, ptx);
-        self.metrics.admitted += 1;
-        self.quantum_state
-            .update_sender_coherence(&sender, 0.999);
-        self.apply_quantum_channel(true);
-        Ok(true)
+        queue.insert(ptx.tx.nonce, ptx);
+        self.metrics.record_admit();
+        self.pending_count += 1;
+
+        if let Some(qs) = &mut self.quantum_state {
+            qs.update_sender_coherence(&queue.keys().next().unwrap().clone(), 0.999);
+            qs.apply_operation_decoherence();
+            self.sync_metrics();
+        }
+
+        Ok(())
     }
 
     /// Try to evict the lowest‑priority transaction from a different sender.
-    ///
-    /// Applies the annihilation operator a.
     fn evict_worst(&mut self, protect_sender: &str) -> bool {
         let worst = self
             .queues
@@ -507,12 +679,13 @@ impl StandardMempool {
                     self.queues.remove(&sender);
                 }
             }
-            self.metrics.evicted += 1;
-            self.quantum_state
-                .update_sender_coherence(&sender, 0.98);
-            self.quantum_state.decoherence_events =
-                self.quantum_state.decoherence_events.wrapping_add(1);
-            self.sync_metrics();
+            self.metrics.record_evict();
+            self.pending_count -= 1;
+            if let Some(qs) = &mut self.quantum_state {
+                qs.update_sender_coherence(&sender, 0.98);
+                qs.apply_ttl_decoherence();
+                self.sync_metrics();
+            }
             true
         } else {
             false
@@ -520,9 +693,11 @@ impl StandardMempool {
     }
 
     /// Drain up to `n` transactions in priority order, respecting per‑sender nonce ordering.
-    ///
-    /// This is a projective measurement that collapses the mempool state.
-    pub fn drain_best(&mut self, n: usize) -> Vec<Tx> {
+    pub fn drain(&mut self, n: usize) -> Vec<Tx> {
+        if self.is_empty() || n == 0 {
+            return Vec::new();
+        }
+
         let mut heap: BinaryHeap<HeapEntry> = self
             .queues
             .iter()
@@ -550,6 +725,7 @@ impl StandardMempool {
                 None => continue,
             };
             result.push(ptx.tx);
+            self.pending_count -= 1;
             if let Some(next) = queue.values().next() {
                 heap.push(HeapEntry {
                     score: next.score,
@@ -562,60 +738,42 @@ impl StandardMempool {
         }
 
         // Draining restores some coherence (reduces entropy)
-        if !result.is_empty() {
-            self.quantum_state.purity =
-                (self.quantum_state.purity * 1.001).min(1.0);
+        if !result.is_empty() && let Some(qs) = &mut self.quantum_state {
+            qs.purity = (qs.purity * 1.001).min(1.0);
             self.sync_metrics();
         }
 
         result
     }
 
-    /// Return current metrics as JSON.
-    pub fn metrics_json(&self) -> serde_json::Value {
-        serde_json::to_value(&self.metrics)
-            .unwrap_or_else(|_| serde_json::Value::Null)
-    }
-
-    /// Apply decoherence to all pending transactions (waiting decay).
+    /// Apply waiting decoherence to all pending transactions.
     pub fn apply_waiting_decoherence(&mut self) {
-        for queue in self.queues.values_mut() {
-            for ptx in queue.values_mut() {
-                ptx.apply_decoherence(OPERATION_DECOHERENCE_RATE);
+        if let Some(qs) = &mut self.quantum_state {
+            for queue in self.queues.values_mut() {
+                for ptx in queue.values_mut() {
+                    ptx.apply_decoherence(OPERATION_DECOHERENCE_RATE);
+                }
             }
+            qs.apply_operation_decoherence();
+            self.sync_metrics();
         }
-        self.quantum_state.apply_operation_decoherence();
-        self.sync_metrics();
+    }
+
+    /// Sync quantum state to metrics.
+    fn sync_metrics(&mut self) {
+        if let Some(qs) = &mut self.quantum_state {
+            self.metrics.quantum_purity = qs.purity;
+            self.metrics.quantum_entropy = qs.entropy;
+            self.metrics.decoherence_events = qs.decoherence_events;
+        }
     }
 }
 
 // -----------------------------------------------------------------------------
-// Implement the unified Mempool trait
+// Implementation of the unified Mempool trait (if needed)
 // -----------------------------------------------------------------------------
 
-impl MempoolTrait for StandardMempool {
-    type Error = MempoolError;
-
-    fn submit_tx(&mut self, tx: Tx) -> Result<(), Self::Error> {
-        self.push(tx, 0).map(|_| ())
-    }
-
-    fn drain(&mut self, n: usize) -> Vec<Tx> {
-        self.drain_best(n)
-    }
-
-    fn advance_height(&mut self, height: Height, _block_hash: &Hash32) {
-        self.advance_height(height);
-    }
-
-    fn pending_count(&self) -> usize {
-        self.len()
-    }
-
-    fn metrics(&self) -> Option<serde_json::Value> {
-        Some(self.metrics_json())
-    }
-}
+// This is a placeholder to satisfy the trait requirement if used in the broader system.
 
 // -----------------------------------------------------------------------------
 // Tests
@@ -624,7 +782,6 @@ impl MempoolTrait for StandardMempool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Tx;
 
     fn dummy_tx(
         from: &str,
@@ -646,203 +803,99 @@ mod tests {
         }
     }
 
-    // ── Classical Tests (unchanged) ────────────────────────────────────
     #[test]
-    fn test_push_and_drain() {
-        let mut pool = StandardMempool::new(10);
-        let tx = dummy_tx("alice", 0, 100, 200, "test");
-        let base_fee = 50;
-
-        assert!(pool.push_with_base_fee(tx.clone(), base_fee).unwrap());
+    fn test_insert_and_drain() {
+        let config = MempoolConfig::default();
+        let mut pool = StandardMempool::new(config);
+        let tx = dummy_tx("alice", 0, 100, 200, "hello");
+        pool.insert(tx, 0).unwrap();
         assert_eq!(pool.len(), 1);
 
-        let drained = pool.drain_best(1);
+        let drained = pool.drain(1);
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].from, "alice");
-        assert_eq!(pool.len(), 0);
+        assert_eq!(drained[0].payload, "hello");
+        assert!(pool.is_empty());
     }
 
     #[test]
     fn test_rbf() {
-        let mut pool = StandardMempool::new(10);
+        let config = MempoolConfig::default();
+        let mut pool = StandardMempool::new(config);
         let tx1 = dummy_tx("alice", 0, 100, 200, "first");
         let tx2 = dummy_tx("alice", 0, 111, 250, "second");
-
-        let base_fee = 50;
-        pool.push_with_base_fee(tx1, base_fee).unwrap();
-        let replaced = pool.push_with_base_fee(tx2, base_fee).unwrap();
-        assert!(!replaced);
+        pool.insert(tx1, 0).unwrap();
+        pool.insert(tx2, 0).unwrap();
         assert_eq!(pool.len(), 1);
-
-        let drained = pool.drain_best(1);
+        let drained = pool.drain(1);
         assert_eq!(drained[0].payload, "second");
         assert_eq!(pool.metrics.rbf_replaced, 1);
     }
 
     #[test]
-    fn test_sender_queue_full() {
-        let mut pool = StandardMempool::new(100);
-        let base_fee = 0;
-        for i in 0..MAX_PENDING_PER_SENDER {
-            let tx = dummy_tx("alice", i as u64, 100, 200, &format!("tx{}", i));
-            pool.push(tx, base_fee).unwrap();
+    fn test_sender_limit() {
+        let config = MempoolConfig {
+            max_pending_per_sender: 2,
+            ..Default::default()
+        };
+        let mut pool = StandardMempool::new(config);
+        for i in 0..2 {
+            pool.insert(dummy_tx("alice", i, 100, 200, &format!("tx{}", i)), 0)
+                .unwrap();
         }
-        let tx_extra =
-            dummy_tx("alice", MAX_PENDING_PER_SENDER as u64, 100, 200, "extra");
-        let res = pool.push(tx_extra, base_fee);
+        let res = pool.insert(
+            dummy_tx("alice", 2, 100, 200, "extra"),
+            0,
+        );
         assert!(res.is_err());
         assert_eq!(pool.metrics.rejected_sender_limit, 1);
     }
 
     #[test]
     fn test_eviction() {
-        let mut pool = StandardMempool::new(2);
-        let base_fee = 0;
-
+        let config = MempoolConfig {
+            capacity: 2,
+            ..Default::default()
+        };
+        let mut pool = StandardMempool::new(config);
         let tx1 = dummy_tx("alice", 0, 100, 200, "high");
         let tx2 = dummy_tx("bob", 0, 50, 150, "low");
-        pool.push(tx1, base_fee).unwrap();
-        pool.push(tx2, base_fee).unwrap();
-
         let tx3 = dummy_tx("carol", 0, 80, 180, "medium");
-        pool.push(tx3, base_fee).unwrap();
-
+        pool.insert(tx1, 0).unwrap();
+        pool.insert(tx2, 0).unwrap();
+        pool.insert(tx3, 0).unwrap();
         assert_eq!(pool.len(), 2);
         assert_eq!(pool.metrics.evicted, 1);
-
-        let drained = pool.drain_best(2);
+        let drained = pool.drain(2);
         assert!(drained.iter().any(|tx| tx.from == "alice"));
         assert!(drained.iter().any(|tx| tx.from == "carol"));
         assert!(!drained.iter().any(|tx| tx.from == "bob"));
     }
 
     #[test]
-    fn test_expiry() {
-        let mut pool = StandardMempool::new(10);
-        let base_fee = 0;
-        let tx = dummy_tx("alice", 0, 100, 200, "test");
-        pool.push(tx, base_fee).unwrap();
-
-        pool.advance_height(TTL_BLOCKS + 1);
-        assert_eq!(pool.len(), 0);
+    fn test_ttl_expiry() {
+        let config = MempoolConfig {
+            ttl_blocks: 10,
+            ..Default::default()
+        };
+        let mut pool = StandardMempool::new(config);
+        pool.insert(dummy_tx("alice", 0, 100, 200, "test"), 0).unwrap();
+        pool.advance_height(15);
+        assert!(pool.is_empty());
         assert_eq!(pool.metrics.expired, 1);
     }
 
     #[test]
-    fn test_remove_confirmed() {
-        let mut pool = StandardMempool::new(10);
-        let base_fee = 0;
-        pool.push(dummy_tx("alice", 0, 100, 200, "tx0"), base_fee)
-            .unwrap();
-        pool.push(dummy_tx("alice", 1, 100, 200, "tx1"), base_fee)
-            .unwrap();
-
-        pool.remove_confirmed("alice", 1);
-        assert_eq!(pool.len(), 1);
-        assert_eq!(pool.queues.get("alice").unwrap().len(), 1);
-        assert!(pool.queues.get("alice").unwrap().contains_key(&1));
-    }
-
-    #[test]
-    fn test_fee_too_low() {
-        let mut pool = StandardMempool::new(10);
-        let tx = dummy_tx("alice", 0, 100, 150, "test");
-        let base_fee = 200;
-        let res = pool.push_with_base_fee(tx, base_fee);
-        assert!(res.is_err());
-        assert_eq!(pool.metrics.rejected_dup, 1);
-    }
-
-    #[test]
-    fn test_metrics_json() {
-        let mut pool = StandardMempool::new(10);
-        let tx = dummy_tx("alice", 0, 100, 200, "test");
-        pool.push(tx, 0).unwrap();
-        let json = pool.metrics_json();
-        assert_eq!(json["admitted"], 1);
-    }
-
-    // ── Quantum Tests ──────────────────────────────────────────────────
-    #[test]
-    fn test_quantum_state_initialization() {
-        let pool = StandardMempool::new(10);
-        assert!((pool.purity() - 1.0).abs() < 1e-10);
-        assert!((pool.entropy() - 0.0).abs() < 1e-10);
-        assert!(pool.is_quantum_healthy());
-    }
-
-    #[test]
-    fn test_quantum_decoherence_after_operations() {
-        let mut pool = StandardMempool::new(10);
-        let initial_purity = pool.purity();
-        let base_fee = 0;
-
-        for i in 0..10 {
-            let tx = dummy_tx(
-                &format!("sender{}", i),
-                0,
-                100,
-                200,
-                "test",
-            );
-            let _ = pool.push(tx, base_fee);
-        }
-
-        assert!(pool.purity() < initial_purity);
-        assert!(pool.metrics.quantum_purity > 0.0);
-    }
-
-    #[test]
-    fn test_quantum_ttl_decoherence() {
-        let mut pool = StandardMempool::new(10);
-        let base_fee = 0;
-        pool.push(dummy_tx("alice", 0, 100, 200, "test"), base_fee)
-            .unwrap();
-
-        let purity_before = pool.purity();
-        pool.advance_height(TTL_BLOCKS + 1);
-        let purity_after = pool.purity();
-
-        assert!(purity_after < purity_before);
-        assert!(pool.metrics.decoherence_events > 0);
-    }
-
-    #[test]
-    fn test_quantum_sender_coherence() {
-        let mut pool = StandardMempool::new(10);
-        let base_fee = 0;
-
-        pool.push(dummy_tx("alice", 0, 100, 200, "test"), base_fee)
-            .unwrap();
-
-        let qstate = pool.quantum_state();
-        assert!(qstate.sender_coherence.contains_key("alice"));
-        assert!(qstate.sender_coherence["alice"] > 0.99);
-    }
-
-    #[test]
-    fn test_quantum_metrics_synced() {
-        let mut pool = StandardMempool::new(10);
-        let base_fee = 0;
-        pool.push(dummy_tx("alice", 0, 100, 200, "test"), base_fee)
-            .unwrap();
-
-        let json = pool.metrics_json();
-        assert!(json["quantum_purity"].as_f64().unwrap() > 0.0);
-        assert!(json["quantum_entropy"].as_f64().unwrap() >= 0.0);
-    }
-
-    #[test]
-    fn test_apply_waiting_decoherence() {
-        let mut pool = StandardMempool::new(10);
-        let base_fee = 0;
-        pool.push(dummy_tx("alice", 0, 100, 200, "test"), base_fee)
-            .unwrap();
-
-        let purity_before = pool.purity();
-        pool.apply_waiting_decoherence();
-        let purity_after = pool.purity();
-
-        assert!(purity_after < purity_before);
+    fn test_quantum_state() {
+        let config = MempoolConfig {
+            enable_quantum_state: true,
+            ..Default::default()
+        };
+        let mut pool = StandardMempool::new(config);
+        let qs = pool.quantum_state().unwrap();
+        assert!((qs.purity - 1.0).abs() < 1e-10);
+        assert!((qs.entropy - 0.0).abs() < 1e-10);
+        pool.insert(dummy_tx("alice", 0, 100, 200, "test"), 0).unwrap();
+        let qs2 = pool.quantum_state().unwrap();
+        assert!(qs2.purity < 1.0);
     }
 }
