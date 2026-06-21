@@ -26,18 +26,34 @@
 //! - **Replay protection**: Nonce + sender uniqueness prevents replay.
 //! - **Expiry enforcement**: Commits expire after TTL blocks.
 //! - **Deterministic shuffling**: Verifiable by any full node.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use iona::mempool::mev::{MevMempool, MevConfig, MevConfigBuilder};
+//!
+//! let config = MevConfigBuilder::default()
+//!     .commit_ttl_blocks(30)
+//!     .enable_threshold_encryption(true)
+//!     .build()?;
+//! let mut mempool = MevMempool::new(config)?;
+//! mempool.submit_tx(tx)?;
+//! let txs = mempool.drain_fair(100);
+//! ```
 
 use crate::types::{hash_bytes, Hash32, Height, Tx};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tracing::{debug, error, info, trace, warn};
 
 // -----------------------------------------------------------------------------
-// Configuration with comprehensive validation
+// Configuration
 // -----------------------------------------------------------------------------
 
-/// MEV protection configuration.
+/// MEV protection configuration with validation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MevConfig {
     /// Enable commit-reveal two-phase submission.
@@ -62,6 +78,8 @@ pub struct MevConfig {
     pub max_revealed_queue: usize,
     /// Minimum salt length for commits.
     pub min_salt_length: usize,
+    /// Whether to verify commit hash on reveal.
+    pub verify_commit_hash: bool,
 }
 
 impl Default for MevConfig {
@@ -78,6 +96,7 @@ impl Default for MevConfig {
             max_encrypted_queue: 50_000,
             max_revealed_queue: 100_000,
             min_salt_length: 16,
+            verify_commit_hash: true,
         }
     }
 }
@@ -86,36 +105,105 @@ impl MevConfig {
     /// Validate all configuration parameters.
     pub fn validate(&self) -> Result<(), MevError> {
         if self.commit_ttl_blocks == 0 {
-            return Err(MevError::InvalidConfig(
-                "commit_ttl_blocks must be > 0".into(),
-            ));
+            return Err(MevError::Config("commit_ttl_blocks must be > 0".into()));
         }
         if self.max_pending_commits == 0 {
-            return Err(MevError::InvalidConfig(
-                "max_pending_commits must be > 0".into(),
-            ));
+            return Err(MevError::Config("max_pending_commits must be > 0".into()));
         }
         if self.max_encrypted_queue == 0 {
-            return Err(MevError::InvalidConfig(
-                "max_encrypted_queue must be > 0".into(),
-            ));
+            return Err(MevError::Config("max_encrypted_queue must be > 0".into()));
         }
         if self.max_revealed_queue == 0 {
-            return Err(MevError::InvalidConfig(
-                "max_revealed_queue must be > 0".into(),
-            ));
+            return Err(MevError::Config("max_revealed_queue must be > 0".into()));
         }
         if self.enable_commit_reveal && self.min_salt_length < 8 {
-            return Err(MevError::InvalidConfig(
+            return Err(MevError::Config(
                 "min_salt_length must be >= 8 for commit-reveal".into(),
             ));
         }
         if self.ordering_jitter_ms > 10_000 {
-            return Err(MevError::InvalidConfig(
+            return Err(MevError::Config(
                 "ordering_jitter_ms must be <= 10000".into(),
             ));
         }
         Ok(())
+    }
+}
+
+/// Builder for `MevConfig` with fluent API.
+#[derive(Default)]
+pub struct MevConfigBuilder {
+    config: MevConfig,
+}
+
+impl MevConfigBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn enable_commit_reveal(mut self, enable: bool) -> Self {
+        self.config.enable_commit_reveal = enable;
+        self
+    }
+
+    pub fn commit_ttl_blocks(mut self, ttl: u64) -> Self {
+        self.config.commit_ttl_blocks = ttl;
+        self
+    }
+
+    pub fn enable_threshold_encryption(mut self, enable: bool) -> Self {
+        self.config.enable_threshold_encryption = enable;
+        self
+    }
+
+    pub fn enable_fair_ordering(mut self, enable: bool) -> Self {
+        self.config.enable_fair_ordering = enable;
+        self
+    }
+
+    pub fn ordering_jitter_ms(mut self, jitter: u64) -> Self {
+        self.config.ordering_jitter_ms = jitter;
+        self
+    }
+
+    pub fn max_pending_commits(mut self, max: usize) -> Self {
+        self.config.max_pending_commits = max;
+        self
+    }
+
+    pub fn backrun_delay_blocks(mut self, delay: u64) -> Self {
+        self.config.backrun_delay_blocks = delay;
+        self
+    }
+
+    pub fn enable_proposer_blindness(mut self, enable: bool) -> Self {
+        self.config.enable_proposer_blindness = enable;
+        self
+    }
+
+    pub fn max_encrypted_queue(mut self, max: usize) -> Self {
+        self.config.max_encrypted_queue = max;
+        self
+    }
+
+    pub fn max_revealed_queue(mut self, max: usize) -> Self {
+        self.config.max_revealed_queue = max;
+        self
+    }
+
+    pub fn min_salt_length(mut self, len: usize) -> Self {
+        self.config.min_salt_length = len;
+        self
+    }
+
+    pub fn verify_commit_hash(mut self, verify: bool) -> Self {
+        self.config.verify_commit_hash = verify;
+        self
+    }
+
+    pub fn build(self) -> Result<MevConfig, MevError> {
+        self.config.validate()?;
+        Ok(self.config)
     }
 }
 
@@ -141,17 +229,17 @@ pub enum MevError {
     #[error("commit expired (TTL {ttl} blocks)")]
     CommitExpired { ttl: u64 },
 
-    #[error("invalid configuration: {0}")]
-    InvalidConfig(String),
+    #[error("configuration error: {0}")]
+    Config(String),
 
     #[error("encryption error: {0}")]
-    EncryptionError(String),
+    Encryption(String),
 
     #[error("decryption error: {0}")]
-    DecryptionError(String),
+    Decryption(String),
 
     #[error("serialization error: {0}")]
-    SerializationError(String),
+    Serialization(String),
 
     #[error("salt too short: {len} < {min}")]
     SaltTooShort { len: usize, min: usize },
@@ -164,6 +252,15 @@ pub enum MevError {
 
     #[error("backrun protection active for sender {sender}")]
     BackrunBlocked { sender: String },
+
+    #[error("epoch mismatch: expected {expected}, got {got}")]
+    EpochMismatch { expected: u64, got: u64 },
+
+    #[error("invalid signature")]
+    InvalidSignature,
+
+    #[error("invalid nonce")]
+    InvalidNonce,
 }
 
 pub type MevResult<T> = Result<T, MevError>;
@@ -227,7 +324,7 @@ pub fn encrypt_tx_envelope(
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 
     let plaintext = serde_json::to_vec(tx)
-        .map_err(|e| MevError::SerializationError(e.to_string()))?;
+        .map_err(|e| MevError::Serialization(e.to_string()))?;
 
     let tx_hash = crate::types::tx_hash(tx);
     let mut nonce_bytes = [0u8; 12];
@@ -235,11 +332,11 @@ pub fn encrypt_tx_envelope(
     nonce_bytes[..copy_len].copy_from_slice(&tx_hash.0[..copy_len]);
 
     let cipher = Aes256Gcm::new_from_slice(epoch_secret)
-        .map_err(|e| MevError::EncryptionError(e.to_string()))?;
+        .map_err(|e| MevError::Encryption(e.to_string()))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, plaintext.as_ref())
-        .map_err(|e| MevError::EncryptionError(e.to_string()))?;
+        .map_err(|e| MevError::Encryption(e.to_string()))?;
 
     Ok(EncryptedEnvelope {
         ciphertext,
@@ -259,14 +356,14 @@ pub fn decrypt_tx_envelope(
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 
     let cipher = Aes256Gcm::new_from_slice(epoch_secret)
-        .map_err(|e| MevError::DecryptionError(e.to_string()))?;
+        .map_err(|e| MevError::Decryption(e.to_string()))?;
     let nonce = Nonce::from_slice(&envelope.nonce);
     let plaintext = cipher
         .decrypt(nonce, envelope.ciphertext.as_ref())
-        .map_err(|e| MevError::DecryptionError(e.to_string()))?;
+        .map_err(|e| MevError::Decryption(e.to_string()))?;
 
     serde_json::from_slice(&plaintext)
-        .map_err(|e| MevError::SerializationError(e.to_string()))
+        .map_err(|e| MevError::Serialization(e.to_string()))
 }
 
 // -----------------------------------------------------------------------------
@@ -350,13 +447,15 @@ pub struct MevMempoolMetrics {
     pub backrun_blocked: u64,
     pub duplicates_rejected: u64,
     pub queue_overflow_rejected: u64,
+    pub commit_ttl_hits: u64,
 }
 
 // -----------------------------------------------------------------------------
 // MEV‑Resistant Mempool
 // -----------------------------------------------------------------------------
 
-/// Production MEV-resistant mempool.
+/// Production MEV-resistant mempool with full protection layers.
+#[derive(Debug)]
 pub struct MevMempool {
     config: MevConfig,
     metrics: MevMempoolMetrics,
@@ -364,7 +463,7 @@ pub struct MevMempool {
     revealed_txs: VecDeque<Tx>,
     encrypted_queue: VecDeque<EncryptedEnvelope>,
     seen_commit_hashes: HashSet<Hash32>,
-    order_counter: u64,
+    order_counter: AtomicU64,
     current_height: Height,
     last_block_hash: Hash32,
     recent_proposers: VecDeque<(Height, String)>,
@@ -382,7 +481,7 @@ impl MevMempool {
             revealed_txs: VecDeque::new(),
             encrypted_queue: VecDeque::new(),
             seen_commit_hashes: HashSet::new(),
-            order_counter: 0,
+            order_counter: AtomicU64::new(0),
             current_height: 0,
             last_block_hash: Hash32::zero(),
             recent_proposers: VecDeque::new(),
@@ -409,6 +508,7 @@ impl MevMempool {
         self.metrics.commits_received += 1;
         self.seen_commit_hashes.insert(commit.commit_hash);
         self.pending_commits.insert(commit.commit_hash, commit);
+        trace!(hash = %hex::encode(&commit.commit_hash.0), "commit submitted");
         Ok(())
     }
 
@@ -435,19 +535,21 @@ impl MevMempool {
             });
         }
 
-        // Verify commit hash
-        let tx_bytes = serde_json::to_vec(&reveal.tx)
-            .map_err(|e| MevError::SerializationError(e.to_string()))?;
-        let expected_hash = compute_commit_hash(
-            &reveal.tx.from,
-            reveal.tx.nonce,
-            &tx_bytes,
-            &reveal.commit_salt,
-        );
+        // Verify commit hash if configured
+        if self.config.verify_commit_hash {
+            let tx_bytes = serde_json::to_vec(&reveal.tx)
+                .map_err(|e| MevError::Serialization(e.to_string()))?;
+            let expected_hash = compute_commit_hash(
+                &reveal.tx.from,
+                reveal.tx.nonce,
+                &tx_bytes,
+                &reveal.commit_salt,
+            );
 
-        if expected_hash != reveal.commit_hash {
-            self.metrics.reveals_invalid += 1;
-            return Err(MevError::RevealHashMismatch);
+            if expected_hash != reveal.commit_hash {
+                self.metrics.reveals_invalid += 1;
+                return Err(MevError::RevealHashMismatch);
+            }
         }
 
         // Check expiry
@@ -472,6 +574,7 @@ impl MevMempool {
         self.metrics.reveals_received += 1;
         self.pending_commits.remove(&reveal.commit_hash);
         self.revealed_txs.push_back(reveal.tx);
+        trace!(hash = %hex::encode(&reveal.commit_hash.0), "reveal submitted");
         Ok(())
     }
 
@@ -485,6 +588,7 @@ impl MevMempool {
         }
         self.metrics.encrypted_received += 1;
         self.encrypted_queue.push_back(envelope);
+        trace!("encrypted envelope submitted");
         Ok(())
     }
 
@@ -501,15 +605,15 @@ impl MevMempool {
         if self.config.enable_commit_reveal {
             let salt = generate_salt(&tx, self.config.min_salt_length);
             let tx_bytes = serde_json::to_vec(&tx)
-                .map_err(|e| MevError::SerializationError(e.to_string()))?;
+                .map_err(|e| MevError::Serialization(e.to_string()))?;
             let commit_hash = compute_commit_hash(&tx.from, tx.nonce, &tx_bytes, &salt);
 
-            self.order_counter = self.order_counter.wrapping_add(1);
+            let order = self.order_counter.fetch_add(1, Ordering::Relaxed);
             let commit = TxCommit {
                 commit_hash,
                 sender: tx.from.clone(),
                 nonce: tx.nonce,
-                received_order: self.order_counter,
+                received_order: order,
                 commit_height: self.current_height,
                 encrypted_tx: None,
             };
@@ -547,7 +651,7 @@ impl MevMempool {
                     decrypted.push(tx);
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    warn!(
                         sender = %envelope.sender,
                         nonce = envelope.sender_nonce,
                         error = %e,
@@ -573,7 +677,7 @@ impl MevMempool {
                 .iter()
                 .enumerate()
                 .map(|(i, tx)| {
-                    let order = self.order_counter.wrapping_add(i as u64);
+                    let order = self.order_counter.fetch_add(1, Ordering::Relaxed);
                     (
                         order,
                         TxCommit {
@@ -622,6 +726,16 @@ impl MevMempool {
         result
     }
 
+    /// Drain all revealed transactions without fair ordering (fast path).
+    pub fn drain_all_revealed(&mut self) -> Vec<Tx> {
+        self.revealed_txs.drain(..).collect()
+    }
+
+    /// Peek at the first `n` revealed transactions without consuming.
+    pub fn peek_revealed(&self, n: usize) -> Vec<&Tx> {
+        self.revealed_txs.iter().take(n).collect()
+    }
+
     /// Advance to a new block height, expiring old commits.
     pub fn advance_height(&mut self, height: Height, block_hash: &Hash32) {
         self.current_height = height;
@@ -639,6 +753,7 @@ impl MevMempool {
             self.pending_commits.remove(h);
             self.seen_commit_hashes.remove(h);
             self.metrics.commits_expired += 1;
+            self.metrics.commit_ttl_hits += 1;
         }
 
         // Prune recent proposers older than backrun window
@@ -650,6 +765,25 @@ impl MevMempool {
                 break;
             }
         }
+    }
+
+    /// Clear all expired commits (force cleanup).
+    pub fn clear_expired(&mut self) -> usize {
+        let ttl = self.config.commit_ttl_blocks;
+        let expired: Vec<Hash32> = self
+            .pending_commits
+            .iter()
+            .filter(|(_, c)| self.current_height.saturating_sub(c.commit_height) > ttl)
+            .map(|(h, _)| *h)
+            .collect();
+
+        let count = expired.len();
+        for h in expired {
+            self.pending_commits.remove(&h);
+            self.seen_commit_hashes.remove(&h);
+            self.metrics.commits_expired += 1;
+        }
+        count
     }
 
     /// Record a block proposer for backrun protection.
@@ -699,6 +833,10 @@ impl MevMempool {
     pub fn current_height(&self) -> Height {
         self.current_height
     }
+
+    pub fn config(&self) -> &MevConfig {
+        &self.config
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -714,8 +852,7 @@ pub fn compute_commit_hash(
     tx_bytes: &[u8],
     salt: &[u8],
 ) -> Hash32 {
-    let mut buf =
-        Vec::with_capacity(11 + sender.len() + 8 + tx_bytes.len() + salt.len());
+    let mut buf = Vec::with_capacity(11 + sender.len() + 8 + tx_bytes.len() + salt.len());
     buf.extend_from_slice(b"IONA_COMMIT");
     buf.extend_from_slice(sender.as_bytes());
     buf.extend_from_slice(&nonce.to_le_bytes());
@@ -728,7 +865,6 @@ pub fn compute_commit_hash(
 fn generate_salt(tx: &Tx, min_length: usize) -> Vec<u8> {
     let h = crate::types::tx_hash(tx);
     let mut salt = Vec::with_capacity(min_length.max(16));
-    // Use transaction hash as base, extend if needed
     while salt.len() < min_length {
         salt.extend_from_slice(&h.0);
     }
@@ -785,6 +921,17 @@ mod tests {
         cfg = MevConfig::default();
         cfg.max_pending_commits = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_builder() -> MevResult<()> {
+        let cfg = MevConfigBuilder::new()
+            .commit_ttl_blocks(30)
+            .max_pending_commits(200_000)
+            .build()?;
+        assert_eq!(cfg.commit_ttl_blocks, 30);
+        assert_eq!(cfg.max_pending_commits, 200_000);
+        Ok(())
     }
 
     // ── Commit-Reveal flow ─────────────────────────────────────────────
@@ -958,6 +1105,28 @@ mod tests {
         let metrics = pool.get_metrics();
         assert_eq!(metrics.commits_received, 1);
         assert_eq!(metrics.reveals_received, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_clear_expired() -> MevResult<()> {
+        let mut pool = MevMempool::new(MevConfig {
+            commit_ttl_blocks: 5,
+            ..Default::default()
+        })?;
+        let commit = TxCommit {
+            commit_hash: Hash32([1; 32]),
+            sender: "alice".into(),
+            nonce: 0,
+            received_order: 1,
+            commit_height: 0,
+            encrypted_tx: None,
+        };
+        pool.submit_commit(commit)?;
+        pool.advance_height(10, &Hash32::zero());
+        let cleared = pool.clear_expired();
+        assert_eq!(cleared, 1);
+        assert_eq!(pool.pending_commit_count(), 0);
         Ok(())
     }
 }
