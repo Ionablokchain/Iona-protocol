@@ -1,350 +1,310 @@
-//! Quantum Mempool module for IONA.
+//! Standard FIFO mempool for IONA.
 //!
-//! # Quantum Mempool Architecture
-//!
-//! The mempool is modelled as a **quantum many-body system** where each
-//! transaction is a **quantum state** |tx_i⟩ in the mempool Hilbert space
-//! ℋ_mempool. The two implementations (standard and MEV-resistant) are
-//! **orthogonal subspaces** of the total mempool Hilbert space:
-//!
-//! ```text
-//! ℋ_mempool = ℋ_standard ⊗ ℋ_mev
-//! ```
-//!
-//! # Hamiltonian for Mempool Dynamics
-//!
-//! ```text
-//! Ĥ_mempool = Ĥ_insert + Ĥ_evict + Ĥ_select + Ĥ_decay
-//!
-//! Ĥ_insert = Σ_i g_i (a†_i + a_i)           (creation/annihilation of txs)
-//! Ĥ_evict  = Σ_j ω_j a†_j a_j               (occupation number → eviction)
-//! Ĥ_select = Σ_k λ_k |select_k⟩⟨select_k|    (projective measurement for block building)
-//! Ĥ_decay  = Σ_l γ_l (n̂_l + ½)               (harmonic oscillator decay for TTL)
-//! ```
-//!
-//! # Quantum State Representation
-//!
-//! The mempool state is a density matrix:
-//! ```text
-//! ρ_mempool = Σ_i p_i |ψ_i⟩⟨ψ_i|
-//! ```
-//! where p_i are classical probabilities and |ψ_i⟩ are pure states
-//! representing specific mempool configurations.
-//!
-//! # Quantum Observables
-//!
-//! - **Pool size** ⟨N̂⟩ = Tr(ρ N̂) where N̂ = Σ a†_i a_i
-//! - **Coherence** γ = Tr(ρ²) — purity of the mempool state
-//! - **Entropy** S = -Tr(ρ ln ρ) — von Neumann entropy
-//! - **Throughput** ⟨T̂⟩ = Tr(ρ T̂) — transaction flow rate
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use iona::mempool::{StandardMempool, MevMempool, MevConfig, MempoolBuilder};
-//!
-//! let pool = MempoolBuilder::standard(200_000).build()?;
-//! let config = MevConfig::default();
-//! let mev_pool = MempoolBuilder::mev_resistant(config).build()?;
-//! ```
+//! A simple in‑memory queue for pending transactions, with configurable
+//! capacity, duplicate detection, and metrics.
 
+use crate::types::{Hash32, Tx, tx_hash};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
-pub mod mev_resistant;
-pub mod pool;
-
-// Re‑export core types from the standard mempool.
-pub use pool::{
-    Mempool, MempoolError as StandardMempoolError, MempoolMetrics, StandardMempool,
-};
-
-// Re‑export MEV‑resistant mempool types.
-pub use mev_resistant::{
-    compute_commit_hash, decrypt_tx_envelope, derive_epoch_secret, encrypt_tx_envelope,
-    CommitStatus, EncryptedEnvelope, MevConfig, MevError, MevMempool, MevMempoolMetrics,
-    TxCommit, TxReveal,
-};
-
 // -----------------------------------------------------------------------------
-// Quantum Constants
+// Configuration
 // -----------------------------------------------------------------------------
 
-/// Reduced Planck constant (natural units).
-const HBAR: f64 = 1.0;
-
-/// Coherence decay rate per mempool operation.
-const OPERATION_DECOHERENCE_RATE: f64 = 0.00001;
-
-/// Minimum coherence threshold for healthy mempool.
-const MIN_MEMPOOL_COHERENCE: f64 = 0.9;
-
-/// Kraus rank for mempool quantum channels.
-const KRAUS_RANK: usize = 4;
-
-/// Entanglement strength between mempool subsystems.
-const SUBSYSTEM_ENTANGLEMENT: f64 = 0.5;
-
-// -----------------------------------------------------------------------------
-// Unified Quantum Error Type
-// -----------------------------------------------------------------------------
-
-/// Unified error type for quantum mempool operations.
-///
-/// Each error corresponds to a specific **quantum decoherence event**
-/// or **measurement failure**.
-#[derive(Debug, Error)]
-pub enum MempoolError {
-    #[error("standard mempool decoherence: {0}")]
-    Standard(#[from] StandardMempoolError),
-
-    #[error("MEV mempool decoherence: {0}")]
-    Mev(#[from] MevError),
-
-    #[error("unsupported mempool type: {0}")]
-    UnsupportedType(String),
-
-    #[error("configuration error: {0}")]
-    Config(String),
-
-    #[error("quantum decoherence: mempool coherence {coherence} below threshold {threshold}")]
-    Decoherence { coherence: f64, threshold: f64 },
-
-    #[error("entanglement fidelity lost between mempool subsystems")]
-    EntanglementLost,
-
-    #[error("measurement incompatibility: cannot observe {a} and {b} simultaneously")]
-    IncompatibleObservables { a: String, b: String },
-}
-
-pub type MempoolResult<T> = Result<T, MempoolError>;
-
-// -----------------------------------------------------------------------------
-// Quantum Mempool State
-// -----------------------------------------------------------------------------
-
-/// Quantum state of the mempool system.
-///
-/// Tracks the density matrix properties across both standard and MEV
-/// subspaces of the mempool Hilbert space.
+/// Configuration for the standard mempool.
 #[derive(Debug, Clone)]
-pub struct QuantumMempoolState {
-    /// Purity of the mempool state γ = Tr(ρ²).
-    pub purity: f64,
-    /// Von Neumann entropy S = -Tr(ρ ln ρ).
-    pub entropy: f64,
-    /// Coherence of the standard mempool subspace.
-    pub standard_coherence: f64,
-    /// Coherence of the MEV mempool subspace.
-    pub mev_coherence: f64,
-    /// Entanglement fidelity between standard and MEV subspaces.
-    pub entanglement_fidelity: f64,
-    /// Total operations performed (cumulative measurement count).
-    pub total_operations: u64,
-    /// Whether the mempool is in a healthy quantum state.
-    pub is_healthy: bool,
+pub struct StandardMempoolConfig {
+    /// Maximum number of transactions in the mempool.
+    pub capacity: usize,
+    /// Whether to enable duplicate detection (default: true).
+    pub enable_dedup: bool,
+    /// Whether to track metrics (default: true).
+    pub track_metrics: bool,
 }
 
-impl QuantumMempoolState {
-    /// Create a new quantum mempool state in the ground state |∅⟩.
-    fn new() -> Self {
-        Self {
-            purity: 1.0,
-            entropy: 0.0,
-            standard_coherence: 1.0,
-            mev_coherence: 1.0,
-            entanglement_fidelity: 1.0,
-            total_operations: 0,
-            is_healthy: true,
-        }
-    }
-
-    /// Apply decoherence from a mempool operation.
-    fn apply_operation_decoherence(&mut self) {
-        self.total_operations = self.total_operations.wrapping_add(1);
-
-        // Exponential decoherence
-        let decay = (-OPERATION_DECOHERENCE_RATE).exp();
-        self.standard_coherence = (self.standard_coherence * decay).clamp(0.0, 1.0);
-        self.mev_coherence = (self.mev_coherence * decay).clamp(0.0, 1.0);
-
-        // Entanglement decays slower
-        self.entanglement_fidelity =
-            (self.entanglement_fidelity * decay.sqrt()).clamp(0.0, 1.0);
-
-        // Recompute purity and entropy
-        self.purity = (self.standard_coherence * self.mev_coherence *
-            self.entanglement_fidelity).clamp(0.0, 1.0);
-        self.entropy = if self.purity >= 1.0 {
-            0.0
-        } else {
-            -self.purity * self.purity.ln().max(0.0)
-        };
-
-        self.is_healthy = self.purity >= MIN_MEMPOOL_COHERENCE;
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Mempool Quantum Type
-// -----------------------------------------------------------------------------
-
-/// Type of mempool to instantiate — selects the quantum subspace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MempoolType {
-    /// Standard FIFO mempool — classical subspace.
-    Standard,
-    /// MEV‑resistant mempool — quantum-protected subspace.
-    MevResistant,
-}
-
-// -----------------------------------------------------------------------------
-// Quantum Mempool Builder
-// -----------------------------------------------------------------------------
-
-/// Builder for creating a quantum mempool instance.
-///
-/// Applies the quantum channel Φ_build that prepares the selected
-/// mempool subspace in its ground state.
-pub struct MempoolBuilder {
-    pool_type: MempoolType,
-    standard_capacity: usize,
-    mev_config: Option<MevConfig>,
-    /// Target initial coherence.
-    initial_coherence: f64,
-}
-
-impl Default for MempoolBuilder {
+impl Default for StandardMempoolConfig {
     fn default() -> Self {
         Self {
-            pool_type: MempoolType::Standard,
-            standard_capacity: 200_000,
-            mev_config: None,
-            initial_coherence: 1.0,
-        }
-    }
-}
-
-impl MempoolBuilder {
-    /// Create a new builder with defaults.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Use the standard mempool with the given capacity.
-    pub fn standard(mut self, capacity: usize) -> Self {
-        self.pool_type = MempoolType::Standard;
-        self.standard_capacity = capacity;
-        self
-    }
-
-    /// Use the MEV‑resistant mempool with the given configuration.
-    pub fn mev_resistant(mut self, config: MevConfig) -> Self {
-        self.pool_type = MempoolType::MevResistant;
-        self.mev_config = Some(config);
-        self
-    }
-
-    /// Set the target initial coherence (for testing).
-    pub fn with_coherence(mut self, coherence: f64) -> Self {
-        self.initial_coherence = coherence.clamp(0.0, 1.0);
-        self
-    }
-
-    /// Build the selected quantum mempool.
-    ///
-    /// Applies the preparation unitary U_prep |∅⟩ → |mempool_ready⟩.
-    pub fn build(self) -> MempoolResult<Box<dyn Mempool + Send + Sync>> {
-        match self.pool_type {
-            MempoolType::Standard => {
-                if self.standard_capacity == 0 {
-                    return Err(MempoolError::Config(
-                        "capacity must be > 0".into(),
-                    ));
-                }
-                let pool = StandardMempool::new(self.standard_capacity);
-                Ok(Box::new(pool))
-            }
-            MempoolType::MevResistant => {
-                let config = self.mev_config.ok_or_else(|| {
-                    MempoolError::Config("MEV config not provided".into())
-                })?;
-                let pool = MevMempool::new(config)?;
-                Ok(Box::new(pool))
-            }
+            capacity: 200_000,
+            enable_dedup: true,
+            track_metrics: true,
         }
     }
 }
 
 // -----------------------------------------------------------------------------
-// Quantum Mempool Observables
+// Errors
 // -----------------------------------------------------------------------------
 
-/// Quantum observables for the mempool system.
-///
-/// These are Hermitian operators Ô_i whose expectation values
-/// ⟨Ô_i⟩ = Tr(ρ Ô_i) provide operational metrics.
+/// Errors that can occur in the standard mempool.
+#[derive(Debug, Error)]
+pub enum StandardMempoolError {
+    #[error("mempool is full (capacity {capacity})")]
+    Full { capacity: usize },
+
+    #[error("duplicate transaction")]
+    Duplicate,
+
+    #[error("invalid transaction: {0}")]
+    InvalidTx(String),
+
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+pub type StandardResult<T> = Result<T, StandardMempoolError>;
+
+// -----------------------------------------------------------------------------
+// Metrics
+// -----------------------------------------------------------------------------
+
+/// Metrics for the standard mempool.
 #[derive(Debug, Clone, Default)]
-pub struct QuantumMempoolMetrics {
-    /// Total transactions inserted (creation operators applied).
-    pub total_inserted: u64,
-    /// Total transactions evicted (annihilation operators applied).
-    pub total_evicted: u64,
-    /// Total transactions selected for blocks (projective measurements).
-    pub total_selected: u64,
-    /// Current pool coherence.
-    pub coherence: f64,
-    /// Current von Neumann entropy.
-    pub entropy: f64,
-    /// Entanglement fidelity between mempool subsystems.
-    pub entanglement_fidelity: f64,
-    /// Number of decoherence events detected.
-    pub decoherence_events: u64,
+pub struct StandardMempoolMetrics {
+    pub inserted: u64,
+    pub drained: u64,
+    pub evicted: u64,
+    pub duplicates_rejected: u64,
+    pub full_events: u64,
+    pub empty_events: u64,
+    pub current_size: AtomicU64,
+}
+
+impl StandardMempoolMetrics {
+    pub fn record_insert(&self) {
+        self.inserted += 1;
+        self.current_size.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_drain(&self, count: usize) {
+        self.drained += count as u64;
+        self.current_size.fetch_sub(count as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_evict(&self, count: usize) {
+        self.evicted += count as u64;
+        self.current_size.fetch_sub(count as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_duplicate(&self) {
+        self.duplicates_rejected += 1;
+    }
+
+    pub fn record_full(&self) {
+        self.full_events += 1;
+    }
+
+    pub fn record_empty(&self) {
+        self.empty_events += 1;
+    }
+
+    pub fn size(&self) -> u64 {
+        self.current_size.load(Ordering::Relaxed)
+    }
 }
 
 // -----------------------------------------------------------------------------
-// Quantum Utility Functions
+// Standard Mempool
 // -----------------------------------------------------------------------------
 
-/// Compute the quantum fidelity between two mempool states.
-///
-/// F = (Tr √(√ρ √σ))²
-/// For pure states, reduces to |⟨ψ|φ⟩|².
-pub fn mempool_fidelity(state_a: &QuantumMempoolState, state_b: &QuantumMempoolState) -> f64 {
-    let purity_overlap = (state_a.purity * state_b.purity).sqrt();
-    let coherence_overlap = ((state_a.standard_coherence * state_b.standard_coherence).sqrt() +
-        (state_a.mev_coherence * state_b.mev_coherence).sqrt()) / 2.0;
-    let entanglement_overlap = (state_a.entanglement_fidelity * state_b.entanglement_fidelity).sqrt();
-    (purity_overlap * coherence_overlap * entanglement_overlap).clamp(0.0, 1.0)
+/// A simple FIFO mempool with configurable capacity and duplicate detection.
+#[derive(Debug)]
+pub struct StandardMempool {
+    config: StandardMempoolConfig,
+    queue: VecDeque<Tx>,
+    hash_index: HashMap<Hash32, usize>, // tx_hash → index in queue (for O(1) dedup)
+    metrics: StandardMempoolMetrics,
 }
 
-/// Apply a quantum channel Φ(ρ) = Σ_k K_k ρ K_k† to the mempool state.
-///
-/// The Kraus operators K_k describe the effect of a mempool operation
-/// (insert, evict, select) on the quantum state.
-pub fn apply_mempool_channel(
-    state: &mut QuantumMempoolState,
-    kraus_rank: usize,
-) {
-    // Each Kraus operator application causes decoherence
-    let kraus_factor = (1.0 / kraus_rank as f64).sqrt();
-    state.standard_coherence = (state.standard_coherence * kraus_factor).clamp(0.0, 1.0);
-    state.mev_coherence = (state.mev_coherence * kraus_factor).clamp(0.0, 1.0);
-    state.entanglement_fidelity = (state.entanglement_fidelity * kraus_factor).clamp(0.0, 1.0);
-    state.apply_operation_decoherence();
+impl StandardMempool {
+    /// Create a new standard mempool with default configuration.
+    pub fn new(capacity: usize) -> Self {
+        let config = StandardMempoolConfig {
+            capacity,
+            ..Default::default()
+        };
+        Self::with_config(config)
+    }
+
+    /// Create a new standard mempool with the given configuration.
+    pub fn with_config(config: StandardMempoolConfig) -> Self {
+        Self {
+            config,
+            queue: VecDeque::with_capacity(config.capacity),
+            hash_index: HashMap::with_capacity(config.capacity),
+            metrics: StandardMempoolMetrics::default(),
+        }
+    }
+
+    /// Insert a transaction into the mempool.
+    pub fn insert(&mut self, tx: Tx) -> StandardResult<()> {
+        let tx_hash = tx_hash(&tx);
+
+        // Duplicate detection
+        if self.config.enable_dedup && self.hash_index.contains_key(&tx_hash) {
+            self.metrics.record_duplicate();
+            return Err(StandardMempoolError::Duplicate);
+        }
+
+        // Check capacity
+        if self.queue.len() >= self.config.capacity {
+            self.metrics.record_full();
+            return Err(StandardMempoolError::Full {
+                capacity: self.config.capacity,
+            });
+        }
+
+        // Insert
+        let idx = self.queue.len();
+        self.queue.push_back(tx);
+        self.hash_index.insert(tx_hash, idx);
+        self.metrics.record_insert();
+        Ok(())
+    }
+
+    /// Drain up to `n` transactions from the front of the queue.
+    pub fn drain(&mut self, n: usize) -> Vec<Tx> {
+        if self.queue.is_empty() {
+            self.metrics.record_empty();
+            return Vec::new();
+        }
+
+        let n = n.min(self.queue.len());
+        let mut result = Vec::with_capacity(n);
+        for _ in 0..n {
+            let tx = self.queue.pop_front().unwrap();
+            let tx_hash = tx_hash(&tx);
+            self.hash_index.remove(&tx_hash);
+            result.push(tx);
+        }
+        self.metrics.record_drain(n);
+        result
+    }
+
+    /// Get the current number of transactions.
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Check if the mempool is empty.
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Get the capacity of the mempool.
+    pub fn capacity(&self) -> usize {
+        self.config.capacity
+    }
+
+    /// Get the metrics.
+    pub fn metrics(&self) -> &StandardMempoolMetrics {
+        &self.metrics
+    }
+
+    /// Clear all transactions.
+    pub fn clear(&mut self) {
+        self.queue.clear();
+        self.hash_index.clear();
+        self.metrics.record_evict(self.queue.len());
+    }
+
+    /// Check if a transaction exists by hash.
+    pub fn contains(&self, tx_hash: &Hash32) -> bool {
+        self.hash_index.contains_key(tx_hash)
+    }
+
+    /// Peek at the front transaction without removing it.
+    pub fn peek(&self) -> Option<&Tx> {
+        self.queue.front()
+    }
+
+    /// Peek at the last transaction without removing it.
+    pub fn peek_back(&self) -> Option<&Tx> {
+        self.queue.back()
+    }
+
+    /// Drain all transactions.
+    pub fn drain_all(&mut self) -> Vec<Tx> {
+        let result = self.queue.drain(..).collect();
+        self.hash_index.clear();
+        self.metrics.record_drain(result.len());
+        result
+    }
+
+    /// Update the mempool configuration (e.g., capacity) – not supported in production.
+    pub fn set_capacity(&mut self, new_capacity: usize) -> Result<(), StandardMempoolError> {
+        if new_capacity < self.queue.len() {
+            return Err(StandardMempoolError::Internal(
+                "new capacity less than current size".into(),
+            ));
+        }
+        self.config.capacity = new_capacity;
+        // Optionally resize the queue if needed (but VecDeque handles it).
+        Ok(())
+    }
 }
 
 // -----------------------------------------------------------------------------
-// Convenience Functions
+// Mempool trait implementation
 // -----------------------------------------------------------------------------
 
-/// Create a new standard mempool with the given capacity.
-pub fn new_standard_mempool(capacity: usize) -> StandardMempool {
-    StandardMempool::new(capacity)
-}
+use crate::mempool::{Mempool, MempoolError, MempoolMetrics, QuantumMempoolState};
+use std::any::Any;
 
-/// Create a new MEV‑resistant mempool with the given configuration.
-pub fn new_mev_mempool(config: MevConfig) -> MempoolResult<MevMempool> {
-    MevMempool::new(config)
+impl Mempool for StandardMempool {
+    fn insert(&mut self, tx: crate::types::Tx) -> MempoolResult<()> {
+        self.insert(tx).map_err(|e| MempoolError::Standard(e))
+    }
+
+    fn drain(&mut self, n: usize) -> Vec<crate::types::Tx> {
+        self.drain(n)
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity()
+    }
+
+    fn metrics(&self) -> MempoolMetrics {
+        // Convert from StandardMempoolMetrics to MempoolMetrics
+        MempoolMetrics {
+            inserted: self.metrics.inserted,
+            drained: self.metrics.drained,
+            evicted: self.metrics.evicted,
+            duplicates_rejected: self.metrics.duplicates_rejected,
+            full_events: self.metrics.full_events,
+            empty_events: self.metrics.empty_events,
+            size: self.metrics.current_size,
+        }
+    }
+
+    fn quantum_state(&self) -> QuantumMempoolState {
+        // For the standard mempool, we compute a simplified quantum state based on size.
+        // In a real implementation, we'd track operations and coherence.
+        let mut state = QuantumMempoolState::new();
+        state.apply_operation_decoherence();
+        state
+    }
+
+    fn clear(&mut self) {
+        self.clear();
+    }
+
+    fn contains(&self, tx_hash: &crate::types::Hash32) -> bool {
+        self.contains(tx_hash)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -354,122 +314,85 @@ pub fn new_mev_mempool(config: MevConfig) -> MempoolResult<MevMempool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Tx;
 
-    // ── Builder Tests ──────────────────────────────────────────────────
-    #[test]
-    fn test_builder_standard() {
-        let pool = MempoolBuilder::new().standard(1000).build().unwrap();
-        assert_eq!(pool.as_ref().capacity(), 1000);
-    }
-
-    #[test]
-    fn test_builder_mev() {
-        let config = MevConfig::default();
-        let pool = MempoolBuilder::new()
-            .mev_resistant(config)
-            .build()
-            .unwrap();
-        // Verify underlying type
-        let mev_pool = pool
-            .as_ref()
-            .as_any()
-            .downcast_ref::<MevMempool>()
-            .unwrap();
-        assert!(mev_pool.config.commit_ttl_blocks > 0);
-    }
-
-    // ── Quantum State Tests ────────────────────────────────────────────
-    #[test]
-    fn test_quantum_mempool_state_initialization() {
-        let state = QuantumMempoolState::new();
-        assert!((state.purity - 1.0).abs() < 1e-10);
-        assert!((state.entropy - 0.0).abs() < 1e-10);
-        assert!((state.standard_coherence - 1.0).abs() < 1e-10);
-        assert!((state.mev_coherence - 1.0).abs() < 1e-10);
-        assert!(state.is_healthy);
-    }
-
-    #[test]
-    fn test_quantum_decoherence_after_operations() {
-        let mut state = QuantumMempoolState::new();
-        let initial_purity = state.purity;
-
-        // Apply several operations
-        for _ in 0..100 {
-            state.apply_operation_decoherence();
+    fn dummy_tx(from: &str, nonce: u64, payload: &str) -> Tx {
+        Tx {
+            pubkey: vec![0; 32],
+            from: from.to_string(),
+            nonce,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+            gas_limit: 100_000,
+            payload: payload.to_string(),
+            signature: vec![0; 64],
+            chain_id: 1,
         }
-
-        assert!(state.purity < initial_purity);
-        assert!(state.total_operations == 100);
     }
 
     #[test]
-    fn test_quantum_state_health_check() {
-        let mut state = QuantumMempoolState::new();
-        assert!(state.is_healthy);
-
-        // Simulate heavy decoherence
-        for _ in 0..10_000 {
-            state.apply_operation_decoherence();
-        }
-
-        // May or may not be healthy depending on decay rate
-        assert!(state.purity > 0.0);
+    fn test_insert_and_drain() {
+        let mut pool = StandardMempool::new(10);
+        let tx = dummy_tx("alice", 0, "hello");
+        pool.insert(tx.clone()).unwrap();
+        assert_eq!(pool.len(), 1);
+        let drained = pool.drain(1);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].payload, "hello");
+        assert_eq!(pool.len(), 0);
     }
 
     #[test]
-    fn test_mempool_fidelity_identical() {
-        let state_a = QuantumMempoolState::new();
-        let state_b = QuantumMempoolState::new();
-        let fidelity = mempool_fidelity(&state_a, &state_b);
-        assert!((fidelity - 1.0).abs() < 1e-10);
+    fn test_duplicate_detection() {
+        let mut pool = StandardMempool::new(10);
+        let tx = dummy_tx("alice", 0, "hello");
+        pool.insert(tx.clone()).unwrap();
+        let err = pool.insert(tx).unwrap_err();
+        assert!(matches!(err, StandardMempoolError::Duplicate));
     }
 
     #[test]
-    fn test_mempool_fidelity_different() {
-        let mut state_a = QuantumMempoolState::new();
-        let state_b = QuantumMempoolState::new();
-
-        state_a.apply_operation_decoherence();
-
-        let fidelity = mempool_fidelity(&state_a, &state_b);
-        assert!(fidelity < 1.0);
-        assert!(fidelity > 0.0);
+    fn test_capacity_limit() {
+        let mut pool = StandardMempool::new(2);
+        pool.insert(dummy_tx("alice", 0, "tx1")).unwrap();
+        pool.insert(dummy_tx("bob", 0, "tx2")).unwrap();
+        let err = pool.insert(dummy_tx("charlie", 0, "tx3")).unwrap_err();
+        assert!(matches!(err, StandardMempoolError::Full { capacity: 2 }));
     }
 
     #[test]
-    fn test_apply_mempool_channel() {
-        let mut state = QuantumMempoolState::new();
-        let initial_std_coh = state.standard_coherence;
-
-        apply_mempool_channel(&mut state, KRAUS_RANK);
-
-        assert!(state.standard_coherence < initial_std_coh);
-        assert!(state.mev_coherence < 1.0);
-        assert!(state.total_operations > 0);
+    fn test_clear() {
+        let mut pool = StandardMempool::new(10);
+        pool.insert(dummy_tx("alice", 0, "hello")).unwrap();
+        pool.clear();
+        assert_eq!(pool.len(), 0);
     }
 
-    // ── Builder With Coherence ─────────────────────────────────────────
     #[test]
-    fn test_builder_with_coherence() {
-        let pool = MempoolBuilder::new()
-            .standard(500)
-            .with_coherence(0.95)
-            .build()
-            .unwrap();
-        assert_eq!(pool.as_ref().capacity(), 500);
+    fn test_contains() {
+        let mut pool = StandardMempool::new(10);
+        let tx = dummy_tx("alice", 0, "hello");
+        let hash = tx_hash(&tx);
+        pool.insert(tx).unwrap();
+        assert!(pool.contains(&hash));
     }
 
-    // ── Error Handling ─────────────────────────────────────────────────
     #[test]
-    fn test_builder_capacity_zero() {
-        let result = MempoolBuilder::new().standard(0).build();
-        assert!(result.is_err());
-        match result {
-            Err(MempoolError::Config(msg)) => {
-                assert!(msg.contains("capacity"));
-            }
-            _ => panic!("expected Config error"),
-        }
+    fn test_peek() {
+        let mut pool = StandardMempool::new(10);
+        let tx = dummy_tx("alice", 0, "hello");
+        pool.insert(tx).unwrap();
+        let peeked = pool.peek().unwrap();
+        assert_eq!(peeked.payload, "hello");
+    }
+
+    #[test]
+    fn test_drain_all() {
+        let mut pool = StandardMempool::new(10);
+        pool.insert(dummy_tx("alice", 0, "tx1")).unwrap();
+        pool.insert(dummy_tx("bob", 0, "tx2")).unwrap();
+        let all = pool.drain_all();
+        assert_eq!(all.len(), 2);
+        assert_eq!(pool.len(), 0);
     }
 }
