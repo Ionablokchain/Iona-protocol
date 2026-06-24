@@ -23,16 +23,20 @@
 //!
 //! 1. Default values (ground state)
 //! 2. Config file (first projective measurement)
-//! 3. CLI flags (second projective measurement)
-//! 4. Environment variables IONA_* (final projective measurement)
+//! 3. Environment variables IONA_* (second projective measurement)
+//! 4. CLI flags (final projective measurement)
 //!
 //! The last measurement collapses the wavefunction to the final configuration.
 
-pub mod validation;
-
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::env;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use tracing::{debug, info, warn};
 
 // -----------------------------------------------------------------------------
 // Quantum Configuration Errors
@@ -55,11 +59,26 @@ pub enum ConfigError {
         source: toml::de::Error,
     },
 
+    #[error("TOML serialization error: {source}")]
+    TomlSerialize {
+        #[source]
+        source: toml::ser::Error,
+    },
+
     #[error("Configuration validation failed: {0}")]
     Validation(String),
 
     #[error("Quantum coherence lost: conflicting configuration eigenvalues")]
     CoherenceLost,
+
+    #[error("Environment variable parse error: {key} = {value}")]
+    EnvParse { key: String, value: String },
+
+    #[error("Lock acquisition failed: {0}")]
+    LockFailed(String),
+
+    #[error("Config file does not exist: {path}")]
+    NotFound { path: PathBuf },
 }
 
 pub type ConfigResult<T> = Result<T, ConfigError>;
@@ -102,32 +121,143 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    /// Measure configuration from a TOML file.
+    /// Measure configuration from a TOML file, applying environment overrides.
     ///
-    /// If the file does not exist, returns the ground state (default).
+    /// If the file does not exist, returns the ground state (defaults) with env overrides.
     pub fn load(path: impl AsRef<Path>) -> ConfigResult<Self> {
         let path = path.as_ref();
+        let mut cfg = if path.exists() {
+            // Acquire shared lock for reading.
+            let file = File::open(path).map_err(|e| ConfigError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+            file.lock_shared().map_err(|e| ConfigError::LockFailed(e.to_string()))?;
 
-        if !path.exists() {
-            return Ok(Self::default());
-        }
+            let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+            let cfg: Self = toml::from_str(&contents).map_err(|e| ConfigError::Toml {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+            // Release lock (file will be dropped).
+            cfg
+        } else {
+            // No file, start with defaults.
+            Self::default()
+        };
 
-        let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
-            path: path.into(),
-            source: e,
-        })?;
+        // Apply environment variables.
+        cfg.apply_env()?;
 
-        let cfg: Self = toml::from_str(&contents).map_err(|e| ConfigError::Toml {
-            path: path.into(),
-            source: e,
-        })?;
+        // Validate.
+        cfg.validate()?;
 
         Ok(cfg)
     }
 
+    /// Apply environment variables of the form IONA_* to override config fields.
+    /// The mapping uses the pattern: IONA_SECTION_FIELD = value.
+    /// For example: IONA_NODE_DATA_DIR = "/data".
+    fn apply_env(&mut self) -> ConfigResult<()> {
+        let mut env_vars: HashMap<String, String> = HashMap::new();
+        for (key, value) in env::vars() {
+            if key.starts_with("IONA_") && !value.is_empty() {
+                env_vars.insert(key, value);
+            }
+        }
+
+        // Helper to parse TOML from env vars.
+        // We'll construct a TOML string from env vars and merge.
+        let mut toml_string = String::new();
+        for (key, value) in &env_vars {
+            // key format: IONA_SECTION_FIELD -> section.field
+            let parts: Vec<&str> = key.splitn(3, '_').collect();
+            if parts.len() == 3 {
+                let section = parts[1].to_lowercase();
+                let field = parts[2].to_lowercase();
+                // Convert value to TOML literal (string, number, bool).
+                let toml_value = if value.parse::<i64>().is_ok()
+                    || value.parse::<f64>().is_ok()
+                    || value.parse::<bool>().is_ok()
+                {
+                    value.clone()
+                } else {
+                    // String needs quoting.
+                    format!("\"{}\"", value.replace('\"', "\\\""))
+                };
+                toml_string.push_str(&format!("{}.{} = {}\n", section, field, toml_value));
+            }
+        }
+
+        if !toml_string.is_empty() {
+            // Parse the TOML overrides and merge into self.
+            // We'll use a temporary TOML value and deserialize into a partial struct.
+            // But easier: we can merge by deserializing into a Value and applying.
+            let overrides: toml::Value = toml::from_str(&toml_string)
+                .map_err(|e| ConfigError::EnvParse {
+                    key: "unknown".to_string(),
+                    value: e.to_string(),
+                })?;
+            // Convert self to toml::Value, merge, and deserialize back.
+            let mut self_value = toml::Value::try_from(self.clone())
+                .map_err(|e| ConfigError::TomlSerialize { source: e })?;
+            merge_toml_values(&mut self_value, overrides);
+            *self = Self::deserialize(self_value)
+                .map_err(|e| ConfigError::Toml { path: PathBuf::from("env"), source: e })?;
+        }
+
+        Ok(())
+    }
+
+    /// Apply CLI overrides: a list of "section.field=value" strings.
+    /// This is the final measurement, so it has highest priority.
+    pub fn apply_cli_overrides(&mut self, overrides: &[String]) -> ConfigResult<()> {
+        if overrides.is_empty() {
+            return Ok(());
+        }
+
+        let mut toml_string = String::new();
+        for override_str in overrides {
+            // Split by '=' to get key and value.
+            let parts: Vec<&str> = override_str.splitn(2, '=').collect();
+            if parts.len() != 2 {
+                return Err(ConfigError::Validation(
+                    format!("Invalid CLI override format: '{}', expected 'section.field=value'", override_str)
+                ));
+            }
+            let key = parts[0].trim();
+            let value = parts[1].trim();
+
+            // Convert value to TOML literal.
+            let toml_value = if value.parse::<i64>().is_ok()
+                || value.parse::<f64>().is_ok()
+                || value.parse::<bool>().is_ok()
+            {
+                value.to_string()
+            } else {
+                // String needs quoting.
+                format!("\"{}\"", value.replace('\"', "\\\""))
+            };
+            toml_string.push_str(&format!("{} = {}\n", key, toml_value));
+        }
+
+        if !toml_string.is_empty() {
+            let overrides: toml::Value = toml::from_str(&toml_string)
+                .map_err(|e| ConfigError::Toml { path: PathBuf::from("cli"), source: e })?;
+            let mut self_value = toml::Value::try_from(self.clone())
+                .map_err(|e| ConfigError::TomlSerialize { source: e })?;
+            merge_toml_values(&mut self_value, overrides);
+            *self = Self::deserialize(self_value)
+                .map_err(|e| ConfigError::Toml { path: PathBuf::from("cli"), source: e })?;
+        }
+
+        Ok(())
+    }
+
     /// Validate the entire configuration — measure all observables.
-    ///
-    /// Returns `Ok(())` if all sections are in valid eigenstates.
     pub fn validate(&self) -> ConfigResult<()> {
         self.node.validate()?;
         self.consensus.validate()?;
@@ -141,14 +271,100 @@ impl NodeConfig {
         Ok(())
     }
 
+    /// Write the configuration to a file atomically (write to temp, then rename).
+    /// Acquires an exclusive lock during writing.
+    pub fn write(&self, path: impl AsRef<Path>) -> ConfigResult<()> {
+        let path = path.as_ref();
+        // Ensure parent directory exists.
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| ConfigError::Io {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
+        }
+
+        // Acquire exclusive lock.
+        let lock_path = path.with_extension("lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| ConfigError::Io { path: lock_path.clone(), source: e })?;
+        lock_file.lock_exclusive().map_err(|e| ConfigError::LockFailed(e.to_string()))?;
+
+        // Write to temp file.
+        let temp_path = path.with_extension("tmp");
+        let toml_string = toml::to_string_pretty(self)
+            .map_err(|e| ConfigError::TomlSerialize { source: e })?;
+        fs::write(&temp_path, toml_string).map_err(|e| ConfigError::Io {
+            path: temp_path.clone(),
+            source: e,
+        })?;
+
+        // Atomic rename.
+        fs::rename(&temp_path, path).map_err(|e| ConfigError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+
+        // Release lock (drop file).
+        Ok(())
+    }
+
     /// Example configuration string (classical representation).
     pub fn example_toml() -> &'static str {
         include_str!("config_example.toml")
     }
 
     /// Write example configuration to a file.
-    pub fn write_example(path: impl AsRef<Path>) -> std::io::Result<()> {
-        std::fs::write(path, Self::example_toml())
+    pub fn write_example(path: impl AsRef<Path>) -> ConfigResult<()> {
+        let path = path.as_ref();
+        // Ensure parent directory exists.
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| ConfigError::Io {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
+        }
+
+        // Acquire exclusive lock.
+        let lock_path = path.with_extension("lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| ConfigError::Io { path: lock_path.clone(), source: e })?;
+        lock_file.lock_exclusive().map_err(|e| ConfigError::LockFailed(e.to_string()))?;
+
+        fs::write(path, Self::example_toml()).map_err(|e| ConfigError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Helper: Merge TOML values recursively
+// -----------------------------------------------------------------------------
+
+/// Merge two TOML values recursively, with `overrides` taking precedence.
+fn merge_toml_values(base: &mut toml::Value, overrides: toml::Value) {
+    match (base, overrides) {
+        (toml::Value::Table(base_table), toml::Value::Table(override_table)) => {
+            for (key, value) in override_table {
+                if let Some(existing) = base_table.get_mut(&key) {
+                    merge_toml_values(existing, value);
+                } else {
+                    base_table.insert(key, value);
+                }
+            }
+        }
+        (base, override_val) => {
+            // Override completely.
+            *base = override_val;
+        }
     }
 }
 
@@ -159,20 +375,13 @@ impl NodeConfig {
 /// Node identity and key management configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSection {
-    /// Data directory path.
     pub data_dir: String,
-    /// Deterministic key seed.
     pub seed: u64,
-    /// Chain identifier.
     pub chain_id: u64,
-    /// Log level: trace | debug | info | warn | error
     pub log_level: String,
-    /// Key storage mode: "plain" | "encrypted"
     pub keystore: String,
-    /// Keystore password fallback.
     #[serde(default)]
     pub keystore_password: String,
-    /// Environment variable for keystore password.
     pub keystore_password_env: String,
 }
 
@@ -205,6 +414,12 @@ impl NodeSection {
                 "encrypted keystore requires keystore_password or keystore_password_env".into(),
             ));
         }
+        // Check log_level validity.
+        if !["trace", "debug", "info", "warn", "error"].contains(&self.log_level.as_str()) {
+            return Err(ConfigError::Validation(
+                "node.log_level must be one of: trace, debug, info, warn, error".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -216,28 +431,17 @@ impl NodeSection {
 /// Consensus protocol configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusSection {
-    /// Propose timeout in milliseconds.
     pub propose_timeout_ms: u64,
-    /// Prevote timeout in milliseconds.
     pub prevote_timeout_ms: u64,
-    /// Precommit timeout in milliseconds.
     pub precommit_timeout_ms: u64,
-    /// Maximum transactions per block.
     pub max_txs_per_block: usize,
-    /// EIP-1559 gas target per block.
     pub gas_target: u64,
-    /// Fast quorum: advance immediately when 2/3+ votes received.
     pub fast_quorum: bool,
-    /// Initial base fee for EIP-1559.
     pub initial_base_fee: u64,
-    /// Stake assigned to each validator.
     pub stake_each: u64,
-    /// Enable Simple PoS block producer.
     pub simple_producer: bool,
-    /// Validator seeds (must match across all nodes).
     #[serde(default = "default_validator_seeds")]
     pub validator_seeds: Vec<u64>,
-    /// Protocol upgrade activation schedule.
     #[serde(default = "default_activations")]
     pub protocol_activations: Vec<crate::protocol::version::ProtocolActivation>,
 }
@@ -296,6 +500,14 @@ impl ConsensusSection {
             ));
         }
 
+        // Check uniqueness of validator seeds.
+        let unique: std::collections::HashSet<_> = self.validator_seeds.iter().collect();
+        if unique.len() != self.validator_seeds.len() {
+            return Err(ConfigError::Validation(
+                "consensus.validator_seeds must contain unique seeds".into(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -308,24 +520,14 @@ impl ConsensusSection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NetworkSection {
-    /// Listen multiaddress.
     pub listen: String,
-    /// Static peer multiaddresses.
     pub peers: Vec<String>,
-    /// Bootstrap peer multiaddresses.
     pub bootnodes: Vec<String>,
-    /// Enable mDNS discovery.
     pub enable_mdns: bool,
-    /// Enable Kademlia DHT.
     pub enable_kad: bool,
-    /// Reconnect interval in seconds.
     pub reconnect_s: u64,
-
-    // Connection limits
     pub max_connections_total: usize,
     pub max_connections_per_peer: usize,
-
-    // Rate limits
     pub rr_max_req_per_sec: u32,
     pub rr_strikes_before_ban: u32,
     pub rr_max_req_per_sec_block: u32,
@@ -338,35 +540,24 @@ pub struct NetworkSection {
     pub rr_max_bytes_per_sec_state: u32,
     pub rr_global_in_bytes_per_sec: u32,
     pub rr_global_out_bytes_per_sec: u32,
-
-    // Peer scoring
     pub peer_strike_decay_s: u64,
     pub peer_score_decay_s: u64,
     pub peer_quarantine_s: u64,
     pub rr_strikes_before_quarantine: u32,
     pub rr_quarantines_before_ban: u32,
     pub persist_quarantine: bool,
-
-    // Gossipsub
+    #[serde(default)]
     pub gossipsub: GossipsubSection,
-
-    // Diversity
+    #[serde(default)]
     pub diversity: DiversitySection,
-
-    /// Eclipse protection profile: "mainnet" | "testnet"
     pub eclipse_profile: String,
-
-    // State sync
     pub enable_p2p_state_sync: bool,
     pub state_sync_chunk_bytes: u32,
     pub state_sync_timeout_s: u64,
-
-    // Snapshot attestation
     pub enable_snapshot_attestation: bool,
     pub snapshot_attestation_threshold: u32,
     pub snapshot_attestation_collect_s: u64,
-
-    // State sync security
+    #[serde(default)]
     pub state_sync_security: StateSyncSecuritySection,
 }
 
@@ -428,6 +619,21 @@ impl NetworkSection {
         if self.rr_max_req_per_sec == 0 {
             return Err(ConfigError::Validation(
                 "network.rr_max_req_per_sec must be > 0".into(),
+            ));
+        }
+        if self.rr_strikes_before_ban == 0 {
+            return Err(ConfigError::Validation(
+                "network.rr_strikes_before_ban must be > 0".into(),
+            ));
+        }
+        if self.rr_strikes_before_quarantine == 0 {
+            return Err(ConfigError::Validation(
+                "network.rr_strikes_before_quarantine must be > 0".into(),
+            ));
+        }
+        if self.rr_quarantines_before_ban == 0 {
+            return Err(ConfigError::Validation(
+                "network.rr_quarantines_before_ban must be > 0".into(),
             ));
         }
         Ok(())
@@ -571,6 +777,13 @@ impl RpcSection {
                 "rpc.listen must be in format 'host:port'".into(),
             ));
         }
+        // Ensure port is numeric.
+        let parts: Vec<&str> = self.listen.split(':').collect();
+        if parts.len() != 2 || parts[1].parse::<u16>().is_err() {
+            return Err(ConfigError::Validation(
+                format!("rpc.listen '{}' must be 'host:port' with a valid port", self.listen)
+            ));
+        }
         Ok(())
     }
 }
@@ -688,6 +901,11 @@ impl StorageSection {
                 "storage.snapshot_zstd_level must be between 1 and 22".into(),
             ));
         }
+        if self.snapshot_keep == 0 {
+            return Err(ConfigError::Validation(
+                "storage.snapshot_keep must be > 0".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -728,6 +946,7 @@ impl ObservabilitySection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_default_config_is_valid() {
@@ -783,5 +1002,42 @@ mod tests {
         let mut cfg = NodeConfig::default();
         cfg.storage.snapshot_zstd_level = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_load_with_env() {
+        // Set env vars.
+        env::set_var("IONA_NODE_DATA_DIR", "/custom/data");
+        env::set_var("IONA_CONSENSUS_PROPOSE_TIMEOUT_MS", "500");
+        let cfg = NodeConfig::load("non_existent_file.toml").unwrap();
+        assert_eq!(cfg.node.data_dir, "/custom/data");
+        assert_eq!(cfg.consensus.propose_timeout_ms, 500);
+        // Clean up.
+        env::remove_var("IONA_NODE_DATA_DIR");
+        env::remove_var("IONA_CONSENSUS_PROPOSE_TIMEOUT_MS");
+    }
+
+    #[test]
+    fn test_cli_overrides() {
+        let mut cfg = NodeConfig::default();
+        let overrides = vec![
+            "node.data_dir=/cli/data".into(),
+            "consensus.propose_timeout_ms=100".into(),
+        ];
+        cfg.apply_cli_overrides(&overrides).unwrap();
+        assert_eq!(cfg.node.data_dir, "/cli/data");
+        assert_eq!(cfg.consensus.propose_timeout_ms, 100);
+    }
+
+    #[test]
+    fn test_write_and_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = NodeConfig::default();
+        cfg.node.data_dir = "/test/data".into();
+        cfg.write(&path).unwrap();
+
+        let loaded = NodeConfig::load(&path).unwrap();
+        assert_eq!(loaded.node.data_dir, "/test/data");
     }
 }
