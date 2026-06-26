@@ -11,6 +11,7 @@
 //! | `0x01–0x0B`| Arithmetic            |
 //! | `0x10–0x1D`| Comparison & Bitwise  |
 //! | `0x20`     | SHA3                  |
+//! | `0x21`     | BLAKE3 (IONA extension) |
 //! | `0x30–0x3E`| Environment           |
 //! | `0x50–0x5B`| Memory / Ctrl Flow    |
 //! | `0x60–0x7F`| Push (1–32 bytes)    |
@@ -19,6 +20,8 @@
 //! | `0xA0–0xA4`| Logging              |
 //! | `0xF0–0xFF`| System               |
 
+use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
 
 // -----------------------------------------------------------------------------
@@ -30,6 +33,12 @@ use thiserror::Error;
 pub enum OpcodeError {
     #[error("invalid opcode: 0x{opcode:02X}")]
     InvalidOpcode { opcode: u8 },
+
+    #[error("truncated push at position {pos}: expected {expected} bytes, got {remaining}")]
+    TruncatedPush { pos: usize, expected: usize, remaining: usize },
+
+    #[error("invalid jump destination at position {pos}")]
+    InvalidJumpDest { pos: usize },
 }
 
 pub type OpcodeResult<T> = Result<T, OpcodeError>;
@@ -42,8 +51,9 @@ pub type OpcodeResult<T> = Result<T, OpcodeError>;
 ///
 /// The numeric values follow the EVM specification, with some IONA-specific
 /// extensions (e.g., `BLAKE3` at `0x21`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
+#[non_exhaustive] // Allow future opcodes without breaking changes
 pub enum Opcode {
     // ── Control (0x00) ──────────────────────────────────────────────────
     Stop = 0x00,
@@ -151,165 +161,176 @@ pub enum Opcode {
 }
 
 // -----------------------------------------------------------------------------
-// Conversion: u8 ↔ Opcode
+// Conversion: u8 ↔ Opcode (with const lookup table)
 // -----------------------------------------------------------------------------
+
+/// A const lookup table mapping `u8` to `Option<Opcode>`.
+/// Generated via a macro to ensure completeness and avoid runtime overhead.
+const OPCODE_LUT: [Option<Opcode>; 256] = build_opcode_lut();
+
+/// Helper macro to build the lookup table at compile time.
+macro_rules! build_opcode_lut {
+    () => {{
+        let mut table = [None; 256];
+        // Arithmetic
+        table[0x00] = Some(Opcode::Stop);
+        table[0x01] = Some(Opcode::Add);
+        table[0x02] = Some(Opcode::Mul);
+        table[0x03] = Some(Opcode::Sub);
+        table[0x04] = Some(Opcode::Div);
+        table[0x05] = Some(Opcode::SDiv);
+        table[0x06] = Some(Opcode::Mod);
+        table[0x07] = Some(Opcode::SMod);
+        table[0x08] = Some(Opcode::AddMod);
+        table[0x09] = Some(Opcode::MulMod);
+        table[0x0A] = Some(Opcode::Exp);
+        table[0x0B] = Some(Opcode::SignExtend);
+        // Comparison & Bitwise
+        table[0x10] = Some(Opcode::Lt);
+        table[0x11] = Some(Opcode::Gt);
+        table[0x12] = Some(Opcode::SLt);
+        table[0x13] = Some(Opcode::SGt);
+        table[0x14] = Some(Opcode::Eq);
+        table[0x15] = Some(Opcode::IsZero);
+        table[0x16] = Some(Opcode::And);
+        table[0x17] = Some(Opcode::Or);
+        table[0x18] = Some(Opcode::Xor);
+        table[0x19] = Some(Opcode::Not);
+        table[0x1A] = Some(Opcode::Byte);
+        table[0x1B] = Some(Opcode::Shl);
+        table[0x1C] = Some(Opcode::Shr);
+        table[0x1D] = Some(Opcode::Sar);
+        // Cryptographic
+        table[0x20] = Some(Opcode::Sha3);
+        table[0x21] = Some(Opcode::Blake3);
+        // Environment
+        table[0x30] = Some(Opcode::Address);
+        table[0x31] = Some(Opcode::Balance);
+        table[0x32] = Some(Opcode::Origin);
+        table[0x33] = Some(Opcode::Caller);
+        table[0x34] = Some(Opcode::CallValue);
+        table[0x35] = Some(Opcode::CallDataLoad);
+        table[0x36] = Some(Opcode::CallDataSize);
+        table[0x37] = Some(Opcode::CallDataCopy);
+        table[0x38] = Some(Opcode::CodeSize);
+        table[0x39] = Some(Opcode::CodeCopy);
+        table[0x3A] = Some(Opcode::GasPrice);
+        table[0x3B] = Some(Opcode::ExtCodeSize);
+        table[0x3C] = Some(Opcode::ExtCodeCopy);
+        table[0x3D] = Some(Opcode::ReturnDataSize);
+        table[0x3E] = Some(Opcode::ReturnDataCopy);
+        // Memory & Control Flow
+        table[0x50] = Some(Opcode::Pop);
+        table[0x51] = Some(Opcode::MLoad);
+        table[0x52] = Some(Opcode::MStore);
+        table[0x53] = Some(Opcode::MStore8);
+        table[0x54] = Some(Opcode::SLoad);
+        table[0x55] = Some(Opcode::SStore);
+        table[0x56] = Some(Opcode::Jump);
+        table[0x57] = Some(Opcode::Jumpi);
+        table[0x58] = Some(Opcode::Pc);
+        table[0x59] = Some(Opcode::MSize);
+        table[0x5A] = Some(Opcode::Gas);
+        table[0x5B] = Some(Opcode::JumpDest);
+        // Push (0x60–0x7F)
+        table[0x60] = Some(Opcode::Push1);
+        table[0x61] = Some(Opcode::Push2);
+        table[0x62] = Some(Opcode::Push3);
+        table[0x63] = Some(Opcode::Push4);
+        table[0x64] = Some(Opcode::Push5);
+        table[0x65] = Some(Opcode::Push6);
+        table[0x66] = Some(Opcode::Push7);
+        table[0x67] = Some(Opcode::Push8);
+        table[0x68] = Some(Opcode::Push9);
+        table[0x69] = Some(Opcode::Push10);
+        table[0x6A] = Some(Opcode::Push11);
+        table[0x6B] = Some(Opcode::Push12);
+        table[0x6C] = Some(Opcode::Push13);
+        table[0x6D] = Some(Opcode::Push14);
+        table[0x6E] = Some(Opcode::Push15);
+        table[0x6F] = Some(Opcode::Push16);
+        table[0x70] = Some(Opcode::Push17);
+        table[0x71] = Some(Opcode::Push18);
+        table[0x72] = Some(Opcode::Push19);
+        table[0x73] = Some(Opcode::Push20);
+        table[0x74] = Some(Opcode::Push21);
+        table[0x75] = Some(Opcode::Push22);
+        table[0x76] = Some(Opcode::Push23);
+        table[0x77] = Some(Opcode::Push24);
+        table[0x78] = Some(Opcode::Push25);
+        table[0x79] = Some(Opcode::Push26);
+        table[0x7A] = Some(Opcode::Push27);
+        table[0x7B] = Some(Opcode::Push28);
+        table[0x7C] = Some(Opcode::Push29);
+        table[0x7D] = Some(Opcode::Push30);
+        table[0x7E] = Some(Opcode::Push31);
+        table[0x7F] = Some(Opcode::Push32);
+        // Dup (0x80–0x8F)
+        table[0x80] = Some(Opcode::Dup1);
+        table[0x81] = Some(Opcode::Dup2);
+        table[0x82] = Some(Opcode::Dup3);
+        table[0x83] = Some(Opcode::Dup4);
+        table[0x84] = Some(Opcode::Dup5);
+        table[0x85] = Some(Opcode::Dup6);
+        table[0x86] = Some(Opcode::Dup7);
+        table[0x87] = Some(Opcode::Dup8);
+        table[0x88] = Some(Opcode::Dup9);
+        table[0x89] = Some(Opcode::Dup10);
+        table[0x8A] = Some(Opcode::Dup11);
+        table[0x8B] = Some(Opcode::Dup12);
+        table[0x8C] = Some(Opcode::Dup13);
+        table[0x8D] = Some(Opcode::Dup14);
+        table[0x8E] = Some(Opcode::Dup15);
+        table[0x8F] = Some(Opcode::Dup16);
+        // Swap (0x90–0x9F)
+        table[0x90] = Some(Opcode::Swap1);
+        table[0x91] = Some(Opcode::Swap2);
+        table[0x92] = Some(Opcode::Swap3);
+        table[0x93] = Some(Opcode::Swap4);
+        table[0x94] = Some(Opcode::Swap5);
+        table[0x95] = Some(Opcode::Swap6);
+        table[0x96] = Some(Opcode::Swap7);
+        table[0x97] = Some(Opcode::Swap8);
+        table[0x98] = Some(Opcode::Swap9);
+        table[0x99] = Some(Opcode::Swap10);
+        table[0x9A] = Some(Opcode::Swap11);
+        table[0x9B] = Some(Opcode::Swap12);
+        table[0x9C] = Some(Opcode::Swap13);
+        table[0x9D] = Some(Opcode::Swap14);
+        table[0x9E] = Some(Opcode::Swap15);
+        table[0x9F] = Some(Opcode::Swap16);
+        // Logging
+        table[0xA0] = Some(Opcode::Log0);
+        table[0xA1] = Some(Opcode::Log1);
+        table[0xA2] = Some(Opcode::Log2);
+        table[0xA3] = Some(Opcode::Log3);
+        table[0xA4] = Some(Opcode::Log4);
+        // System
+        table[0xF0] = Some(Opcode::Create);
+        table[0xF1] = Some(Opcode::Call);
+        table[0xF2] = Some(Opcode::CallCode);
+        table[0xF3] = Some(Opcode::Return);
+        table[0xF4] = Some(Opcode::DelegateCall);
+        table[0xF5] = Some(Opcode::Create2);
+        table[0xFA] = Some(Opcode::StaticCall);
+        table[0xFD] = Some(Opcode::Revert);
+        table[0xFE] = Some(Opcode::Invalid);
+        table[0xFF] = Some(Opcode::SelfDestruct);
+        table
+    }};
+}
+
+/// Build the const lookup table (called at compile time).
+#[allow(clippy::items_after_test_module)]
+const fn build_opcode_lut() -> [Option<Opcode>; 256] {
+    build_opcode_lut!()
+}
 
 impl TryFrom<u8> for Opcode {
     type Error = OpcodeError;
 
     fn try_from(value: u8) -> OpcodeResult<Self> {
-        // Use a lookup table for O(1) conversion without unsafe.
-        // The table covers the full 0x00–0xFF range; invalid slots hold None.
-        static LUT: Lazy<[Option<Opcode>; 256]> = Lazy::new(|| {
-            let mut table = [None; 256];
-            // Arithmetic
-            table[0x00] = Some(Opcode::Stop);
-            table[0x01] = Some(Opcode::Add);
-            table[0x02] = Some(Opcode::Mul);
-            table[0x03] = Some(Opcode::Sub);
-            table[0x04] = Some(Opcode::Div);
-            table[0x05] = Some(Opcode::SDiv);
-            table[0x06] = Some(Opcode::Mod);
-            table[0x07] = Some(Opcode::SMod);
-            table[0x08] = Some(Opcode::AddMod);
-            table[0x09] = Some(Opcode::MulMod);
-            table[0x0A] = Some(Opcode::Exp);
-            table[0x0B] = Some(Opcode::SignExtend);
-            // Comparison & Bitwise
-            table[0x10] = Some(Opcode::Lt);
-            table[0x11] = Some(Opcode::Gt);
-            table[0x12] = Some(Opcode::SLt);
-            table[0x13] = Some(Opcode::SGt);
-            table[0x14] = Some(Opcode::Eq);
-            table[0x15] = Some(Opcode::IsZero);
-            table[0x16] = Some(Opcode::And);
-            table[0x17] = Some(Opcode::Or);
-            table[0x18] = Some(Opcode::Xor);
-            table[0x19] = Some(Opcode::Not);
-            table[0x1A] = Some(Opcode::Byte);
-            table[0x1B] = Some(Opcode::Shl);
-            table[0x1C] = Some(Opcode::Shr);
-            table[0x1D] = Some(Opcode::Sar);
-            // Cryptographic
-            table[0x20] = Some(Opcode::Sha3);
-            table[0x21] = Some(Opcode::Blake3);
-            // Environment
-            table[0x30] = Some(Opcode::Address);
-            table[0x31] = Some(Opcode::Balance);
-            table[0x32] = Some(Opcode::Origin);
-            table[0x33] = Some(Opcode::Caller);
-            table[0x34] = Some(Opcode::CallValue);
-            table[0x35] = Some(Opcode::CallDataLoad);
-            table[0x36] = Some(Opcode::CallDataSize);
-            table[0x37] = Some(Opcode::CallDataCopy);
-            table[0x38] = Some(Opcode::CodeSize);
-            table[0x39] = Some(Opcode::CodeCopy);
-            table[0x3A] = Some(Opcode::GasPrice);
-            table[0x3B] = Some(Opcode::ExtCodeSize);
-            table[0x3C] = Some(Opcode::ExtCodeCopy);
-            table[0x3D] = Some(Opcode::ReturnDataSize);
-            table[0x3E] = Some(Opcode::ReturnDataCopy);
-            // Memory & Control Flow
-            table[0x50] = Some(Opcode::Pop);
-            table[0x51] = Some(Opcode::MLoad);
-            table[0x52] = Some(Opcode::MStore);
-            table[0x53] = Some(Opcode::MStore8);
-            table[0x54] = Some(Opcode::SLoad);
-            table[0x55] = Some(Opcode::SStore);
-            table[0x56] = Some(Opcode::Jump);
-            table[0x57] = Some(Opcode::Jumpi);
-            table[0x58] = Some(Opcode::Pc);
-            table[0x59] = Some(Opcode::MSize);
-            table[0x5A] = Some(Opcode::Gas);
-            table[0x5B] = Some(Opcode::JumpDest);
-            // Push (0x60–0x7F)
-            table[0x60] = Some(Opcode::Push1);
-            table[0x61] = Some(Opcode::Push2);
-            table[0x62] = Some(Opcode::Push3);
-            table[0x63] = Some(Opcode::Push4);
-            table[0x64] = Some(Opcode::Push5);
-            table[0x65] = Some(Opcode::Push6);
-            table[0x66] = Some(Opcode::Push7);
-            table[0x67] = Some(Opcode::Push8);
-            table[0x68] = Some(Opcode::Push9);
-            table[0x69] = Some(Opcode::Push10);
-            table[0x6A] = Some(Opcode::Push11);
-            table[0x6B] = Some(Opcode::Push12);
-            table[0x6C] = Some(Opcode::Push13);
-            table[0x6D] = Some(Opcode::Push14);
-            table[0x6E] = Some(Opcode::Push15);
-            table[0x6F] = Some(Opcode::Push16);
-            table[0x70] = Some(Opcode::Push17);
-            table[0x71] = Some(Opcode::Push18);
-            table[0x72] = Some(Opcode::Push19);
-            table[0x73] = Some(Opcode::Push20);
-            table[0x74] = Some(Opcode::Push21);
-            table[0x75] = Some(Opcode::Push22);
-            table[0x76] = Some(Opcode::Push23);
-            table[0x77] = Some(Opcode::Push24);
-            table[0x78] = Some(Opcode::Push25);
-            table[0x79] = Some(Opcode::Push26);
-            table[0x7A] = Some(Opcode::Push27);
-            table[0x7B] = Some(Opcode::Push28);
-            table[0x7C] = Some(Opcode::Push29);
-            table[0x7D] = Some(Opcode::Push30);
-            table[0x7E] = Some(Opcode::Push31);
-            table[0x7F] = Some(Opcode::Push32);
-            // Dup (0x80–0x8F)
-            table[0x80] = Some(Opcode::Dup1);
-            table[0x81] = Some(Opcode::Dup2);
-            table[0x82] = Some(Opcode::Dup3);
-            table[0x83] = Some(Opcode::Dup4);
-            table[0x84] = Some(Opcode::Dup5);
-            table[0x85] = Some(Opcode::Dup6);
-            table[0x86] = Some(Opcode::Dup7);
-            table[0x87] = Some(Opcode::Dup8);
-            table[0x88] = Some(Opcode::Dup9);
-            table[0x89] = Some(Opcode::Dup10);
-            table[0x8A] = Some(Opcode::Dup11);
-            table[0x8B] = Some(Opcode::Dup12);
-            table[0x8C] = Some(Opcode::Dup13);
-            table[0x8D] = Some(Opcode::Dup14);
-            table[0x8E] = Some(Opcode::Dup15);
-            table[0x8F] = Some(Opcode::Dup16);
-            // Swap (0x90–0x9F)
-            table[0x90] = Some(Opcode::Swap1);
-            table[0x91] = Some(Opcode::Swap2);
-            table[0x92] = Some(Opcode::Swap3);
-            table[0x93] = Some(Opcode::Swap4);
-            table[0x94] = Some(Opcode::Swap5);
-            table[0x95] = Some(Opcode::Swap6);
-            table[0x96] = Some(Opcode::Swap7);
-            table[0x97] = Some(Opcode::Swap8);
-            table[0x98] = Some(Opcode::Swap9);
-            table[0x99] = Some(Opcode::Swap10);
-            table[0x9A] = Some(Opcode::Swap11);
-            table[0x9B] = Some(Opcode::Swap12);
-            table[0x9C] = Some(Opcode::Swap13);
-            table[0x9D] = Some(Opcode::Swap14);
-            table[0x9E] = Some(Opcode::Swap15);
-            table[0x9F] = Some(Opcode::Swap16);
-            // Logging
-            table[0xA0] = Some(Opcode::Log0);
-            table[0xA1] = Some(Opcode::Log1);
-            table[0xA2] = Some(Opcode::Log2);
-            table[0xA3] = Some(Opcode::Log3);
-            table[0xA4] = Some(Opcode::Log4);
-            // System
-            table[0xF0] = Some(Opcode::Create);
-            table[0xF1] = Some(Opcode::Call);
-            table[0xF2] = Some(Opcode::CallCode);
-            table[0xF3] = Some(Opcode::Return);
-            table[0xF4] = Some(Opcode::DelegateCall);
-            table[0xF5] = Some(Opcode::Create2);
-            table[0xFA] = Some(Opcode::StaticCall);
-            table[0xFD] = Some(Opcode::Revert);
-            table[0xFE] = Some(Opcode::Invalid);
-            table[0xFF] = Some(Opcode::SelfDestruct);
-            table
-        });
-
-        LUT[value as usize].ok_or(OpcodeError::InvalidOpcode { opcode: value })
+        OPCODE_LUT[value as usize].ok_or(OpcodeError::InvalidOpcode { opcode: value })
     }
 }
 
@@ -383,13 +404,227 @@ impl Opcode {
     pub const fn is_jump(self) -> bool {
         matches!(self, Opcode::Jump | Opcode::Jumpi | Opcode::JumpDest)
     }
+
+    /// Returns `true` if the opcode is a system operation (call, create, etc.).
+    pub const fn is_system(self) -> bool {
+        matches!(
+            self,
+            Opcode::Create | Opcode::Create2 | Opcode::Call | Opcode::CallCode |
+            Opcode::DelegateCall | Opcode::StaticCall | Opcode::SelfDestruct
+        )
+    }
+
+    /// Returns the human-readable name of the opcode.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Opcode::Stop => "STOP",
+            Opcode::Add => "ADD",
+            Opcode::Mul => "MUL",
+            Opcode::Sub => "SUB",
+            Opcode::Div => "DIV",
+            Opcode::SDiv => "SDIV",
+            Opcode::Mod => "MOD",
+            Opcode::SMod => "SMOD",
+            Opcode::AddMod => "ADDMOD",
+            Opcode::MulMod => "MULMOD",
+            Opcode::Exp => "EXP",
+            Opcode::SignExtend => "SIGNEXTEND",
+            Opcode::Lt => "LT",
+            Opcode::Gt => "GT",
+            Opcode::SLt => "SLT",
+            Opcode::SGt => "SGT",
+            Opcode::Eq => "EQ",
+            Opcode::IsZero => "ISZERO",
+            Opcode::And => "AND",
+            Opcode::Or => "OR",
+            Opcode::Xor => "XOR",
+            Opcode::Not => "NOT",
+            Opcode::Byte => "BYTE",
+            Opcode::Shl => "SHL",
+            Opcode::Shr => "SHR",
+            Opcode::Sar => "SAR",
+            Opcode::Sha3 => "SHA3",
+            Opcode::Blake3 => "BLAKE3",
+            Opcode::Address => "ADDRESS",
+            Opcode::Balance => "BALANCE",
+            Opcode::Origin => "ORIGIN",
+            Opcode::Caller => "CALLER",
+            Opcode::CallValue => "CALLVALUE",
+            Opcode::CallDataLoad => "CALLDATALOAD",
+            Opcode::CallDataSize => "CALLDATASIZE",
+            Opcode::CallDataCopy => "CALLDATACOPY",
+            Opcode::CodeSize => "CODESIZE",
+            Opcode::CodeCopy => "CODECOPY",
+            Opcode::GasPrice => "GASPRICE",
+            Opcode::ExtCodeSize => "EXTCODESIZE",
+            Opcode::ExtCodeCopy => "EXTCODECOPY",
+            Opcode::ReturnDataSize => "RETURNDATASIZE",
+            Opcode::ReturnDataCopy => "RETURNDATACOPY",
+            Opcode::Pop => "POP",
+            Opcode::MLoad => "MLOAD",
+            Opcode::MStore => "MSTORE",
+            Opcode::MStore8 => "MSTORE8",
+            Opcode::SLoad => "SLOAD",
+            Opcode::SStore => "SSTORE",
+            Opcode::Jump => "JUMP",
+            Opcode::Jumpi => "JUMPI",
+            Opcode::Pc => "PC",
+            Opcode::MSize => "MSIZE",
+            Opcode::Gas => "GAS",
+            Opcode::JumpDest => "JUMPDEST",
+            Opcode::Push1 => "PUSH1",
+            Opcode::Push2 => "PUSH2",
+            Opcode::Push3 => "PUSH3",
+            Opcode::Push4 => "PUSH4",
+            Opcode::Push5 => "PUSH5",
+            Opcode::Push6 => "PUSH6",
+            Opcode::Push7 => "PUSH7",
+            Opcode::Push8 => "PUSH8",
+            Opcode::Push9 => "PUSH9",
+            Opcode::Push10 => "PUSH10",
+            Opcode::Push11 => "PUSH11",
+            Opcode::Push12 => "PUSH12",
+            Opcode::Push13 => "PUSH13",
+            Opcode::Push14 => "PUSH14",
+            Opcode::Push15 => "PUSH15",
+            Opcode::Push16 => "PUSH16",
+            Opcode::Push17 => "PUSH17",
+            Opcode::Push18 => "PUSH18",
+            Opcode::Push19 => "PUSH19",
+            Opcode::Push20 => "PUSH20",
+            Opcode::Push21 => "PUSH21",
+            Opcode::Push22 => "PUSH22",
+            Opcode::Push23 => "PUSH23",
+            Opcode::Push24 => "PUSH24",
+            Opcode::Push25 => "PUSH25",
+            Opcode::Push26 => "PUSH26",
+            Opcode::Push27 => "PUSH27",
+            Opcode::Push28 => "PUSH28",
+            Opcode::Push29 => "PUSH29",
+            Opcode::Push30 => "PUSH30",
+            Opcode::Push31 => "PUSH31",
+            Opcode::Push32 => "PUSH32",
+            Opcode::Dup1 => "DUP1",
+            Opcode::Dup2 => "DUP2",
+            Opcode::Dup3 => "DUP3",
+            Opcode::Dup4 => "DUP4",
+            Opcode::Dup5 => "DUP5",
+            Opcode::Dup6 => "DUP6",
+            Opcode::Dup7 => "DUP7",
+            Opcode::Dup8 => "DUP8",
+            Opcode::Dup9 => "DUP9",
+            Opcode::Dup10 => "DUP10",
+            Opcode::Dup11 => "DUP11",
+            Opcode::Dup12 => "DUP12",
+            Opcode::Dup13 => "DUP13",
+            Opcode::Dup14 => "DUP14",
+            Opcode::Dup15 => "DUP15",
+            Opcode::Dup16 => "DUP16",
+            Opcode::Swap1 => "SWAP1",
+            Opcode::Swap2 => "SWAP2",
+            Opcode::Swap3 => "SWAP3",
+            Opcode::Swap4 => "SWAP4",
+            Opcode::Swap5 => "SWAP5",
+            Opcode::Swap6 => "SWAP6",
+            Opcode::Swap7 => "SWAP7",
+            Opcode::Swap8 => "SWAP8",
+            Opcode::Swap9 => "SWAP9",
+            Opcode::Swap10 => "SWAP10",
+            Opcode::Swap11 => "SWAP11",
+            Opcode::Swap12 => "SWAP12",
+            Opcode::Swap13 => "SWAP13",
+            Opcode::Swap14 => "SWAP14",
+            Opcode::Swap15 => "SWAP15",
+            Opcode::Swap16 => "SWAP16",
+            Opcode::Log0 => "LOG0",
+            Opcode::Log1 => "LOG1",
+            Opcode::Log2 => "LOG2",
+            Opcode::Log3 => "LOG3",
+            Opcode::Log4 => "LOG4",
+            Opcode::Create => "CREATE",
+            Opcode::Call => "CALL",
+            Opcode::CallCode => "CALLCODE",
+            Opcode::Return => "RETURN",
+            Opcode::DelegateCall => "DELEGATECALL",
+            Opcode::Create2 => "CREATE2",
+            Opcode::StaticCall => "STATICCALL",
+            Opcode::Revert => "REVERT",
+            Opcode::Invalid => "INVALID",
+            Opcode::SelfDestruct => "SELFDESTRUCT",
+        }
+    }
+}
+
+impl fmt::Display for Opcode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
 }
 
 // -----------------------------------------------------------------------------
-// Backward-compatible constants (re‑exported as raw u8)
+// Bytecode validation and disassembly
 // -----------------------------------------------------------------------------
 
-// Helper macro to generate constants
+/// Validates that every byte in `code` is a defined opcode and that all
+/// PUSH instructions have sufficient data.
+///
+/// Returns `Ok(())` if valid, or an error with position and details.
+pub fn validate_bytecode(code: &[u8]) -> Result<(), OpcodeError> {
+    let mut i = 0;
+    while i < code.len() {
+        let op = Opcode::try_from(code[i])?;
+        if op.is_push() {
+            let data_size = op.push_data_size();
+            let remaining = code.len() - i - 1;
+            if data_size > remaining {
+                return Err(OpcodeError::TruncatedPush {
+                    pos: i,
+                    expected: data_size,
+                    remaining,
+                });
+            }
+            i += 1 + data_size;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Disassemble bytecode into a human-readable string.
+///
+/// Each line is formatted as: `PC: OPCODE [data]`
+pub fn disassemble(code: &[u8]) -> String {
+    let mut output = String::new();
+    let mut i = 0;
+    while i < code.len() {
+        let op = match Opcode::try_from(code[i]) {
+            Ok(op) => op,
+            Err(_) => {
+                output.push_str(&format!("{:04X}: INVALID 0x{:02X}\n", i, code[i]));
+                i += 1;
+                continue;
+            }
+        };
+        if op.is_push() {
+            let size = op.push_data_size();
+            let end = (i + 1 + size).min(code.len());
+            let data = &code[i + 1..end];
+            let hex_data = data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join("");
+            output.push_str(&format!("{:04X}: {:8} {}\n", i, op.name(), hex_data));
+            i = end;
+        } else {
+            output.push_str(&format!("{:04X}: {:8}\n", i, op.name()));
+            i += 1;
+        }
+    }
+    output
+}
+
+// -----------------------------------------------------------------------------
+// Legacy constants (backward compatibility)
+// -----------------------------------------------------------------------------
+
 macro_rules! opcode_consts {
     ($($name:ident = $op:ident),* $(,)?) => {
         $(
@@ -450,34 +685,47 @@ opcode_consts! {
     REVERT = Revert, INVALID = Invalid, SELFDESTRUCT = SelfDestruct,
 }
 
-// -----------------------------------------------------------------------------
-// Bytecode validation
-// -----------------------------------------------------------------------------
-
-/// Validates that every byte in `code` is a defined opcode.
-pub fn validate_bytecode(code: &[u8]) -> Result<(), OpcodeError> {
-    let mut i = 0;
-    while i < code.len() {
-        let op = Opcode::try_from(code[i])?;
-        if op.is_push() {
-            let data_size = op.push_data_size();
-            // Ensure push data does not exceed remaining bytes
-            if i + data_size >= code.len() {
-                return Err(OpcodeError::InvalidOpcode { opcode: code[i] });
-            }
-            i += 1 + data_size;
-        } else {
-            i += 1;
-        }
+// Legacy functions (for backward compatibility)
+#[inline]
+pub const fn push_data_size(opcode: u8) -> usize {
+    // Only valid for PUSH opcodes; returns 0 otherwise.
+    match opcode {
+        0x60..=0x7F => (opcode - 0x60 + 1) as usize,
+        _ => 0,
     }
-    Ok(())
 }
 
-// -----------------------------------------------------------------------------
-// Lazy initialisation helper
-// -----------------------------------------------------------------------------
+#[inline]
+pub const fn is_push(opcode: u8) -> bool {
+    matches!(opcode, 0x60..=0x7F)
+}
 
-use spin::Lazy;
+#[inline]
+pub const fn is_dup(opcode: u8) -> bool {
+    matches!(opcode, 0x80..=0x8F)
+}
+
+#[inline]
+pub const fn is_swap(opcode: u8) -> bool {
+    matches!(opcode, 0x90..=0x9F)
+}
+
+#[inline]
+pub const fn is_log(opcode: u8) -> bool {
+    matches!(opcode, 0xA0..=0xA4)
+}
+
+#[inline]
+pub const fn log_topic_count(opcode: u8) -> usize {
+    match opcode {
+        0xA0 => 0,
+        0xA1 => 1,
+        0xA2 => 2,
+        0xA3 => 3,
+        0xA4 => 4,
+        _ => 0,
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Tests
@@ -563,6 +811,54 @@ mod tests {
     }
 
     #[test]
+    fn test_is_system() {
+        assert!(Opcode::Call.is_system());
+        assert!(Opcode::Create.is_system());
+        assert!(!Opcode::Add.is_system());
+    }
+
+    #[test]
+    fn test_opcode_name() {
+        assert_eq!(Opcode::Add.name(), "ADD");
+        assert_eq!(Opcode::Push32.name(), "PUSH32");
+        assert_eq!(Opcode::Blake3.name(), "BLAKE3");
+    }
+
+    #[test]
+    fn test_display() {
+        assert_eq!(format!("{}", Opcode::Add), "ADD");
+        assert_eq!(format!("{}", Opcode::Blake3), "BLAKE3");
+    }
+
+    #[test]
+    fn test_validate_bytecode_valid() {
+        let code = vec![0x60, 0x01, 0x01]; // PUSH1 0x01, ADD
+        assert!(validate_bytecode(&code).is_ok());
+    }
+
+    #[test]
+    fn test_validate_bytecode_truncated_push() {
+        let code = vec![0x60]; // PUSH1 without data
+        let err = validate_bytecode(&code).unwrap_err();
+        assert!(matches!(err, OpcodeError::TruncatedPush { pos: 0, expected: 1, remaining: 0 }));
+    }
+
+    #[test]
+    fn test_validate_bytecode_invalid_opcode() {
+        let code = vec![0x0C]; // undefined
+        let err = validate_bytecode(&code).unwrap_err();
+        assert!(matches!(err, OpcodeError::InvalidOpcode { opcode: 0x0C }));
+    }
+
+    #[test]
+    fn test_disassemble() {
+        let code = vec![0x60, 0x01, 0x01, 0x60, 0x02, 0x01];
+        let output = disassemble(&code);
+        let expected = "0000: PUSH1    01\n0003: ADD\n0004: PUSH1    02\n0007: ADD\n";
+        assert_eq!(output, expected);
+    }
+
+    #[test]
     fn test_legacy_functions() {
         assert_eq!(push_data_size(PUSH1), 1);
         assert_eq!(push_data_size(PUSH32), 32);
@@ -577,24 +873,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_bytecode_valid() {
-        let code = vec![0x60, 0x01, 0x01]; // PUSH1 0x01, ADD
-        assert!(validate_bytecode(&code).is_ok());
-    }
-
-    #[test]
-    fn test_validate_bytecode_truncated_push() {
-        let code = vec![0x60]; // PUSH1 without data
-        assert!(validate_bytecode(&code).is_err());
-    }
-
-    #[test]
-    fn test_validate_bytecode_invalid_opcode() {
-        let code = vec![0x0C]; // undefined opcode
-        assert!(validate_bytecode(&code).is_err());
-    }
-
-    #[test]
     fn test_opcode_constants_match() {
         assert_eq!(STOP, 0x00);
         assert_eq!(ADD, 0x01);
@@ -605,5 +883,14 @@ mod tests {
         assert_eq!(CREATE, 0xF0);
         assert_eq!(INVALID, 0xFE);
         assert_eq!(BLAKE3, 0x21);
+    }
+
+    #[test]
+    fn test_const_lookup_table() {
+        // Ensure the const table is correctly built.
+        assert_eq!(OPCODE_LUT[0x01], Some(Opcode::Add));
+        assert_eq!(OPCODE_LUT[0x60], Some(Opcode::Push1));
+        assert_eq!(OPCODE_LUT[0x21], Some(Opcode::Blake3));
+        assert_eq!(OPCODE_LUT[0x0C], None);
     }
 }
