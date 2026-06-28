@@ -28,9 +28,10 @@
 use crate::consensus::{proposal_sign_bytes, ConsensusMsg, Outbox, Proposal, Step};
 use crate::crypto::Signer;
 use crate::execution::build_block;
-use crate::types::Tx;
+use crate::types::{Block, Tx};
+use crate::economics::params::EconomicsParams;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -47,6 +48,9 @@ const MIN_MAX_TXS: usize = 1;
 
 /// Maximum allowed value for `max_txs` (prevents memory exhaustion).
 const MAX_ALLOWED_TXS: usize = 100_000;
+
+/// Default max gas per block.
+const DEFAULT_MAX_GAS_PER_BLOCK: u64 = 30_000_000;
 
 // -----------------------------------------------------------------------------
 // Error types
@@ -79,6 +83,12 @@ pub enum ProducerError {
 
     #[error("signing failed: {reason}")]
     SigningError { reason: String },
+
+    #[error("proposer address derivation failed: {reason}")]
+    ProposerAddressError { reason: String },
+
+    #[error("transaction list exceeds max_txs: {count} > {max}")]
+    TransactionLimitExceeded { count: usize, max: usize },
 }
 
 /// Result type for producer operations.
@@ -96,6 +106,8 @@ pub struct ProducerConfig {
     /// Whether to embed the full block inside the proposal message.
     /// If `false`, peers must request the block separately.
     pub include_block_in_proposal: bool,
+    /// Maximum gas per block (enforced during block building).
+    pub max_gas_per_block: u64,
 }
 
 impl Default for ProducerConfig {
@@ -103,6 +115,7 @@ impl Default for ProducerConfig {
         Self {
             max_txs: DEFAULT_MAX_TXS,
             include_block_in_proposal: DEFAULT_INCLUDE_BLOCK,
+            max_gas_per_block: DEFAULT_MAX_GAS_PER_BLOCK,
         }
     }
 }
@@ -115,6 +128,13 @@ impl ProducerConfig {
                 max_txs: self.max_txs,
                 min: MIN_MAX_TXS,
                 max: MAX_ALLOWED_TXS,
+            });
+        }
+        if self.max_gas_per_block == 0 {
+            return Err(ProducerError::InvalidMaxTxs {
+                max_txs: 0,
+                min: 1,
+                max: u64::MAX as usize,
             });
         }
         Ok(())
@@ -145,10 +165,15 @@ impl SimpleBlockProducer {
 
     /// Derive the proposer address (20‑byte hex) from a signer's public key.
     /// This matches the address format used in `build_block`.
-    pub fn proposer_address(signer: &dyn Signer) -> String {
+    pub fn proposer_address(signer: &dyn Signer) -> Result<String, ProducerError> {
         let pk_bytes = &signer.public_key().0;
+        if pk_bytes.len() < 20 {
+            return Err(ProducerError::ProposerAddressError {
+                reason: format!("public key too short: {} bytes", pk_bytes.len()),
+            });
+        }
         let hash = blake3::hash(pk_bytes);
-        hex::encode(&hash.as_bytes()[..20])
+        Ok(hex::encode(&hash.as_bytes()[..20]))
     }
 
     /// Check if the local node is the proposer for the current engine state.
@@ -183,6 +208,7 @@ impl SimpleBlockProducer {
         store: &B,
         out: &mut O,
         txs: Vec<Tx>,
+        econ_params: &EconomicsParams,
     ) -> ProducerResult<bool> {
         // ── Precondition 1: Correct step ──────────────────────────────────
         if engine.state.step != Step::Propose {
@@ -217,17 +243,37 @@ impl SimpleBlockProducer {
             height = engine.state.height,
             round = engine.state.round,
             max_txs = self.cfg.max_txs,
+            max_gas = self.cfg.max_gas_per_block,
             "producing proposal"
         );
 
-        let proposer_addr = Self::proposer_address(signer);
+        // Derive proposer address
+        let proposer_addr = Self::proposer_address(signer)?;
 
-        // Limit transactions to max_txs
-        let txs_to_include: Vec<Tx> = txs.into_iter().take(self.cfg.max_txs).collect();
+        // Limit transactions to max_txs and max gas
+        let mut txs_to_include: Vec<Tx> = Vec::with_capacity(self.cfg.max_txs.min(txs.len()));
+        let mut total_gas = 0u64;
+        for tx in txs.into_iter().take(self.cfg.max_txs) {
+            let intrinsic_gas = crate::execution::intrinsic_gas(&tx);
+            if total_gas.saturating_add(intrinsic_gas) > self.cfg.max_gas_per_block {
+                trace!("Gas limit reached: {} + {} > {}", total_gas, intrinsic_gas, self.cfg.max_gas_per_block);
+                break;
+            }
+            txs_to_include.push(tx);
+            total_gas = total_gas.saturating_add(intrinsic_gas);
+        }
         let tx_count = txs_to_include.len();
 
+        info!(
+            height = engine.state.height,
+            round = engine.state.round,
+            tx_count = tx_count,
+            total_gas = total_gas,
+            "selected transactions for block"
+        );
+
         // Build the block
-        let (block, _next_state, _receipts) = build_block(
+        let (block, next_state, receipts) = build_block(
             engine.state.height,
             engine.state.round,
             engine.prev_block_id.clone(),
@@ -235,18 +281,33 @@ impl SimpleBlockProducer {
             &proposer_addr,
             &engine.app_state,
             engine.base_fee_per_gas,
+            econ_params,
             txs_to_include,
+            self.cfg.max_gas_per_block,
         );
 
         let block_id = block.id();
         debug!(
             block_id = %hex::encode(&block_id.0[..8]),
             tx_count = tx_count,
+            state_root = %hex::encode(&block.header.state_root.0[..8]),
             "block built"
         );
 
         // Persist the block
-        store.put(block.clone());
+        store.put(block.clone()).map_err(|e| {
+            ProducerError::BlockStoreError {
+                reason: format!("failed to store block: {}", e),
+            }
+        })?;
+
+        // Update engine state
+        engine.app_state = next_state;
+        engine.base_fee_per_gas = crate::execution::next_base_fee(
+            engine.base_fee_per_gas,
+            block.header.gas_used,
+            econ_params.gas_target,
+        );
 
         // Sign the proposal
         let sign_bytes = proposal_sign_bytes(
@@ -275,6 +336,11 @@ impl SimpleBlockProducer {
         engine.state.proposal = Some(proposal.clone());
         engine.state.proposal_block = Some(block);
 
+        // Commit receipts to block store if supported
+        if let Err(e) = store.put_receipts(&block_id, receipts) {
+            warn!("Failed to store receipts: {}", e);
+        }
+
         // Broadcast
         out.broadcast(ConsensusMsg::Proposal(proposal));
 
@@ -283,6 +349,7 @@ impl SimpleBlockProducer {
             round = engine.state.round,
             block_id = %hex::encode(&block_id.0[..8]),
             tx_count = tx_count,
+            gas_used = block.header.gas_used,
             "proposal broadcast"
         );
 
@@ -310,15 +377,20 @@ mod tests {
 
     struct MockBlockStore {
         blocks: Mutex<HashMap<Hash32, crate::types::Block>>,
+        receipts: Mutex<HashMap<Hash32, Vec<crate::types::Receipt>>>,
     }
     impl MockBlockStore {
         fn new() -> Self {
             Self {
                 blocks: Mutex::new(HashMap::new()),
+                receipts: Mutex::new(HashMap::new()),
             }
         }
         fn stored_count(&self) -> usize {
             self.blocks.lock().unwrap().len()
+        }
+        fn receipt_count(&self) -> usize {
+            self.receipts.lock().unwrap().len()
         }
     }
     impl crate::consensus::BlockStore for MockBlockStore {
@@ -327,6 +399,9 @@ mod tests {
         }
         fn put(&self, block: crate::types::Block) {
             self.blocks.lock().unwrap().insert(block.id(), block);
+        }
+        fn put_receipts(&self, block_id: &Hash32, receipts: Vec<crate::types::Receipt>) {
+            self.receipts.lock().unwrap().insert(*block_id, receipts);
         }
     }
 
@@ -409,6 +484,13 @@ mod tests {
         }
     }
 
+    fn default_econ_params() -> EconomicsParams {
+        EconomicsParams {
+            gas_target: 15_000_000,
+            ..Default::default()
+        }
+    }
+
     // ── Configuration tests ─────────────────────────────────────────────
     #[test]
     fn test_config_valid() {
@@ -455,8 +537,9 @@ mod tests {
         assert_eq!(engine.state.step, Step::Propose);
         assert!(engine.state.proposal.is_none());
 
+        let econ_params = default_econ_params();
         let result = producer
-            .try_produce(&mut engine, &signer, &store, &mut outbox, vec![])
+            .try_produce(&mut engine, &signer, &store, &mut outbox, vec![], &econ_params)
             .unwrap();
 
         assert!(result);
@@ -480,8 +563,9 @@ mod tests {
         let mut outbox = MockOutbox::new();
         let producer = SimpleBlockProducer::new(ProducerConfig::default()).unwrap();
 
+        let econ_params = default_econ_params();
         let result = producer
-            .try_produce(&mut engine, &non_proposer, &store, &mut outbox, vec![])
+            .try_produce(&mut engine, &non_proposer, &store, &mut outbox, vec![], &econ_params)
             .unwrap();
 
         assert!(!result);
@@ -497,16 +581,17 @@ mod tests {
         let store = MockBlockStore::new();
         let mut outbox = MockOutbox::new();
         let producer = SimpleBlockProducer::new(ProducerConfig::default()).unwrap();
+        let econ_params = default_econ_params();
 
         // First proposal
         let first = producer
-            .try_produce(&mut engine, &signer, &store, &mut outbox, vec![])
+            .try_produce(&mut engine, &signer, &store, &mut outbox, vec![], &econ_params)
             .unwrap();
         assert!(first);
 
         // Second attempt — should skip
         let second = producer
-            .try_produce(&mut engine, &signer, &store, &mut outbox, vec![])
+            .try_produce(&mut engine, &signer, &store, &mut outbox, vec![], &econ_params)
             .unwrap();
         assert!(!second);
         assert_eq!(outbox.proposal_count(), 1);
@@ -521,12 +606,14 @@ mod tests {
         let cfg = ProducerConfig {
             max_txs: 3,
             include_block_in_proposal: true,
+            ..Default::default()
         };
         let producer = SimpleBlockProducer::new(cfg).unwrap();
 
         let txs: Vec<Tx> = (0..10).map(make_tx).collect();
+        let econ_params = default_econ_params();
         let result = producer
-            .try_produce(&mut engine, &signer, &store, &mut outbox, txs)
+            .try_produce(&mut engine, &signer, &store, &mut outbox, txs, &econ_params)
             .unwrap();
 
         assert!(result);
@@ -536,15 +623,44 @@ mod tests {
     }
 
     #[test]
+    fn test_producer_respects_max_gas() {
+        let signer = Ed25519Keypair::from_seed([1u8; 32]);
+        let mut engine = make_engine(&signer);
+        let store = MockBlockStore::new();
+        let mut outbox = MockOutbox::new();
+        let cfg = ProducerConfig {
+            max_txs: 100,
+            max_gas_per_block: 50_000, // Low gas limit
+            include_block_in_proposal: true,
+        };
+        let producer = SimpleBlockProducer::new(cfg).unwrap();
+
+        // Each tx has intrinsic gas ~21_000 + payload gas
+        // With 50_000 gas, we should get at most 2 txs.
+        let txs: Vec<Tx> = (0..10).map(make_tx).collect();
+        let econ_params = default_econ_params();
+        let result = producer
+            .try_produce(&mut engine, &signer, &store, &mut outbox, txs, &econ_params)
+            .unwrap();
+
+        assert!(result);
+        let proposal = outbox.last_proposal().unwrap();
+        let block = proposal.block.as_ref().unwrap();
+        assert!(block.txs.len() <= 2);
+        assert!(block.header.gas_used <= 50_000);
+    }
+
+    #[test]
     fn test_producer_with_empty_txs() {
         let signer = Ed25519Keypair::from_seed([1u8; 32]);
         let mut engine = make_engine(&signer);
         let store = MockBlockStore::new();
         let mut outbox = MockOutbox::new();
         let producer = SimpleBlockProducer::new(ProducerConfig::default()).unwrap();
+        let econ_params = default_econ_params();
 
         let result = producer
-            .try_produce(&mut engine, &signer, &store, &mut outbox, vec![])
+            .try_produce(&mut engine, &signer, &store, &mut outbox, vec![], &econ_params)
             .unwrap();
 
         assert!(result);
@@ -556,7 +672,7 @@ mod tests {
     #[test]
     fn test_proposer_address_derivation() {
         let signer = Ed25519Keypair::from_seed([42u8; 32]);
-        let addr = SimpleBlockProducer::proposer_address(&signer);
+        let addr = SimpleBlockProducer::proposer_address(&signer).unwrap();
         assert_eq!(addr.len(), 40);
         assert!(addr.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -564,8 +680,8 @@ mod tests {
     #[test]
     fn test_proposer_address_deterministic() {
         let signer = Ed25519Keypair::from_seed([99u8; 32]);
-        let addr1 = SimpleBlockProducer::proposer_address(&signer);
-        let addr2 = SimpleBlockProducer::proposer_address(&signer);
+        let addr1 = SimpleBlockProducer::proposer_address(&signer).unwrap();
+        let addr2 = SimpleBlockProducer::proposer_address(&signer).unwrap();
         assert_eq!(addr1, addr2);
     }
 
@@ -578,5 +694,26 @@ mod tests {
 
         assert!(producer.is_proposer(&engine, &proposer));
         assert!(!producer.is_proposer(&engine, &non_proposer));
+    }
+
+    #[test]
+    fn test_producer_updates_engine_state() {
+        let signer = Ed25519Keypair::from_seed([1u8; 32]);
+        let mut engine = make_engine(&signer);
+        let store = MockBlockStore::new();
+        let mut outbox = MockOutbox::new();
+        let producer = SimpleBlockProducer::new(ProducerConfig::default()).unwrap();
+        let econ_params = default_econ_params();
+
+        let old_base_fee = engine.base_fee_per_gas;
+        let result = producer
+            .try_produce(&mut engine, &signer, &store, &mut outbox, vec![], &econ_params)
+            .unwrap();
+
+        assert!(result);
+        assert!(engine.state.proposal.is_some());
+        assert!(engine.state.proposal_block.is_some());
+        // Base fee should be updated even with empty block (decreases)
+        assert!(engine.base_fee_per_gas <= old_base_fee);
     }
 }
