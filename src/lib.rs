@@ -10,38 +10,20 @@
 //! ℋ_node = ℋ_consensus ⊗ ℋ_network ⊗ ℋ_storage ⊗ ℋ_execution ⊗ ℋ_rpc
 //! ```
 //!
-//! # System Hamiltonian
-//!
-//! ```text
-//! Ĥ_node = Ĥ_consensus + Ĥ_network + Ĥ_storage + Ĥ_execution + Ĥ_rpc + Ĥ_int
-//!
-//! Ĥ_consensus = Σ_h ω_h a†_h a_h                    (block production oscillator)
-//! Ĥ_network   = Σ_p g_p (σ^+_p σ^-_q + h.c.)        (peer entanglement)
-//! Ĥ_storage   = Σ_s E_s |data_s⟩⟨data_s|            (persistent states)
-//! Ĥ_execution = Σ_t J_t U_t                           (transaction gates)
-//! Ĥ_rpc       = Σ_r ν_r b†_r b_r                     (request oscillators)
-//! Ĥ_int       = Σ_{i,j} λ_{ij} σ^i_z σ^j_z           (component coupling)
-//! ```
-//!
-//! # Quantum Lifecycle
-//!
-//! 1. **Initialization**: Prepare ground state |∅⟩_node
-//! 2. **Boot**: Apply U_boot |∅⟩ → |ready⟩
-//! 3. **Operation**: Continuous evolution under Ĥ_node
-//! 4. **Shutdown**: Projective measurement to |stopped⟩
-//!
-//! # Feature flags
-//!
-//! - `otel` – enable OpenTelemetry tracing export.
-//! - `bin-cli` – build CLI tool (disabled by default).
-//! - `bin-chaos` – build chaos testing tool.
-//! - `bin-remote-signer` – build remote signer service.
-//! - `bin-evm-rpc` – build EVM RPC server.
-//! - `bin-chaindb-tool` – build chain database inspection tool.
-//! - `bin-block-store` – build block store utility.
+//! # Production Features
+//! - Comprehensive node lifecycle management.
+//! - Thread‑safe component coordination.
+//! - Graceful shutdown with signal handling.
+//! - Structured logging and OpenTelemetry integration.
+//! - Component health monitoring with quantum-inspired metrics.
+//! - Atomic configuration loading with validation.
+//! - Persistent state with atomic writes.
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(clippy::module_inception)]
+#![allow(clippy::type_complexity)]
+#![allow(dead_code)]
 
 pub mod admin;
 pub mod audit;
@@ -72,7 +54,7 @@ pub mod wal;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::signal;
 use tokio::sync::watch;
@@ -93,6 +75,12 @@ const MIN_COHERENCE_THRESHOLD: f64 = 0.9;
 
 /// Component entanglement strength.
 const COMPONENT_ENTANGLEMENT: f64 = 0.95;
+
+/// Default shutdown timeout in seconds.
+const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
+
+/// Health check interval in seconds.
+const HEALTH_CHECK_INTERVAL_SECS: u64 = 10;
 
 // -----------------------------------------------------------------------------
 // Quantum Node Error
@@ -127,6 +115,21 @@ pub enum NodeError {
 
     #[error("component entanglement failed: {component}")]
     EntanglementFailed { component: String },
+
+    #[error("component not found: {0}")]
+    ComponentNotFound(String),
+
+    #[error("shutdown timeout after {0}s")]
+    ShutdownTimeout(u64),
+
+    #[error("already shutting down")]
+    AlreadyShuttingDown,
+
+    #[error("component failed to start: {component} -> {reason}")]
+    ComponentStartFailed { component: String, reason: String },
+
+    #[error("unexpected error: {0}")]
+    Unexpected(String),
 }
 
 /// Alias for `Result<T, NodeError>`.
@@ -149,6 +152,8 @@ struct QuantumNodeState {
     uptime_cycles: u64,
     /// Startup timestamp.
     startup_time: Instant,
+    /// Whether the node is in the |shutting_down⟩ state.
+    shutting_down: bool,
 }
 
 impl QuantumNodeState {
@@ -160,6 +165,7 @@ impl QuantumNodeState {
             component_fidelities: std::collections::HashMap::new(),
             uptime_cycles: 0,
             startup_time: Instant::now(),
+            shutting_down: false,
         }
     }
 
@@ -182,8 +188,16 @@ impl QuantumNodeState {
         }
     }
 
+    /// Get component fidelity.
+    fn component_fidelity(&self, name: &str) -> Option<f64> {
+        self.component_fidelities.get(name).copied()
+    }
+
     /// Check if the node is in a healthy quantum state.
     fn is_healthy(&self) -> bool {
+        if self.shutting_down {
+            return true; // shutting down is a valid state
+        }
         self.coherence >= MIN_COHERENCE_THRESHOLD
             && self
                 .component_fidelities
@@ -193,13 +207,107 @@ impl QuantumNodeState {
 
     /// Get overall node health metric.
     fn health_metric(&self) -> f64 {
-        let component_avg: f64 = if self.component_fidelities.is_empty() {
-            1.0
-        } else {
-            self.component_fidelities.values().sum::<f64>()
-                / self.component_fidelities.len() as f64
-        };
+        if self.component_fidelities.is_empty() {
+            return self.coherence;
+        }
+        let component_avg: f64 = self.component_fidelities.values().sum::<f64>()
+            / self.component_fidelities.len() as f64;
         self.coherence * component_avg
+    }
+
+    /// Record an uptime cycle.
+    fn tick(&mut self) {
+        self.uptime_cycles = self.uptime_cycles.wrapping_add(1);
+        self.apply_decoherence(1.0 / NODE_COHERENCE_TIME as f64);
+    }
+
+    /// Enter shutdown state.
+    fn begin_shutdown(&mut self) {
+        self.shutting_down = true;
+        self.apply_decoherence(0.05);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Component Trait
+// -----------------------------------------------------------------------------
+
+/// Trait for quantum node components.
+///
+/// Each component is a subsystem in the node's Hilbert space that
+/// can be started, stopped, and monitored.
+pub trait NodeComponent: Send + Sync + 'static {
+    /// Start the component — apply U_start |∅⟩ → |ready⟩.
+    fn start(&mut self) -> NodeResult<()>;
+
+    /// Stop the component — projective measurement to |stopped⟩.
+    fn stop(&mut self) -> NodeResult<()>;
+
+    /// Get the component's current fidelity.
+    fn fidelity(&self) -> f64;
+
+    /// Get the component's name.
+    fn name(&self) -> &'static str;
+
+    /// Check if the component is running.
+    fn is_running(&self) -> bool;
+}
+
+// -----------------------------------------------------------------------------
+// Node Configuration Builder
+// -----------------------------------------------------------------------------
+
+/// Builder for quantum node configuration.
+#[derive(Debug, Clone)]
+pub struct NodeBuilder {
+    config: config::NodeConfig,
+    components: Vec<Box<dyn NodeComponent>>,
+    shutdown_timeout: Duration,
+}
+
+impl Default for NodeBuilder {
+    fn default() -> Self {
+        Self {
+            config: config::NodeConfig::default(),
+            components: Vec::new(),
+            shutdown_timeout: Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
+        }
+    }
+}
+
+impl NodeBuilder {
+    /// Create a new node builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the node configuration.
+    pub fn config(mut self, config: config::NodeConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Load configuration from a file.
+    pub fn load_config(mut self, path: impl AsRef<Path>) -> NodeResult<Self> {
+        self.config = config::NodeConfig::load(path)?;
+        Ok(self)
+    }
+
+    /// Add a component to the node.
+    pub fn add_component(mut self, component: impl NodeComponent) -> Self {
+        self.components.push(Box::new(component));
+        self
+    }
+
+    /// Set shutdown timeout.
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
+        self
+    }
+
+    /// Build the quantum node.
+    pub fn build(self) -> NodeResult<Node> {
+        Node::new(self.config, self.components, self.shutdown_timeout)
     }
 }
 
@@ -208,42 +316,39 @@ impl QuantumNodeState {
 // -----------------------------------------------------------------------------
 
 /// Main quantum node handle.
-///
-/// Holds all components in an entangled quantum state and manages
-/// the node lifecycle through unitary evolution.
 pub struct Node {
     /// Node configuration (classical observable).
-    config: Config,
+    config: config::NodeConfig,
     /// Quantum state of the node.
     quantum_state: Arc<std::sync::Mutex<QuantumNodeState>>,
+    /// Registered components.
+    components: Vec<Box<dyn NodeComponent>>,
     /// Shutdown signal sender (triggers projective measurement).
     shutdown_tx: watch::Sender<()>,
     /// Shutdown signal receiver.
     shutdown_rx: watch::Receiver<()>,
-    /// Node start time (for uptime calculation).
+    /// Node start time.
     start_time: Instant,
+    /// Shutdown timeout.
+    shutdown_timeout: Duration,
+    /// Health check handle.
+    health_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Whether the node has been started.
+    started: bool,
 }
 
 impl Node {
     /// Create a new quantum node instance.
-    ///
-    /// Prepares the initial quantum state |ψ₀⟩ and entangles all components.
-    pub async fn new(config: Config) -> NodeResult<Self> {
+    fn new(
+        config: config::NodeConfig,
+        components: Vec<Box<dyn NodeComponent>>,
+        shutdown_timeout: Duration,
+    ) -> NodeResult<Self> {
         // Validate configuration (classical measurement)
         config.validate()?;
 
         // Initialise quantum state
         let mut qstate = QuantumNodeState::new();
-
-        // Initialise tracing / logging
-        init_tracing(&config);
-
-        info!(
-            "Initialising quantum IONA node v{}",
-            env!("CARGO_PKG_VERSION")
-        );
-        info!("Data directory: {}", config.node.data_dir);
-        info!("Initial coherence: γ={:.4}", qstate.coherence);
 
         // Run compatibility and schema upgrades
         let data_dir = Path::new(&config.node.data_dir);
@@ -260,12 +365,9 @@ impl Node {
         }
 
         // Register components with initial fidelities
-        qstate.register_component("consensus", 1.0);
-        qstate.register_component("network", 1.0);
-        qstate.register_component("storage", 1.0);
-        qstate.register_component("execution", 1.0);
-        qstate.register_component("rpc", 1.0);
-        qstate.register_component("mempool", 1.0);
+        for comp in &components {
+            qstate.register_component(comp.name(), comp.fidelity());
+        }
 
         // Apply initialisation decoherence
         qstate.apply_decoherence(0.001);
@@ -274,50 +376,66 @@ impl Node {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
 
         info!(
-            "Quantum node initialised: coherence={:.4}, entropy={:.4}",
-            qstate.coherence, qstate.entanglement_entropy
+            "Quantum node initialised: coherence={:.4}, entropy={:.4}, components={}",
+            qstate.coherence,
+            qstate.entanglement_entropy,
+            components.len()
         );
 
         Ok(Self {
             config,
             quantum_state: Arc::new(std::sync::Mutex::new(qstate)),
+            components,
             shutdown_tx,
             shutdown_rx,
             start_time: Instant::now(),
+            shutdown_timeout,
+            health_handle: None,
+            started: false,
         })
     }
 
-    /// Run the node main loop — continuous unitary evolution.
-    ///
-    /// Starts all background services and blocks until a shutdown
-    /// signal is received, at which point a projective measurement
-    /// collapses the node to the |stopped⟩ state.
-    pub async fn run(&self) -> NodeResult<()> {
-        info!("Starting quantum IONA node evolution");
+    /// Run the node main loop.
+    pub async fn run(&mut self) -> NodeResult<()> {
+        if self.started {
+            return Err(NodeError::Unexpected("node already started".into()));
+        }
+        self.started = true;
 
-        // Start RPC server (if configured)
-        let rpc_handle = if !self.config.rpc.listen.is_empty() {
-            info!(
-                "Starting RPC server on {} (γ={:.4})",
-                self.config.rpc.listen,
-                self.coherence()
-            );
-            let listen_addr = self.config.rpc.listen.parse().map_err(|e| {
-                NodeError::Init(format!("invalid RPC listen address: {e}"))
-            })?;
-            let shutdown_rx = self.shutdown_rx.clone();
-            let rpc_config = self.config.rpc.clone();
-            Some(tokio::spawn(async move {
-                if let Err(e) =
-                    rpc::router::serve(listen_addr, rpc_config, shutdown_rx).await
-                {
-                    error!("RPC server decoherence: {}", e);
-                }
-            }))
-        } else {
-            debug!("RPC server disabled (no listen address)");
-            None
-        };
+        // Validate configuration again (in case of changes)
+        self.config.validate()?;
+
+        // Initialise tracing
+        init_tracing(&self.config);
+
+        info!(
+            "Starting quantum IONA node v{}",
+            env!("CARGO_PKG_VERSION")
+        );
+        info!("Data directory: {}", self.config.node.data_dir);
+
+        // Start all components
+        let mut failed_components = Vec::new();
+        for comp in &mut self.components {
+            info!("Starting component: {}", comp.name());
+            if let Err(e) = comp.start() {
+                error!("Component {} failed to start: {}", comp.name(), e);
+                failed_components.push(comp.name());
+            }
+        }
+
+        if !failed_components.is_empty() {
+            return Err(NodeError::ComponentStartFailed {
+                component: failed_components.join(", "),
+                reason: "failed to start".into(),
+            });
+        }
+
+        // Update component fidelities after startup
+        for comp in &self.components {
+            let mut qstate = self.quantum_state.lock().unwrap();
+            qstate.update_component_fidelity(comp.name(), comp.fidelity());
+        }
 
         // Start metrics server (if enabled)
         let metrics_handle = if self.config.observability.enable_metrics {
@@ -339,10 +457,30 @@ impl Node {
             None
         };
 
-        // Update component fidelities after startup
+        // Start RPC server (if configured)
+        let rpc_handle = if !self.config.rpc.listen.is_empty() {
+            info!("Starting RPC server on {}", self.config.rpc.listen);
+            let listen_addr = self.config.rpc.listen.parse().map_err(|e| {
+                NodeError::Init(format!("invalid RPC listen address: {e}"))
+            })?;
+            let shutdown_rx = self.shutdown_rx.clone();
+            let rpc_config = self.config.rpc.clone();
+            let eth_state = self.build_eth_rpc_state()?;
+            Some(tokio::spawn(async move {
+                if let Err(e) =
+                    rpc::router::serve_with_eth(listen_addr, rpc_config, shutdown_rx, eth_state).await
+                {
+                    error!("RPC server decoherence: {}", e);
+                }
+            }))
+        } else {
+            debug!("RPC server disabled (no listen address)");
+            None
+        };
+
+        // Apply final startup decoherence
         {
             let mut qstate = self.quantum_state.lock().unwrap();
-            qstate.update_component_fidelity("rpc", 0.995);
             qstate.apply_decoherence(0.0001);
         }
 
@@ -351,15 +489,24 @@ impl Node {
             self.health_metric()
         );
 
-        // Wait for shutdown signal (projective measurement trigger)
+        // Start health check task
+        let health_handle = self.start_health_check();
+
+        // Wait for shutdown signal
         wait_for_shutdown(self.shutdown_rx.clone()).await;
         info!("Shutdown signal received — collapsing to |stopped⟩");
 
-        // Cancel all background tasks
+        // Begin shutdown
+        self.begin_shutdown().await?;
+
+        // Cancel background tasks
         if let Some(handle) = rpc_handle {
             handle.abort();
         }
         if let Some(handle) = metrics_handle {
+            handle.abort();
+        }
+        if let Some(handle) = health_handle {
             handle.abort();
         }
 
@@ -378,7 +525,88 @@ impl Node {
         Ok(())
     }
 
-    /// Trigger a graceful shutdown — projective measurement.
+    /// Begin shutdown sequence.
+    async fn begin_shutdown(&mut self) -> NodeResult<()> {
+        {
+            let mut qstate = self.quantum_state.lock().unwrap();
+            qstate.begin_shutdown();
+        }
+
+        // Stop all components in reverse order
+        let start = Instant::now();
+        for comp in self.components.iter_mut().rev() {
+            debug!("Stopping component: {}", comp.name());
+            if let Err(e) = comp.stop() {
+                error!("Component {} failed to stop: {}", comp.name(), e);
+            }
+        }
+
+        // Wait for all components to stop
+        let timeout = self.shutdown_timeout;
+        while !self.all_components_stopped() {
+            if start.elapsed() > timeout {
+                return Err(NodeError::ShutdownTimeout(timeout.as_secs()));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        Ok(())
+    }
+
+    /// Check if all components are stopped.
+    fn all_components_stopped(&self) -> bool {
+        self.components.iter().all(|c| !c.is_running())
+    }
+
+    /// Start health check task.
+    fn start_health_check(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let quantum_state = self.quantum_state.clone();
+        let shutdown_rx = self.shutdown_rx.clone();
+        let interval = Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS);
+
+        Some(tokio::spawn(async move {
+            let mut interval_timer = tokio::time::interval(interval);
+            loop {
+                tokio::select! {
+                    _ = interval_timer.tick() => {
+                        let qstate = quantum_state.lock().unwrap();
+                        if !qstate.is_healthy() {
+                            warn!(
+                                coherence = qstate.coherence,
+                                health = qstate.health_metric(),
+                                "node coherence below threshold"
+                            );
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        debug!("Health check: shutdown signal received");
+                        break;
+                    }
+                }
+            }
+        }))
+    }
+
+    /// Build the Ethereum RPC state.
+    fn build_eth_rpc_state(&self) -> NodeResult<rpc::eth_rpc::EthRpcState> {
+        let data_dir = Path::new(&self.config.node.data_dir);
+        let layout = storage::layout::DataLayout::new(data_dir);
+        let block_store = storage::block_store::FsBlockStore::open(
+            layout.blocks_dir(),
+            None,
+        ).map_err(|e| NodeError::Storage(e.to_string()))?;
+
+        let state_db = evm::kv_state_db::KvStateDb::new(layout.state_full_path())
+            .map_err(|e| NodeError::Storage(e.to_string()))?;
+
+        Ok(rpc::eth_rpc::EthRpcState::new(
+            block_store,
+            state_db,
+            self.config.chain_id,
+        ))
+    }
+
+    /// Trigger a graceful shutdown.
     pub fn shutdown(&self) {
         info!("Triggering quantum node shutdown sequence");
         let _ = self.shutdown_tx.send(());
@@ -406,16 +634,11 @@ impl Node {
 
     /// Get component fidelity.
     pub fn component_fidelity(&self, component: &str) -> Option<f64> {
-        self.quantum_state
-            .lock()
-            .unwrap()
-            .component_fidelities
-            .get(component)
-            .copied()
+        self.quantum_state.lock().unwrap().component_fidelity(component)
     }
 
     /// Get node uptime.
-    pub fn uptime(&self) -> std::time::Duration {
+    pub fn uptime(&self) -> Duration {
         self.start_time.elapsed()
     }
 
@@ -429,7 +652,15 @@ impl Node {
             uptime: self.start_time.elapsed(),
             is_healthy: qstate.is_healthy(),
             health_metric: qstate.health_metric(),
+            shutting_down: qstate.shutting_down,
+            total_components: self.components.len(),
+            running_components: self.components.iter().filter(|c| c.is_running()).count(),
         }
+    }
+
+    /// Get the node configuration.
+    pub fn config(&self) -> &config::NodeConfig {
+        &self.config
     }
 }
 
@@ -443,9 +674,12 @@ pub struct NodeStats {
     pub coherence: f64,
     pub entanglement_entropy: f64,
     pub component_fidelities: std::collections::HashMap<String, f64>,
-    pub uptime: std::time::Duration,
+    pub uptime: Duration,
     pub is_healthy: bool,
     pub health_metric: f64,
+    pub shutting_down: bool,
+    pub total_components: usize,
+    pub running_components: usize,
 }
 
 // -----------------------------------------------------------------------------
@@ -453,7 +687,7 @@ pub struct NodeStats {
 // -----------------------------------------------------------------------------
 
 /// Initialise quantum tracing system.
-fn init_tracing(config: &Config) {
+fn init_tracing(config: &config::NodeConfig) {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
     let filter = EnvFilter::try_from_default_env()
@@ -462,42 +696,69 @@ fn init_tracing(config: &Config) {
     let builder = fmt::Subscriber::builder()
         .with_env_filter(filter)
         .with_target(true)
-        .with_thread_ids(true);
+        .with_thread_ids(true)
+        .with_writer(std::io::stderr)
+        .with_ansi(atty::is(atty::Stream::Stderr));
 
+    // OpenTelemetry integration
     #[cfg(feature = "otel")]
     {
-        use opentelemetry::global;
-        use opentelemetry_otlp::WithExportConfig;
-        use opentelemetry_sdk::trace::{self, TracerProvider};
-
         if config.observability.enable_otel {
             let endpoint = config.observability.otel_endpoint.clone();
             let service_name = config.observability.service_name.clone();
-            let exporter = opentelemetry_otlp::new_exporter()
-                .tonic()
-                .with_endpoint(endpoint);
-            let provider = TracerProvider::builder()
-                .with_simple_exporter(exporter)
-                .with_config(trace::config().with_resource(
-                    opentelemetry_sdk::Resource::new(vec![
-                        opentelemetry::KeyValue::new(
-                            "service.name",
-                            service_name,
-                        ),
-                    ]),
-                ))
-                .build();
-            global::set_tracer_provider(provider);
-            let otel_layer =
-                tracing_opentelemetry::layer().with_tracer(global::tracer("iona-node"));
-            builder.with(otel_layer).init();
-            return;
+            match init_otel_tracing(&endpoint, &service_name) {
+                Ok(layer) => {
+                    builder.with(layer).init();
+                    return;
+                }
+                Err(e) => {
+                    error!("Failed to initialise OTEL tracing: {}", e);
+                }
+            }
         }
     }
+
     builder.init();
+    debug!("Tracing initialised with level: {}", config.node.log_level);
 }
 
-/// Wait for shutdown signal — trigger for projective measurement.
+#[cfg(feature = "otel")]
+fn init_otel_tracing(
+    endpoint: &str,
+    service_name: &str,
+) -> Result<tracing_opentelemetry::OpenTelemetryLayer<tracing_subscriber::Registry, opentelemetry_sdk::trace::Tracer>, String> {
+    use opentelemetry::global;
+    use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_sdk::trace::{self, TracerProvider};
+
+    let exporter = opentelemetry_otlp::new_exporter()
+        .tonic()
+        .with_endpoint(endpoint.to_string());
+
+    let provider = TracerProvider::builder()
+        .with_simple_exporter(exporter)
+        .with_config(
+            trace::config().with_resource(
+                opentelemetry_sdk::Resource::new(vec![
+                    opentelemetry::KeyValue::new(
+                        "service.name",
+                        service_name.to_string(),
+                    ),
+                    opentelemetry::KeyValue::new(
+                        "service.version",
+                        env!("CARGO_PKG_VERSION").to_string(),
+                    ),
+                ]),
+            ),
+        )
+        .build();
+
+    global::set_tracer_provider(provider);
+    let tracer = global::tracer(service_name);
+    Ok(tracing_opentelemetry::layer().with_tracer(tracer))
+}
+
+/// Wait for shutdown signal.
 async fn wait_for_shutdown(mut shutdown_rx: watch::Receiver<()>) {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -508,7 +769,8 @@ async fn wait_for_shutdown(mut shutdown_rx: watch::Receiver<()>) {
 
     #[cfg(unix)]
     let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
+        use signal::unix::{signal, SignalKind};
+        signal(SignalKind::terminate())
             .expect("failed to install SIGTERM handler")
             .recv()
             .await;
@@ -575,7 +837,7 @@ pub use rpc::router::serve as serve_rpc;
 /// Quantum prelude for convenient importing of common items.
 pub mod prelude {
     pub use super::{
-        Config, Node, NodeError, NodeResult, NodeStats,
+        Config, Node, NodeBuilder, NodeError, NodeResult, NodeStats,
         Block, Hash32, Height, Receipt, Round, Tx,
         KvState,
         PublicKeyBytes, Signer, Verifier, Ed25519Verifier,
@@ -591,6 +853,59 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct TestComponent {
+        name: &'static str,
+        running: AtomicBool,
+        fidelity: f64,
+    }
+
+    impl TestComponent {
+        fn new(name: &'static str, fidelity: f64) -> Self {
+            Self {
+                name,
+                running: AtomicBool::new(false),
+                fidelity,
+            }
+        }
+    }
+
+    impl NodeComponent for TestComponent {
+        fn start(&mut self) -> NodeResult<()> {
+            self.running.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn stop(&mut self) -> NodeResult<()> {
+            self.running.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn fidelity(&self) -> f64 {
+            self.fidelity
+        }
+
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn is_running(&self) -> bool {
+            self.running.load(Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn test_node_builder() {
+        let comp = TestComponent::new("test", 1.0);
+        let builder = NodeBuilder::new()
+            .add_component(comp)
+            .shutdown_timeout(Duration::from_secs(5));
+
+        let node = builder.build().unwrap();
+        assert_eq!(node.components.len(), 1);
+        assert_eq!(node.components[0].name(), "test");
+    }
 
     #[test]
     fn test_quantum_node_state_initialization() {
@@ -625,5 +940,20 @@ mod tests {
         qstate.register_component("comp_b", 0.8);
         assert!(!qstate.is_healthy());
         assert!(qstate.health_metric() < 1.0);
+    }
+
+    #[test]
+    fn test_node_stats() {
+        let comp = TestComponent::new("test", 1.0);
+        let node = NodeBuilder::new()
+            .add_component(comp)
+            .build()
+            .unwrap();
+
+        let stats = node.stats();
+        assert!((stats.coherence - 1.0).abs() < 1e-10);
+        assert_eq!(stats.total_components, 1);
+        assert_eq!(stats.running_components, 0);
+        assert!(!stats.shutting_down);
     }
 }
