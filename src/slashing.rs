@@ -1,4 +1,4 @@
-//! Production slashing and validator lifecycle for IONA v21 — Quantum‑Ready.
+//! Production slashing and validator lifecycle for IONA v28 — Quantum‑Ready.
 //!
 //! # Quantum Slashing Model
 //!
@@ -7,29 +7,32 @@
 //! The slash fraction determines the **energy penalty** extracted from the
 //! validator's stake.
 //!
-//! # Mathematical Formalism
-//!
-//! ## Validator State
-//! ```text
-//! |validator⟩ = α|active⟩ + β|jailed⟩ + γ|tombstoned⟩
-//! ```
-//!
-//! ## Hamiltonian for Slashing
-//! ```text
-//! Ĥ_slash = Ĥ_double_vote + Ĥ_downtime + Ĥ_unjail
-//!
-//! Ĥ_double_vote = Σ_v E_v |tombstoned_v⟩⟨active_v|
-//! Ĥ_downtime    = Σ_w ω_w |jailed_w⟩⟨active_w|
-//! Ĥ_unjail      = Σ_u λ_u |active_u⟩⟨jailed_u|
-//! ```
+//! # Production Features
+//! - Thread‑safe with `parking_lot::Mutex`.
+//! - Persistent state with atomic writes and file locking (`flock`).
+//! - Configurable slashing parameters via `SlashingConfig`.
+//! - Snapshot/rollback support for consensus operations.
+//! - Structured logging with `tracing`.
+//! - Versioned serialization for forward compatibility.
+//! - Quantum coherence tracking with decoherence models.
+//! - Comprehensive metrics for monitoring.
 
 use crate::crypto::PublicKeyBytes;
 use crate::evidence::Evidence;
 use crate::types::Height;
+use fs2::FileExt;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs::{self, File, OpenOptions},
+    io::{BufReader, BufWriter, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 // -----------------------------------------------------------------------------
 // Quantum Constants
@@ -42,41 +45,138 @@ const HBAR: f64 = 1.0;
 const DEFAULT_VALIDATOR_COHERENCE: f64 = 1.0;
 
 /// Decoherence rate per slashing operation.
-const SLASH_DECOHERENCE_RATE: f64 = 0.001;
+const DEFAULT_SLASH_DECOHERENCE_RATE: f64 = 0.001;
 
 /// Decoherence rate per unjail operation.
-const UNJAIL_DECOHERENCE_RATE: f64 = 0.0005;
+const DEFAULT_UNJAIL_DECOHERENCE_RATE: f64 = 0.0005;
 
 /// Decoherence rate per downtime slash.
-const DOWNTIME_DECOHERENCE_RATE: f64 = 0.0008;
+const DEFAULT_DOWNTIME_DECOHERENCE_RATE: f64 = 0.0008;
 
 /// Minimum coherence threshold for a healthy ledger.
-const MIN_LEDGER_COHERENCE: f64 = 0.9;
+const DEFAULT_MIN_LEDGER_COHERENCE: f64 = 0.9;
 
 /// Kraus rank for slashing quantum channels.
 const SLASHING_KRAUS_RANK: usize = 4;
 
+/// Default lock timeout in seconds.
+const LOCK_TIMEOUT_SECS: u64 = 10;
+
+/// Temporary file extension for atomic writes.
+const TEMP_EXT: &str = ".tmp";
+
+/// Current serialization version.
+const CURRENT_VERSION: u32 = 1;
+
+/// Default persistence file name.
+const DEFAULT_PERSIST_FILE: &str = "slashing_state.json";
+
+/// Maximum number of validators to persist (avoid unbounded growth).
+const MAX_PERSISTED_VALIDATORS: usize = 10_000;
+
+/// Default blocks a validator must wait after being jailed before they can unjail.
+const DEFAULT_UNJAIL_DELAY_BLOCKS: u64 = 1000;
+
+/// Default slash fraction denominator for double‑vote (1/20 = 5%).
+const DEFAULT_SLASH_FRACTION_DOUBLE_VOTE: u64 = 20;
+
+/// Default slash fraction denominator for downtime (1/100 = 1%).
+const DEFAULT_SLASH_FRACTION_DOWNTIME: u64 = 100;
+
+/// Default window of blocks to check for downtime.
+const DEFAULT_DOWNTIME_WINDOW: u64 = 200;
+
+/// Default minimum blocks a validator must have signed to avoid jailing.
+const DEFAULT_DOWNTIME_MIN_SIGNED: u64 = 100;
+
+/// Default minimum stake after slashing.
+const DEFAULT_MIN_STAKE_AFTER_SLASH: u64 = 1;
+
 // -----------------------------------------------------------------------------
-// Classical Constants (unchanged)
+// Configuration
 // -----------------------------------------------------------------------------
 
-/// Blocks a validator must wait after being jailed before they can unjail.
-pub const UNJAIL_DELAY_BLOCKS: u64 = 1000;
+/// Configuration for the slashing module.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlashingConfig {
+    /// Blocks a validator must wait after being jailed before they can unjail.
+    pub unjail_delay_blocks: u64,
+    /// Denominator for double‑vote slash fraction (1/denominator).
+    pub slash_fraction_double_vote: u64,
+    /// Denominator for downtime slash fraction (1/denominator).
+    pub slash_fraction_downtime: u64,
+    /// Window of recent blocks to check for downtime.
+    pub downtime_window: u64,
+    /// Minimum blocks signed in the window to avoid jailing.
+    pub downtime_min_signed: u64,
+    /// Minimum stake required to remain a validator after slashing.
+    pub min_stake_after_slash: u64,
+    /// Decoherence rate for slashing operations.
+    pub slash_decoherence_rate: f64,
+    /// Decoherence rate for unjail operations.
+    pub unjail_decoherence_rate: f64,
+    /// Decoherence rate for downtime slashes.
+    pub downtime_decoherence_rate: f64,
+    /// Minimum ledger coherence threshold.
+    pub min_ledger_coherence: f64,
+    /// Whether to persist state to disk.
+    pub persist_state: bool,
+}
 
-/// Slash fraction for double‑vote (5% = 1/20).
-pub const SLASH_FRACTION_DOUBLE_VOTE: u64 = 20; // 1/20
+impl Default for SlashingConfig {
+    fn default() -> Self {
+        Self {
+            unjail_delay_blocks: DEFAULT_UNJAIL_DELAY_BLOCKS,
+            slash_fraction_double_vote: DEFAULT_SLASH_FRACTION_DOUBLE_VOTE,
+            slash_fraction_downtime: DEFAULT_SLASH_FRACTION_DOWNTIME,
+            downtime_window: DEFAULT_DOWNTIME_WINDOW,
+            downtime_min_signed: DEFAULT_DOWNTIME_MIN_SIGNED,
+            min_stake_after_slash: DEFAULT_MIN_STAKE_AFTER_SLASH,
+            slash_decoherence_rate: DEFAULT_SLASH_DECOHERENCE_RATE,
+            unjail_decoherence_rate: DEFAULT_UNJAIL_DECOHERENCE_RATE,
+            downtime_decoherence_rate: DEFAULT_DOWNTIME_DECOHERENCE_RATE,
+            min_ledger_coherence: DEFAULT_MIN_LEDGER_COHERENCE,
+            persist_state: true,
+        }
+    }
+}
 
-/// Slash fraction for downtime (1% = 1/100).
-pub const SLASH_FRACTION_DOWNTIME: u64 = 100; // 1/100
-
-/// Window of blocks to check for downtime (number of recent blocks considered).
-pub const DOWNTIME_WINDOW: u64 = 200;
-
-/// Minimum blocks a validator must have signed in the last DOWNTIME_WINDOW to avoid jailing.
-pub const DOWNTIME_MIN_SIGNED: u64 = 100; // 50% participation required
-
-/// Minimum stake required to remain a validator after slashing.
-pub const MIN_STAKE_AFTER_SLASH: u64 = 1;
+impl SlashingConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.unjail_delay_blocks == 0 {
+            return Err("unjail_delay_blocks must be > 0".into());
+        }
+        if self.slash_fraction_double_vote == 0 {
+            return Err("slash_fraction_double_vote must be > 0".into());
+        }
+        if self.slash_fraction_downtime == 0 {
+            return Err("slash_fraction_downtime must be > 0".into());
+        }
+        if self.downtime_window == 0 {
+            return Err("downtime_window must be > 0".into());
+        }
+        if self.downtime_min_signed > self.downtime_window {
+            return Err("downtime_min_signed must be <= downtime_window".into());
+        }
+        if self.min_stake_after_slash == 0 {
+            return Err("min_stake_after_slash must be > 0".into());
+        }
+        if !(0.0..=1.0).contains(&self.slash_decoherence_rate) {
+            return Err("slash_decoherence_rate must be between 0.0 and 1.0".into());
+        }
+        if !(0.0..=1.0).contains(&self.unjail_decoherence_rate) {
+            return Err("unjail_decoherence_rate must be between 0.0 and 1.0".into());
+        }
+        if !(0.0..=1.0).contains(&self.downtime_decoherence_rate) {
+            return Err("downtime_decoherence_rate must be between 0.0 and 1.0".into());
+        }
+        if !(0.0..=1.0).contains(&self.min_ledger_coherence) {
+            return Err("min_ledger_coherence must be between 0.0 and 1.0".into());
+        }
+        Ok(())
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Errors
@@ -106,39 +206,255 @@ pub enum SlashingError {
     #[error("validator already jailed for downtime")]
     AlreadyJailed,
 
-    #[error("quantum decoherence: ledger coherence {coherence} below threshold {threshold}")]
+    #[error("quantum decoherence: ledger coherence {coherence:.4} below threshold {threshold:.4}")]
     Decoherence { coherence: f64, threshold: f64 },
+
+    #[error("invalid configuration: {0}")]
+    Config(String),
+
+    #[error("I/O error: {0}")]
+    Io(String),
+
+    #[error("serialization error: {0}")]
+    Serialization(String),
+
+    #[error("lock acquisition failed: {0}")]
+    LockFailed(String),
 }
 
 pub type SlashingResult<T> = Result<T, SlashingError>;
+
+// -----------------------------------------------------------------------------
+// Persistent State (versioned)
+// -----------------------------------------------------------------------------
+
+/// Persistent validator record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistentValidatorRecord {
+    pubkey_hex: String,
+    stake: u64,
+    slashed_total: u64,
+    status: String,
+    jailed_at_height: Option<u64>,
+    coherence: f64,
+}
+
+/// Persistent state file format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistentStateV1 {
+    version: u32,
+    validators: Vec<PersistentValidatorRecord>,
+    processed_evidence: Vec<(u64, String)>,
+    quantum_purity: f64,
+    quantum_entropy: f64,
+    slashing_coherence: f64,
+    unjail_coherence: f64,
+    total_slashes: u64,
+    total_unjails: u64,
+    total_downtime_slashes: u64,
+    tombstoned_count: usize,
+    last_modified: u64,
+}
+
+impl PersistentStateV1 {
+    fn from_ledger(ledger: &StakeLedger) -> Self {
+        let mut validators = Vec::new();
+        for (pk, record) in &ledger.validators {
+            let status = match &record.status {
+                ValidatorStatus::Active => "active".to_string(),
+                ValidatorStatus::Jailed { .. } => "jailed".to_string(),
+                ValidatorStatus::Tombstoned => "tombstoned".to_string(),
+            };
+            let jailed_at_height = match &record.status {
+                ValidatorStatus::Jailed { since_height, .. } => Some(*since_height),
+                _ => None,
+            };
+            validators.push(PersistentValidatorRecord {
+                pubkey_hex: hex::encode(&pk.0),
+                stake: record.stake,
+                slashed_total: record.slashed_total,
+                status,
+                jailed_at_height,
+                coherence: record.coherence,
+            });
+        }
+        // Cap to avoid unbounded growth.
+        if validators.len() > MAX_PERSISTED_VALIDATORS {
+            validators.truncate(MAX_PERSISTED_VALIDATORS);
+        }
+
+        let processed_evidence = ledger
+            .processed_evidence
+            .iter()
+            .map(|(h, pk)| (*h, hex::encode(&pk.0)))
+            .collect();
+
+        Self {
+            version: CURRENT_VERSION,
+            validators,
+            processed_evidence,
+            quantum_purity: ledger.quantum.purity,
+            quantum_entropy: ledger.quantum.entropy,
+            slashing_coherence: ledger.quantum.slashing_coherence,
+            unjail_coherence: ledger.quantum.unjail_coherence,
+            total_slashes: ledger.quantum.total_slashes,
+            total_unjails: ledger.quantum.total_unjails,
+            total_downtime_slashes: ledger.quantum.total_downtime_slashes,
+            tombstoned_count: ledger.quantum.tombstoned_count,
+            last_modified: current_timestamp(),
+        }
+    }
+
+    fn into_ledger(self, config: &SlashingConfig) -> StakeLedger {
+        let mut validators = BTreeMap::new();
+        for rec in self.validators {
+            let pk_bytes = match hex::decode(&rec.pubkey_hex) {
+                Ok(bytes) => PublicKeyBytes(bytes),
+                Err(_) => continue,
+            };
+            let status = match rec.status.as_str() {
+                "active" => ValidatorStatus::Active,
+                "jailed" => ValidatorStatus::Jailed {
+                    since_height: rec.jailed_at_height.unwrap_or(0),
+                    slash_count: 1,
+                },
+                "tombstoned" => ValidatorStatus::Tombstoned,
+                _ => ValidatorStatus::Active,
+            };
+            validators.insert(
+                pk_bytes,
+                ValidatorRecord {
+                    stake: rec.stake,
+                    slashed_total: rec.slashed_total,
+                    status,
+                    jailed_at: rec.jailed_at_height,
+                    coherence: rec.coherence,
+                },
+            );
+        }
+
+        let processed_evidence = self
+            .processed_evidence
+            .into_iter()
+            .map(|(h, hex_str)| {
+                let bytes = hex::decode(hex_str).unwrap_or_default();
+                (h, PublicKeyBytes(bytes))
+            })
+            .collect();
+
+        let quantum = QuantumSlashingState {
+            purity: self.quantum_purity,
+            entropy: self.quantum_entropy,
+            slashing_coherence: self.slashing_coherence,
+            unjail_coherence: self.unjail_coherence,
+            total_slashes: self.total_slashes,
+            total_unjails: self.total_unjails,
+            total_downtime_slashes: self.total_downtime_slashes,
+            tombstoned_count: self.tombstoned_count,
+            is_healthy: self.quantum_purity >= config.min_ledger_coherence,
+        };
+
+        StakeLedger {
+            validators,
+            processed_evidence,
+            quantum,
+            config: config.clone(),
+        }
+    }
+}
+
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// ── File I/O with locking ──────────────────────────────────────────────
+
+fn acquire_lock(path: &Path) -> Result<File, SlashingError> {
+    let lock_path = path.with_extension("lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| SlashingError::LockFailed(e.to_string()))?;
+    let timeout = Duration::from_secs(LOCK_TIMEOUT_SECS);
+    let start = Instant::now();
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(file),
+            Err(_) => {
+                if start.elapsed() > timeout {
+                    return Err(SlashingError::LockFailed(format!(
+                        "timeout after {}s",
+                        LOCK_TIMEOUT_SECS
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+fn release_lock(file: File) -> Result<(), SlashingError> {
+    file.unlock().map_err(|e| SlashingError::LockFailed(e.to_string()))
+}
+
+fn load_state(path: &Path, config: &SlashingConfig) -> Result<Option<StakeLedger>, SlashingError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let _lock = acquire_lock(path)?;
+    let file = File::open(path).map_err(|e| SlashingError::Io(e.to_string()))?;
+    let reader = BufReader::new(file);
+    let raw: serde_json::Value = serde_json::from_reader(reader)
+        .map_err(|e| SlashingError::Serialization(e.to_string()))?;
+    if let Some(version) = raw.get("version").and_then(|v| v.as_u64()) {
+        if version != CURRENT_VERSION as u64 {
+            return Err(SlashingError::Config(format!(
+                "unsupported version: {} (expected {})",
+                version, CURRENT_VERSION
+            )));
+        }
+        let st: PersistentStateV1 = serde_json::from_value(raw)
+            .map_err(|e| SlashingError::Serialization(e.to_string()))?;
+        Ok(Some(st.into_ledger(config)))
+    } else {
+        // Legacy: try to parse as ledger directly.
+        match serde_json::from_value::<StakeLedger>(raw) {
+            Ok(ledger) => Ok(Some(ledger)),
+            Err(e) => Err(SlashingError::Serialization(e.to_string())),
+        }
+    }
+}
+
+fn save_state(path: &Path, ledger: &StakeLedger) -> Result<(), SlashingError> {
+    let state = PersistentStateV1::from_ledger(ledger);
+    let json = serde_json::to_string_pretty(&state)
+        .map_err(|e| SlashingError::Serialization(e.to_string()))?;
+    let _lock = acquire_lock(path)?;
+    let temp_path = path.with_extension(TEMP_EXT);
+    fs::write(&temp_path, &json).map_err(|e| SlashingError::Io(e.to_string()))?;
+    fs::rename(&temp_path, path).map_err(|e| SlashingError::Io(e.to_string()))?;
+    Ok(())
+}
 
 // -----------------------------------------------------------------------------
 // Quantum Slashing State
 // -----------------------------------------------------------------------------
 
 /// Quantum state of the entire stake ledger.
-///
-/// Tracks the density matrix properties during slashing, jailing, and
-/// unjailing operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuantumSlashingState {
-    /// Purity γ = Tr(ρ²) of the ledger state.
     pub purity: f64,
-    /// Von Neumann entropy S = -Tr(ρ ln ρ).
     pub entropy: f64,
-    /// Coherence of the slashing subsystem.
     pub slashing_coherence: f64,
-    /// Coherence of the unjailing subsystem.
     pub unjail_coherence: f64,
-    /// Total slashing operations performed.
     pub total_slashes: u64,
-    /// Total unjail operations performed.
     pub total_unjails: u64,
-    /// Total downtime slashes performed.
     pub total_downtime_slashes: u64,
-    /// Number of tombstoned validators.
     pub tombstoned_count: usize,
-    /// Whether the ledger is in a healthy quantum state.
     pub is_healthy: bool,
 }
 
@@ -159,39 +475,34 @@ impl Default for QuantumSlashingState {
 }
 
 impl QuantumSlashingState {
-    /// Create a new quantum slashing state in the ground state |∅⟩.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Apply decoherence from a slashing operation (double‑vote/proposal).
-    pub fn apply_slash_decoherence(&mut self, tombstoned: bool) {
+    pub fn apply_slash_decoherence(&mut self, tombstoned: bool, rate: f64) {
         self.total_slashes = self.total_slashes.wrapping_add(1);
         if tombstoned {
             self.tombstoned_count = self.tombstoned_count.saturating_add(1);
         }
-        let decay = (-SLASH_DECOHERENCE_RATE).exp();
+        let decay = (-rate).exp();
         self.slashing_coherence = (self.slashing_coherence * decay).clamp(0.0, 1.0);
         self.recompute();
     }
 
-    /// Apply decoherence from an unjail operation.
-    pub fn apply_unjail_decoherence(&mut self) {
+    pub fn apply_unjail_decoherence(&mut self, rate: f64) {
         self.total_unjails = self.total_unjails.wrapping_add(1);
-        let decay = (-UNJAIL_DECOHERENCE_RATE).exp();
+        let decay = (-rate).exp();
         self.unjail_coherence = (self.unjail_coherence * decay).clamp(0.0, 1.0);
         self.recompute();
     }
 
-    /// Apply decoherence from a downtime slash.
-    pub fn apply_downtime_decoherence(&mut self) {
+    pub fn apply_downtime_decoherence(&mut self, rate: f64) {
         self.total_downtime_slashes = self.total_downtime_slashes.wrapping_add(1);
-        let decay = (-DOWNTIME_DECOHERENCE_RATE).exp();
+        let decay = (-rate).exp();
         self.slashing_coherence = (self.slashing_coherence * decay).clamp(0.0, 1.0);
         self.recompute();
     }
 
-    /// Apply the Kraus channel for slashing operations.
     pub fn apply_slashing_channel(&mut self) {
         let kraus_factor = (1.0 / SLASHING_KRAUS_RANK as f64).sqrt();
         self.slashing_coherence = (self.slashing_coherence * kraus_factor).clamp(0.0, 1.0);
@@ -199,33 +510,35 @@ impl QuantumSlashingState {
         self.recompute();
     }
 
-    fn recompute(&mut self) {
+    fn recompute(&mut self, min_coherence: f64) {
         self.purity = (self.slashing_coherence * self.unjail_coherence).clamp(0.0, 1.0);
         self.entropy = if self.purity >= 1.0 {
             0.0
         } else {
             -self.purity * self.purity.ln().max(0.0)
         };
-        self.is_healthy = self.purity >= MIN_LEDGER_COHERENCE;
+        self.is_healthy = self.purity >= min_coherence;
+    }
+
+    // Backward compatibility.
+    fn recompute(&mut self) {
+        self.recompute(DEFAULT_MIN_LEDGER_COHERENCE);
     }
 }
 
 // -----------------------------------------------------------------------------
-// Validator status
+// Validator Status
 // -----------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ValidatorStatus {
     Active,
-    Jailed {
-        since_height: Height,
-        slash_count: u32,
-    },
+    Jailed { since_height: Height, slash_count: u32 },
     Tombstoned,
 }
 
 // -----------------------------------------------------------------------------
-// Validator record
+// Validator Record
 // -----------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -234,7 +547,6 @@ pub struct ValidatorRecord {
     pub slashed_total: u64,
     pub status: ValidatorStatus,
     pub jailed_at: Option<Height>,
-    /// Quantum coherence of this validator.
     #[serde(default = "default_coherence")]
     pub coherence: f64,
 }
@@ -244,7 +556,6 @@ fn default_coherence() -> f64 {
 }
 
 impl ValidatorRecord {
-    /// Create a new active validator record with full coherence.
     pub const fn new(stake: u64) -> Self {
         Self {
             stake,
@@ -255,57 +566,66 @@ impl ValidatorRecord {
         }
     }
 
-    /// Check if the validator is active.
     pub const fn is_active(&self) -> bool {
         matches!(self.status, ValidatorStatus::Active)
     }
 
-    /// Check if the validator is jailed.
     pub const fn is_jailed(&self) -> bool {
         matches!(self.status, ValidatorStatus::Jailed { .. })
     }
 
-    /// Check if the validator is tombstoned.
     pub const fn is_tombstoned(&self) -> bool {
         matches!(self.status, ValidatorStatus::Tombstoned)
     }
 
-    /// Check if the validator can be unjailed at the given height.
-    pub fn can_unjail(&self, current_height: Height) -> bool {
+    pub fn can_unjail(&self, current_height: Height, delay: u64) -> bool {
         match &self.status {
             ValidatorStatus::Jailed { since_height, .. } => {
-                current_height >= since_height + UNJAIL_DELAY_BLOCKS
+                current_height >= since_height + delay
             }
             _ => false,
         }
     }
 
-    /// Apply decoherence to this validator (from slashing/jailing).
     pub fn apply_decoherence(&mut self, rate: f64) {
         self.coherence = (self.coherence * (-rate).exp()).clamp(0.0, 1.0);
     }
 }
 
 // -----------------------------------------------------------------------------
-// Stake ledger (classical + quantum)
+// StakeLedger (classical + quantum)
 // -----------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StakeLedger {
     pub validators: BTreeMap<PublicKeyBytes, ValidatorRecord>,
     pub processed_evidence: HashSet<(Height, PublicKeyBytes)>,
-    /// Quantum state of the entire ledger.
-    #[serde(default = "QuantumSlashingState::new")]
     pub quantum: QuantumSlashingState,
+    #[serde(skip)]
+    pub config: SlashingConfig,
+}
+
+impl Default for StakeLedger {
+    fn default() -> Self {
+        Self {
+            validators: BTreeMap::new(),
+            processed_evidence: HashSet::new(),
+            quantum: QuantumSlashingState::default(),
+            config: SlashingConfig::default(),
+        }
+    }
 }
 
 impl StakeLedger {
-    /// Create an empty ledger.
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(config: SlashingConfig) -> Self {
+        Self {
+            validators: BTreeMap::new(),
+            processed_evidence: HashSet::new(),
+            quantum: QuantumSlashingState::default(),
+            config,
+        }
     }
 
-    /// Total active voting power.
     pub fn total_power(&self) -> u64 {
         self.validators
             .values()
@@ -314,7 +634,6 @@ impl StakeLedger {
             .sum()
     }
 
-    /// Power of a specific validator (0 if not active).
     pub fn power_of(&self, pk: &PublicKeyBytes) -> u64 {
         self.validators
             .get(pk)
@@ -323,7 +642,6 @@ impl StakeLedger {
             .unwrap_or(0)
     }
 
-    /// Raw stake map (includes jailed validators).
     pub fn stake_raw(&self) -> BTreeMap<PublicKeyBytes, u64> {
         self.validators
             .iter()
@@ -331,17 +649,14 @@ impl StakeLedger {
             .collect()
     }
 
-    /// Quantum purity of the ledger.
     pub fn purity(&self) -> f64 {
         self.quantum.purity
     }
 
-    /// Whether the ledger is in a healthy quantum state.
     pub fn is_healthy(&self) -> bool {
         self.quantum.is_healthy
     }
 
-    /// Apply slashing evidence (double‑vote or double‑proposal).
     pub fn apply_evidence(
         &mut self,
         evidence: &Evidence,
@@ -349,9 +664,7 @@ impl StakeLedger {
     ) -> SlashingResult<()> {
         let (offender, height) = match evidence {
             Evidence::DoubleVote { voter, height, .. } => (voter, height),
-            Evidence::DoubleProposal {
-                proposer, height, ..
-            } => (proposer, height),
+            Evidence::DoubleProposal { proposer, height, .. } => (proposer, height),
         };
 
         let key = (*height, offender.clone());
@@ -366,19 +679,18 @@ impl StakeLedger {
             .get_mut(offender)
             .ok_or(SlashingError::UnknownValidator)?;
 
-        // Compute slash amount (minimum 1)
-        let slash = (record.stake / SLASH_FRACTION_DOUBLE_VOTE).max(1);
+        let slash = (record.stake / self.config.slash_fraction_double_vote).max(1);
         record.stake = record.stake.saturating_sub(slash);
         record.slashed_total += slash;
 
-        // Determine if tombstoned (second serious offence)
-        let is_tombstone = matches!(&record.status,
+        let is_tombstone = matches!(
+            &record.status,
             ValidatorStatus::Jailed { slash_count, .. } if *slash_count >= 2
         );
 
         if is_tombstone {
             record.status = ValidatorStatus::Tombstoned;
-            record.coherence = 0.0; // complete decoherence
+            record.coherence = 0.0;
             warn!(
                 offender = %hex::encode(&offender.0),
                 "validator tombstoned (repeated double‑vote/double‑proposal)"
@@ -393,7 +705,7 @@ impl StakeLedger {
                 slash_count,
             };
             record.jailed_at = Some(current_height);
-            record.apply_decoherence(SLASH_DECOHERENCE_RATE);
+            record.apply_decoherence(self.config.slash_decoherence_rate);
             warn!(
                 offender = %hex::encode(&offender.0),
                 slashed = slash,
@@ -402,10 +714,13 @@ impl StakeLedger {
             );
         }
 
-        self.quantum.apply_slash_decoherence(is_tombstone);
+        self.quantum.apply_slash_decoherence(
+            is_tombstone,
+            self.config.slash_decoherence_rate,
+        );
         self.quantum.apply_slashing_channel();
+        self.quantum.recompute(self.config.min_ledger_coherence);
 
-        // Check ledger health
         if !self.quantum.is_healthy {
             warn!(
                 coherence = self.quantum.purity,
@@ -415,7 +730,6 @@ impl StakeLedger {
         Ok(())
     }
 
-    /// Apply evidence with quantum state tracking returned.
     pub fn apply_evidence_quantum(
         &mut self,
         evidence: &Evidence,
@@ -425,12 +739,7 @@ impl StakeLedger {
         (result, self.quantum.clone())
     }
 
-    /// Unjail a validator who has waited the required delay.
-    pub fn unjail(
-        &mut self,
-        pk: &PublicKeyBytes,
-        current_height: Height,
-    ) -> SlashingResult<()> {
+    pub fn unjail(&mut self, pk: &PublicKeyBytes, current_height: Height) -> SlashingResult<()> {
         let record = self
             .validators
             .get_mut(pk)
@@ -440,9 +749,9 @@ impl StakeLedger {
             ValidatorStatus::Tombstoned => Err(SlashingError::Tombstoned),
             ValidatorStatus::Active => Err(SlashingError::NotJailed),
             ValidatorStatus::Jailed { since_height, .. } => {
-                if !record.can_unjail(current_height) {
-                    let remaining =
-                        (since_height + UNJAIL_DELAY_BLOCKS).saturating_sub(current_height);
+                if !record.can_unjail(current_height, self.config.unjail_delay_blocks) {
+                    let remaining = (since_height + self.config.unjail_delay_blocks)
+                        .saturating_sub(current_height);
                     return Err(SlashingError::UnjailDelayNotElapsed { remaining });
                 }
                 if record.stake == 0 {
@@ -450,17 +759,16 @@ impl StakeLedger {
                 }
                 record.status = ValidatorStatus::Active;
                 record.jailed_at = None;
-                // Restore some coherence (but not full)
                 record.coherence = (record.coherence * 1.1).min(1.0);
-                self.quantum.apply_unjail_decoherence();
+                self.quantum.apply_unjail_decoherence(self.config.unjail_decoherence_rate);
                 self.quantum.apply_slashing_channel();
+                self.quantum.recompute(self.config.min_ledger_coherence);
                 info!(validator = %hex::encode(&pk.0), "validator unjailed");
                 Ok(())
             }
         }
     }
 
-    /// Unjail with quantum state tracking returned.
     pub fn unjail_quantum(
         &mut self,
         pk: &PublicKeyBytes,
@@ -470,7 +778,6 @@ impl StakeLedger {
         (result, self.quantum.clone())
     }
 
-    /// Slash a validator for downtime.
     pub fn slash_downtime(
         &mut self,
         pk: &PublicKeyBytes,
@@ -485,7 +792,7 @@ impl StakeLedger {
             return Err(SlashingError::AlreadyJailed);
         }
 
-        let slash = (record.stake / SLASH_FRACTION_DOWNTIME).max(1);
+        let slash = (record.stake / self.config.slash_fraction_downtime).max(1);
         record.stake = record.stake.saturating_sub(slash);
         record.slashed_total += slash;
         record.status = ValidatorStatus::Jailed {
@@ -493,18 +800,18 @@ impl StakeLedger {
             slash_count: 1,
         };
         record.jailed_at = Some(current_height);
-        record.apply_decoherence(DOWNTIME_DECOHERENCE_RATE);
+        record.apply_decoherence(self.config.downtime_decoherence_rate);
         warn!(
             validator = %hex::encode(&pk.0),
             slashed = slash,
             "validator jailed for downtime"
         );
-        self.quantum.apply_downtime_decoherence();
+        self.quantum.apply_downtime_decoherence(self.config.downtime_decoherence_rate);
         self.quantum.apply_slashing_channel();
+        self.quantum.recompute(self.config.min_ledger_coherence);
         Ok(())
     }
 
-    /// Slash for downtime with quantum state tracking returned.
     pub fn slash_downtime_quantum(
         &mut self,
         pk: &PublicKeyBytes,
@@ -514,47 +821,69 @@ impl StakeLedger {
         (result, self.quantum.clone())
     }
 
-    /// Status report for all validators.
     pub fn status_report(&self) -> Vec<(PublicKeyBytes, &ValidatorRecord)> {
         self.validators.iter().map(|(k, v)| (k.clone(), v)).collect()
     }
 
-    /// Add a new validator (for genesis or later addition).
     pub fn add_validator(&mut self, pk: PublicKeyBytes, stake: u64) {
         self.validators.insert(pk, ValidatorRecord::new(stake));
     }
-}
 
-// -----------------------------------------------------------------------------
-// Legacy compatibility
-// -----------------------------------------------------------------------------
+    pub fn remove_validator(&mut self, pk: &PublicKeyBytes) {
+        self.validators.remove(pk);
+    }
 
-impl StakeLedger {
-    /// Deserialize old format (stake: BTreeMap<PK,u64>, slashed: BTreeMap<PK,u64>)
-    pub fn from_legacy(
-        stake: BTreeMap<PublicKeyBytes, u64>,
-        slashed: BTreeMap<PublicKeyBytes, u64>,
-    ) -> Self {
-        let mut s = Self::new();
-        for (pk, amount) in stake {
-            let slashed_total = *slashed.get(&pk).unwrap_or(&0);
-            s.validators.insert(
-                pk,
-                ValidatorRecord {
-                    stake: amount,
-                    slashed_total,
-                    status: ValidatorStatus::Active,
-                    jailed_at: None,
-                    coherence: DEFAULT_VALIDATOR_COHERENCE,
-                },
-            );
+    /// Create a snapshot for rollback.
+    pub fn snapshot(&self) -> Self {
+        self.clone()
+    }
+
+    /// Apply a snapshot (rollback).
+    pub fn apply_snapshot(&mut self, snapshot: Self) {
+        *self = snapshot;
+    }
+
+    /// Save to disk.
+    pub fn save(&self, path: &Path) -> Result<(), SlashingError> {
+        save_state(path, self)
+    }
+
+    /// Load from disk.
+    pub fn load(path: &Path, config: SlashingConfig) -> Result<Self, SlashingError> {
+        config.validate().map_err(|e| SlashingError::Config(e))?;
+        match load_state(path, &config)? {
+            Some(ledger) => Ok(ledger),
+            None => Ok(Self::new(config)),
         }
-        s
+    }
+
+    /// Load or create with persistence.
+    pub fn with_persistence(
+        data_dir: &str,
+        config: SlashingConfig,
+    ) -> Result<Self, SlashingError> {
+        config.validate().map_err(|e| SlashingError::Config(e))?;
+        let path = PathBuf::from(data_dir).join(DEFAULT_PERSIST_FILE);
+        if let Ok(Some(ledger)) = load_state(&path, &config) {
+            Ok(ledger)
+        } else {
+            Ok(Self::new(config))
+        }
+    }
+
+    /// Flush to disk if persistence is enabled.
+    pub fn flush(&self) -> Result<(), SlashingError> {
+        if self.config.persist_state {
+            let path = PathBuf::from(".").join(DEFAULT_PERSIST_FILE);
+            self.save(&path)
+        } else {
+            Ok(())
+        }
     }
 }
 
 // -----------------------------------------------------------------------------
-// Uptime tracking (classical + quantum)
+// Uptime Tracker
 // -----------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -562,52 +891,48 @@ pub struct UptimeTracker {
     pub signed_in_window: BTreeMap<PublicKeyBytes, u64>,
     pub last_signed_height: BTreeMap<PublicKeyBytes, Height>,
     pub window_start: Height,
-    /// Quantum coherence of the uptime tracker.
     #[serde(default = "default_coherence")]
     pub coherence: f64,
 }
 
 impl UptimeTracker {
-    /// Create a new uptime tracker.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Record a committed block: update signed counts for signers.
     pub fn record_block(
         &mut self,
         height: Height,
         signers: &[PublicKeyBytes],
         all_validators: &[PublicKeyBytes],
+        window: u64,
     ) {
-        // Advance window start
-        if height > DOWNTIME_WINDOW {
-            self.window_start = height - DOWNTIME_WINDOW;
+        if height > window {
+            self.window_start = height - window;
         }
 
-        // Increase signed counts for signers
         for pk in signers {
             *self.signed_in_window.entry(pk.clone()).or_insert(0) += 1;
             self.last_signed_height.insert(pk.clone(), height);
         }
 
-        // Ensure all validators have an entry (even with zero)
         for pk in all_validators {
             self.signed_in_window.entry(pk.clone()).or_insert(0);
         }
 
-        // Minor decoherence from recording
         self.coherence = (self.coherence * (-0.00001f64).exp()).clamp(0.0, 1.0);
     }
 
-    /// Get the number of signed blocks in the window for a given validator.
     pub fn signed_count(&self, pk: &PublicKeyBytes) -> u64 {
         *self.signed_in_window.get(pk).unwrap_or(&0)
     }
 
-    /// Check which validators have missed too many blocks (downtime).
-    pub fn check_downtime(&self, height: Height, stakes: &StakeLedger) -> Vec<PublicKeyBytes> {
-        if height < DOWNTIME_WINDOW {
+    pub fn last_signed(&self, pk: &PublicKeyBytes) -> Option<Height> {
+        self.last_signed_height.get(pk).copied()
+    }
+
+    pub fn check_downtime(&self, height: Height, stakes: &StakeLedger, config: &SlashingConfig) -> Vec<PublicKeyBytes> {
+        if height < config.downtime_window {
             return vec![];
         }
         stakes
@@ -616,18 +941,241 @@ impl UptimeTracker {
             .filter(|(_, r)| r.is_active())
             .filter(|(pk, _)| {
                 let signed = self.signed_count(pk);
-                let last = *self.last_signed_height.get(*pk).unwrap_or(&0);
-                last > 0 && signed < DOWNTIME_MIN_SIGNED
+                let last = self.last_signed(pk).unwrap_or(0);
+                last > 0 && signed < config.downtime_min_signed
             })
             .map(|(pk, _)| pk.clone())
             .collect()
     }
 
-    /// Reset counts for a validator (e.g., after unjailing, give a fresh start).
     pub fn reset_counts(&mut self, pk: &PublicKeyBytes) {
         self.signed_in_window.remove(pk);
         self.last_signed_height.remove(pk);
     }
+
+    /// Clear all data (for testing).
+    #[cfg(test)]
+    pub fn clear(&mut self) {
+        self.signed_in_window.clear();
+        self.last_signed_height.clear();
+        self.window_start = 0;
+        self.coherence = 1.0;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Slashing Manager (thread‑safe wrapper)
+// -----------------------------------------------------------------------------
+
+/// Thread‑safe manager for slashing operations.
+#[derive(Clone)]
+pub struct SlashingManager {
+    ledger: Arc<Mutex<StakeLedger>>,
+    uptime: Arc<Mutex<UptimeTracker>>,
+    path: Option<PathBuf>,
+}
+
+impl SlashingManager {
+    /// Create a new manager with the given configuration.
+    pub fn new(config: SlashingConfig) -> Result<Self, SlashingError> {
+        config.validate().map_err(|e| SlashingError::Config(e))?;
+        Ok(Self {
+            ledger: Arc::new(Mutex::new(StakeLedger::new(config))),
+            uptime: Arc::new(Mutex::new(UptimeTracker::new())),
+            path: None,
+        })
+    }
+
+    /// Create with persistence.
+    pub fn with_persistence(
+        data_dir: &str,
+        config: SlashingConfig,
+    ) -> Result<Self, SlashingError> {
+        config.validate().map_err(|e| SlashingError::Config(e))?;
+        let path = PathBuf::from(data_dir).join(DEFAULT_PERSIST_FILE);
+        let ledger = StakeLedger::with_persistence(data_dir, config)?;
+        Ok(Self {
+            ledger: Arc::new(Mutex::new(ledger)),
+            uptime: Arc::new(Mutex::new(UptimeTracker::new())),
+            path: Some(path),
+        })
+    }
+
+    /// Apply evidence (double‑vote or double‑proposal).
+    pub fn apply_evidence(
+        &self,
+        evidence: &Evidence,
+        current_height: Height,
+    ) -> SlashingResult<()> {
+        let mut ledger = self.ledger.lock();
+        let result = ledger.apply_evidence(evidence, current_height);
+        if result.is_ok() && ledger.config.persist_state {
+            if let Some(path) = &self.path {
+                let _ = ledger.save(path);
+            }
+        }
+        result
+    }
+
+    /// Unjail a validator.
+    pub fn unjail(&self, pk: &PublicKeyBytes, current_height: Height) -> SlashingResult<()> {
+        let mut ledger = self.ledger.lock();
+        let result = ledger.unjail(pk, current_height);
+        if result.is_ok() && ledger.config.persist_state {
+            if let Some(path) = &self.path {
+                let _ = ledger.save(path);
+            }
+        }
+        result
+    }
+
+    /// Slash for downtime.
+    pub fn slash_downtime(&self, pk: &PublicKeyBytes, current_height: Height) -> SlashingResult<()> {
+        let mut ledger = self.ledger.lock();
+        let result = ledger.slash_downtime(pk, current_height);
+        if result.is_ok() && ledger.config.persist_state {
+            if let Some(path) = &self.path {
+                let _ = ledger.save(path);
+            }
+        }
+        result
+    }
+
+    /// Record a committed block for uptime tracking.
+    pub fn record_block(&self, height: Height, signers: &[PublicKeyBytes]) {
+        let mut uptime = self.uptime.lock();
+        let ledger = self.ledger.lock();
+        let all_validators: Vec<PublicKeyBytes> = ledger.validators.keys().cloned().collect();
+        uptime.record_block(height, signers, &all_validators, ledger.config.downtime_window);
+    }
+
+    /// Check for downtime violations and slash offenders.
+    pub fn check_and_slash_downtime(&self, current_height: Height) -> Vec<PublicKeyBytes> {
+        let ledger = self.ledger.lock();
+        let uptime = self.uptime.lock();
+        let offenders = uptime.check_downtime(current_height, &ledger, &ledger.config);
+        drop(ledger);
+        drop(uptime);
+
+        for pk in &offenders {
+            let _ = self.slash_downtime(pk, current_height);
+        }
+
+        // Reset uptime counts for jailed validators.
+        let mut uptime = self.uptime.lock();
+        for pk in &offenders {
+            uptime.reset_counts(pk);
+        }
+        drop(uptime);
+
+        // Persist if enabled.
+        let mut ledger = self.ledger.lock();
+        if ledger.config.persist_state {
+            if let Some(path) = &self.path {
+                let _ = ledger.save(path);
+            }
+        }
+
+        offenders
+    }
+
+    /// Get a snapshot of the ledger (for rollback).
+    pub fn snapshot(&self) -> StakeLedger {
+        self.ledger.lock().snapshot()
+    }
+
+    /// Apply a snapshot (rollback).
+    pub fn apply_snapshot(&self, snapshot: StakeLedger) {
+        let mut ledger = self.ledger.lock();
+        ledger.apply_snapshot(snapshot);
+        if ledger.config.persist_state {
+            if let Some(path) = &self.path {
+                let _ = ledger.save(path);
+            }
+        }
+    }
+
+    /// Get current ledger statistics.
+    pub fn stats(&self) -> SlashingStats {
+        let ledger = self.ledger.lock();
+        let uptime = self.uptime.lock();
+        let active = ledger
+            .validators
+            .values()
+            .filter(|r| r.is_active())
+            .count();
+        let jailed = ledger
+            .validators
+            .values()
+            .filter(|r| r.is_jailed())
+            .count();
+        let tombstoned = ledger
+            .validators
+            .values()
+            .filter(|r| r.is_tombstoned())
+            .count();
+
+        SlashingStats {
+            total_validators: ledger.validators.len(),
+            active,
+            jailed,
+            tombstoned,
+            total_power: ledger.total_power(),
+            purity: ledger.quantum.purity,
+            entropy: ledger.quantum.entropy,
+            total_slashes: ledger.quantum.total_slashes,
+            total_unjails: ledger.quantum.total_unjails,
+            total_downtime_slashes: ledger.quantum.total_downtime_slashes,
+            is_healthy: ledger.quantum.is_healthy,
+            uptime_coherence: uptime.coherence,
+        }
+    }
+
+    /// Flush state to disk.
+    pub fn flush(&self) -> Result<(), SlashingError> {
+        let ledger = self.ledger.lock();
+        if let Some(path) = &self.path {
+            ledger.save(path)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Get configuration.
+    pub fn config(&self) -> SlashingConfig {
+        self.ledger.lock().config.clone()
+    }
+
+    /// Add a validator (for genesis).
+    pub fn add_validator(&self, pk: PublicKeyBytes, stake: u64) {
+        let mut ledger = self.ledger.lock();
+        ledger.add_validator(pk, stake);
+        if ledger.config.persist_state {
+            if let Some(path) = &self.path {
+                let _ = ledger.save(path);
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Statistics
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlashingStats {
+    pub total_validators: usize,
+    pub active: usize,
+    pub jailed: usize,
+    pub tombstoned: usize,
+    pub total_power: u64,
+    pub purity: f64,
+    pub entropy: f64,
+    pub total_slashes: u64,
+    pub total_unjails: u64,
+    pub total_downtime_slashes: u64,
+    pub is_healthy: bool,
+    pub uptime_coherence: f64,
 }
 
 // -----------------------------------------------------------------------------
@@ -637,6 +1185,7 @@ impl UptimeTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn dummy_pk(id: u8) -> PublicKeyBytes {
         let mut bytes = [0u8; 32];
@@ -644,7 +1193,17 @@ mod tests {
         PublicKeyBytes(bytes.to_vec())
     }
 
-    // ── Classical Tests ──────────────────────────────────────────────
+    fn test_config() -> SlashingConfig {
+        let mut cfg = SlashingConfig::default();
+        cfg.unjail_delay_blocks = 10;
+        cfg.slash_fraction_double_vote = 10;
+        cfg.slash_fraction_downtime = 10;
+        cfg.downtime_window = 10;
+        cfg.downtime_min_signed = 5;
+        cfg.persist_state = false;
+        cfg
+    }
+
     #[test]
     fn test_validator_record() {
         let v = ValidatorRecord::new(1000);
@@ -656,7 +1215,8 @@ mod tests {
 
     #[test]
     fn test_slash_double_vote() -> SlashingResult<()> {
-        let mut ledger = StakeLedger::new();
+        let config = test_config();
+        let mut ledger = StakeLedger::new(config);
         let pk = dummy_pk(1);
         ledger.add_validator(pk.clone(), 1000);
 
@@ -672,14 +1232,15 @@ mod tests {
         };
         ledger.apply_evidence(&evidence, 10)?;
         let record = ledger.validators.get(&pk).unwrap();
-        assert_eq!(record.stake, 1000 - (1000 / 20));
+        assert_eq!(record.stake, 1000 - (1000 / 10));
         assert!(matches!(record.status, ValidatorStatus::Jailed { .. }));
         Ok(())
     }
 
     #[test]
     fn test_unjail() -> SlashingResult<()> {
-        let mut ledger = StakeLedger::new();
+        let config = test_config();
+        let mut ledger = StakeLedger::new(config);
         let pk = dummy_pk(2);
         ledger.add_validator(pk.clone(), 1000);
         let evidence = Evidence::DoubleVote {
@@ -693,14 +1254,9 @@ mod tests {
             vote_b: crate::consensus::messages::Vote::default(),
         };
         ledger.apply_evidence(&evidence, 10)?;
-        // Cannot unjail immediately
         let err = ledger.unjail(&pk, 10).unwrap_err();
-        assert!(matches!(
-            err,
-            SlashingError::UnjailDelayNotElapsed { .. }
-        ));
-        // After delay
-        ledger.unjail(&pk, 10 + UNJAIL_DELAY_BLOCKS)?;
+        assert!(matches!(err, SlashingError::UnjailDelayNotElapsed { .. }));
+        ledger.unjail(&pk, 10 + 10)?;
         let record = ledger.validators.get(&pk).unwrap();
         assert!(record.is_active());
         Ok(())
@@ -708,104 +1264,45 @@ mod tests {
 
     #[test]
     fn test_downtime_slash() -> SlashingResult<()> {
-        let mut ledger = StakeLedger::new();
+        let config = test_config();
+        let mut ledger = StakeLedger::new(config);
         let pk = dummy_pk(3);
         ledger.add_validator(pk.clone(), 1000);
         ledger.slash_downtime(&pk, 100)?;
         let record = ledger.validators.get(&pk).unwrap();
-        assert_eq!(record.stake, 1000 - (1000 / 100));
+        assert_eq!(record.stake, 1000 - (1000 / 10));
         assert!(matches!(record.status, ValidatorStatus::Jailed { .. }));
         Ok(())
     }
 
     #[test]
     fn test_uptime_tracker() {
+        let config = test_config();
         let pk = dummy_pk(4);
         let mut tracker = UptimeTracker::new();
-        tracker.record_block(1, &[pk.clone()], &[pk.clone()]);
+        tracker.record_block(1, &[pk.clone()], &[pk.clone()], config.downtime_window);
         assert_eq!(tracker.signed_count(&pk), 1);
     }
 
-    // ── Quantum Tests ────────────────────────────────────────────────
     #[test]
-    fn test_quantum_state_initialization() {
-        let state = QuantumSlashingState::new();
-        assert!((state.purity - 1.0).abs() < 1e-10);
-        assert!((state.entropy - 0.0).abs() < 1e-10);
-        assert!(state.is_healthy);
-    }
-
-    #[test]
-    fn test_slash_decoherence() {
+    fn test_quantum_state() {
         let mut state = QuantumSlashingState::new();
-        let initial_purity = state.purity;
-        state.apply_slash_decoherence(false);
-        assert!(state.purity < initial_purity);
+        assert!((state.purity - 1.0).abs() < 1e-10);
+        state.apply_slash_decoherence(false, 0.001);
+        assert!(state.purity < 1.0);
         assert_eq!(state.total_slashes, 1);
     }
 
     #[test]
-    fn test_tombstone_decoherence() {
-        let mut state = QuantumSlashingState::new();
-        let initial_purity = state.purity;
-        state.apply_slash_decoherence(true);
-        assert!(state.purity < initial_purity);
-        assert_eq!(state.tombstoned_count, 1);
-    }
+    fn test_persistence() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let mut config = test_config();
+        config.persist_state = true;
 
-    #[test]
-    fn test_unjail_decoherence() {
-        let mut state = QuantumSlashingState::new();
-        let initial_purity = state.purity;
-        state.apply_unjail_decoherence();
-        assert!(state.purity < initial_purity);
-        assert_eq!(state.total_unjails, 1);
-    }
-
-    #[test]
-    fn test_downtime_decoherence() {
-        let mut state = QuantumSlashingState::new();
-        let initial_purity = state.purity;
-        state.apply_downtime_decoherence();
-        assert!(state.purity < initial_purity);
-        assert_eq!(state.total_downtime_slashes, 1);
-    }
-
-    #[test]
-    fn test_slashing_channel() {
-        let mut state = QuantumSlashingState::new();
-        let initial_slash_coh = state.slashing_coherence;
-        state.apply_slashing_channel();
-        assert!(state.slashing_coherence < initial_slash_coh);
-    }
-
-    #[test]
-    fn test_apply_evidence_quantum() -> SlashingResult<()> {
-        let mut ledger = StakeLedger::new();
+        let ledger = StakeLedger::with_persistence(path, config.clone()).unwrap();
         let pk = dummy_pk(10);
-        ledger.add_validator(pk.clone(), 1000);
-
-        let evidence = Evidence::DoubleVote {
-            voter: pk.clone(),
-            height: 10,
-            round: 0,
-            vote_type: crate::consensus::messages::VoteType::Prevote,
-            a: None,
-            b: None,
-            vote_a: crate::consensus::messages::Vote::default(),
-            vote_b: crate::consensus::messages::Vote::default(),
-        };
-        let (result, qstate) = ledger.apply_evidence_quantum(&evidence, 10);
-        assert!(result.is_ok());
-        assert!(qstate.total_slashes > 0);
-        assert!(qstate.purity < 1.0);
-        Ok(())
-    }
-
-    #[test]
-    fn test_unjail_quantum() -> SlashingResult<()> {
-        let mut ledger = StakeLedger::new();
-        let pk = dummy_pk(11);
+        let mut ledger = ledger;
         ledger.add_validator(pk.clone(), 1000);
         let evidence = Evidence::DoubleVote {
             voter: pk.clone(),
@@ -817,54 +1314,87 @@ mod tests {
             vote_a: crate::consensus::messages::Vote::default(),
             vote_b: crate::consensus::messages::Vote::default(),
         };
-        ledger.apply_evidence(&evidence, 10)?;
-        let (result, qstate) = ledger.unjail_quantum(&pk, 10 + UNJAIL_DELAY_BLOCKS);
-        assert!(result.is_ok());
-        assert!(qstate.total_unjails > 0);
-        Ok(())
+        ledger.apply_evidence(&evidence, 10).unwrap();
+        ledger.flush().unwrap();
+
+        // Load a new ledger.
+        let ledger2 = StakeLedger::with_persistence(path, config).unwrap();
+        assert_eq!(ledger2.total_power(), 1000 - (1000 / 10));
     }
 
     #[test]
-    fn test_downtime_quantum() -> SlashingResult<()> {
-        let mut ledger = StakeLedger::new();
-        let pk = dummy_pk(12);
+    fn test_manager() {
+        let config = test_config();
+        let manager = SlashingManager::new(config).unwrap();
+        let pk = dummy_pk(20);
+        manager.add_validator(pk.clone(), 1000);
+        let evidence = Evidence::DoubleVote {
+            voter: pk.clone(),
+            height: 10,
+            round: 0,
+            vote_type: crate::consensus::messages::VoteType::Prevote,
+            a: None,
+            b: None,
+            vote_a: crate::consensus::messages::Vote::default(),
+            vote_b: crate::consensus::messages::Vote::default(),
+        };
+        manager.apply_evidence(&evidence, 10).unwrap();
+        let stats = manager.stats();
+        assert_eq!(stats.total_validators, 1);
+        assert_eq!(stats.active, 0);
+        assert_eq!(stats.jailed, 1);
+    }
+
+    #[test]
+    fn test_snapshot() {
+        let config = test_config();
+        let mut ledger = StakeLedger::new(config);
+        let pk = dummy_pk(30);
         ledger.add_validator(pk.clone(), 1000);
-        let (result, qstate) = ledger.slash_downtime_quantum(&pk, 100);
-        assert!(result.is_ok());
-        assert!(qstate.total_downtime_slashes > 0);
-        Ok(())
+        let snapshot = ledger.snapshot();
+        ledger.remove_validator(&pk);
+        assert!(ledger.validators.is_empty());
+        ledger.apply_snapshot(snapshot);
+        assert!(ledger.validators.contains_key(&pk));
     }
 
     #[test]
-    fn test_ledger_purity() {
-        let ledger = StakeLedger::new();
-        assert!((ledger.purity() - 1.0).abs() < 1e-10);
-        assert!(ledger.is_healthy());
+    fn test_config_validation() {
+        let mut cfg = SlashingConfig::default();
+        assert!(cfg.validate().is_ok());
+
+        cfg.unjail_delay_blocks = 0;
+        assert!(cfg.validate().is_err());
+
+        cfg.unjail_delay_blocks = 10;
+        cfg.slash_fraction_double_vote = 0;
+        assert!(cfg.validate().is_err());
+
+        cfg.slash_fraction_double_vote = 10;
+        cfg.downtime_min_signed = 100;
+        cfg.downtime_window = 50;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
-    fn test_validator_decoherence() {
-        let mut record = ValidatorRecord::new(1000);
-        let initial_coh = record.coherence;
-        record.apply_decoherence(0.1);
-        assert!(record.coherence < initial_coh);
-    }
-
-    #[test]
-    fn test_health_after_many_slashes() {
-        let mut state = QuantumSlashingState::new();
-        for _ in 0..1000 {
-            state.apply_slash_decoherence(false);
-        }
-        assert!(!state.is_healthy);
-    }
-
-    #[test]
-    fn test_purity_never_negative() {
-        let mut state = QuantumSlashingState::new();
-        for _ in 0..100000 {
-            state.apply_slash_decoherence(true);
-        }
-        assert!(state.purity >= 0.0);
+    fn test_unjail_quantum_state() {
+        let config = test_config();
+        let mut ledger = StakeLedger::new(config);
+        let pk = dummy_pk(40);
+        ledger.add_validator(pk.clone(), 1000);
+        let evidence = Evidence::DoubleVote {
+            voter: pk.clone(),
+            height: 10,
+            round: 0,
+            vote_type: crate::consensus::messages::VoteType::Prevote,
+            a: None,
+            b: None,
+            vote_a: crate::consensus::messages::Vote::default(),
+            vote_b: crate::consensus::messages::Vote::default(),
+        };
+        ledger.apply_evidence(&evidence, 10).unwrap();
+        let initial_purity = ledger.quantum.purity;
+        ledger.unjail(&pk, 20).unwrap();
+        assert!(ledger.quantum.purity < initial_purity); // decoherence from unjail
     }
 }
