@@ -4,7 +4,7 @@
 //! - Configurable via `TxPoolConfig` (max age, pool size, per‑sender limits, fee bump).
 //! - `TxPoolManager` with thread‑safe wrapper (`parking_lot::Mutex`).
 //! - Metrics for pool size, insertions, evictions, replacements.
-//! - Persistent state (optional) with atomic writes and file locking.
+//! - Persistent state with atomic writes and file locking.
 //! - Structured logging with `tracing`.
 //! - Full test coverage.
 
@@ -470,6 +470,15 @@ impl TxPool {
         self.metrics.set_pool_size(self.len());
     }
 
+    /// Clear the pool completely.
+    pub fn clear(&mut self) {
+        let count = self.len();
+        self.by_sender.clear();
+        self.metrics.record_eviction("clear");
+        self.metrics.set_pool_size(0);
+        trace!(count, "pool cleared");
+    }
+
     /// Save the pool to disk (atomic write).
     pub fn save(&self, path: &Path) -> Result<(), TxPoolError> {
         let _lock = acquire_lock(path)
@@ -607,6 +616,17 @@ impl TxPoolManager {
         }
     }
 
+    /// Clear the pool.
+    pub fn clear(&self) {
+        let mut pool = self.inner.lock();
+        pool.clear();
+        if self.config.persist_pool {
+            if let Some(ref p) = self.path {
+                let _ = pool.save(p);
+            }
+        }
+    }
+
     /// Save the pool to disk.
     pub fn save(&self) -> Result<(), TxPoolError> {
         let pool = self.inner.lock();
@@ -615,6 +635,11 @@ impl TxPoolManager {
         } else {
             Err(TxPoolError::Config("no persistence path set".into()))
         }
+    }
+
+    /// Flush the pool to disk (alias for `save`).
+    pub fn flush(&self) -> Result<(), TxPoolError> {
+        self.save()
     }
 
     /// Get pool metrics.
@@ -635,6 +660,30 @@ impl TxPoolManager {
     /// Get configuration.
     pub fn config(&self) -> &TxPoolConfig {
         &self.config
+    }
+
+    /// Get a snapshot of all pending transactions.
+    pub fn pending_txs(&self) -> Vec<PendingTx> {
+        let pool = self.inner.lock();
+        let mut all = Vec::with_capacity(pool.len());
+        for lane in pool.by_sender.values() {
+            for tx in lane.values() {
+                all.push(tx.clone());
+            }
+        }
+        all
+    }
+
+    /// Get pending transactions for a specific sender.
+    pub fn pending_for_sender(&self, sender: &str) -> Vec<PendingTx> {
+        let pool = self.inner.lock();
+        let mut result = Vec::new();
+        if let Some(lane) = pool.by_sender.get(sender) {
+            for tx in lane.values() {
+                result.push(tx.clone());
+            }
+        }
+        result
     }
 }
 
@@ -873,5 +922,50 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(manager.len(), 10);
+    }
+
+    #[test]
+    fn test_clear() {
+        let cfg = test_config();
+        let mut pool = TxPool::new(cfg);
+        pool.insert(dummy_tx("alice", 0, 100, 10)).unwrap();
+        pool.insert(dummy_tx("bob", 0, 100, 11)).unwrap();
+        assert_eq!(pool.len(), 2);
+        pool.clear();
+        assert_eq!(pool.len(), 0);
+        assert!(pool.by_sender.is_empty());
+    }
+
+    #[test]
+    fn test_pending_txs() {
+        let cfg = test_config();
+        let manager = TxPoolManager::new(cfg).unwrap();
+        manager.insert(dummy_tx("alice", 0, 100, 10)).unwrap();
+        manager.insert(dummy_tx("bob", 1, 100, 11)).unwrap();
+
+        let all = manager.pending_txs();
+        assert_eq!(all.len(), 2);
+
+        let alice = manager.pending_for_sender("alice");
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].from, "alice");
+    }
+
+    #[test]
+    fn test_flush() -> Result<(), TxPoolError> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("txpool.json");
+        let mut cfg = test_config();
+        cfg.persist_pool = true;
+        cfg.persist_path = Some(path.clone());
+
+        let manager = TxPoolManager::new(cfg)?;
+        manager.insert(dummy_tx("alice", 0, 100, 10))?;
+        manager.flush()?;
+
+        let manager2 = TxPoolManager::new(cfg)?;
+        assert_eq!(manager2.len(), 1);
+
+        Ok(())
     }
 }
