@@ -31,3 +31,6 @@ pub fn migrate(data_dir: &str, meta: &mut SchemaMeta) -> io::Result<()> {
 
     Ok(())
 }
+
+// Integrate into MigrationRegistry:
+// registry.register(Box::new(MigrationV3ToV4));
