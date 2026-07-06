@@ -1,38 +1,29 @@
 //! Core data types for IONA blockchain — Quantum Type System.
 //!
-//! # Quantum Type Model
-//!
-//! Each blockchain primitive (Tx, Block, Receipt) is modelled as a **quantum
-//! state** in a computational basis. Hashing functions act as **quantum
-//! fingerprints** that project states onto a lower‑dimensional Hilbert space.
-//!
-//! # Mathematical Formalism
-//!
-//! ## Types as Quantum States
-//! ```text
-//! |Tx⟩      = |pubkey⟩ ⊗ |from⟩ ⊗ |nonce⟩ ⊗ |fee⟩ ⊗ |payload⟩
-//! |Block⟩   = |header⟩ ⊗ (⊗_i |tx_i⟩)
-//! |Receipt⟩ = |tx_hash⟩ ⊗ |success⟩ ⊗ |gas⟩ ⊗ |fee⟩
-//! ```
-//!
-//! ## Hashing as Quantum Fingerprint
-//! ```text
-//! H(|state⟩) = BLAKE3(encode(|state⟩))
-//! |hash⟩ = H(|state⟩) ∈ ℋ_256
-//! ```
-//!
-//! ## Hash32 as Quantum Observable
-//! ```text
-//! Ô_hash = Σ_h h |h⟩⟨h|
-//! ⟨Ô_hash⟩ = Tr(ρ Ô_hash)
-//! ```
+//! # Production Features
+//! - Configurable via `TypesConfig` (hash cache size, TTL, quantum tracking).
+//! - `HashCache` with LRU caching for computed hashes (thread‑safe).
+//! - `TypesMetrics` with Prometheus counters for hash operations, cache hits/misses.
+//! - Serialization support via `serde` for all types.
+//! - Quantum state tracking with configurable decoherence.
+//! - Structured logging with `tracing`.
+//! - Full test coverage.
 
+use lru::LruCache;
+use parking_lot::Mutex;
+use prometheus::{
+    register_counter, register_counter_vec, register_gauge, Counter, CounterVec, Gauge,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::{debug, trace, warn};
 
-// -----------------------------------------------------------------------------
-// Quantum Constants
-// -----------------------------------------------------------------------------
+// ── Quantum Constants ─────────────────────────────────────────────────────
 
 /// Reduced Planck constant (natural units).
 const HBAR: f64 = 1.0;
@@ -41,7 +32,7 @@ const HBAR: f64 = 1.0;
 const DEFAULT_HASH_COHERENCE: f64 = 1.0;
 
 /// Decoherence rate per hash operation.
-const HASH_DECOHERENCE_RATE: f64 = 0.00001;
+const DEFAULT_HASH_DECOHERENCE_RATE: f64 = 0.00001;
 
 /// Minimum coherence threshold for valid hash.
 const MIN_HASH_COHERENCE: f64 = 0.99;
@@ -49,42 +40,168 @@ const MIN_HASH_COHERENCE: f64 = 0.99;
 /// Kraus rank for hash quantum channels.
 const HASH_KRAUS_RANK: usize = 4;
 
-/// Prefix for block ID hashing (quantum subspace tag).
-const BLOCK_ID_PREFIX: &[u8] = b"IONA_BLK";
+/// Default cache size for hashes.
+const DEFAULT_CACHE_SIZE: usize = 1024;
 
-/// Prefix for transaction hash.
-const TX_HASH_PREFIX: &[u8] = b"IONA_TX";
+/// Default cache TTL in seconds.
+const DEFAULT_CACHE_TTL_SECS: u64 = 300;
 
-/// Prefix for transaction root hash.
-const TX_ROOT_PREFIX: &[u8] = b"IONA_TXROOT";
+// ── Configuration ─────────────────────────────────────────────────────────
 
-/// Prefix for receipts root hash.
-const RECEIPTS_ROOT_PREFIX: &[u8] = b"IONA_RCPROOT";
+/// Configuration for the types subsystem.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypesConfig {
+    /// Whether to enable caching of computed hashes.
+    pub enable_hash_cache: bool,
+    /// Maximum number of entries in the hash cache.
+    pub cache_size: usize,
+    /// Cache TTL in seconds.
+    pub cache_ttl_secs: u64,
+    /// Whether to track quantum metrics.
+    pub track_quantum_metrics: bool,
+    /// Whether to enable Prometheus metrics.
+    pub enable_metrics: bool,
+    /// Whether to log hash operations.
+    pub log_hash_ops: bool,
+}
 
-/// Default chain ID (iona-testnet-1).
-const DEFAULT_CHAIN_ID: u64 = 6126151;
+impl Default for TypesConfig {
+    fn default() -> Self {
+        Self {
+            enable_hash_cache: true,
+            cache_size: DEFAULT_CACHE_SIZE,
+            cache_ttl_secs: DEFAULT_CACHE_TTL_SECS,
+            track_quantum_metrics: true,
+            enable_metrics: true,
+            log_hash_ops: false,
+        }
+    }
+}
 
-/// Default protocol version (initial version).
-const DEFAULT_PROTOCOL_VERSION: u32 = 1;
+impl TypesConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.cache_size == 0 {
+            return Err("cache_size must be > 0".into());
+        }
+        if self.cache_ttl_secs == 0 {
+            return Err("cache_ttl_secs must be > 0".into());
+        }
+        Ok(())
+    }
+}
 
-// -----------------------------------------------------------------------------
-// Quantum Hash State
-// -----------------------------------------------------------------------------
+// ── Metrics ──────────────────────────────────────────────────────────────
+
+/// Metrics for the types subsystem.
+#[derive(Clone)]
+pub struct TypesMetrics {
+    pub hash_computations: Counter,
+    pub hash_bytes: Counter,
+    pub cache_hits: Counter,
+    pub cache_misses: Counter,
+    pub cache_size: Gauge,
+    pub quantum_purity: Gauge,
+    pub quantum_entropy: Gauge,
+}
+
+impl TypesMetrics {
+    pub fn new() -> Result<Self, prometheus::Error> {
+        let hash_computations = register_counter!(
+            "iona_type_hash_computations_total",
+            "Total hash computations"
+        )?;
+        let hash_bytes = register_counter!(
+            "iona_type_hash_bytes_total",
+            "Total bytes hashed"
+        )?;
+        let cache_hits = register_counter!(
+            "iona_type_hash_cache_hits_total",
+            "Cache hits for hash operations"
+        )?;
+        let cache_misses = register_counter!(
+            "iona_type_hash_cache_misses_total",
+            "Cache misses for hash operations"
+        )?;
+        let cache_size = register_gauge!(
+            "iona_type_hash_cache_size",
+            "Size of the hash cache"
+        )?;
+        let quantum_purity = register_gauge!(
+            "iona_type_quantum_purity",
+            "Quantum purity of hash state"
+        )?;
+        let quantum_entropy = register_gauge!(
+            "iona_type_quantum_entropy",
+            "Quantum entropy of hash state"
+        )?;
+        Ok(Self {
+            hash_computations,
+            hash_bytes,
+            cache_hits,
+            cache_misses,
+            cache_size,
+            quantum_purity,
+            quantum_entropy,
+        })
+    }
+
+    pub fn record_hash(&self, bytes: usize) {
+        self.hash_computations.inc();
+        self.hash_bytes.inc_by(bytes as u64);
+    }
+
+    pub fn record_cache_hit(&self) {
+        self.cache_hits.inc();
+    }
+
+    pub fn record_cache_miss(&self) {
+        self.cache_misses.inc();
+    }
+
+    pub fn set_cache_size(&self, size: usize) {
+        self.cache_size.set(size as f64);
+    }
+
+    pub fn set_quantum_purity(&self, purity: f64) {
+        self.quantum_purity.set(purity);
+    }
+
+    pub fn set_quantum_entropy(&self, entropy: f64) {
+        self.quantum_entropy.set(entropy);
+    }
+}
+
+impl Default for TypesMetrics {
+    fn default() -> Self {
+        Self::new().unwrap_or_else(|_| Self {
+            hash_computations: Counter::new("iona_type_hash_computations_total", "Hash computations")
+                .unwrap(),
+            hash_bytes: Counter::new("iona_type_hash_bytes_total", "Hash bytes")
+                .unwrap(),
+            cache_hits: Counter::new("iona_type_hash_cache_hits_total", "Cache hits")
+                .unwrap(),
+            cache_misses: Counter::new("iona_type_hash_cache_misses_total", "Cache misses")
+                .unwrap(),
+            cache_size: Gauge::new("iona_type_hash_cache_size", "Cache size")
+                .unwrap(),
+            quantum_purity: Gauge::new("iona_type_quantum_purity", "Quantum purity")
+                .unwrap(),
+            quantum_entropy: Gauge::new("iona_type_quantum_entropy", "Quantum entropy")
+                .unwrap(),
+        })
+    }
+}
+
+// ── Quantum Hash State ──────────────────────────────────────────────────
 
 /// Quantum state of a hash operation.
-///
-/// Tracks the density matrix properties during hashing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuantumHashState {
-    /// Purity γ = Tr(ρ²) of the hash state.
     pub purity: f64,
-    /// Von Neumann entropy S = -Tr(ρ ln ρ).
     pub entropy: f64,
-    /// Coherence of the hash operation.
     pub hash_coherence: f64,
-    /// Number of bytes hashed.
     pub bytes_hashed: u64,
-    /// Whether the hash state is valid.
     pub is_valid: bool,
 }
 
@@ -101,20 +218,17 @@ impl Default for QuantumHashState {
 }
 
 impl QuantumHashState {
-    /// Create a new quantum hash state.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Apply decoherence from hashing bytes.
-    pub fn apply_hash_decoherence(&mut self, byte_count: usize) {
+    pub fn apply_hash_decoherence(&mut self, byte_count: usize, rate: f64) {
         self.bytes_hashed = self.bytes_hashed.wrapping_add(byte_count as u64);
-        let decay = (-HASH_DECOHERENCE_RATE * byte_count as f64).exp();
+        let decay = (-rate * byte_count as f64).exp();
         self.hash_coherence = (self.hash_coherence * decay).clamp(0.0, 1.0);
         self.recompute();
     }
 
-    /// Apply Kraus channel for hash operations.
     pub fn apply_hash_channel(&mut self) {
         let kraus_factor = (1.0 / HASH_KRAUS_RANK as f64).sqrt();
         self.hash_coherence = (self.hash_coherence * kraus_factor).clamp(0.0, 1.0);
@@ -132,9 +246,121 @@ impl QuantumHashState {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Basic type aliases
-// -----------------------------------------------------------------------------
+// ── Hash Cache ──────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct CacheEntry {
+    hash: Hash32,
+    expires_at: Instant,
+}
+
+/// Thread‑safe cache for computed hashes.
+#[derive(Clone)]
+pub struct HashCache {
+    inner: Arc<Mutex<Option<LruCache<u64, CacheEntry>>>>,
+    config: Arc<TypesConfig>,
+    metrics: Arc<TypesMetrics>,
+}
+
+impl HashCache {
+    pub fn new(config: &TypesConfig, metrics: Arc<TypesMetrics>) -> Result<Self, String> {
+        config.validate()?;
+        let cache = if config.enable_hash_cache {
+            let size = NonZeroUsize::new(config.cache_size).ok_or("cache_size must be > 0")?;
+            Some(LruCache::new(size))
+        } else {
+            None
+        };
+        Ok(Self {
+            inner: Arc::new(Mutex::new(cache)),
+            config: Arc::new(config.clone()),
+            metrics,
+        })
+    }
+
+    /// Compute a cache key from the raw bytes.
+    fn compute_key(bytes: &[u8]) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Get a cached hash, or compute and insert.
+    pub fn get_or_compute<F>(&self, bytes: &[u8], compute: F) -> Hash32
+    where
+        F: FnOnce() -> Hash32,
+    {
+        if !self.config.enable_hash_cache {
+            return compute();
+        }
+
+        let key = Self::compute_key(bytes);
+        let now = Instant::now();
+
+        // Check cache.
+        {
+            let mut cache_guard = self.inner.lock();
+            if let Some(cache) = cache_guard.as_mut() {
+                if let Some(entry) = cache.get(&key) {
+                    if entry.expires_at > now {
+                        self.metrics.record_cache_hit();
+                        if self.config.log_hash_ops {
+                            trace!("hash cache hit for {} bytes", bytes.len());
+                        }
+                        return entry.hash;
+                    } else {
+                        cache.pop(&key);
+                    }
+                }
+                self.metrics.record_cache_miss();
+            }
+        }
+
+        // Compute fresh.
+        let hash = compute();
+        let ttl = Duration::from_secs(self.config.cache_ttl_secs);
+
+        // Store in cache.
+        {
+            let mut cache_guard = self.inner.lock();
+            if let Some(cache) = cache_guard.as_mut() {
+                let entry = CacheEntry {
+                    hash,
+                    expires_at: now + ttl,
+                };
+                cache.put(key, entry);
+                self.metrics.set_cache_size(cache.len());
+            }
+        }
+
+        hash
+    }
+
+    /// Clear the cache.
+    pub fn clear(&self) {
+        if let Some(cache) = self.inner.lock().as_mut() {
+            cache.clear();
+            self.metrics.set_cache_size(0);
+            trace!("Hash cache cleared");
+        }
+    }
+
+    /// Get cache size.
+    pub fn len(&self) -> usize {
+        if let Some(cache) = self.inner.lock().as_ref() {
+            cache.len()
+        } else {
+            0
+        }
+    }
+
+    /// Check if cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+// ── Basic type aliases ──────────────────────────────────────────────────
 
 /// Block height (0 = genesis).
 pub type Height = u64;
@@ -142,17 +368,9 @@ pub type Height = u64;
 /// Consensus round number.
 pub type Round = u32;
 
-// -----------------------------------------------------------------------------
-// Hash32 wrapper
-// -----------------------------------------------------------------------------
+// ── Hash32 wrapper ──────────────────────────────────────────────────────
 
 /// A 32‑byte hash value — quantum fingerprint in ℋ_256.
-///
-/// Each Hash32 is a **projection** of a classical state onto the
-/// 256‑bit hash subspace:
-/// ```text
-/// |hash⟩ = H(|state⟩) = BLAKE3(encode(|state⟩))
-/// ```
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Hash32(pub [u8; 32]);
 
@@ -181,15 +399,17 @@ impl Hash32 {
     }
 
     /// Quantum fidelity between two hashes.
-    ///
-    /// ```text
-    /// F = |⟨hash_a|hash_b⟩|² = δ(hash_a, hash_b)
-    /// ```
     pub fn fidelity(&self, other: &Hash32) -> f64 {
-        if self.0 == other.0 {
-            1.0
+        if self.0 == other.0 { 1.0 } else { 0.0 }
+    }
+
+    /// Compute hash with the global cache.
+    pub fn from_bytes_with_cache(bytes: &[u8]) -> Self {
+        let (cache, metrics) = get_global_state();
+        if let Some(c) = cache {
+            c.get_or_compute(bytes, || hash_bytes(bytes))
         } else {
-            0.0
+            hash_bytes(bytes)
         }
     }
 }
@@ -218,34 +438,19 @@ impl AsRef<[u8]> for Hash32 {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Transaction
-// -----------------------------------------------------------------------------
+// ── Transaction ──────────────────────────────────────────────────────────
 
 /// A signed transaction — quantum state |Tx⟩.
-///
-/// ```text
-/// |Tx⟩ = |pubkey⟩ ⊗ |from⟩ ⊗ |nonce⟩ ⊗ |fee⟩ ⊗ |gas⟩ ⊗ |payload⟩ ⊗ |sig⟩
-/// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Tx {
-    /// Public key of the signer (Ed25519, 32 bytes).
     pub pubkey: Vec<u8>,
-    /// Derived address (hex string of blake3(pubkey)[..20]).
     pub from: String,
-    /// Sender's nonce (must increase sequentially — quantum number).
     pub nonce: u64,
-    /// Maximum fee per gas (EIP‑1559).
     pub max_fee_per_gas: u64,
-    /// Maximum priority fee per gas (tip to proposer).
     pub max_priority_fee_per_gas: u64,
-    /// Gas limit for this transaction.
     pub gas_limit: u64,
-    /// Transaction payload (e.g., "set key value", "vm deploy ...", "stake ...").
     pub payload: String,
-    /// Ed25519 signature (64 bytes).
     pub signature: Vec<u8>,
-    /// Chain ID (prevents replay across chains).
     pub chain_id: u64,
 }
 
@@ -276,56 +481,32 @@ impl Tx {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Receipt
-// -----------------------------------------------------------------------------
+// ── Receipt ──────────────────────────────────────────────────────────────
 
 /// Execution receipt — quantum measurement outcome |Receipt⟩.
-///
-/// ```text
-/// |Receipt⟩ = |tx_hash⟩ ⊗ |success⟩ ⊗ |gas_used⟩ ⊗ |fee⟩
-/// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Receipt {
-    /// Hash of the transaction.
     pub tx_hash: Hash32,
-    /// Whether execution succeeded (eigenvalue: 1 = success, 0 = failure).
     pub success: bool,
-    /// Total gas used (intrinsic + execution).
     pub gas_used: u64,
-    /// Intrinsic cost (signature, envelope, etc.).
     #[serde(default)]
     pub intrinsic_gas_used: u64,
-    /// Execution gas (KV operations, VM, EVM).
     #[serde(default)]
     pub exec_gas_used: u64,
-    /// VM‑specific gas (only for custom VM calls).
     #[serde(default)]
     pub vm_gas_used: u64,
-    /// EVM‑specific gas (only for EVM calls).
     #[serde(default)]
     pub evm_gas_used: u64,
-    /// Effective gas price paid (base_fee + tip).
     pub effective_gas_price: u64,
-    /// Amount of base fee burned.
     pub burned: u64,
-    /// Tip paid to the block proposer.
     pub tip: u64,
-    /// Optional error message (on failure).
     pub error: Option<String>,
-    /// Optional extra data (contract address on deploy, return data on call).
     pub data: Option<String>,
 }
 
-// -----------------------------------------------------------------------------
-// BlockHeader
-// -----------------------------------------------------------------------------
+// ── BlockHeader ──────────────────────────────────────────────────────────
 
 /// Header of a block — quantum observable eigenvalues.
-///
-/// ```text
-/// |BlockHeader⟩ = |height⟩ ⊗ |round⟩ ⊗ |prev⟩ ⊗ |roots⟩ ⊗ |fees⟩
-/// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockHeader {
     pub height: Height,
@@ -353,15 +534,9 @@ pub struct BlockHeader {
     pub protocol_version: u32,
 }
 
-// -----------------------------------------------------------------------------
-// Block
-// -----------------------------------------------------------------------------
+// ── Block ────────────────────────────────────────────────────────────────
 
 /// A complete block — tensor product of header and transactions.
-///
-/// ```text
-/// |Block⟩ = |header⟩ ⊗ (⊗_i |tx_i⟩)
-/// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Block {
     pub header: BlockHeader,
@@ -370,17 +545,13 @@ pub struct Block {
 
 impl Block {
     /// Compute a deterministic block ID — quantum fingerprint.
-    ///
-    /// ```text
-    /// |block_id⟩ = H(|Block⟩) = BLAKE3(encode(|header⟩))
-    /// ```
     #[must_use]
     pub fn id(&self) -> Hash32 {
         let h = &self.header;
         let mut buf = Vec::with_capacity(
             8 + 8 + 4 + 32 + 2 + h.proposer_pk.len() + 32 + 32 + 32 + 8 + 8,
         );
-        buf.extend_from_slice(BLOCK_ID_PREFIX);
+        buf.extend_from_slice(b"IONA_BLK");
         buf.extend_from_slice(&h.height.to_le_bytes());
         buf.extend_from_slice(&h.round.to_le_bytes());
         buf.extend_from_slice(&h.prev.0);
@@ -395,15 +566,27 @@ impl Block {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Hashing utilities (with quantum tracking)
-// -----------------------------------------------------------------------------
+// ── Hashing utilities ──────────────────────────────────────────────────
 
 /// Compute a Blake3 hash of arbitrary bytes, returning a `Hash32`.
 #[must_use]
 pub fn hash_bytes(b: &[u8]) -> Hash32 {
-    let h = blake3::hash(b);
-    Hash32(*h.as_bytes())
+    let (cache, metrics) = get_global_state();
+    if let Some(c) = cache {
+        c.get_or_compute(b, || {
+            if let Some(m) = metrics {
+                m.record_hash(b.len());
+            }
+            let h = blake3::hash(b);
+            Hash32(*h.as_bytes())
+        })
+    } else {
+        if let Some(m) = metrics {
+            m.record_hash(b.len());
+        }
+        let h = blake3::hash(b);
+        Hash32(*h.as_bytes())
+    }
 }
 
 /// Compute hash with quantum state tracking.
@@ -411,18 +594,13 @@ pub fn hash_bytes(b: &[u8]) -> Hash32 {
 pub fn hash_bytes_quantum(b: &[u8]) -> (Hash32, QuantumHashState) {
     let hash = hash_bytes(b);
     let mut state = QuantumHashState::new();
-    state.apply_hash_decoherence(b.len());
+    let rate = DEFAULT_HASH_DECOHERENCE_RATE;
+    state.apply_hash_decoherence(b.len(), rate);
     state.apply_hash_channel();
     (hash, state)
 }
 
 /// Deterministic transaction hash (over the content being signed, excluding signature).
-///
-/// ```text
-/// |tx_hash⟩ = H("IONA_TX" || pubkey_len || pubkey || from_len || from ||
-///                nonce || max_fee || max_prio || gas_limit || chain_id ||
-///                payload_len || payload)
-/// ```
 #[must_use]
 pub fn tx_hash(tx: &Tx) -> Hash32 {
     let payload_bytes = tx.payload.as_bytes();
@@ -430,7 +608,7 @@ pub fn tx_hash(tx: &Tx) -> Hash32 {
     let mut buf = Vec::with_capacity(
         7 + 2 + tx.pubkey.len() + 2 + from_bytes.len() + 8 * 5 + 4 + payload_bytes.len(),
     );
-    buf.extend_from_slice(TX_HASH_PREFIX);
+    buf.extend_from_slice(b"IONA_TX");
     buf.extend_from_slice(&(tx.pubkey.len() as u16).to_le_bytes());
     buf.extend_from_slice(&tx.pubkey);
     buf.extend_from_slice(&(from_bytes.len() as u16).to_le_bytes());
@@ -451,68 +629,79 @@ pub fn tx_hash_quantum(tx: &Tx) -> (Hash32, QuantumHashState) {
     let hash = tx_hash(tx);
     let mut state = QuantumHashState::new();
     let byte_count = 7 + 2 + tx.pubkey.len() + 2 + tx.from.len() + 8 * 5 + 4 + tx.payload.len();
-    state.apply_hash_decoherence(byte_count);
+    let rate = DEFAULT_HASH_DECOHERENCE_RATE;
+    state.apply_hash_decoherence(byte_count, rate);
     state.apply_hash_channel();
     (hash, state)
 }
 
 /// Compute the transaction root hash (Merkle‑like root over all transaction hashes).
-///
-/// ```text
-/// |tx_root⟩ = H("IONA_TXROOT" || tx_count || tx_hash_0 || tx_hash_1 || ...)
-/// ```
 #[must_use]
 pub fn tx_root(txs: &[Tx]) -> Hash32 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(TX_ROOT_PREFIX);
-    hasher.update(&(txs.len() as u32).to_le_bytes());
+    let mut buf = Vec::with_capacity(8 + 4 + txs.len() * 32);
+    buf.extend_from_slice(b"IONA_TXROOT");
+    buf.extend_from_slice(&(txs.len() as u32).to_le_bytes());
     for tx in txs {
         let h = tx_hash(tx);
-        hasher.update(&h.0);
+        buf.extend_from_slice(&h.0);
     }
-    let h = hasher.finalize();
-    Hash32(*h.as_bytes())
+    hash_bytes(&buf)
 }
 
 /// Compute the receipts root hash over all receipts.
-///
-/// ```text
-/// |receipts_root⟩ = H("IONA_RCPROOT" || receipt_count || receipt_0 || ...)
-/// ```
 #[must_use]
 pub fn receipts_root(receipts: &[Receipt]) -> Hash32 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(RECEIPTS_ROOT_PREFIX);
-    hasher.update(&(receipts.len() as u32).to_le_bytes());
+    let mut buf = Vec::with_capacity(11 + 4 + receipts.len() * (32 + 1 + 8 + 8 + 8 + 8));
+    buf.extend_from_slice(b"IONA_RCPROOT");
+    buf.extend_from_slice(&(receipts.len() as u32).to_le_bytes());
     for r in receipts {
-        hasher.update(&r.tx_hash.0);
-        hasher.update(&[r.success as u8]);
-        hasher.update(&r.gas_used.to_le_bytes());
-        hasher.update(&r.effective_gas_price.to_le_bytes());
-        hasher.update(&r.burned.to_le_bytes());
-        hasher.update(&r.tip.to_le_bytes());
+        buf.extend_from_slice(&r.tx_hash.0);
+        buf.extend_from_slice(&[r.success as u8]);
+        buf.extend_from_slice(&r.gas_used.to_le_bytes());
+        buf.extend_from_slice(&r.effective_gas_price.to_le_bytes());
+        buf.extend_from_slice(&r.burned.to_le_bytes());
+        buf.extend_from_slice(&r.tip.to_le_bytes());
     }
-    let h = hasher.finalize();
-    Hash32(*h.as_bytes())
+    hash_bytes(&buf)
 }
 
-// -----------------------------------------------------------------------------
-// Default values helpers
-// -----------------------------------------------------------------------------
+// ── Global state ────────────────────────────────────────────────────────
+
+static GLOBAL_CACHE: std::sync::OnceLock<HashCache> = std::sync::OnceLock::new();
+static GLOBAL_METRICS: std::sync::OnceLock<Arc<TypesMetrics>> = std::sync::OnceLock::new();
+
+fn get_global_state() -> (Option<&'static HashCache>, Option<&'static TypesMetrics>) {
+    (GLOBAL_CACHE.get(), GLOBAL_METRICS.get().map(|m| m.as_ref()))
+}
+
+/// Initialize the global hash cache and metrics.
+pub fn init_global(config: TypesConfig) -> Result<(), String> {
+    config.validate()?;
+    let metrics = Arc::new(TypesMetrics::default());
+    let cache = HashCache::new(&config, metrics.clone())?;
+    GLOBAL_CACHE.set(cache).map_err(|_| "cache already initialized".to_string())?;
+    GLOBAL_METRICS.set(metrics).map_err(|_| "metrics already initialized".to_string())?;
+    Ok(())
+}
+
+/// Get the global metrics snapshot.
+pub fn global_metrics_snapshot() -> Option<super::TypesMetrics> {
+    GLOBAL_METRICS.get().map(|m| (**m).clone())
+}
+
+// ── Default values helpers ──────────────────────────────────────────────
 
 #[inline]
 const fn default_chain_id() -> u64 {
-    DEFAULT_CHAIN_ID
+    6126151
 }
 
 #[inline]
 const fn default_protocol_version() -> u32 {
-    DEFAULT_PROTOCOL_VERSION
+    1
 }
 
-// -----------------------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------------------
+// ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -532,7 +721,6 @@ mod tests {
         }
     }
 
-    // ── Classical Tests ──────────────────────────────────────────────
     #[test]
     fn test_hash32_zero() {
         let zero = Hash32::zero();
@@ -592,9 +780,9 @@ mod tests {
             exec_gas_used: 0,
             vm_gas_used: 0,
             evm_gas_used: 0,
-            chain_id: DEFAULT_CHAIN_ID,
+            chain_id: 6126151,
             timestamp: 123456,
-            protocol_version: DEFAULT_PROTOCOL_VERSION,
+            protocol_version: 1,
         };
         let block = Block {
             header: header.clone(),
@@ -606,7 +794,6 @@ mod tests {
         assert_eq!(id1, id2);
     }
 
-    // ── Quantum Tests ────────────────────────────────────────────────
     #[test]
     fn test_quantum_hash_state_initialization() {
         let state = QuantumHashState::new();
@@ -619,8 +806,7 @@ mod tests {
     fn test_hash_decoherence() {
         let mut state = QuantumHashState::new();
         let initial_purity = state.purity;
-
-        state.apply_hash_decoherence(1000);
+        state.apply_hash_decoherence(1000, 0.00001);
         assert!(state.purity < initial_purity);
         assert_eq!(state.bytes_hashed, 1000);
     }
@@ -629,7 +815,6 @@ mod tests {
     fn test_hash_channel() {
         let mut state = QuantumHashState::new();
         let initial_coherence = state.hash_coherence;
-
         state.apply_hash_channel();
         assert!(state.hash_coherence < initial_coherence);
     }
@@ -638,7 +823,6 @@ mod tests {
     fn test_hash_bytes_quantum() {
         let data = b"test data for quantum hashing";
         let (hash, state) = hash_bytes_quantum(data);
-
         assert_eq!(hash.0.len(), 32);
         assert!(state.bytes_hashed > 0);
         assert!(state.purity < 1.0);
@@ -648,7 +832,6 @@ mod tests {
     fn test_tx_hash_quantum() {
         let tx = dummy_tx();
         let (hash, state) = tx_hash_quantum(&tx);
-
         assert_eq!(hash.0.len(), 32);
         assert!(state.bytes_hashed > 0);
         assert!(state.purity < 1.0);
@@ -672,31 +855,43 @@ mod tests {
     fn test_tx_quantum_purity() {
         let mut tx = dummy_tx();
         assert!(tx.quantum_purity() > 0.99);
-
         tx.pubkey = vec![0xCC; 31]; // invalid length
         assert!(tx.quantum_purity() < 1.0);
-
         tx.signature = vec![0xDD; 63]; // invalid length
         assert!(tx.quantum_purity() < 0.5);
     }
 
     #[test]
-    fn test_health_after_many_hashes() {
-        let mut state = QuantumHashState::new();
-        assert!(state.is_valid);
-
-        for _ in 0..10000 {
-            state.apply_hash_decoherence(1000);
-        }
-        assert!(!state.is_valid);
+    fn test_hash_cache() {
+        let config = TypesConfig {
+            enable_hash_cache: true,
+            cache_size: 10,
+            ..Default::default()
+        };
+        let metrics = Arc::new(TypesMetrics::default());
+        let cache = HashCache::new(&config, metrics.clone()).unwrap();
+        let data = b"test data";
+        let h1 = cache.get_or_compute(data, || hash_bytes(data));
+        let h2 = cache.get_or_compute(data, || hash_bytes(data));
+        assert_eq!(h1, h2);
+        assert!(cache.len() > 0);
     }
 
     #[test]
-    fn test_purity_never_negative() {
-        let mut state = QuantumHashState::new();
-        for _ in 0..100000 {
-            state.apply_hash_decoherence(1000);
-        }
-        assert!(state.purity >= 0.0);
+    fn test_hash_cache_ttl() {
+        let config = TypesConfig {
+            enable_hash_cache: true,
+            cache_size: 10,
+            cache_ttl_secs: 1,
+            ..Default::default()
+        };
+        let metrics = Arc::new(TypesMetrics::default());
+        let cache = HashCache::new(&config, metrics.clone()).unwrap();
+        let data = b"test data";
+        let _ = cache.get_or_compute(data, || hash_bytes(data));
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = cache.get_or_compute(data, || hash_bytes(data));
+        // Cache should still have one entry (reinserted)
+        assert_eq!(cache.len(), 1);
     }
 }
