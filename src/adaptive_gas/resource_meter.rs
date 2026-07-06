@@ -1,263 +1,138 @@
-//! Resource meter – tracks CPU, IO, NET, and STORAGE consumption.
+//! Resource metering for IONA gas pricing.
 //!
-//! Each resource has a configurable limit per transaction / block,
-//! and the meter accumulates usage linearly. On overflow or exceeding
-//! a limit, it returns a dedicated error.
+//! Tracks usage of CPU, I/O, network, and storage resources.
 
-use std::cmp;
-use thiserror::Error;
+use serde::{Deserialize, Serialize};
 
-// -----------------------------------------------------------------------------
-// Resource dimensions
-// -----------------------------------------------------------------------------
-
-/// Enum representing the four resource dimensions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Resource {
+/// Types of resources that can be metered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ResourceType {
     Cpu,
     Io,
-    Net,
+    Network,
     Storage,
 }
 
-impl Resource {
-    /// Iterator over all resource types.
-    pub const ALL: [Resource; 4] = [Resource::Cpu, Resource::Io, Resource::Net, Resource::Storage];
+impl ResourceType {
+    pub fn to_string(&self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Io => "io",
+            Self::Network => "network",
+            Self::Storage => "storage",
+        }
+    }
 }
 
-// -----------------------------------------------------------------------------
-// Resource usage
-// -----------------------------------------------------------------------------
+impl std::fmt::Display for ResourceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_string())
+    }
+}
 
-/// Accumulated resource usage for a single execution context (transaction).
-#[derive(Debug, Clone, Default)]
+/// Resource usage data for a block or transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceUsage {
-    /// CPU usage in abstract "gas‑equivalent" units (already scaled to gas).
-    pub cpu: u64,
-    /// IO usage (state reads / writes) in gas‑equivalent units.
-    pub io: u64,
-    /// Network usage (bytes transferred) in gas‑equivalent units.
-    pub net: u64,
-    /// Storage usage (bytes written permanently) in gas‑equivalent units.
-    pub storage: u64,
+    pub cpu_used: u64,
+    pub io_used: u64,
+    pub network_used: u64,
+    pub storage_used: u64,
+    pub target_cpu: u64,
+    pub target_io: u64,
+    pub target_network: u64,
+    pub target_storage: u64,
 }
 
 impl ResourceUsage {
-    /// Create a new empty usage.
+    /// Create a new usage with zeros.
+    pub fn zero() -> Self {
+        Self {
+            cpu_used: 0,
+            io_used: 0,
+            network_used: 0,
+            storage_used: 0,
+            target_cpu: 0,
+            target_io: 0,
+            target_network: 0,
+            target_storage: 0,
+        }
+    }
+
+    /// Compute the ratio of used to target for a given resource.
+    pub fn ratio(&self, resource: ResourceType) -> f64 {
+        match resource {
+            ResourceType::Cpu => {
+                if self.target_cpu == 0 {
+                    return 1.0;
+                }
+                self.cpu_used as f64 / self.target_cpu as f64
+            }
+            ResourceType::Io => {
+                if self.target_io == 0 {
+                    return 1.0;
+                }
+                self.io_used as f64 / self.target_io as f64
+            }
+            ResourceType::Network => {
+                if self.target_network == 0 {
+                    return 1.0;
+                }
+                self.network_used as f64 / self.target_network as f64
+            }
+            ResourceType::Storage => {
+                if self.target_storage == 0 {
+                    return 1.0;
+                }
+                self.storage_used as f64 / self.target_storage as f64
+            }
+        }
+    }
+}
+
+/// Meter that tracks resource usage during execution.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceMeter {
+    pub cpu: u64,
+    pub io: u64,
+    pub network: u64,
+    pub storage: u64,
+}
+
+impl ResourceMeter {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Total gas across all resources.
-    pub fn total(&self) -> u64 {
-        self.cpu
-            .saturating_add(self.io)
-            .saturating_add(self.net)
-            .saturating_add(self.storage)
+    pub fn record_cpu(&mut self, amount: u64) {
+        self.cpu = self.cpu.saturating_add(amount);
     }
 
-    /// Add another usage into this one (for block‑level aggregation).
-    pub fn add(&mut self, other: &ResourceUsage) {
-        self.cpu = self.cpu.saturating_add(other.cpu);
-        self.io = self.io.saturating_add(other.io);
-        self.net = self.net.saturating_add(other.net);
-        self.storage = self.storage.saturating_add(other.storage);
+    pub fn record_io(&mut self, amount: u64) {
+        self.io = self.io.saturating_add(amount);
     }
 
-    /// Charge a specific resource with the given amount.
-    pub fn charge(&mut self, resource: Resource, amount: u64) -> Result<(), ResourceError> {
-        let target = match resource {
-            Resource::Cpu => &mut self.cpu,
-            Resource::Io => &mut self.io,
-            Resource::Net => &mut self.net,
-            Resource::Storage => &mut self.storage,
-        };
-        *target = target.checked_add(amount).ok_or(ResourceError::Overflow {
-            resource,
-            current: *target,
-            amount,
-        })?;
-        Ok(())
+    pub fn record_network(&mut self, amount: u64) {
+        self.network = self.network.saturating_add(amount);
     }
 
-    /// Check if any dimension exceeds a given per‑transaction limit.
-    pub fn exceeds(&self, limits: &ResourceLimits) -> Option<Resource> {
-        if self.cpu > limits.max_cpu {
-            return Some(Resource::Cpu);
+    pub fn record_storage(&mut self, amount: u64) {
+        self.storage = self.storage.saturating_add(amount);
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn snapshot(&self) -> ResourceUsage {
+        ResourceUsage {
+            cpu_used: self.cpu,
+            io_used: self.io,
+            network_used: self.network,
+            storage_used: self.storage,
+            target_cpu: 0,
+            target_io: 0,
+            target_network: 0,
+            target_storage: 0,
         }
-        if self.io > limits.max_io {
-            return Some(Resource::Io);
-        }
-        if self.net > limits.max_net {
-            return Some(Resource::Net);
-        }
-        if self.storage > limits.max_storage {
-            return Some(Resource::Storage);
-        }
-        None
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Resource limits
-// -----------------------------------------------------------------------------
-
-/// Per‑transaction resource limits.
-#[derive(Debug, Clone)]
-pub struct ResourceLimits {
-    pub max_cpu: u64,
-    pub max_io: u64,
-    pub max_net: u64,
-    pub max_storage: u64,
-}
-
-impl Default for ResourceLimits {
-    fn default() -> Self {
-        Self {
-            max_cpu: 30_000_000,
-            max_io: 10_000_000,
-            max_net: 5_000_000,
-            max_storage: 20_000_000,
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Resource errors
-// -----------------------------------------------------------------------------
-
-/// Errors that can occur during resource metering.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum ResourceError {
-    #[error("resource limit exceeded: {resource:?} used {used} > max {max}")]
-    LimitExceeded {
-        resource: Resource,
-        used: u64,
-        max: u64,
-    },
-    #[error("resource overflow: {resource:?} at {current}, adding {amount}")]
-    Overflow {
-        resource: Resource,
-        current: u64,
-        amount: u64,
-    },
-}
-
-// -----------------------------------------------------------------------------
-// Resource meter
-// -----------------------------------------------------------------------------
-
-/// Tracks resource usage during VM execution and enforces limits.
-#[derive(Debug, Clone)]
-pub struct ResourceMeter {
-    /// Current usage for this execution context.
-    pub usage: ResourceUsage,
-    /// Per‑transaction limits.
-    pub limits: ResourceLimits,
-    /// Block‑level accumulated usage (for price adjustment).
-    pub block_usage: ResourceUsage,
-}
-
-impl ResourceMeter {
-    /// Create a new meter with the given limits.
-    pub fn new(limits: ResourceLimits) -> Self {
-        Self {
-            usage: ResourceUsage::new(),
-            limits,
-            block_usage: ResourceUsage::new(),
-        }
-    }
-
-    /// Charge a specific resource. Returns an error if the limit is exceeded.
-    pub fn charge(&mut self, resource: Resource, amount: u64) -> Result<(), ResourceError> {
-        self.usage.charge(resource, amount)?;
-        if let Some(exceeded) = self.usage.exceeds(&self.limits) {
-            let used = match exceeded {
-                Resource::Cpu => self.usage.cpu,
-                Resource::Io => self.usage.io,
-                Resource::Net => self.usage.net,
-                Resource::Storage => self.usage.storage,
-            };
-            let max = match exceeded {
-                Resource::Cpu => self.limits.max_cpu,
-                Resource::Io => self.limits.max_io,
-                Resource::Net => self.limits.max_net,
-                Resource::Storage => self.limits.max_storage,
-            };
-            return Err(ResourceError::LimitExceeded {
-                resource: exceeded,
-                used,
-                max,
-            });
-        }
-        Ok(())
-    }
-
-    /// Consume the current usage into the block accumulator and reset.
-    pub fn flush_to_block(&mut self) {
-        self.block_usage.add(&self.usage);
-        self.usage = ResourceUsage::new();
-    }
-
-    /// Reset block accumulator (call at the beginning of a new block).
-    pub fn reset_block(&mut self) {
-        self.block_usage = ResourceUsage::new();
-    }
-
-    /// Get the fraction of block capacity used for a specific resource.
-    pub fn block_utilization(&self, resource: Resource, block_limits: &ResourceLimits) -> f64 {
-        let used = match resource {
-            Resource::Cpu => self.block_usage.cpu,
-            Resource::Io => self.block_usage.io,
-            Resource::Net => self.block_usage.net,
-            Resource::Storage => self.block_usage.storage,
-        };
-        let limit = match resource {
-            Resource::Cpu => block_limits.max_cpu,
-            Resource::Io => block_limits.max_io,
-            Resource::Net => block_limits.max_net,
-            Resource::Storage => block_limits.max_storage,
-        };
-        if limit == 0 {
-            return 1.0;
-        }
-        cmp::min(used, limit) as f64 / limit as f64
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_resource_charge() {
-        let limits = ResourceLimits::default();
-        let mut meter = ResourceMeter::new(limits);
-        meter.charge(Resource::Cpu, 100).unwrap();
-        assert_eq!(meter.usage.cpu, 100);
-    }
-
-    #[test]
-    fn test_resource_limit_exceeded() {
-        let limits = ResourceLimits {
-            max_cpu: 50,
-            ..Default::default()
-        };
-        let mut meter = ResourceMeter::new(limits);
-        meter.charge(Resource::Cpu, 60).unwrap_err();
-    }
-
-    #[test]
-    fn test_block_accumulation() {
-        let limits = ResourceLimits::default();
-        let mut meter = ResourceMeter::new(limits.clone());
-        meter.charge(Resource::Io, 200).unwrap();
-        meter.flush_to_block();
-        assert_eq!(meter.usage.io, 0);
-        assert_eq!(meter.block_usage.io, 200);
     }
 }
