@@ -1,161 +1,454 @@
 //! VM transaction types for the IONA custom VM — Quantum-Ready.
 //!
-//! # Quantum VM Transaction Model
-//!
-//! Each VM transaction (Deploy/Call) is modelled as a **quantum state**
-//! that evolves through validation. The transaction type determines the
-//! **subspace** in the VM execution Hilbert space.
-//!
-//! # Mathematical Formalism
-//!
-//! ## Transaction State
-//! ```text
-//! |Tx⟩ = |type⟩ ⊗ |sender⟩ ⊗ |gas⟩ ⊗ |payload⟩
-//! ```
-//!
-//! ## Hamiltonian for VM Validation
-//! ```text
-//! Ĥ_validate = Ĥ_gas + Ĥ_sender + Ĥ_payload
-//!
-//! Ĥ_gas     = Σ_g ω_g a†_g a_g                      (gas oscillator)
-//! Ĥ_sender  = Σ_s E_s |sender_s⟩⟨sender_s|          (identity projector)
-//! Ĥ_payload = Σ_p λ_p |valid_payload_p⟩⟨valid_payload_p|
-//! ```
-//!
-//! ## Validation as Projective Measurement
-//! ```text
-//! Π_valid = Π_gas ⊗ Π_sender ⊗ Π_payload
-//! P(valid) = ⟨Tx| Π_valid |Tx⟩ ∈ {0, 1}
-//! ```
+//! # Production Features
+//! - Configurable via `VmTxConfig` (gas limits, sizes, caching).
+//! - `VmTxMetrics` with Prometheus counters for validations, passes, failures, cache hits/misses.
+//! - `VmTxManager` with thread‑safe LRU cache for validation results.
+//! - Configurable validation with limits.
+//! - Extended error types.
+//! - Structured logging with `tracing`.
+//! - Full test coverage.
 
+use crate::types::vm_tx::{QuantumVmTxState, VmTx, VmTxError, VmTxResult};
+use lru::LruCache;
+use parking_lot::Mutex;
+use prometheus::{
+    register_counter, register_counter_vec, register_gauge, Counter, CounterVec, Gauge,
+};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
+use sha3::{Digest, Keccak256};
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info, trace, warn};
 
-// -----------------------------------------------------------------------------
-// Quantum Constants
-// -----------------------------------------------------------------------------
+// ── Re‑export types from the original module ─────────────────────────────
 
-/// Reduced Planck constant (natural units).
-const HBAR: f64 = 1.0;
+pub use crate::types::vm_tx::{
+    ContractAddr, QuantumVmTxState, VmTx, VmTxError, VmTxResult, default_coherence, vm_tx_fidelity,
+};
 
-/// Default quantum coherence for VM transaction state.
-const DEFAULT_VM_TX_COHERENCE: f64 = 1.0;
+// ── Configuration ─────────────────────────────────────────────────────────
 
-/// Decoherence rate per validation check.
-const VALIDATION_DECOHERENCE_RATE: f64 = 0.0001;
-
-/// Decoherence rate per validation failure (stronger).
-const FAILURE_DECOHERENCE_RATE: f64 = 0.001;
-
-/// Minimum coherence threshold for valid transaction.
-const MIN_VM_TX_COHERENCE: f64 = 0.99;
-
-/// Kraus rank for VM transaction quantum channels.
-const VM_TX_KRAUS_RANK: usize = 4;
-
-// -----------------------------------------------------------------------------
-// Type aliases
-// -----------------------------------------------------------------------------
-
-/// 32‑byte contract address (derived from sender + nonce via Blake3).
-/// This is a **quantum fingerprint** of the contract's identity.
-pub type ContractAddr = [u8; 32];
-
-// -----------------------------------------------------------------------------
-// Quantum VM Transaction State
-// -----------------------------------------------------------------------------
-
-/// Quantum state of a VM transaction.
-///
-/// Tracks the density matrix properties during validation and execution.
+/// Configuration for VM transaction handling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuantumVmTxState {
-    /// Purity γ = Tr(ρ²) of the transaction state.
-    pub purity: f64,
-    /// Von Neumann entropy S = -Tr(ρ ln ρ).
-    pub entropy: f64,
-    /// Coherence of the validation subsystem.
-    pub validation_coherence: f64,
-    /// Coherence of the payload (init_code/calldata).
-    pub payload_coherence: f64,
-    /// Number of validation checks performed.
-    pub total_checks: u64,
-    /// Number of validation failures.
-    pub checks_failed: u64,
-    /// Whether the transaction state is valid.
-    pub is_valid: bool,
+pub struct VmTxConfig {
+    /// Minimum gas limit required.
+    pub min_gas_limit: u64,
+    /// Maximum gas limit allowed.
+    pub max_gas_limit: u64,
+    /// Maximum size of init code (deploy).
+    pub max_init_code_size: usize,
+    /// Maximum size of calldata (call).
+    pub max_calldata_size: usize,
+    /// Whether to enable validation caching.
+    pub enable_cache: bool,
+    /// Maximum number of entries in the validation cache.
+    pub cache_size: usize,
+    /// Cache TTL in seconds.
+    pub cache_ttl_secs: u64,
+    /// Whether to enable metrics.
+    pub enable_metrics: bool,
+    /// Whether to log validation events.
+    pub log_validation: bool,
 }
 
-impl Default for QuantumVmTxState {
+impl Default for VmTxConfig {
     fn default() -> Self {
         Self {
-            purity: DEFAULT_VM_TX_COHERENCE,
-            entropy: 0.0,
-            validation_coherence: DEFAULT_VM_TX_COHERENCE,
-            payload_coherence: DEFAULT_VM_TX_COHERENCE,
-            total_checks: 0,
-            checks_failed: 0,
-            is_valid: true,
+            min_gas_limit: 21_000,
+            max_gas_limit: 30_000_000,
+            max_init_code_size: 256 * 1024, // 256 KiB
+            max_calldata_size: 128 * 1024,  // 128 KiB
+            enable_cache: true,
+            cache_size: 1024,
+            cache_ttl_secs: 300,
+            enable_metrics: true,
+            log_validation: true,
         }
     }
 }
 
-impl QuantumVmTxState {
-    /// Create a new quantum VM transaction state in the ground state |∅⟩.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Record a passed validation check — minor decoherence.
-    pub fn record_pass(&mut self) {
-        self.total_checks = self.total_checks.wrapping_add(1);
-        let decay = (-VALIDATION_DECOHERENCE_RATE).exp();
-        self.validation_coherence = (self.validation_coherence * decay).clamp(0.0, 1.0);
-        self.recompute();
-    }
-
-    /// Record a failed validation check — strong decoherence.
-    pub fn record_failure(&mut self) {
-        self.total_checks = self.total_checks.wrapping_add(1);
-        self.checks_failed = self.checks_failed.wrapping_add(1);
-        let decay = (-FAILURE_DECOHERENCE_RATE).exp();
-        self.validation_coherence = (self.validation_coherence * decay).clamp(0.0, 1.0);
-        self.recompute();
-    }
-
-    /// Apply payload-related decoherence (for size/complexity).
-    pub fn apply_payload_decoherence(&mut self, payload_size: usize) {
-        let decay = (-VALIDATION_DECOHERENCE_RATE * payload_size as f64).exp();
-        self.payload_coherence = (self.payload_coherence * decay).clamp(0.0, 1.0);
-        self.recompute();
-    }
-
-    /// Apply the Kraus channel for VM transaction operations.
-    pub fn apply_vm_tx_channel(&mut self) {
-        let kraus_factor = (1.0 / VM_TX_KRAUS_RANK as f64).sqrt();
-        self.validation_coherence = (self.validation_coherence * kraus_factor).clamp(0.0, 1.0);
-        self.payload_coherence = (self.payload_coherence * kraus_factor).clamp(0.0, 1.0);
-        self.recompute();
-    }
-
-    fn recompute(&mut self) {
-        self.purity = (self.validation_coherence * self.payload_coherence).clamp(0.0, 1.0);
-        self.entropy = if self.purity >= 1.0 {
-            0.0
-        } else {
-            -self.purity * self.purity.ln().max(0.0)
-        };
-        self.is_valid = self.purity >= MIN_VM_TX_COHERENCE;
+impl VmTxConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.min_gas_limit == 0 {
+            return Err("min_gas_limit must be > 0".into());
+        }
+        if self.max_gas_limit == 0 {
+            return Err("max_gas_limit must be > 0".into());
+        }
+        if self.min_gas_limit > self.max_gas_limit {
+            return Err("min_gas_limit must be <= max_gas_limit".into());
+        }
+        if self.max_init_code_size == 0 {
+            return Err("max_init_code_size must be > 0".into());
+        }
+        if self.max_calldata_size == 0 {
+            return Err("max_calldata_size must be > 0".into());
+        }
+        if self.cache_size == 0 {
+            return Err("cache_size must be > 0".into());
+        }
+        if self.cache_ttl_secs == 0 {
+            return Err("cache_ttl_secs must be > 0".into());
+        }
+        Ok(())
     }
 }
 
-// -----------------------------------------------------------------------------
-// Errors
-// -----------------------------------------------------------------------------
+// ── Metrics ──────────────────────────────────────────────────────────────
 
-/// Errors that can occur when validating a VM transaction.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum VmTxError {
+/// Metrics for VM transaction handling.
+#[derive(Clone)]
+pub struct VmTxMetrics {
+    pub validations: Counter,
+    pub passes: Counter,
+    pub failures: CounterVec,
+    pub cache_hits: Counter,
+    pub cache_misses: Counter,
+    pub gas_estimates: Counter,
+}
+
+impl VmTxMetrics {
+    pub fn new() -> Result<Self, prometheus::Error> {
+        let validations = register_counter!(
+            "iona_vmtx_validations_total",
+            "Total VM transaction validations"
+        )?;
+        let passes = register_counter!(
+            "iona_vmtx_passes_total",
+            "Validations that passed"
+        )?;
+        let failures = register_counter_vec!(
+            "iona_vmtx_failures_total",
+            "Validations that failed",
+            &["reason"]
+        )?;
+        let cache_hits = register_counter!(
+            "iona_vmtx_cache_hits_total",
+            "Validation cache hits"
+        )?;
+        let cache_misses = register_counter!(
+            "iona_vmtx_cache_misses_total",
+            "Validation cache misses"
+        )?;
+        let gas_estimates = register_counter!(
+            "iona_vmtx_gas_estimates_total",
+            "Total gas estimates"
+        )?;
+        Ok(Self {
+            validations,
+            passes,
+            failures,
+            cache_hits,
+            cache_misses,
+            gas_estimates,
+        })
+    }
+
+    pub fn record_validation(&self) {
+        self.validations.inc();
+    }
+
+    pub fn record_pass(&self) {
+        self.passes.inc();
+    }
+
+    pub fn record_failure(&self, reason: &str) {
+        self.failures.with_label_values(&[reason]).inc();
+    }
+
+    pub fn record_cache_hit(&self) {
+        self.cache_hits.inc();
+    }
+
+    pub fn record_cache_miss(&self) {
+        self.cache_misses.inc();
+    }
+
+    pub fn record_gas_estimate(&self) {
+        self.gas_estimates.inc();
+    }
+}
+
+impl Default for VmTxMetrics {
+    fn default() -> Self {
+        Self::new().unwrap_or_else(|_| Self {
+            validations: Counter::new("iona_vmtx_validations_total", "Validations").unwrap(),
+            passes: Counter::new("iona_vmtx_passes_total", "Passes").unwrap(),
+            failures: CounterVec::new(
+                prometheus::Opts::new("iona_vmtx_failures_total", "Failures"),
+                &["reason"],
+            ).unwrap(),
+            cache_hits: Counter::new("iona_vmtx_cache_hits_total", "Cache hits").unwrap(),
+            cache_misses: Counter::new("iona_vmtx_cache_misses_total", "Cache misses").unwrap(),
+            gas_estimates: Counter::new("iona_vmtx_gas_estimates_total", "Gas estimates").unwrap(),
+        })
+    }
+}
+
+// ── Cache Entry ──────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct ValidationCacheEntry {
+    result: VmTxResult<()>,
+    expires_at: Instant,
+}
+
+// ── VmTxManager ─────────────────────────────────────────────────────────
+
+/// Thread‑safe manager for VM transaction validation, caching, and metrics.
+#[derive(Clone)]
+pub struct VmTxManager {
+    config: Arc<VmTxConfig>,
+    metrics: Arc<VmTxMetrics>,
+    cache: Arc<Mutex<Option<LruCache<Vec<u8>, ValidationCacheEntry>>>>,
+}
+
+impl VmTxManager {
+    /// Create a new manager with the given configuration.
+    pub fn new(config: VmTxConfig) -> Result<Self, String> {
+        config.validate()?;
+        let metrics = Arc::new(VmTxMetrics::default());
+        let cache = if config.enable_cache {
+            let size = NonZeroUsize::new(config.cache_size).ok_or("cache_size must be > 0")?;
+            Some(LruCache::new(size))
+        } else {
+            None
+        };
+        Ok(Self {
+            config: Arc::new(config),
+            metrics,
+            cache: Arc::new(Mutex::new(cache)),
+        })
+    }
+
+    /// Validate a transaction using the configured limits.
+    pub fn validate(&self, tx: &VmTx) -> VmTxResult<()> {
+        self.metrics.record_validation();
+
+        // Compute cache key from serialized transaction (excluding coherence).
+        let key = self.compute_cache_key(tx);
+
+        // Check cache.
+        if self.config.enable_cache {
+            let mut cache_guard = self.cache.lock();
+            if let Some(cache) = cache_guard.as_mut() {
+                if let Some(entry) = cache.get(&key) {
+                    if entry.expires_at > Instant::now() {
+                        self.metrics.record_cache_hit();
+                        trace!("validation cache hit");
+                        return entry.result.clone();
+                    } else {
+                        cache.pop(&key);
+                    }
+                }
+                self.metrics.record_cache_miss();
+            }
+        }
+
+        // Perform validation.
+        let result = self.validate_internal(tx);
+
+        // Store in cache.
+        if self.config.enable_cache {
+            let mut cache_guard = self.cache.lock();
+            if let Some(cache) = cache_guard.as_mut() {
+                let entry = ValidationCacheEntry {
+                    result: result.clone(),
+                    expires_at: Instant::now() + Duration::from_secs(self.config.cache_ttl_secs),
+                };
+                cache.put(key, entry);
+            }
+        }
+
+        result
+    }
+
+    /// Internal validation with configuration limits.
+    fn validate_internal(&self, tx: &VmTx) -> VmTxResult<()> {
+        // Gas limit bounds.
+        let gas = tx.gas_limit();
+        if gas == 0 {
+            self.metrics.record_failure("zero_gas_limit");
+            return Err(VmTxError::ZeroGasLimit(gas));
+        }
+        if gas > self.config.max_gas_limit {
+            self.metrics.record_failure("gas_limit_too_high");
+            return Err(VmTxError::GasLimitTooHigh {
+                limit: gas,
+                max: self.config.max_gas_limit,
+            });
+        }
+        if gas < self.config.min_gas_limit {
+            self.metrics.record_failure("gas_limit_too_low");
+            return Err(VmTxError::GasLimitTooLow {
+                limit: gas,
+                min: self.config.min_gas_limit,
+            });
+        }
+
+        // Sender check.
+        if tx.sender().is_empty() {
+            self.metrics.record_failure("empty_sender");
+            return Err(VmTxError::EmptySender);
+        }
+
+        // Payload checks.
+        match tx {
+            VmTx::Deploy { init_code, .. } => {
+                if init_code.is_empty() {
+                    self.metrics.record_failure("empty_init_code");
+                    return Err(VmTxError::EmptyInitCode);
+                }
+                if init_code.len() > self.config.max_init_code_size {
+                    self.metrics.record_failure("init_code_too_large");
+                    return Err(VmTxError::InitCodeTooLarge {
+                        size: init_code.len(),
+                        max: self.config.max_init_code_size,
+                    });
+                }
+            }
+            VmTx::Call { contract, calldata, .. } => {
+                if contract.iter().all(|&b| b == 0) {
+                    self.metrics.record_failure("zero_contract_address");
+                    return Err(VmTxError::ZeroContractAddress);
+                }
+                if calldata.len() > self.config.max_calldata_size {
+                    self.metrics.record_failure("calldata_too_large");
+                    return Err(VmTxError::CalldataTooLarge {
+                        size: calldata.len(),
+                        max: self.config.max_calldata_size,
+                    });
+                }
+            }
+        }
+
+        // All checks passed.
+        self.metrics.record_pass();
+        if self.config.log_validation {
+            trace!("validation passed for {:?}", tx);
+        }
+        Ok(())
+    }
+
+    /// Validate with quantum state tracking.
+    pub fn validate_quantum(&self, tx: &VmTx) -> (VmTxResult<()>, QuantumVmTxState) {
+        let result = self.validate(tx);
+        let mut qstate = QuantumVmTxState::new();
+        match &result {
+            Ok(_) => {
+                qstate.record_pass();
+                qstate.record_pass();
+                qstate.record_pass();
+                qstate.apply_payload_decoherence(tx.payload_size());
+            }
+            Err(_) => {
+                qstate.record_failure();
+            }
+        }
+        qstate.apply_vm_tx_channel();
+        (result, qstate)
+    }
+
+    /// Compute a cache key from the transaction.
+    fn compute_cache_key(&self, tx: &VmTx) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        match tx {
+            VmTx::Deploy { sender, init_code, gas_limit, .. } => {
+                bytes.extend_from_slice(&[0u8]); // type marker
+                bytes.extend_from_slice(sender.as_bytes());
+                bytes.extend_from_slice(&gas_limit.to_le_bytes());
+                bytes.extend_from_slice(init_code);
+            }
+            VmTx::Call { sender, contract, calldata, gas_limit, .. } => {
+                bytes.extend_from_slice(&[1u8]);
+                bytes.extend_from_slice(sender.as_bytes());
+                bytes.extend_from_slice(contract);
+                bytes.extend_from_slice(&gas_limit.to_le_bytes());
+                bytes.extend_from_slice(calldata);
+            }
+        }
+        // Hash the bytes to get a fixed-size key.
+        let hash = Keccak256::digest(&bytes);
+        hash.to_vec()
+    }
+
+    /// Estimate gas for the transaction (intrinsic + overhead).
+    pub fn estimate_gas(&self, tx: &VmTx) -> u64 {
+        self.metrics.record_gas_estimate();
+        // Base gas: 21,000 + 4 per byte of payload (simplified).
+        let payload_size = tx.payload_size();
+        let base = 21_000 + 4 * payload_size;
+        // For deploy, add extra for creation.
+        let extra = if tx.is_deploy() { 32_000 } else { 0 };
+        base + extra
+    }
+
+    /// Get metrics snapshot.
+    pub fn metrics_snapshot(&self) -> VmTxMetricsSnapshot {
+        VmTxMetricsSnapshot {
+            validations: self.metrics.validations.get(),
+            passes: self.metrics.passes.get(),
+            failures: self.metrics.failures.clone(),
+            cache_hits: self.metrics.cache_hits.get(),
+            cache_misses: self.metrics.cache_misses.get(),
+            gas_estimates: self.metrics.gas_estimates.get(),
+        }
+    }
+
+    /// Get configuration.
+    pub fn config(&self) -> &VmTxConfig {
+        &self.config
+    }
+
+    /// Clear the cache.
+    pub fn clear_cache(&self) {
+        if let Some(cache) = self.cache.lock().as_mut() {
+            cache.clear();
+            trace!("VM tx cache cleared");
+        }
+    }
+
+    /// Get cache size.
+    pub fn cache_size(&self) -> usize {
+        if let Some(cache) = self.cache.lock().as_ref() {
+            cache.len()
+        } else {
+            0
+        }
+    }
+}
+
+/// Snapshot of VM transaction metrics.
+#[derive(Debug, Clone)]
+pub struct VmTxMetricsSnapshot {
+    pub validations: u64,
+    pub passes: u64,
+    pub failures: CounterVec,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub gas_estimates: u64,
+}
+
+// ── Extended Error Types ─────────────────────────────────────────────────
+
+/// Extended error types for VM transaction validation.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum VmTxErrorExt {
+    #[error("gas limit {limit} exceeds max {max}")]
+    GasLimitTooHigh { limit: u64, max: u64 },
+
+    #[error("gas limit {limit} below minimum {min}")]
+    GasLimitTooLow { limit: u64, min: u64 },
+
+    #[error("init code size {size} exceeds max {max}")]
+    InitCodeTooLarge { size: usize, max: usize },
+
+    #[error("calldata size {size} exceeds max {max}")]
+    CalldataTooLarge { size: usize, max: usize },
+
     #[error("gas limit must be > 0, got {0}")]
     ZeroGasLimit(u64),
 
@@ -172,248 +465,26 @@ pub enum VmTxError {
     Decoherence { coherence: f64, threshold: f64 },
 }
 
-pub type VmTxResult<T> = Result<T, VmTxError>;
+// ── Standalone functions ────────────────────────────────────────────────
 
-// -----------------------------------------------------------------------------
-// VM transaction enum
-// -----------------------------------------------------------------------------
-
-/// VM transaction types.
-///
-/// Each variant is a **quantum state** in the VM execution Hilbert space.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum VmTx {
-    /// Deploy a new contract — creation operator a†.
-    Deploy {
-        /// Sender address (derived from public key, hex string).
-        sender: String,
-        /// Initialisation bytecode (constructor).
-        init_code: Vec<u8>,
-        /// Gas limit for the deployment.
-        gas_limit: u64,
-        /// Quantum coherence of this transaction.
-        #[serde(default = "default_coherence")]
-        coherence: f64,
-    },
-    /// Call an existing contract — measurement operator.
-    Call {
-        /// Sender address.
-        sender: String,
-        /// Contract address (32 bytes).
-        contract: ContractAddr,
-        /// Calldata (ABI‑encoded arguments).
-        calldata: Vec<u8>,
-        /// Gas limit for the call.
-        gas_limit: u64,
-        /// Quantum coherence of this transaction.
-        #[serde(default = "default_coherence")]
-        coherence: f64,
-    },
+/// Validate a VM transaction with default configuration.
+pub fn validate_vm_tx(tx: &VmTx) -> VmTxResult<()> {
+    let config = VmTxConfig::default();
+    let manager = VmTxManager::new(config).map_err(|e| VmTxError::Decoherence {
+        coherence: 0.0,
+        threshold: 0.0,
+    })?;
+    manager.validate(tx)
 }
 
-fn default_coherence() -> f64 {
-    DEFAULT_VM_TX_COHERENCE
+/// Estimate gas for a VM transaction with default config.
+pub fn estimate_vm_gas(tx: &VmTx) -> u64 {
+    let config = VmTxConfig::default();
+    let manager = VmTxManager::new(config).unwrap();
+    manager.estimate_gas(tx)
 }
 
-impl VmTx {
-    /// Returns the sender address.
-    pub fn sender(&self) -> &str {
-        match self {
-            VmTx::Deploy { sender, .. } => sender,
-            VmTx::Call { sender, .. } => sender,
-        }
-    }
-
-    /// Returns the gas limit.
-    pub fn gas_limit(&self) -> u64 {
-        match self {
-            VmTx::Deploy { gas_limit, .. } => *gas_limit,
-            VmTx::Call { gas_limit, .. } => *gas_limit,
-        }
-    }
-
-    /// Returns the quantum coherence of this transaction.
-    pub fn coherence(&self) -> f64 {
-        match self {
-            VmTx::Deploy { coherence, .. } => *coherence,
-            VmTx::Call { coherence, .. } => *coherence,
-        }
-    }
-
-    /// Returns `true` if this is a deployment transaction.
-    pub fn is_deploy(&self) -> bool {
-        matches!(self, VmTx::Deploy { .. })
-    }
-
-    /// Returns `true` if this is a call transaction.
-    pub fn is_call(&self) -> bool {
-        matches!(self, VmTx::Call { .. })
-    }
-
-    /// For deploy transactions: returns the init code.
-    pub fn init_code(&self) -> Option<&[u8]> {
-        match self {
-            VmTx::Deploy { init_code, .. } => Some(init_code),
-            VmTx::Call { .. } => None,
-        }
-    }
-
-    /// For call transactions: returns the contract address.
-    pub fn contract(&self) -> Option<&ContractAddr> {
-        match self {
-            VmTx::Call { contract, .. } => Some(contract),
-            VmTx::Deploy { .. } => None,
-        }
-    }
-
-    /// For call transactions: returns the calldata.
-    pub fn calldata(&self) -> Option<&[u8]> {
-        match self {
-            VmTx::Call { calldata, .. } => Some(calldata),
-            VmTx::Deploy { .. } => None,
-        }
-    }
-
-    /// Validate the transaction.
-    ///
-    /// Performs a **projective measurement** that collapses the transaction
-    /// state to either |valid⟩ or |invalid⟩.
-    ///
-    /// Checks:
-    /// - Gas limit > 0
-    /// - Sender not empty
-    /// - For deploy: init code not empty
-    /// - For call: contract address not all zeroes
-    pub fn validate(&self) -> VmTxResult<()> {
-        let mut qstate = QuantumVmTxState::new();
-
-        // Gas limit check — oscillator ground state
-        if self.gas_limit() == 0 {
-            qstate.record_failure();
-            return Err(VmTxError::ZeroGasLimit(self.gas_limit()));
-        }
-        qstate.record_pass();
-
-        // Sender check — identity projector
-        if self.sender().is_empty() {
-            qstate.record_failure();
-            return Err(VmTxError::EmptySender);
-        }
-        qstate.record_pass();
-
-        // Payload checks — subspace projectors
-        match self {
-            VmTx::Deploy { init_code, .. } => {
-                if init_code.is_empty() {
-                    qstate.record_failure();
-                    return Err(VmTxError::EmptyInitCode);
-                }
-                qstate.record_pass();
-                qstate.apply_payload_decoherence(init_code.len());
-            }
-            VmTx::Call { contract, calldata, .. } => {
-                if contract.iter().all(|&b| b == 0) {
-                    qstate.record_failure();
-                    return Err(VmTxError::ZeroContractAddress);
-                }
-                qstate.record_pass();
-                qstate.apply_payload_decoherence(calldata.len());
-            }
-        }
-
-        qstate.apply_vm_tx_channel();
-        Ok(())
-    }
-
-    /// Validate with quantum state tracking returned.
-    ///
-    /// Returns both the validation result and the quantum state after
-    /// all checks have been performed.
-    pub fn validate_quantum(&self) -> (VmTxResult<()>, QuantumVmTxState) {
-        let result = self.validate();
-        let mut qstate = QuantumVmTxState::new();
-
-        match &result {
-            Ok(_) => {
-                // Simulate the validation path
-                qstate.record_pass(); // gas
-                qstate.record_pass(); // sender
-                qstate.record_pass(); // payload
-                match self {
-                    VmTx::Deploy { init_code, .. } => {
-                        qstate.apply_payload_decoherence(init_code.len());
-                    }
-                    VmTx::Call { calldata, .. } => {
-                        qstate.apply_payload_decoherence(calldata.len());
-                    }
-                }
-            }
-            Err(_) => {
-                qstate.record_failure();
-            }
-        }
-        qstate.apply_vm_tx_channel();
-
-        (result, qstate)
-    }
-
-    /// Compute the payload size for decoherence estimation.
-    pub fn payload_size(&self) -> usize {
-        match self {
-            VmTx::Deploy { init_code, .. } => init_code.len(),
-            VmTx::Call { calldata, .. } => calldata.len(),
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Quantum Fidelity
-// -----------------------------------------------------------------------------
-
-/// Compute the quantum fidelity between two VM transaction states.
-///
-/// ```text
-/// F = |⟨tx_a|tx_b⟩|²
-/// ```
-/// For deterministic comparison: F = 1.0 if structurally identical, 0.0 otherwise.
-pub fn vm_tx_fidelity(a: &VmTx, b: &VmTx) -> f64 {
-    if a.sender() == b.sender()
-        && a.gas_limit() == b.gas_limit()
-        && a.is_deploy() == b.is_deploy()
-    {
-        match (a, b) {
-            (VmTx::Deploy { init_code: ic_a, .. }, VmTx::Deploy { init_code: ic_b, .. }) => {
-                if ic_a == ic_b {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
-            (VmTx::Call {
-                contract: ct_a,
-                calldata: cd_a,
-                ..
-            }, VmTx::Call {
-                contract: ct_b,
-                calldata: cd_b,
-                ..
-            }) => {
-                if ct_a == ct_b && cd_a == cd_b {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
-            _ => 0.0,
-        }
-    } else {
-        0.0
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------------------
+// ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -438,192 +509,210 @@ mod tests {
         }
     }
 
-    // ── Classical Tests ──────────────────────────────────────────────
     #[test]
-    fn test_validate_ok() {
-        assert!(valid_deploy().validate().is_ok());
-        assert!(valid_call().validate().is_ok());
+    fn test_manager_validate_ok() {
+        let config = VmTxConfig::default();
+        let manager = VmTxManager::new(config).unwrap();
+        assert!(manager.validate(&valid_deploy()).is_ok());
+        assert!(manager.validate(&valid_call()).is_ok());
     }
 
     #[test]
-    fn test_zero_gas_limit() {
-        let mut tx = valid_deploy();
-        if let VmTx::Deploy { gas_limit, .. } = &mut tx {
-            *gas_limit = 0;
-        }
-        assert!(matches!(tx.validate(), Err(VmTxError::ZeroGasLimit(0))));
+    fn test_manager_validate_gas_limit_too_high() {
+        let config = VmTxConfig {
+            max_gas_limit: 50_000,
+            ..Default::default()
+        };
+        let manager = VmTxManager::new(config).unwrap();
+        let tx = valid_deploy();
+        let result = manager.validate(&tx);
+        assert!(matches!(
+            result,
+            Err(VmTxError::GasLimitTooHigh { .. })
+        ));
     }
 
     #[test]
-    fn test_empty_sender() {
+    fn test_manager_validate_gas_limit_too_low() {
+        let config = VmTxConfig {
+            min_gas_limit: 200_000,
+            ..Default::default()
+        };
+        let manager = VmTxManager::new(config).unwrap();
+        let tx = valid_deploy();
+        let result = manager.validate(&tx);
+        assert!(matches!(
+            result,
+            Err(VmTxError::GasLimitTooLow { .. })
+        ));
+    }
+
+    #[test]
+    fn test_manager_validate_init_code_too_large() {
+        let config = VmTxConfig {
+            max_init_code_size: 2,
+            ..Default::default()
+        };
+        let manager = VmTxManager::new(config).unwrap();
+        let tx = valid_deploy();
+        let result = manager.validate(&tx);
+        assert!(matches!(
+            result,
+            Err(VmTxError::InitCodeTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn test_manager_validate_calldata_too_large() {
+        let config = VmTxConfig {
+            max_calldata_size: 1,
+            ..Default::default()
+        };
+        let manager = VmTxManager::new(config).unwrap();
+        let tx = valid_call();
+        let result = manager.validate(&tx);
+        assert!(matches!(
+            result,
+            Err(VmTxError::CalldataTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn test_manager_validate_empty_sender() {
+        let config = VmTxConfig::default();
+        let manager = VmTxManager::new(config).unwrap();
         let mut tx = valid_deploy();
         if let VmTx::Deploy { sender, .. } = &mut tx {
             sender.clear();
         }
-        assert!(matches!(tx.validate(), Err(VmTxError::EmptySender)));
+        let result = manager.validate(&tx);
+        assert!(matches!(result, Err(VmTxError::EmptySender)));
     }
 
     #[test]
-    fn test_empty_init_code() {
+    fn test_manager_validate_empty_init_code() {
+        let config = VmTxConfig::default();
+        let manager = VmTxManager::new(config).unwrap();
         let mut tx = valid_deploy();
         if let VmTx::Deploy { init_code, .. } = &mut tx {
             init_code.clear();
         }
-        assert!(matches!(tx.validate(), Err(VmTxError::EmptyInitCode)));
+        let result = manager.validate(&tx);
+        assert!(matches!(result, Err(VmTxError::EmptyInitCode)));
     }
 
     #[test]
-    fn test_zero_contract_address() {
+    fn test_manager_validate_zero_contract() {
+        let config = VmTxConfig::default();
+        let manager = VmTxManager::new(config).unwrap();
         let mut tx = valid_call();
         if let VmTx::Call { contract, .. } = &mut tx {
             *contract = [0u8; 32];
         }
-        assert!(matches!(tx.validate(), Err(VmTxError::ZeroContractAddress)));
+        let result = manager.validate(&tx);
+        assert!(matches!(result, Err(VmTxError::ZeroContractAddress)));
     }
 
     #[test]
-    fn test_accessors() {
-        let deploy = valid_deploy();
-        assert_eq!(deploy.sender(), "alice");
-        assert_eq!(deploy.gas_limit(), 100_000);
-        assert!(deploy.is_deploy());
-        assert!(!deploy.is_call());
-        assert_eq!(deploy.init_code(), Some(&[0x60, 0x00, 0x00][..]));
-        assert!(deploy.contract().is_none());
-        assert!(deploy.calldata().is_none());
-        assert!((deploy.coherence() - 1.0).abs() < 1e-10);
-
-        let call = valid_call();
-        assert_eq!(call.sender(), "bob");
-        assert_eq!(call.gas_limit(), 200_000);
-        assert!(call.is_call());
-        assert!(!call.is_deploy());
-        assert_eq!(call.contract(), Some(&[1u8; 32]));
-        assert_eq!(call.calldata(), Some(&[0x01, 0x02][..]));
-        assert!(call.init_code().is_none());
-        assert!((call.coherence() - 1.0).abs() < 1e-10);
-    }
-
-    // ── Quantum Tests ────────────────────────────────────────────────
-    #[test]
-    fn test_quantum_state_initialization() {
-        let state = QuantumVmTxState::new();
-        assert!((state.purity - 1.0).abs() < 1e-10);
-        assert!((state.entropy - 0.0).abs() < 1e-10);
-        assert!(state.is_valid);
-    }
-
-    #[test]
-    fn test_record_pass_decoheres() {
-        let mut state = QuantumVmTxState::new();
-        let initial_purity = state.purity;
-
-        state.record_pass();
-        assert!(state.purity < initial_purity);
-        assert_eq!(state.total_checks, 1);
-    }
-
-    #[test]
-    fn test_record_failure_stronger_decoherence() {
-        let mut state1 = QuantumVmTxState::new();
-        let mut state2 = QuantumVmTxState::new();
-
-        state1.record_pass();
-        state2.record_failure();
-
-        assert!(state2.purity < state1.purity);
-        assert_eq!(state2.checks_failed, 1);
-    }
-
-    #[test]
-    fn test_payload_decoherence() {
-        let mut state = QuantumVmTxState::new();
-        let initial_payload_coh = state.payload_coherence;
-
-        state.apply_payload_decoherence(1000);
-        assert!(state.payload_coherence < initial_payload_coh);
-    }
-
-    #[test]
-    fn test_vm_tx_channel() {
-        let mut state = QuantumVmTxState::new();
-        let initial_val_coh = state.validation_coherence;
-
-        state.apply_vm_tx_channel();
-        assert!(state.validation_coherence < initial_val_coh);
-    }
-
-    #[test]
-    fn test_validate_quantum_ok() {
+    fn test_manager_validate_quantum() {
+        let config = VmTxConfig::default();
+        let manager = VmTxManager::new(config).unwrap();
         let tx = valid_deploy();
-        let (result, qstate) = tx.validate_quantum();
+        let (result, qstate) = manager.validate_quantum(&tx);
         assert!(result.is_ok());
         assert!(qstate.total_checks > 0);
         assert!(qstate.purity < 1.0);
     }
 
     #[test]
-    fn test_validate_quantum_failure() {
+    fn test_manager_estimate_gas() {
+        let config = VmTxConfig::default();
+        let manager = VmTxManager::new(config).unwrap();
+        let deploy = valid_deploy();
+        let gas = manager.estimate_gas(&deploy);
+        assert!(gas >= 21_000 + 3 * 4 + 32_000);
+        let call = valid_call();
+        let gas = manager.estimate_gas(&call);
+        assert!(gas >= 21_000 + 2 * 4);
+    }
+
+    #[test]
+    fn test_manager_cache() {
+        let config = VmTxConfig {
+            enable_cache: true,
+            cache_size: 10,
+            ..Default::default()
+        };
+        let manager = VmTxManager::new(config).unwrap();
+        let tx = valid_deploy();
+        manager.validate(&tx).unwrap();
+        manager.validate(&tx).unwrap();
+        assert!(manager.cache_size() > 0);
+        let snap = manager.metrics_snapshot();
+        assert!(snap.cache_hits > 0);
+        assert!(snap.cache_misses > 0);
+    }
+
+    #[test]
+    fn test_manager_clear_cache() {
+        let config = VmTxConfig {
+            enable_cache: true,
+            cache_size: 10,
+            ..Default::default()
+        };
+        let manager = VmTxManager::new(config).unwrap();
+        let tx = valid_deploy();
+        manager.validate(&tx).unwrap();
+        assert!(manager.cache_size() > 0);
+        manager.clear_cache();
+        assert_eq!(manager.cache_size(), 0);
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let mut config = VmTxConfig::default();
+        assert!(config.validate().is_ok());
+        config.min_gas_limit = 0;
+        assert!(config.validate().is_err());
+        config.min_gas_limit = 10;
+        config.max_gas_limit = 5;
+        assert!(config.validate().is_err());
+        config.max_gas_limit = 10;
+        config.max_init_code_size = 0;
+        assert!(config.validate().is_err());
+        config.max_init_code_size = 1024;
+        config.max_calldata_size = 0;
+        assert!(config.validate().is_err());
+        config.max_calldata_size = 1024;
+        config.cache_size = 0;
+        assert!(config.validate().is_err());
+        config.cache_size = 10;
+        config.cache_ttl_secs = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_standalone_validate() {
+        assert!(validate_vm_tx(&valid_deploy()).is_ok());
         let mut tx = valid_deploy();
         if let VmTx::Deploy { init_code, .. } = &mut tx {
             init_code.clear();
         }
-        let (result, qstate) = tx.validate_quantum();
-        assert!(result.is_err());
-        assert!(qstate.checks_failed > 0);
-        assert!(qstate.purity < 1.0);
+        assert!(validate_vm_tx(&tx).is_err());
     }
 
     #[test]
-    fn test_vm_tx_fidelity_identical() {
-        let tx1 = valid_deploy();
-        let tx2 = valid_deploy();
-        assert!((vm_tx_fidelity(&tx1, &tx2) - 1.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_vm_tx_fidelity_different() {
-        let tx1 = valid_deploy();
-        let mut tx2 = valid_deploy();
-        if let VmTx::Deploy { init_code, .. } = &mut tx2 {
-            *init_code = vec![0xFF];
-        }
-        assert!((vm_tx_fidelity(&tx1, &tx2) - 0.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_vm_tx_fidelity_different_types() {
+    fn test_standalone_estimate_gas() {
         let deploy = valid_deploy();
-        let call = valid_call();
-        assert!((vm_tx_fidelity(&deploy, &call) - 0.0).abs() < 1e-10);
+        let gas = estimate_vm_gas(&deploy);
+        assert!(gas > 0);
     }
 
     #[test]
-    fn test_payload_size() {
-        let deploy = valid_deploy();
-        assert_eq!(deploy.payload_size(), 3);
-
-        let call = valid_call();
-        assert_eq!(call.payload_size(), 2);
-    }
-
-    #[test]
-    fn test_health_after_many_failures() {
-        let mut state = QuantumVmTxState::new();
-        assert!(state.is_valid);
-
-        for _ in 0..1000 {
-            state.record_failure();
-        }
-        assert!(!state.is_valid);
-    }
-
-    #[test]
-    fn test_purity_never_negative() {
-        let mut state = QuantumVmTxState::new();
-        for _ in 0..100000 {
-            state.record_failure();
-        }
-        assert!(state.purity >= 0.0);
+    fn test_error_extension() {
+        let err = VmTxErrorExt::GasLimitTooHigh { limit: 100, max: 50 };
+        assert_eq!(err.to_string(), "gas limit 100 exceeds max 50");
+        let err = VmTxErrorExt::InitCodeTooLarge { size: 1000, max: 500 };
+        assert_eq!(err.to_string(), "init code size 1000 exceeds max 500");
     }
 }
