@@ -1,88 +1,34 @@
-//! IONA ChainDB Maintenance Tool
+//! IONA chain database tool – inspect, prune, and compact JSONL chain storage.
 //!
-//! Provides commands to inspect, prune, and compact the chain database.
-//! The database is stored as JSONL (JSON Lines) files for blocks, receipts,
-//! transactions, and logs.
+//! This tool provides operations on the append‑only chain database used by the RPC layer.
+//!
+//! # Commands
+//!
+//! - `info` – print meta information and counts of blocks, receipts, transactions, logs.
+//! - `prune-compact` – keep only the last N blocks, compact the JSONL files and rebuild indices.
+//! - `compact` – rebuild in‑memory state from files and write fresh compacted files.
 //!
 //! # Usage
 //!
-//! ```text
-//! iona-chaindb-tool --chain-db-dir ./chaindb info
-//! iona-chaindb-tool --chain-db-dir ./chaindb prune-compact --keep-blocks 10000
-//! iona-chaindb-tool --chain-db-dir ./chaindb compact --keep-blocks 10000 --dry-run
+//! ```bash
+//! cargo run --bin iona-chaindb-tool -- --chain-db-dir ./chaindb info
+//! cargo run --bin iona-chaindb-tool -- --chain-db-dir ./chaindb prune-compact --keep-blocks 10000
 //! ```
 
 use clap::{Parser, Subcommand};
 use iona::rpc::eth_rpc::EthRpcState;
-use iona::rpc::chain_store::{self, ensure_meta, files, load_jsonl, prune_and_compact};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-use thiserror::Error;
+use tracing::{info, warn};
 
 // -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
-
-/// Default chain database directory.
-const DEFAULT_CHAIN_DB_DIR: &str = "./chaindb";
-
-/// Default number of blocks to keep when pruning.
-const DEFAULT_KEEP_BLOCKS: usize = 10_000;
-
-/// Backup directory suffix format.
-const BACKUP_SUFFIX_FORMAT: &str = "%Y%m%d_%H%M%S";
-
-// -----------------------------------------------------------------------------
-// Errors
-// -----------------------------------------------------------------------------
-
-/// Errors that can occur during tool execution.
-#[derive(Debug, Error)]
-pub enum ToolError {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
-
-    #[error("chain store error: {0}")]
-    ChainStore(#[from] chain_store::ChainStoreError),
-
-    #[error("invalid directory: {0}")]
-    InvalidDirectory(PathBuf),
-
-    #[error("keep_blocks must be > 0, got {0}")]
-    InvalidKeepBlocks(usize),
-
-    #[error("keep_blocks ({keep_blocks}) exceeds total blocks ({total_blocks})")]
-    KeepBlocksExceedsTotal { keep_blocks: usize, total_blocks: usize },
-
-    #[error("backup failed: {0}")]
-    BackupFailed(String),
-
-    #[error("user aborted")]
-    Aborted,
-}
-
-pub type ToolResult<T> = Result<T, ToolError>;
-
-// -----------------------------------------------------------------------------
-// CLI Arguments
+// Command-line arguments
 // -----------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(name = "iona-chaindb-tool")]
-#[command(about = "IONA ChainDB maintenance tool", long_about = None)]
+#[command(name = "iona-chaindb-tool", about = "Inspect and manipulate the IONA chain database")]
 struct Args {
     /// Chain database directory (JSONL files).
-    #[arg(long, default_value = DEFAULT_CHAIN_DB_DIR)]
-    chain_db_dir: PathBuf,
-
-    /// Do not ask for confirmation (dangerous).
-    #[arg(long, default_value_t = false)]
-    force: bool,
+    #[arg(long, default_value = "./chaindb")]
+    chain_db_dir: String,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -90,29 +36,19 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Print metadata and record counts.
+    /// Print meta information and record counts.
     Info,
-
-    /// Prune old blocks and compact files (preserve only last N blocks).
+    /// Prune to keep last N blocks, compact files, and rebuild indices.
     PruneCompact {
-        /// Number of blocks to keep (oldest are removed).
-        #[arg(long, default_value_t = DEFAULT_KEEP_BLOCKS)]
+        /// Number of most recent blocks to keep.
+        #[arg(long, default_value_t = 10_000)]
         keep_blocks: usize,
-
-        /// Show what would be done without actually doing it.
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
     },
-
-    /// Full rebuild: load state, then write fresh compacted files.
+    /// Rebuild in‑memory state from files and then write fresh compacted files.
     Compact {
-        /// Number of blocks to keep.
-        #[arg(long, default_value_t = DEFAULT_KEEP_BLOCKS)]
+        /// Number of most recent blocks to keep.
+        #[arg(long, default_value_t = 10_000)]
         keep_blocks: usize,
-
-        /// Show what would be done without actually doing it.
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
     },
 }
 
@@ -120,165 +56,113 @@ enum Cmd {
 // Main
 // -----------------------------------------------------------------------------
 
-fn main() -> ToolResult<()> {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let dir = &args.chain_db_dir;
 
-    // Validate directory existence for commands that need it
+    // Initialise logging (stderr, plain text for CLI tool).
+    init_logging();
+
+    info!("Starting IONA chain database tool (version {})", env!("CARGO_PKG_VERSION"));
+
     match args.cmd {
         Cmd::Info => {
-            if !dir.exists() {
-                return Err(ToolError::InvalidDirectory(dir.clone()));
-            }
+            cmd_info(&args.chain_db_dir)?;
         }
-        Cmd::PruneCompact { keep_blocks, .. } | Cmd::Compact { keep_blocks, .. } => {
-            if !dir.exists() {
-                return Err(ToolError::InvalidDirectory(dir.clone()));
-            }
-            if keep_blocks == 0 {
-                return Err(ToolError::InvalidKeepBlocks(keep_blocks));
-            }
-            // Check total blocks later
+        Cmd::PruneCompact { keep_blocks } => {
+            cmd_prune_compact(&args.chain_db_dir, keep_blocks)?;
+        }
+        Cmd::Compact { keep_blocks } => {
+            cmd_compact(&args.chain_db_dir, keep_blocks)?;
         }
     }
 
-    match args.cmd {
-        Cmd::Info => cmd_info(dir),
-        Cmd::PruneCompact { keep_blocks, dry_run } => cmd_prune_compact(dir, keep_blocks, dry_run, args.force),
-        Cmd::Compact { keep_blocks, dry_run } => cmd_compact(dir, keep_blocks, dry_run, args.force),
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Helper functions
-// -----------------------------------------------------------------------------
-
-/// Create a timestamped backup directory and copy original files.
-fn create_backup(dir: &Path) -> ToolResult<PathBuf> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let timestamp = chrono::NaiveDateTime::from_timestamp_opt(now as i64, 0)
-        .unwrap()
-        .format(BACKUP_SUFFIX_FORMAT)
-        .to_string();
-    let backup_dir = dir.parent().unwrap_or(Path::new("."))
-        .join(format!("{}_backup_{}", dir.file_name().unwrap_or_default().to_string_lossy(), timestamp));
-    fs::create_dir_all(&backup_dir)?;
-
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() {
-            let dest = backup_dir.join(path.file_name().unwrap());
-            fs::copy(&path, &dest)?;
-        }
-    }
-    Ok(backup_dir)
-}
-
-/// Compute total number of blocks in the database.
-fn count_blocks(dir: &Path) -> ToolResult<usize> {
-    let file_set = files(dir);
-    let reader = BufReader::new(File::open(&file_set.blocks)?);
-    let mut count = 0;
-    for line in reader.lines() {
-        let _ = line?;
-        count += 1;
-    }
-    Ok(count)
-}
-
-/// Ask user for confirmation.
-fn confirm(question: &str) -> ToolResult<bool> {
-    print!("{} [y/N] ", question);
-    std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    Ok(input.trim().eq_ignore_ascii_case("y"))
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
 // Command implementations
 // -----------------------------------------------------------------------------
 
-/// Display metadata and record counts.
-fn cmd_info(dir: &Path) -> ToolResult<()> {
-    let meta = ensure_meta(dir)?;
-    println!("Metadata:");
-    println!("  schema_version:  {}", meta.schema_version);
-    println!("  created_at_unix: {}", meta.created_at_unix);
+/// Print meta information and record counts.
+fn cmd_info(chain_db_dir: &str) -> anyhow::Result<()> {
+    info!("Loading meta from {}", chain_db_dir);
+    let meta = iona::rpc::chain_store::ensure_meta(chain_db_dir)?;
+    println!(
+        "meta: schema_version={}, created_at_unix={}",
+        meta.schema_version, meta.created_at_unix
+    );
 
-    let file_set = files(dir);
-    let blocks: Vec<ionafaston::rpc::eth_rpc::Block> = load_jsonl(&file_set.blocks)?;
-    let receipts: Vec<ionafast::rpc::eth_rpc::Receipt> = load_jsonl(&file_set.receipts)?;
-    let txs: Vec<ionafast::rpc::eth_rpc::TxRecord> = load_jsonl(&file_set.txs)?;
-    let logs: Vec<ionafast::rpc::eth_rpc::Log> = load_jsonl(&file_set.logs)?;
+    let files = iona::rpc::chain_store::files(chain_db_dir);
+    let blocks: Vec<iona::rpc::eth_rpc::Block> =
+        iona::rpc::chain_store::load_jsonl(&files.blocks).unwrap_or_default();
+    let receipts: Vec<iona::rpc::eth_rpc::Receipt> =
+        iona::rpc::chain_store::load_jsonl(&files.receipts).unwrap_or_default();
+    let txs: Vec<iona::rpc::eth_rpc::TxRecord> =
+        iona::rpc::chain_store::load_jsonl(&files.txs).unwrap_or_default();
+    let logs: Vec<iona::rpc::eth_rpc::Log> =
+        iona::rpc::chain_store::load_jsonl(&files.logs).unwrap_or_default();
 
-    println!("Counts:");
-    println!("  blocks:    {}", blocks.len());
-    println!("  receipts:  {}", receipts.len());
-    println!("  txs:       {}", txs.len());
-    println!("  logs:      {}", logs.len());
-
+    println!(
+        "blocks={} receipts={} txs={} logs={}",
+        blocks.len(),
+        receipts.len(),
+        txs.len(),
+        logs.len()
+    );
+    info!("Info command completed");
     Ok(())
 }
 
-/// Prune and compact: remove old blocks, compact files, rebuild indices.
-fn cmd_prune_compact(dir: &Path, keep_blocks: usize, dry_run: bool, force: bool) -> ToolResult<()> {
-    let total_blocks = count_blocks(dir)?;
-    if keep_blocks > total_blocks {
-        return Err(ToolError::KeepBlocksExceedsTotal { keep_blocks, total_blocks });
-    }
-    println!("Current total blocks: {}", total_blocks);
-    println!("Will keep the most recent {} blocks.", keep_blocks);
-    if dry_run {
-        println!("DRY RUN: No changes will be made.");
-        return Ok(());
-    }
+/// Prune and compact the chain database.
+fn cmd_prune_compact(chain_db_dir: &str, keep_blocks: usize) -> anyhow::Result<()> {
+    info!(keep_blocks, "Prune and compact operation started");
+    let mut st = EthRpcState::default();
+    st.chain_db_dir = Some(chain_db_dir.to_string());
 
-    if !force {
-        let backup_dir = create_backup(dir)?;
-        println!("Backup created at: {}", backup_dir.display());
-        if !confirm("Proceed with prune and compact?")? {
-            return Err(ToolError::Aborted);
-        }
-    }
+    info!("Loading state from chain database");
+    iona::rpc::chain_store::load_into_state(chain_db_dir, &mut st)?;
 
-    let mut state = EthRpcState::default();
-    state.chain_db_dir = Some(dir.to_path_buf());
-    chain_store::load_into_state(dir, &mut state)?;
-    chain_store::prune_and_compact(dir, &state, keep_blocks)?;
-    println!("Prune and compact completed successfully.");
+    info!("Pruning and compacting (keeping last {} blocks)", keep_blocks);
+    iona::rpc::chain_store::prune_and_compact(chain_db_dir, &st, keep_blocks)?;
+
+    println!("done");
+    info!("Prune and compact completed");
     Ok(())
 }
 
-/// Full rebuild: load state, then write fresh compacted files.
-fn cmd_compact(dir: &Path, keep_blocks: usize, dry_run: bool, force: bool) -> ToolResult<()> {
-    let total_blocks = count_blocks(dir)?;
-    if keep_blocks > total_blocks {
-        return Err(ToolError::KeepBlocksExceedsTotal { keep_blocks, total_blocks });
-    }
-    println!("Current total blocks: {}", total_blocks);
-    println!("Will keep the most recent {} blocks.", keep_blocks);
-    if dry_run {
-        println!("DRY RUN: No changes will be made.");
-        return Ok(());
-    }
+/// Rebuild the chain database from scratch (compact) without pruning first.
+fn cmd_compact(chain_db_dir: &str, keep_blocks: usize) -> anyhow::Result<()> {
+    info!(keep_blocks, "Compact operation started");
+    let mut st = EthRpcState::default();
+    st.chain_db_dir = Some(chain_db_dir.to_string());
 
-    if !force {
-        let backup_dir = create_backup(dir)?;
-        println!("Backup created at: {}", backup_dir.display());
-        if !confirm("Proceed with full compact? This may take a while.")? {
-            return Err(ToolError::Aborted);
-        }
-    }
+    info!("Loading state from chain database");
+    iona::rpc::chain_store::load_into_state(chain_db_dir, &mut st)?;
 
-    let mut state = EthRpcState::default();
-    state.chain_db_dir = Some(dir.to_path_buf());
-    chain_store::load_into_state(dir, &mut state)?;
-    chain_store::prune_and_compact(dir, &state, keep_blocks)?;
-    println!("Full compact completed successfully.");
+    info!("Compacting (keeping last {} blocks)", keep_blocks);
+    iona::rpc::chain_store::prune_and_compact(chain_db_dir, &st, keep_blocks)?;
+
+    println!("done");
+    info!("Compact completed");
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Logging initialisation (simple text output for CLI)
+// -----------------------------------------------------------------------------
+
+fn init_logging() {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+    // For CLI tool, we use plain text with INFO level by default.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let subscriber = fmt::Subscriber::builder()
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_env_filter(filter)
+        .finish();
+
+    let _ = tracing::subscriber::set_global_default(subscriber);
 }
