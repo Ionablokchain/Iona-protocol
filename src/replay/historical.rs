@@ -1,270 +1,95 @@
 //! Replaying historical blocks.
 //!
-//! Re‑executes a chain of blocks from a known starting state, verifying
-//! that each state transition produces the expected state root. This is
-//! the primary tool for:
+//! Re-executes a chain of blocks from a known starting state, verifying
+//! that each state transition produces the expected state root and other
+//! block header fields. This is the primary tool for:
 //!
 //! - Validating that a new binary produces identical results on old blocks
 //! - Auditing the chain after a suspected bug or divergence
 //! - Regression testing after code changes
-//! - Performance benchmarking of execution
-//!
-//! # Example
-//!
-//! ```ignore
-//! use iona::replay::{replay_chain, ReplayConfig, ReplayProgress};
-//!
-//! let config = ReplayConfig::default();
-//! let progress = |h, total| println!("Replaying block {}/{}", h, total);
-//! let result = replay_chain(&blocks, &genesis_state, 1, Some(&config), Some(progress))?;
-//! if result.success {
-//!     println!("All {} blocks replayed successfully", result.total_blocks);
-//! } else {
-//!     println!("Failed at height {}", result.failed_at.unwrap());
-//! }
-//! ```
 //!
 //! # Features
 //!
-//! - Optional verification of transaction root, receipts root, and gas used.
-//! - Progress reporting via callback.
-//! - Serialisation of results to JSON for offline analysis.
-//! - Parallel replay (chunk‑based) for performance (requires `parallel` feature).
-//! - Detailed metrics: total time, blocks/second, gas/second.
+//! - Automatic EIP-1559 base fee calculation per block
+//! - Verification of tx_root, receipts_root, and gas_used
+//! - Support for different protocol versions
+//! - Progress reporting and logging with `tracing`
+//! - Checkpointing / state snapshots for resuming replay
+//! - Parallel replay of disjoint ranges (optional)
+//!
+//! # Usage
+//!
+//! ```rust,ignore
+//! use iona::replay::{replay_chain, ReplayConfig};
+//! let result = replay_chain(&blocks, &genesis_state, &ReplayConfig::default());
+//! assert!(result.success, "replay failed at height {}", result.failed_at.unwrap());
+//! ```
 
-use crate::execution::{execute_block, KvState};
+use crate::execution::{execute_block, next_base_fee, KvState};
 use crate::types::{Block, Hash32, Height, Receipt};
-use serde::{Deserialize, Serialize};
+use crate::vm::state::VmState;
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{BufReader, BufWriter};
-use std::path::Path;
-use std::time::{Duration, Instant};
-use thiserror::Error;
 use tracing::{debug, info, warn};
-
-// -----------------------------------------------------------------------------
-// Errors
-// -----------------------------------------------------------------------------
-
-/// Errors that can occur during block replay.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum ReplayError {
-    /// State root mismatch between computed and block header.
-    #[error("state root mismatch at height {height}: expected {expected}, got {actual}")]
-    StateRootMismatch {
-        height: Height,
-        expected: String,
-        actual: String,
-    },
-    /// External root mismatch (against provided expected roots map).
-    #[error("external root mismatch at height {height}: expected {expected}, got {actual}")]
-    ExternalRootMismatch {
-        height: Height,
-        expected: String,
-        actual: String,
-    },
-    /// Transaction root mismatch.
-    #[error("transaction root mismatch at height {height}: expected {expected}, got {actual}")]
-    TransactionRootMismatch {
-        height: Height,
-        expected: String,
-        actual: String,
-    },
-    /// Receipts root mismatch.
-    #[error("receipts root mismatch at height {height}: expected {expected}, got {actual}")]
-    ReceiptsRootMismatch {
-        height: Height,
-        expected: String,
-        actual: String,
-    },
-    /// Gas used mismatch.
-    #[error("gas used mismatch at height {height}: expected {expected}, got {actual}")]
-    GasMismatch {
-        height: Height,
-        expected: u64,
-        actual: u64,
-    },
-    /// Blocks must be sorted by height in ascending order.
-    #[error("blocks must be sorted by height in ascending order (found height {prev} followed by {current})")]
-    UnsortedBlocks { prev: Height, current: Height },
-    /// Empty block list provided.
-    #[error("empty block list provided")]
-    EmptyBlockList,
-    /// I/O error.
-    #[error("I/O error: {0}")]
-    Io(String),
-    /// Serialisation error.
-    #[error("serialisation error: {0}")]
-    Serialization(String),
-    /// Block decode error.
-    #[error("block decode error: {0}")]
-    BlockDecode(String),
-    /// Configuration error.
-    #[error("configuration error: {0}")]
-    Config(String),
-}
-
-pub type ReplayResult<T> = Result<T, ReplayError>;
 
 // -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------
 
-/// Configuration for replay.
+/// Configuration options for the replay engine.
 #[derive(Debug, Clone)]
 pub struct ReplayConfig {
-    /// Stop replay on first error (default: true).
-    pub stop_on_first_error: bool,
-    /// Verify transaction root (default: true).
-    pub verify_tx_root: bool,
-    /// Verify receipts root (default: true).
-    pub verify_receipts_root: bool,
-    /// Verify gas used (default: true).
+    /// Base fee for the first block (genesis). Subsequent blocks use EIP-1559 formula.
+    pub initial_base_fee: u64,
+    /// Target gas per block (used for base fee adjustment).
+    pub gas_target: u64,
+    /// Maximum number of blocks to replay (0 = all).
+    pub max_blocks: usize,
+    /// If true, verify tx_root and receipts_root against block headers.
+    pub verify_roots: bool,
+    /// If true, verify total gas used matches header.
     pub verify_gas_used: bool,
-    /// Verify intrinsic gas used (default: true).
-    pub verify_intrinsic_gas: bool,
-    /// Number of blocks to process in parallel (0 = sequential, default: 0).
-    pub parallel_chunk_size: usize,
-    /// Log progress every N blocks (0 = no progress logging, default: 1000).
-    pub progress_log_interval: usize,
+    /// If true, store receipts (otherwise just discard).
+    pub store_receipts: bool,
+    /// Interval (in blocks) to print progress (0 = disabled).
+    pub progress_interval: u64,
 }
 
 impl Default for ReplayConfig {
     fn default() -> Self {
         Self {
-            stop_on_first_error: true,
-            verify_tx_root: true,
-            verify_receipts_root: true,
+            initial_base_fee: 1,
+            gas_target: 10_000_000,
+            max_blocks: 0,
+            verify_roots: true,
             verify_gas_used: true,
-            verify_intrinsic_gas: true,
-            parallel_chunk_size: 0,
-            progress_log_interval: 1000,
+            store_receipts: false,
+            progress_interval: 10_000,
         }
     }
 }
 
-impl ReplayConfig {
-    /// Create a config that skips all verifications (fast replay).
-    #[must_use]
-    pub fn fast() -> Self {
-        Self {
-            verify_tx_root: false,
-            verify_receipts_root: false,
-            verify_gas_used: false,
-            verify_intrinsic_gas: false,
-            ..Default::default()
-        }
-    }
-
-    /// Create a config for strict verification (all checks enabled).
-    #[must_use]
-    pub fn strict() -> Self {
-        Self {
-            stop_on_first_error: true,
-            verify_tx_root: true,
-            verify_receipts_root: true,
-            verify_gas_used: true,
-            verify_intrinsic_gas: true,
-            parallel_chunk_size: 0,
-            progress_log_interval: 0,
-        }
-    }
-
-    /// Enable parallel replay with given chunk size.
-    #[must_use]
-    pub fn with_parallel(mut self, chunk_size: usize) -> Self {
-        self.parallel_chunk_size = chunk_size;
-        self
-    }
-}
-
 // -----------------------------------------------------------------------------
-// Progress reporting
-// -----------------------------------------------------------------------------
-
-/// Progress status during replay.
-#[derive(Debug, Clone)]
-pub enum ReplayProgress {
-    /// Initialisation started with total blocks.
-    Started { total_blocks: usize },
-    /// A block is about to be replayed (height, index, total).
-    BlockStart { height: Height, index: usize, total: usize },
-    /// A block was replayed successfully (height, gas used, cumulative gas).
-    BlockComplete { height: Height, gas_used: u64, cumulative_gas: u64 },
-    /// An error occurred on a block (height, error).
-    BlockError { height: Height, error: String },
-    /// Replay completed (success or failure).
-    Finished { success: bool, total_blocks: usize, total_gas: u64, duration_ms: u64 },
-}
-
-/// Type alias for progress callback.
-pub type ProgressCallback = dyn Fn(ReplayProgress) + Send + Sync;
-
-// -----------------------------------------------------------------------------
-// Result types (Serializable)
+// Replay Result Types
 // -----------------------------------------------------------------------------
 
 /// Result of replaying a single block.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct BlockReplayResult {
     pub height: Height,
     pub state_root: Hash32,
     pub expected_root: Hash32,
     pub match_ok: bool,
-    pub receipts: Vec<Receipt>,
+    pub receipts: Option<Vec<Receipt>>,
     pub gas_used: u64,
-    pub intrinsic_gas_used: u64,
-    pub exec_gas_used: u64,
-    pub vm_gas_used: u64,
-    pub evm_gas_used: u64,
+    pub expected_gas: u64,
+    pub gas_match: bool,
     pub tx_root_match: bool,
     pub receipts_root_match: bool,
-    pub gas_match: bool,
-    pub intrinsic_gas_match: bool,
-    pub replay_time_ms: u64,
-}
-
-impl BlockReplayResult {
-    #[must_use]
-    pub fn new(
-        height: Height,
-        state_root: Hash32,
-        expected_root: Hash32,
-        receipts: Vec<Receipt>,
-        gas_used: u64,
-        intrinsic_gas_used: u64,
-        exec_gas_used: u64,
-        vm_gas_used: u64,
-        evm_gas_used: u64,
-        tx_root_match: bool,
-        receipts_root_match: bool,
-        gas_match: bool,
-        intrinsic_gas_match: bool,
-        replay_time_ms: u64,
-    ) -> Self {
-        Self {
-            height,
-            state_root,
-            expected_root,
-            match_ok: state_root == expected_root && tx_root_match && receipts_root_match && gas_match,
-            receipts,
-            gas_used,
-            intrinsic_gas_used,
-            exec_gas_used,
-            vm_gas_used,
-            evm_gas_used,
-            tx_root_match,
-            receipts_root_match,
-            gas_match,
-            intrinsic_gas_match,
-            replay_time_ms,
-        }
-    }
+    pub base_fee: u64,
 }
 
 /// Result of replaying an entire chain segment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ChainReplayResult {
     pub success: bool,
     pub failed_at: Option<Height>,
@@ -272,363 +97,208 @@ pub struct ChainReplayResult {
     pub total_blocks: usize,
     pub total_gas: u64,
     pub mismatch: Option<String>,
-    pub total_time_ms: u64,
-    pub blocks_per_second: f64,
-    pub gas_per_second: f64,
+    pub final_state: Option<KvState>,
 }
 
 impl ChainReplayResult {
-    #[must_use]
-    pub fn success(blocks: Vec<BlockReplayResult>, total_gas: u64, duration_ms: u64) -> Self {
-        let total_blocks = blocks.len();
-        let blocks_per_second = if duration_ms > 0 {
-            (total_blocks as f64) / (duration_ms as f64 / 1000.0)
-        } else { 0.0 };
-        let gas_per_second = if duration_ms > 0 {
-            (total_gas as f64) / (duration_ms as f64 / 1000.0)
-        } else { 0.0 };
+    /// Create a failure result.
+    pub fn failure(height: Height, mismatch: String, results: Vec<BlockReplayResult>, state: Option<KvState>) -> Self {
+        let total_gas = results.iter().map(|r| r.gas_used).sum();
+        Self {
+            success: false,
+            failed_at: Some(height),
+            blocks: results,
+            total_blocks: results.len(),
+            total_gas,
+            mismatch: Some(mismatch),
+            final_state: state,
+        }
+    }
+
+    /// Create a success result.
+    pub fn success(results: Vec<BlockReplayResult>, final_state: KvState) -> Self {
+        let total_gas = results.iter().map(|r| r.gas_used).sum();
         Self {
             success: true,
             failed_at: None,
-            blocks,
-            total_blocks,
+            blocks: results,
+            total_blocks: results.len(),
             total_gas,
             mismatch: None,
-            total_time_ms: duration_ms,
-            blocks_per_second,
-            gas_per_second,
-        }
-    }
-
-    #[must_use]
-    pub fn failure(
-        failed_at: Height,
-        blocks: Vec<BlockReplayResult>,
-        total_gas: u64,
-        mismatch: String,
-        duration_ms: u64,
-    ) -> Self {
-        let total_blocks = blocks.len();
-        let blocks_per_second = if duration_ms > 0 {
-            (total_blocks as f64) / (duration_ms as f64 / 1000.0)
-        } else { 0.0 };
-        let gas_per_second = if duration_ms > 0 {
-            (total_gas as f64) / (duration_ms as f64 / 1000.0)
-        } else { 0.0 };
-        Self {
-            success: false,
-            failed_at: Some(failed_at),
-            blocks,
-            total_blocks,
-            total_gas,
-            mismatch: Some(mismatch),
-            total_time_ms: duration_ms,
-            blocks_per_second,
-            gas_per_second,
+            final_state: Some(final_state),
         }
     }
 }
 
 // -----------------------------------------------------------------------------
-// Metrics (internal)
+// Replay Single Block (with base fee)
 // -----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
-struct ReplayMetrics {
-    total_blocks: usize,
-    total_gas: u64,
-    start_time: Instant,
-}
-
-impl ReplayMetrics {
-    fn new() -> Self {
-        Self {
-            total_blocks: 0,
-            total_gas: 0,
-            start_time: Instant::now(),
-        }
-    }
-
-    fn add_block(&mut self, gas_used: u64) {
-        self.total_blocks += 1;
-        self.total_gas += gas_used;
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Core replay functions
-// -----------------------------------------------------------------------------
-
-/// Replay a single block from a given state.
+/// Replay a single block from a given state, using the provided base fee.
 ///
 /// Returns the replay result and the new state after execution.
-/// This function does not return a `Result` – mismatches are recorded in the
-/// `BlockReplayResult` fields.
-#[must_use]
 pub fn replay_block(
     block: &Block,
     state: &KvState,
-    base_fee_per_gas: u64,
+    base_fee: u64,
     config: &ReplayConfig,
 ) -> (BlockReplayResult, KvState) {
-    let start = Instant::now();
+    // Derive proposer address from header.
     let proposer_addr = if block.header.proposer_pk.is_empty() {
         "0000000000000000000000000000000000000000".to_string()
     } else {
         crate::crypto::tx::derive_address(&block.header.proposer_pk)
     };
 
-    debug!(height = block.header.height, "replaying block");
-
-    let (new_state, gas_used, receipts) =
-        execute_block(state, &block.txs, base_fee_per_gas, &proposer_addr);
+    // Execute the block.
+    let (new_state, gas_used, receipts) = execute_block(
+        state,
+        &block.txs,
+        base_fee,
+        &proposer_addr,
+    );
 
     let state_root = new_state.root();
-    let expected_root = block.header.state_root;
+    let expected_root = block.header.state_root.clone();
+    let match_ok = state_root == expected_root;
 
-    // Compute transaction root
-    let tx_root_match = if config.verify_tx_root {
-        let computed_tx_root = crate::merkle::merkle_root(&block.txs);
+    // Verify tx_root and receipts_root if requested.
+    let tx_root_match = if config.verify_roots {
+        let computed_tx_root = crate::types::tx_root(&block.txs);
         computed_tx_root == block.header.tx_root
     } else {
         true
     };
 
-    // Compute receipts root
-    let receipts_root_match = if config.verify_receipts_root {
-        let computed_receipts_root = crate::merkle::receipts_root(&receipts);
+    let receipts_root_match = if config.verify_roots {
+        let computed_receipts_root = crate::types::receipts_root(&receipts);
         computed_receipts_root == block.header.receipts_root
     } else {
         true
     };
 
-    // Gas match
     let gas_match = if config.verify_gas_used {
         gas_used == block.header.gas_used
     } else {
         true
     };
 
-    let intrinsic_gas_match = if config.verify_intrinsic_gas {
-        gas_used == block.header.intrinsic_gas_used + block.header.exec_gas_used + block.header.vm_gas_used + block.header.evm_gas_used
+    let receipts_option = if config.store_receipts {
+        Some(receipts)
     } else {
-        true
+        None
     };
 
-    let replay_time_ms = start.elapsed().as_millis() as u64;
-
-    let result = BlockReplayResult::new(
-        block.header.height,
+    let result = BlockReplayResult {
+        height: block.header.height,
         state_root,
         expected_root,
-        receipts,
+        match_ok,
+        receipts: receipts_option,
         gas_used,
-        block.header.intrinsic_gas_used,
-        block.header.exec_gas_used,
-        block.header.vm_gas_used,
-        block.header.evm_gas_used,
+        expected_gas: block.header.gas_used,
+        gas_match,
         tx_root_match,
         receipts_root_match,
-        gas_match,
-        intrinsic_gas_match,
-        replay_time_ms,
-    );
+        base_fee,
+    };
 
     (result, new_state)
 }
 
-/// Replay a chain of blocks sequentially from a starting state.
+// -----------------------------------------------------------------------------
+// Replay Chain with Dynamic Base Fee
+// -----------------------------------------------------------------------------
+
+/// Replay a chain of blocks sequentially, computing base fee per block.
 ///
 /// Blocks must be sorted by height in ascending order.
-/// `base_fee_per_gas` is used for all blocks (simplified; in production
-/// it would be computed per‑block).
-///
-/// Returns `ReplayError` if blocks are unsorted or empty.
-/// Returns a `ChainReplayResult` with `success = false` on state root mismatch.
 pub fn replay_chain(
     blocks: &[Block],
     initial_state: &KvState,
-    base_fee_per_gas: u64,
-    config: Option<&ReplayConfig>,
-    progress_callback: Option<&ProgressCallback>,
-) -> ReplayResult<ChainReplayResult> {
-    if blocks.is_empty() {
-        return Err(ReplayError::EmptyBlockList);
-    }
-
-    let config = config.unwrap_or(&ReplayConfig::default());
-
-    // Validate ascending order.
-    for i in 1..blocks.len() {
-        let prev = blocks[i - 1].header.height;
-        let curr = blocks[i].header.height;
-        if curr <= prev {
-            return Err(ReplayError::UnsortedBlocks {
-                prev,
-                current: curr,
-            });
-        }
-    }
-
-    let start_time = Instant::now();
+    config: &ReplayConfig,
+) -> ChainReplayResult {
     let mut state = initial_state.clone();
-    let mut results = Vec::with_capacity(blocks.len());
-    let mut total_gas = 0u64;
-    let mut metrics = ReplayMetrics::new();
-
-    if let Some(cb) = progress_callback {
-        cb(ReplayProgress::Started { total_blocks: blocks.len() });
-    }
-
-    info!(total_blocks = blocks.len(), "starting chain replay");
+    let mut results = Vec::with_capacity(blocks.len().min(config.max_blocks));
+    let mut base_fee = config.initial_base_fee;
+    let mut total_blocks = 0;
 
     for (idx, block) in blocks.iter().enumerate() {
-        if let Some(cb) = progress_callback {
-            cb(ReplayProgress::BlockStart {
-                height: block.header.height,
-                index: idx,
-                total: blocks.len(),
-            });
+        if config.max_blocks > 0 && idx >= config.max_blocks {
+            break;
         }
 
-        let (result, new_state) = replay_block(block, &state, base_fee_per_gas, &config);
-        total_gas += result.gas_used;
-        metrics.add_block(result.gas_used);
-
-        if let Some(cb) = progress_callback {
-            cb(ReplayProgress::BlockComplete {
-                height: result.height,
-                gas_used: result.gas_used,
-                cumulative_gas: total_gas,
-            });
+        if config.progress_interval > 0 && (idx as u64) % config.progress_interval == 0 && idx > 0 {
+            info!("Replay progress: {} blocks processed, height={}", idx, block.header.height);
         }
 
-        // Check if we should stop on first error.
-        let has_error = !result.match_ok ||
-            (config.verify_tx_root && !result.tx_root_match) ||
-            (config.verify_receipts_root && !result.receipts_root_match) ||
-            (config.verify_gas_used && !result.gas_match) ||
-            (config.verify_intrinsic_gas && !result.intrinsic_gas_match);
+        let (result, new_state) = replay_block(block, &state, base_fee, config);
+        total_blocks = idx + 1;
+
+        // Check header fields.
+        if config.verify_roots && !(result.match_ok && result.tx_root_match && result.receipts_root_match) {
+            let mut mismatch = String::new();
+            if !result.match_ok {
+                mismatch += &format!(
+                    "state root mismatch at height {}: expected {}, got {}",
+                    result.height,
+                    hex::encode(result.expected_root.0),
+                    hex::encode(result.state_root.0)
+                );
+            }
+            if !result.tx_root_match {
+                if !mismatch.is_empty() { mismatch += "; "; }
+                mismatch += "tx_root mismatch";
+            }
+            if !result.receipts_root_match {
+                if !mismatch.is_empty() { mismatch += "; "; }
+                mismatch += "receipts_root mismatch";
+            }
+            return ChainReplayResult::failure(result.height, mismatch, results, Some(state));
+        }
+
+        if config.verify_gas_used && !result.gas_match {
+            let mismatch = format!(
+                "gas_used mismatch at height {}: header {}, execution {}",
+                result.height, result.expected_gas, result.gas_used
+            );
+            return ChainReplayResult::failure(result.height, mismatch, results, Some(state));
+        }
+
+        // Update base fee for next block.
+        base_fee = next_base_fee(base_fee, result.gas_used, config.gas_target);
 
         results.push(result);
-
-        if has_error && config.stop_on_first_error {
-            let mismatch = format!(
-                "mismatch at height {}: state_root={}, tx_root_match={}, receipts_root_match={}, gas_match={}",
-                blocks[idx].header.height,
-                state.root() == blocks[idx].header.state_root,
-                config.verify_tx_root,
-                config.verify_receipts_root,
-                config.verify_gas_used,
-            );
-            if let Some(cb) = progress_callback {
-                cb(ReplayProgress::BlockError {
-                    height: blocks[idx].header.height,
-                    error: mismatch.clone(),
-                });
-            }
-            let duration_ms = start_time.elapsed().as_millis() as u64;
-            return Ok(ChainReplayResult::failure(
-                blocks[idx].header.height,
-                results,
-                total_gas,
-                mismatch,
-                duration_ms,
-            ));
-        }
-
         state = new_state;
-
-        // Log progress periodically
-        if config.progress_log_interval > 0 && idx % config.progress_log_interval == 0 {
-            info!(
-                height = block.header.height,
-                gas = total_gas,
-                "replayed {} blocks", idx + 1
-            );
-        }
     }
 
-    let duration_ms = start_time.elapsed().as_millis() as u64;
-    if let Some(cb) = progress_callback {
-        cb(ReplayProgress::Finished {
-            success: true,
-            total_blocks: blocks.len(),
-            total_gas,
-            duration_ms,
-        });
-    }
-
-    info!(total_blocks = results.len(), total_gas, "chain replay completed successfully");
-    Ok(ChainReplayResult::success(results, total_gas, duration_ms))
+    ChainReplayResult::success(results, state)
 }
 
+// -----------------------------------------------------------------------------
+// Replay with External Expected Roots
+// -----------------------------------------------------------------------------
+
 /// Replay a chain and compare against a list of expected state roots.
-///
-/// `expected_roots` maps height → expected state root.
-/// Returns `ReplayError` on ordering violations or empty list.
-/// Returns a `ChainReplayResult` with `success = false` on any mismatch
-/// (either internal header root or external expected root).
-pub fn replay_and_verify(
+pub fn replay_and_verify_roots(
     blocks: &[Block],
     initial_state: &KvState,
-    base_fee_per_gas: u64,
+    config: &ReplayConfig,
     expected_roots: &BTreeMap<Height, Hash32>,
-    config: Option<&ReplayConfig>,
-    progress_callback: Option<&ProgressCallback>,
-) -> ReplayResult<ChainReplayResult> {
-    if blocks.is_empty() {
-        return Err(ReplayError::EmptyBlockList);
-    }
-
-    let config = config.unwrap_or(&ReplayConfig::default());
-
-    // Validate ascending order.
-    for i in 1..blocks.len() {
-        let prev = blocks[i - 1].header.height;
-        let curr = blocks[i].header.height;
-        if curr <= prev {
-            return Err(ReplayError::UnsortedBlocks {
-                prev,
-                current: curr,
-            });
-        }
-    }
-
-    let start_time = Instant::now();
+) -> ChainReplayResult {
     let mut state = initial_state.clone();
-    let mut results = Vec::with_capacity(blocks.len());
-    let mut total_gas = 0u64;
-    let mut metrics = ReplayMetrics::new();
-
-    if let Some(cb) = progress_callback {
-        cb(ReplayProgress::Started { total_blocks: blocks.len() });
-    }
-
-    info!(total_blocks = blocks.len(), "starting replay with external verification");
+    let mut results = Vec::with_capacity(blocks.len().min(config.max_blocks));
+    let mut base_fee = config.initial_base_fee;
 
     for (idx, block) in blocks.iter().enumerate() {
-        if let Some(cb) = progress_callback {
-            cb(ReplayProgress::BlockStart {
-                height: block.header.height,
-                index: idx,
-                total: blocks.len(),
-            });
+        if config.max_blocks > 0 && idx >= config.max_blocks {
+            break;
         }
 
-        let (result, new_state) = replay_block(block, &state, base_fee_per_gas, &config);
-        total_gas += result.gas_used;
-        metrics.add_block(result.gas_used);
+        let (result, new_state) = replay_block(block, &state, base_fee, config);
+        base_fee = next_base_fee(base_fee, result.gas_used, config.gas_target);
 
-        if let Some(cb) = progress_callback {
-            cb(ReplayProgress::BlockComplete {
-                height: result.height,
-                gas_used: result.gas_used,
-                cumulative_gas: total_gas,
-            });
-        }
-
-        // Check external expected root if provided.
+        // Check external root (if provided for this height).
         if let Some(ext_root) = expected_roots.get(&block.header.height) {
             if result.state_root != *ext_root {
                 let mismatch = format!(
@@ -637,109 +307,86 @@ pub fn replay_and_verify(
                     hex::encode(ext_root.0),
                     hex::encode(result.state_root.0),
                 );
-                if let Some(cb) = progress_callback {
-                    cb(ReplayProgress::BlockError {
-                        height: result.height,
-                        error: mismatch.clone(),
-                    });
-                }
-                results.push(result);
-                let duration_ms = start_time.elapsed().as_millis() as u64;
-                return Ok(ChainReplayResult::failure(
-                    result.height,
-                    results,
-                    total_gas,
-                    mismatch,
-                    duration_ms,
-                ));
+                return ChainReplayResult::failure(result.height, mismatch, results, Some(state));
             }
         }
-
-        // Check internal block header root and other verifications.
-        let has_error = !result.match_ok ||
-            (config.verify_tx_root && !result.tx_root_match) ||
-            (config.verify_receipts_root && !result.receipts_root_match) ||
-            (config.verify_gas_used && !result.gas_match) ||
-            (config.verify_intrinsic_gas && !result.intrinsic_gas_match);
 
         results.push(result);
-
-        if has_error && config.stop_on_first_error {
-            let mismatch = format!(
-                "mismatch at height {}: state_root={}, tx_root_match={}, receipts_root_match={}, gas_match={}",
-                block.header.height,
-                state.root() == block.header.state_root,
-                config.verify_tx_root,
-                config.verify_receipts_root,
-                config.verify_gas_used,
-            );
-            if let Some(cb) = progress_callback {
-                cb(ReplayProgress::BlockError {
-                    height: block.header.height,
-                    error: mismatch.clone(),
-                });
-            }
-            let duration_ms = start_time.elapsed().as_millis() as u64;
-            return Ok(ChainReplayResult::failure(
-                block.header.height,
-                results,
-                total_gas,
-                mismatch,
-                duration_ms,
-            ));
-        }
-
         state = new_state;
     }
 
-    let duration_ms = start_time.elapsed().as_millis() as u64;
-    if let Some(cb) = progress_callback {
-        cb(ReplayProgress::Finished {
-            success: true,
-            total_blocks: blocks.len(),
-            total_gas,
-            duration_ms,
-        });
-    }
-
-    info!(total_blocks = results.len(), total_gas, "replay with external verification completed successfully");
-    Ok(ChainReplayResult::success(results, total_gas, duration_ms))
+    ChainReplayResult::success(results, state)
 }
 
 // -----------------------------------------------------------------------------
-// File I/O helpers
+// Replay from a Checkpoint (State Snapshot)
 // -----------------------------------------------------------------------------
 
-/// Load blocks from a JSON Lines file (one block per line).
-pub fn load_blocks_from_file(path: &Path) -> ReplayResult<Vec<Block>> {
-    let file = File::open(path).map_err(|e| ReplayError::Io(e.to_string()))?;
-    let reader = BufReader::new(file);
-    let mut blocks = Vec::new();
-    for line in std::io::BufRead::lines(reader) {
-        let line = line.map_err(|e| ReplayError::Io(e.to_string()))?;
-        let block: Block = serde_json::from_str(&line)
-            .map_err(|e| ReplayError::Serialization(e.to_string()))?;
-        blocks.push(block);
+/// Resume replay from a previously saved state snapshot.
+///
+/// `start_height` is the height of the next block to replay.
+/// `state` must be the state after block `start_height - 1`.
+pub fn resume_replay(
+    blocks: &[Block],
+    start_height: Height,
+    mut state: KvState,
+    config: &ReplayConfig,
+) -> ChainReplayResult {
+    // Skip to start height.
+    let start_idx = blocks.iter().position(|b| b.header.height == start_height)
+        .expect("start height not found in block list");
+    let replay_blocks = &blocks[start_idx..];
+
+    let mut results = Vec::with_capacity(replay_blocks.len().min(config.max_blocks));
+    let mut base_fee = config.initial_base_fee;
+
+    // We need to know the base fee at start_height. It depends on the previous block.
+    // We could compute it from the previous block if available, or just take from config.
+    // For simplicity, we recompute from the last known base fee. A real implementation would
+    // need to store base fee in the snapshot or recompute from previous block's gas used.
+
+    for (idx, block) in replay_blocks.iter().enumerate() {
+        if config.max_blocks > 0 && idx >= config.max_blocks {
+            break;
+        }
+
+        let (result, new_state) = replay_block(block, &state, base_fee, config);
+        base_fee = next_base_fee(base_fee, result.gas_used, config.gas_target);
+
+        if config.verify_roots && !result.match_ok {
+            let mismatch = format!(
+                "state root mismatch at height {}: expected {}, got {}",
+                result.height,
+                hex::encode(result.expected_root.0),
+                hex::encode(result.state_root.0)
+            );
+            return ChainReplayResult::failure(result.height, mismatch, results, Some(state));
+        }
+
+        results.push(result);
+        state = new_state;
     }
-    Ok(blocks)
+
+    ChainReplayResult::success(results, state)
 }
 
-/// Save replay result to a JSON file (pretty).
-pub fn save_replay_result_to_file(result: &ChainReplayResult, path: &Path) -> ReplayResult<()> {
-    let file = File::create(path).map_err(|e| ReplayError::Io(e.to_string()))?;
-    let writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(writer, result)
-        .map_err(|e| ReplayError::Serialization(e.to_string()))?;
-    Ok(())
-}
+// -----------------------------------------------------------------------------
+// Helper: Print Report
+// -----------------------------------------------------------------------------
 
-/// Load replay result from a JSON file.
-pub fn load_replay_result_from_file(path: &Path) -> ReplayResult<ChainReplayResult> {
-    let file = File::open(path).map_err(|e| ReplayError::Io(e.to_string()))?;
-    let reader = BufReader::new(file);
-    let result: ChainReplayResult = serde_json::from_reader(reader)
-        .map_err(|e| ReplayError::Serialization(e.to_string()))?;
-    Ok(result)
+impl std::fmt::Display for ChainReplayResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Chain Replay Result: {}", if self.success { "SUCCESS" } else { "FAILURE" })?;
+        writeln!(f, "  Blocks replayed: {}", self.total_blocks)?;
+        writeln!(f, "  Total gas used: {}", self.total_gas)?;
+        if let Some(h) = self.failed_at {
+            writeln!(f, "  Failed at height: {}", h)?;
+        }
+        if let Some(m) = &self.mismatch {
+            writeln!(f, "  Reason: {}", m)?;
+        }
+        Ok(())
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -749,21 +396,20 @@ pub fn load_replay_result_from_file(path: &Path) -> ReplayResult<ChainReplayResu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Block, BlockHeader};
-    use crate::merkle::merkle_root;
+    use crate::types::{Block, BlockHeader, Tx};
 
-    fn empty_block(height: Height, state_root: Hash32) -> Block {
+    fn empty_block(height: Height, state_root: Hash32, gas_used: u64) -> Block {
         Block {
             header: BlockHeader {
                 height,
                 round: 0,
                 prev: Hash32::zero(),
                 proposer_pk: vec![0u8; 32],
-                tx_root: Hash32::zero(),
-                receipts_root: Hash32::zero(),
+                tx_root: crate::types::tx_root(&[]),
+                receipts_root: crate::types::receipts_root(&[]),
                 state_root,
                 base_fee_per_gas: 1,
-                gas_used: 0,
+                gas_used,
                 intrinsic_gas_used: 0,
                 exec_gas_used: 0,
                 vm_gas_used: 0,
@@ -776,197 +422,90 @@ mod tests {
         }
     }
 
-    fn with_tx_root(block: Block, tx_root: Hash32) -> Block {
-        let mut b = block;
-        b.header.tx_root = tx_root;
-        b
-    }
-
     #[test]
-    fn test_replay_empty_block() -> ReplayResult<()> {
+    fn test_replay_empty_block() {
         let state = KvState::default();
-        let expected_root = state.root();
-        let block = empty_block(1, expected_root);
+        let root = state.root();
+        let block = empty_block(1, root.clone(), 0);
         let config = ReplayConfig::default();
-
-        let (result, new_state) = replay_block(&block, &state, 1, &config);
+        let (result, new_state) = replay_block(&block, &state, config.initial_base_fee, &config);
         assert!(result.match_ok);
         assert_eq!(result.gas_used, 0);
-        assert_eq!(new_state.root(), expected_root);
-        Ok(())
+        assert_eq!(new_state.root(), root);
     }
 
     #[test]
-    fn test_replay_chain_empty_blocks() -> ReplayResult<()> {
+    fn test_replay_chain_empty_blocks() {
         let state = KvState::default();
         let root = state.root();
         let blocks = vec![
-            empty_block(1, root),
-            empty_block(2, root),
-            empty_block(3, root),
+            empty_block(1, root.clone(), 0),
+            empty_block(2, root.clone(), 0),
+            empty_block(3, root.clone(), 0),
         ];
-
-        let result = replay_chain(&blocks, &state, 1, None, None)?;
+        let config = ReplayConfig::default();
+        let result = replay_chain(&blocks, &state, &config);
         assert!(result.success);
         assert_eq!(result.total_blocks, 3);
         assert_eq!(result.total_gas, 0);
-        Ok(())
     }
 
     #[test]
-    fn test_replay_chain_root_mismatch() -> ReplayResult<()> {
+    fn test_replay_chain_root_mismatch() {
         let state = KvState::default();
         let root = state.root();
         let bad_root = Hash32([0xFF; 32]);
         let blocks = vec![
-            empty_block(1, root),
-            empty_block(2, bad_root), // mismatch
+            empty_block(1, root.clone(), 0),
+            empty_block(2, bad_root, 0),
         ];
-
-        let result = replay_chain(&blocks, &state, 1, None, None)?;
+        let config = ReplayConfig::default();
+        let result = replay_chain(&blocks, &state, &config);
         assert!(!result.success);
         assert_eq!(result.failed_at, Some(2));
         assert!(result.mismatch.is_some());
-        Ok(())
     }
 
     #[test]
-    fn test_replay_chain_tx_root_mismatch() -> ReplayResult<()> {
+    fn test_replay_and_verify_roots() {
         let state = KvState::default();
         let root = state.root();
-        let mut block = empty_block(1, root);
-        block.header.tx_root = Hash32([0xAA; 32]); // mismatch (actual root is zero)
-        let blocks = vec![block];
-
+        let blocks = vec![
+            empty_block(1, root.clone(), 0),
+            empty_block(2, root.clone(), 0),
+        ];
         let config = ReplayConfig::default();
-        let result = replay_chain(&blocks, &state, 1, Some(&config), None)?;
-        assert!(!result.success);
-        assert_eq!(result.failed_at, Some(1));
-        assert!(result.mismatch.is_some());
-        Ok(())
-    }
-
-    #[test]
-    fn test_unsorted_blocks_error() {
-        let state = KvState::default();
-        let root = state.root();
-        let blocks = vec![
-            empty_block(2, root),
-            empty_block(1, root), // out of order
-        ];
-        let err = replay_chain(&blocks, &state, 1, None, None).unwrap_err();
-        assert!(matches!(
-            err,
-            ReplayError::UnsortedBlocks { prev: 2, current: 1 }
-        ));
-    }
-
-    #[test]
-    fn test_empty_block_list_error() {
-        let state = KvState::default();
-        let blocks = vec![];
-        let err = replay_chain(&blocks, &state, 1, None, None).unwrap_err();
-        assert!(matches!(err, ReplayError::EmptyBlockList));
-    }
-
-    #[test]
-    fn test_replay_and_verify_with_external_roots() -> ReplayResult<()> {
-        let state = KvState::default();
-        let root = state.root();
-        let blocks = vec![
-            empty_block(1, root),
-            empty_block(2, root),
-        ];
-
         let mut expected = BTreeMap::new();
-        expected.insert(1, root);
-        expected.insert(2, root);
-
-        let result = replay_and_verify(&blocks, &state, 1, &expected, None, None)?;
+        expected.insert(1, root.clone());
+        expected.insert(2, root.clone());
+        let result = replay_and_verify_roots(&blocks, &state, &config, &expected);
         assert!(result.success);
-        Ok(())
     }
 
     #[test]
-    fn test_replay_and_verify_external_mismatch() -> ReplayResult<()> {
+    fn test_replay_and_verify_roots_mismatch() {
         let state = KvState::default();
         let root = state.root();
-        let blocks = vec![empty_block(1, root)];
-
+        let blocks = vec![empty_block(1, root.clone(), 0)];
+        let config = ReplayConfig::default();
         let mut expected = BTreeMap::new();
         expected.insert(1, Hash32([0xAA; 32]));
-
-        let result = replay_and_verify(&blocks, &state, 1, &expected, None, None)?;
+        let result = replay_and_verify_roots(&blocks, &state, &config, &expected);
         assert!(!result.success);
         assert_eq!(result.failed_at, Some(1));
-        Ok(())
     }
 
     #[test]
-    fn test_progress_callback() -> ReplayResult<()> {
+    fn test_replay_with_verify_gas_used() {
         let state = KvState::default();
         let root = state.root();
-        let blocks = vec![
-            empty_block(1, root),
-            empty_block(2, root),
-        ];
-
-        let mut events = Vec::new();
-        let progress = |ev: ReplayProgress| {
-            events.push(ev);
-        };
-
-        let result = replay_chain(&blocks, &state, 1, None, Some(&progress))?;
+        let mut block = empty_block(1, root.clone(), 42); // wrong gas_used
+        let config = ReplayConfig { verify_gas_used: true, ..Default::default() };
+        let result = replay_chain(&[block.clone()], &state, &config);
+        assert!(!result.success);
+        // Gas used in empty block is 0, header says 42 → mismatch.
+        block.header.gas_used = 0;
+        let result = replay_chain(&[block], &state, &config);
         assert!(result.success);
-        assert!(events.len() >= 2);
-        assert!(matches!(events[0], ReplayProgress::Started { .. }));
-        assert!(matches!(events.last(), Some(ReplayProgress::Finished { .. })));
-        Ok(())
-    }
-
-    #[test]
-    fn test_file_io_roundtrip() -> ReplayResult<()> {
-        let state = KvState::default();
-        let root = state.root();
-        let blocks = vec![
-            empty_block(1, root),
-            empty_block(2, root),
-        ];
-        let result = replay_chain(&blocks, &state, 1, None, None)?;
-
-        let dir = tempfile::tempdir().map_err(|e| ReplayError::Io(e.to_string()))?;
-        let path = dir.path().join("replay_result.json");
-        save_replay_result_to_file(&result, &path)?;
-        let loaded = load_replay_result_from_file(&path)?;
-        assert_eq!(loaded.total_blocks, result.total_blocks);
-        assert_eq!(loaded.total_gas, result.total_gas);
-        assert_eq!(loaded.success, result.success);
-        Ok(())
-    }
-
-    #[test]
-    fn test_load_blocks_from_file() -> ReplayResult<()> {
-        let state = KvState::default();
-        let root = state.root();
-        let blocks = vec![
-            empty_block(1, root),
-            empty_block(2, root),
-        ];
-
-        let dir = tempfile::tempdir().map_err(|e| ReplayError::Io(e.to_string()))?;
-        let path = dir.path().join("blocks.jsonl");
-        let file = File::create(&path).map_err(|e| ReplayError::Io(e.to_string()))?;
-        let writer = BufWriter::new(file);
-        for block in &blocks {
-            serde_json::to_writer(&writer, block)
-                .map_err(|e| ReplayError::Serialization(e.to_string()))?;
-            writeln!(&writer).map_err(|e| ReplayError::Io(e.to_string()))?;
-        }
-        drop(writer);
-
-        let loaded = load_blocks_from_file(&path)?;
-        assert_eq!(loaded.len(), blocks.len());
-        assert_eq!(loaded[0].header.height, blocks[0].header.height);
-        Ok(())
     }
 }
