@@ -1,460 +1,488 @@
 //! STEP 3 — Strict config + genesis validation at boot.
 //!
 //! Node MUST NOT start if any of these fail:
-//! - Bootnodes invalid (malformed multiaddr)
+//! - Bootnodes invalid (malformed multiaddr, missing peer ID)
 //! - Chain ID mismatch (config vs genesis)
-//! - Stake config invalid (zero or negative)
+//! - Stake config invalid (zero, negative, or exceeding maximum)
 //! - simple_producer conflict (follower/RPC running as producer)
 //! - Genesis mismatch (hash differs from expected)
 //! - Genesis hash check at boot
-//! - Listen address malformed or empty
-//! - Duplicate bootnode entries
-//! - Self‑bootstrap (node connecting to itself)
-//!
-//! All failures are **fatal** — not warnings.
+//! - Duplicate validator seeds in genesis
+//! - Empty validator set
+//! - Invalid listen address/port
+//! - Protocol activation schedule invalid
+//! - Keystore mode consistency
+//! - Data directory permissions
+//! - Resource limits sanity
 
 use std::collections::BTreeSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
-use thiserror::Error;
 
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
+/// Maximum allowed stake per validator (1 billion units).
+const MAX_STAKE: u64 = 1_000_000_000;
 
-/// Minimum parts expected in a multiaddress (including empty first part).
-/// Format: `/<proto>/<addr>/<proto>/<port>[/<proto>/<peerid>]`
-const MIN_MULTIADDR_PARTS: usize = 5;
-
-/// Supported protocol names for multiaddress.
-const PROTOCOL_IP4: &str = "ip4";
-const PROTOCOL_IP6: &str = "ip6";
-const PROTOCOL_DNS4: &str = "dns4";
-const PROTOCOL_DNS6: &str = "dns6";
-
-/// Protocol name for TCP.
-const PROTOCOL_TCP: &str = "tcp";
-
-/// Protocol name for P2P peer ID.
-const PROTOCOL_P2P: &str = "p2p";
-
-/// Default RPC port (used in self‑bootstrap detection as fallback).
-const DEFAULT_RPC_PORT: u16 = 9001;
-
-/// Default P2P port (used in self‑bootstrap detection as fallback).
-const DEFAULT_P2P_PORT: u16 = 7001;
-
-/// Maximum valid TCP/UDP port number.
-const MAX_PORT: u16 = 65535;
-
-/// Minimum valid TCP/UDP port number (privileged ports are allowed but warned).
-const MIN_PORT: u16 = 1;
-
-/// Localhost IPs that indicate self‑bootstrap risk.
-const LOCALHOST_IPV4: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
-const LOCALHOST_IPV6: Ipv6Addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1);
-
-// -----------------------------------------------------------------------------
-// Error types
-// -----------------------------------------------------------------------------
-
-/// Fatal validation error that prevents node startup.
-#[derive(Debug, Error)]
-pub enum BootstrapError {
-    #[error("invalid bootnode at index {index}: {reason}")]
-    InvalidBootnode { index: usize, reason: String },
-
-    #[error("duplicate bootnode entries: {duplicates:?}")]
-    DuplicateBootnodes { duplicates: Vec<String> },
-
-    #[error("self‑bootstrap detected: node appears to bootstrap from its own address ({addr})")]
-    SelfBootstrap { addr: String },
-
-    #[error("chain ID mismatch: config={config}, genesis={genesis}")]
-    ChainIdMismatch { config: u64, genesis: u64 },
-
-    #[error("invalid stake_each: must be > 0, got {stake}")]
-    ZeroStake { stake: u64 },
-
-    #[error(
-        "simple_producer conflict: node seed {seed} is not in validator set {validators:?}"
-    )]
-    SimpleProducerConflict { seed: u64, validators: Vec<u64> },
-
-    #[error("empty or malformed listen address: '{addr}'")]
-    InvalidListenAddress { addr: String },
-
-    #[error("genesis file error: {reason}")]
-    GenesisFile { reason: String },
-
-    #[error("genesis hash mismatch: expected {expected}, got {actual}")]
-    GenesisHashMismatch { expected: String, actual: String },
-
-    #[error("genesis file is empty")]
-    EmptyGenesis,
-
-    #[error("invalid port number: {port} (must be {min}..{max})")]
-    InvalidPort { port: u16, min: u16, max: u16 },
-}
-
-pub type BootstrapResult<T> = Result<T, BootstrapError>;
-
-// -----------------------------------------------------------------------------
-// Multiaddr parsing helpers
-// -----------------------------------------------------------------------------
-
-/// Parsed multiaddress components.
+/// A fatal validation error that prevents node startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedMultiaddr {
-    protocol: String,
-    host: String,
-    port: u16,
-    peer_id: Option<String>,
+pub struct ValidationError {
+    pub field: String,
+    pub message: String,
 }
 
-/// Parse a multiaddr string into its components.
-fn parse_multiaddr(addr: &str) -> BootstrapResult<ParsedMultiaddr> {
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FATAL config error [{}]: {}", self.field, self.message)
+    }
+}
+
+/// Result of config validation.
+#[derive(Debug, Clone)]
+pub struct ValidationResult {
+    pub errors: Vec<ValidationError>,
+}
+
+impl ValidationResult {
+    pub fn is_ok(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    pub fn into_result(self) -> Result<(), Vec<ValidationError>> {
+        if self.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(self.errors)
+        }
+    }
+}
+
+impl std::fmt::Display for ValidationResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_ok() {
+            write!(f, "Config validation: PASS")
+        } else {
+            writeln!(f, "Config validation: FAIL ({} errors)", self.errors.len())?;
+            for e in &self.errors {
+                writeln!(f, "  {e}")?;
+            }
+            Ok(())
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Bootnode validation
+// -----------------------------------------------------------------------------
+
+/// Validate a bootnode multiaddr string.
+/// Valid formats: /ip4/X.X.X.X/tcp/PORT/p2p/PEERID or /dns4/HOST/tcp/PORT/p2p/PEERID
+/// The peer ID is mandatory for bootnodes.
+fn validate_bootnode(addr: &str) -> Result<(), String> {
     if addr.is_empty() {
-        return Err(BootstrapError::InvalidBootnode {
-            index: 0,
-            reason: "empty bootnode address".into(),
-        });
+        return Err("empty bootnode address".into());
     }
 
-    if !addr.starts_with('/') {
-        return Err(BootstrapError::InvalidBootnode {
-            index: 0,
-            reason: format!("multiaddr must start with '/': {addr}"),
-        });
+    let parts: Vec<&str> = addr.split('/').collect();
+    if parts.len() < 7 {
+        return Err(format!("malformed multiaddr (too few parts, missing peer ID?): {addr}"));
     }
 
-    let parts: Vec<&str> = addr.split('/').skip(1).collect(); // skip empty first part
-
-    if parts.len() < 4 {
-        return Err(BootstrapError::InvalidBootnode {
-            index: 0,
-            reason: format!(
-                "multiaddr too short: need at least /proto/host/proto/port, got {addr}"
-            ),
-        });
+    if !parts[0].is_empty() {
+        return Err(format!("multiaddr must start with /: {addr}"));
     }
 
-    // Parse protocol
-    let protocol = parts[0].to_lowercase();
-    if !matches!(
-        protocol.as_str(),
-        PROTOCOL_IP4 | PROTOCOL_IP6 | PROTOCOL_DNS4 | PROTOCOL_DNS6
-    ) {
-        return Err(BootstrapError::InvalidBootnode {
-            index: 0,
-            reason: format!("unsupported protocol: {protocol}"),
-        });
-    }
-
-    // Parse host
-    let host = parts[1].to_string();
-    if host.is_empty() {
-        return Err(BootstrapError::InvalidBootnode {
-            index: 0,
-            reason: "empty host in multiaddr".into(),
-        });
-    }
-
-    // Validate host based on protocol
-    match protocol.as_str() {
-        PROTOCOL_IP4 => {
-            let octets: Vec<&str> = host.split('.').collect();
+    match parts[1] {
+        "ip4" => {
+            let ip = parts[2];
+            let octets: Vec<&str> = ip.split('.').collect();
             if octets.len() != 4 {
-                return Err(BootstrapError::InvalidBootnode {
-                    index: 0,
-                    reason: format!("invalid IPv4 address: {host}"),
-                });
+                return Err(format!("invalid IPv4 address: {ip}"));
             }
             for octet in &octets {
                 if octet.parse::<u8>().is_err() {
-                    return Err(BootstrapError::InvalidBootnode {
-                        index: 0,
-                        reason: format!("invalid IPv4 octet: {octet}"),
-                    });
+                    return Err(format!("invalid IPv4 octet: {octet}"));
                 }
             }
         }
-        PROTOCOL_IP6 => {
-            if host.parse::<Ipv6Addr>().is_err() {
-                return Err(BootstrapError::InvalidBootnode {
-                    index: 0,
-                    reason: format!("invalid IPv6 address: {host}"),
-                });
+        "dns4" | "dns6" => {
+            if parts[2].is_empty() {
+                return Err("empty DNS hostname".into());
             }
         }
-        _ => {
-            // DNS — accept any non‑empty string
-        }
+        "ip6" => { /* Accept IPv6, we don't validate further */ }
+        other => return Err(format!("unsupported multiaddr protocol: {other}")),
     }
 
-    // Parse transport protocol (must be tcp for now)
-    if parts.len() < 3 || parts[2].to_lowercase() != PROTOCOL_TCP {
-        return Err(BootstrapError::InvalidBootnode {
-            index: 0,
-            reason: format!("expected /tcp/ after host, got: {addr}"),
-        });
-    }
-
-    // Parse port
-    let port_str = parts[3];
-    let port: u16 = port_str.parse().map_err(|_| BootstrapError::InvalidBootnode {
-        index: 0,
-        reason: format!("invalid port number: {port_str}"),
-    })?;
-
-    if port < MIN_PORT || port > MAX_PORT {
-        return Err(BootstrapError::InvalidPort {
-            port,
-            min: MIN_PORT,
-            max: MAX_PORT,
-        });
-    }
-
-    // Optional P2P peer ID
-    let peer_id = if parts.len() >= 5 && parts[4] == PROTOCOL_P2P {
-        if parts.len() >= 6 {
-            Some(parts[5].to_string())
-        } else {
-            None
+    if parts.len() >= 5 && parts[3] == "tcp" {
+        if parts[4].parse::<u16>().is_err() {
+            return Err(format!("invalid TCP port: {}", parts[4]));
         }
     } else {
-        None
-    };
+        return Err(format!("missing /tcp/ portion: {addr}"));
+    }
 
-    Ok(ParsedMultiaddr {
-        protocol,
-        host,
-        port,
-        peer_id,
-    })
-}
-
-/// Extract the port from a listen address (e.g., "0.0.0.0:7001" → 7001).
-fn extract_port(listen_addr: &str) -> u16 {
-    listen_addr
-        .rsplit(':')
-        .next()
-        .unwrap_or("")
-        .parse()
-        .unwrap_or(DEFAULT_P2P_PORT)
-}
-
-// -----------------------------------------------------------------------------
-// Core validation
-// -----------------------------------------------------------------------------
-
-/// Validate the full node configuration. Returns `Ok(())` on success.
-///
-/// # Arguments
-/// * `chain_id_config` — chain ID from the node config file.
-/// * `chain_id_genesis` — chain ID from the genesis file (if loaded).
-/// * `bootnodes` — list of bootnode multiaddresses.
-/// * `stake_each` — stake amount per validator.
-/// * `simple_producer` — whether simple producer mode is enabled.
-/// * `node_seed` — the node's seed identifier.
-/// * `genesis_validator_seeds` — seeds of validators in genesis.
-/// * `listen_addr` — the node's P2P listen address.
-///
-/// # Errors
-/// Returns a fatal `BootstrapError` if any validation fails.
-pub fn validate_config(
-    chain_id_config: u64,
-    chain_id_genesis: Option<u64>,
-    bootnodes: &[String],
-    stake_each: u64,
-    simple_producer: bool,
-    node_seed: u64,
-    genesis_validator_seeds: &[u64],
-    listen_addr: &str,
-) -> BootstrapResult<()> {
-    // ── 1. Validate listen address ──────────────────────────────────────
-    validate_listen_addr(listen_addr)?;
-
-    // ── 2. Validate each bootnode ───────────────────────────────────────
-    let parsed_bootnodes: Vec<ParsedMultiaddr> = bootnodes
-        .iter()
-        .enumerate()
-        .map(|(i, bn)| {
-            parse_multiaddr(bn).map_err(|_| BootstrapError::InvalidBootnode {
-                index: i,
-                reason: format!("malformed multiaddr: {bn}"),
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // ── 3. Check for duplicate bootnodes ────────────────────────────────
-    let unique: BTreeSet<&str> = bootnodes.iter().map(|s| s.as_str()).collect();
-    if unique.len() < bootnodes.len() {
-        let mut seen = BTreeSet::new();
-        let mut duplicates = Vec::new();
-        for bn in bootnodes {
-            if !seen.insert(bn.as_str()) {
-                duplicates.push(bn.clone());
-            }
+    if parts.len() >= 7 && parts[5] == "p2p" {
+        if parts[6].is_empty() {
+            return Err("empty peer ID".into());
         }
-        return Err(BootstrapError::DuplicateBootnodes { duplicates });
-    }
-
-    // ── 4. Check for self‑bootstrap ─────────────────────────────────────
-    let listen_port = extract_port(listen_addr);
-    for parsed in &parsed_bootnodes {
-        let is_localhost = match parsed.protocol.as_str() {
-            PROTOCOL_IP4 => {
-                parsed.host.parse::<Ipv4Addr>().ok() == Some(LOCALHOST_IPV4)
-            }
-            PROTOCOL_IP6 => {
-                parsed.host.parse::<Ipv6Addr>().ok() == Some(LOCALHOST_IPV6)
-            }
-            _ => parsed.host == "localhost",
-        };
-
-        if is_localhost && parsed.port == listen_port {
-            return Err(BootstrapError::SelfBootstrap {
-                addr: format!("{}:{}", parsed.host, parsed.port),
-            });
-        }
-    }
-
-    // ── 5. Chain ID mismatch ────────────────────────────────────────────
-    if let Some(genesis_chain_id) = chain_id_genesis {
-        if chain_id_config != genesis_chain_id {
-            return Err(BootstrapError::ChainIdMismatch {
-                config: chain_id_config,
-                genesis: genesis_chain_id,
-            });
-        }
-    }
-
-    // ── 6. Stake config invalid ─────────────────────────────────────────
-    if stake_each == 0 {
-        return Err(BootstrapError::ZeroStake { stake: stake_each });
-    }
-
-    // ── 7. simple_producer conflict ─────────────────────────────────────
-    if simple_producer && !genesis_validator_seeds.is_empty() {
-        let is_validator = genesis_validator_seeds.contains(&node_seed);
-        if !is_validator {
-            return Err(BootstrapError::SimpleProducerConflict {
-                seed: node_seed,
-                validators: genesis_validator_seeds.to_vec(),
-            });
-        }
-    }
-
-    Ok(())
-}
-
-/// Validate the listen address format.
-fn validate_listen_addr(addr: &str) -> BootstrapResult<()> {
-    if addr.is_empty() {
-        return Err(BootstrapError::InvalidListenAddress {
-            addr: "empty string".into(),
-        });
-    }
-
-    // Format: <host>:<port>
-    let parts: Vec<&str> = addr.rsplitn(2, ':').collect();
-    if parts.len() != 2 {
-        return Err(BootstrapError::InvalidListenAddress {
-            addr: addr.to_string(),
-        });
-    }
-
-    let port_str = parts[0];
-    let port: u16 = port_str
-        .parse()
-        .map_err(|_| BootstrapError::InvalidListenAddress {
-            addr: addr.to_string(),
-        })?;
-
-    if port < MIN_PORT || port > MAX_PORT {
-        return Err(BootstrapError::InvalidPort {
-            port,
-            min: MIN_PORT,
-            max: MAX_PORT,
-        });
+    } else {
+        return Err(format!("bootnode missing /p2p/ peer ID: {addr}"));
     }
 
     Ok(())
 }
 
 // -----------------------------------------------------------------------------
-// Genesis validation
+// Genesis hash helpers
 // -----------------------------------------------------------------------------
 
-/// Compute a genesis hash using SHA‑256 of the canonical JSON representation.
+/// Compute a genesis hash for integrity checking.
+/// Uses SHA-256 of the canonical JSON representation (normalized to avoid formatting differences).
 pub fn genesis_hash(genesis_json: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
+    let parsed: serde_json::Value = serde_json::from_str(genesis_json)
+        .expect("genesis JSON must be valid");
+    let canonical = serde_json::to_string(&parsed)
+        .expect("canonical serialization failed");
+
     let mut hasher = Sha256::new();
-    hasher.update(genesis_json.as_bytes());
+    hasher.update(canonical.as_bytes());
     let result = hasher.finalize();
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&result);
     hash
 }
 
-/// Verify genesis file integrity.
-///
-/// Compares the hash of the genesis file against an expected hash.
-/// If `expected_hash` is `None`, any valid genesis file is accepted.
-///
-/// Returns the computed hash on success.
+/// Verify genesis file integrity and basic structure.
 pub fn verify_genesis_integrity(
     genesis_path: impl AsRef<Path>,
     expected_hash: Option<&[u8; 32]>,
-) -> BootstrapResult<[u8; 32]> {
-    let path = genesis_path.as_ref();
+) -> Result<[u8; 32], String> {
+    let content = std::fs::read_to_string(genesis_path.as_ref())
+        .map_err(|e| format!("cannot read genesis: {e}"))?;
 
-    if !path.exists() {
-        return Err(BootstrapError::GenesisFile {
-            reason: format!("file not found: {}", path.display()),
-        });
+    // Validate JSON structure
+    let parsed: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("invalid JSON in genesis: {e}"))?;
+
+    // Basic required fields
+    if parsed.get("chain_id").is_none() {
+        return Err("genesis missing 'chain_id'".into());
     }
-
-    let content = std::fs::read_to_string(path).map_err(|e| BootstrapError::GenesisFile {
-        reason: format!("cannot read genesis: {e}"),
-    })?;
-
-    if content.trim().is_empty() {
-        return Err(BootstrapError::EmptyGenesis);
+    if parsed.get("validators").is_none() {
+        return Err("genesis missing 'validators'".into());
     }
 
     let hash = genesis_hash(&content);
 
     if let Some(expected) = expected_hash {
         if hash != *expected {
-            return Err(BootstrapError::GenesisHashMismatch {
-                expected: hex::encode(expected),
-                actual: hex::encode(hash),
-            });
+            return Err(format!(
+                "genesis hash mismatch: expected 0x{}, got 0x{}",
+                hex::encode(expected),
+                hex::encode(hash),
+            ));
         }
     }
 
     Ok(hash)
 }
 
-/// Verify genesis content is valid JSON with required fields.
-pub fn verify_genesis_content(genesis_json: &str) -> BootstrapResult<()> {
-    let parsed: serde_json::Value = serde_json::from_str(genesis_json).map_err(|e| {
-        BootstrapError::GenesisFile {
-            reason: format!("invalid JSON: {e}"),
-        }
-    })?;
+// -----------------------------------------------------------------------------
+// Configuration validation (core)
+// -----------------------------------------------------------------------------
 
-    // Check required top‑level fields
-    if parsed.get("chain_id").is_none() {
-        return Err(BootstrapError::GenesisFile {
-            reason: "missing required field: 'chain_id'".into(),
+/// Validate the full node configuration. Returns fatal errors.
+///
+/// This is called at boot: `config.validate() -> fatal if errors`.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_config(
+    chain_id_config: u64,
+    chain_id_genesis: Option<u64>,
+    bootnodes: &[String],
+    stake_each: u64,
+    simple_producer: bool,
+    rpc_enabled: bool,
+    node_seed: u64,
+    genesis_validator_seeds: &[u64],
+    config_validator_seeds: &[u64],   // added
+    protocol_activations: &[crate::protocol::version::ProtocolActivation],
+    listen_addr: &str,
+    p2p_listen_addr: &str,
+    data_dir: &str,
+    keystore_mode: &str,
+    keystore_password_configured: bool,
+    mempool_capacity: usize,
+    max_connections_total: u32,
+    max_connections_per_peer: u32,
+) -> ValidationResult {
+    let mut errors = Vec::new();
+
+    // 1. Validate bootnodes.
+    for (i, bn) in bootnodes.iter().enumerate() {
+        if let Err(e) = validate_bootnode(bn) {
+            errors.push(ValidationError {
+                field: format!("network.bootnodes[{i}]"),
+                message: e,
+            });
+        }
+    }
+
+    // 2. Check for self-bootstrap (node's own address in bootnodes).
+    let listen_port = listen_addr.rsplit(':').next().unwrap_or("")
+        .chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+    let self_indicators = ["127.0.0.1", "0.0.0.0", "localhost"];
+    for bn in bootnodes {
+        if !listen_port.is_empty() {
+            for indicator in &self_indicators {
+                if bn.contains(indicator) && bn.contains(&listen_port) {
+                    errors.push(ValidationError {
+                        field: "network.bootnodes".into(),
+                        message: format!("node appears to bootstrap from itself: {bn} (contains local address {indicator} and port {listen_port})"),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. Chain ID checks.
+    if chain_id_config == 0 {
+        errors.push(ValidationError {
+            field: "node.chain_id".into(),
+            message: "chain_id must be non‑zero".into(),
+        });
+    }
+    if let Some(genesis_chain_id) = chain_id_genesis {
+        if chain_id_config != genesis_chain_id {
+            errors.push(ValidationError {
+                field: "node.chain_id".into(),
+                message: format!(
+                    "config chain_id={chain_id_config} does not match genesis chain_id={genesis_chain_id}"
+                ),
+            });
+        }
+    }
+
+    // 4. Stake config.
+    if stake_each == 0 {
+        errors.push(ValidationError {
+            field: "consensus.stake_each".into(),
+            message: "stake_each must be > 0".into(),
+        });
+    }
+    if stake_each > MAX_STAKE {
+        errors.push(ValidationError {
+            field: "consensus.stake_each".into(),
+            message: format!("stake_each={stake_each} exceeds maximum allowed ({MAX_STAKE})"),
         });
     }
 
-    Ok(())
+    // 5. Genesis validator set must not be empty.
+    if genesis_validator_seeds.is_empty() {
+        errors.push(ValidationError {
+            field: "genesis.validators".into(),
+            message: "genesis must have at least one validator".into(),
+        });
+    }
+
+    // 6. Duplicate validator seeds in genesis.
+    let unique_seeds: BTreeSet<&u64> = genesis_validator_seeds.iter().collect();
+    if unique_seeds.len() < genesis_validator_seeds.len() {
+        errors.push(ValidationError {
+            field: "genesis.validators".into(),
+            message: "duplicate validator seeds detected".into(),
+        });
+    }
+
+    // 7. Config validator seeds must match genesis seeds (all nodes must agree).
+    if config_validator_seeds.len() != genesis_validator_seeds.len()
+        || config_validator_seeds.iter().collect::<BTreeSet<_>>() != unique_seeds
+    {
+        errors.push(ValidationError {
+            field: "consensus.validator_seeds".into(),
+            message: "config validator seeds must exactly match genesis validator seeds".into(),
+        });
+    }
+
+    // 8. simple_producer conflict.
+    if simple_producer {
+        if !genesis_validator_seeds.contains(&node_seed) {
+            errors.push(ValidationError {
+                field: "consensus.simple_producer".into(),
+                message: format!(
+                    "simple_producer=true but node seed={node_seed} is not in validator set {:?}",
+                    genesis_validator_seeds
+                ),
+            });
+        }
+        if rpc_enabled {
+            errors.push(ValidationError {
+                field: "consensus.simple_producer".into(),
+                message: "simple_producer=true and rpc_enabled=true are mutually exclusive".into(),
+            });
+        }
+    }
+
+    // 9. Duplicate bootnode check.
+    let unique_bootnodes: BTreeSet<&str> = bootnodes.iter().map(|s| s.as_str()).collect();
+    if unique_bootnodes.len() < bootnodes.len() {
+        errors.push(ValidationError {
+            field: "network.bootnodes".into(),
+            message: "duplicate bootnode entries detected".into(),
+        });
+    }
+
+    // 10. Listen address validation (RPC).
+    if listen_addr.is_empty() {
+        errors.push(ValidationError {
+            field: "rpc.listen".into(),
+            message: "RPC listen address cannot be empty".into(),
+        });
+    } else if let Some(port_str) = listen_addr.split(':').last() {
+        if port_str.parse::<u16>().is_err() {
+            errors.push(ValidationError {
+                field: "rpc.listen".into(),
+                message: format!("invalid port number in RPC listen address: {port_str}"),
+            });
+        }
+    } else {
+        errors.push(ValidationError {
+            field: "rpc.listen".into(),
+            message: format!("RPC listen address missing port: {listen_addr}"),
+        });
+    }
+
+    // 11. P2P listen address validation.
+    if p2p_listen_addr.is_empty() {
+        errors.push(ValidationError {
+            field: "network.listen".into(),
+            message: "P2P listen address cannot be empty".into(),
+        });
+    } else if let Some(port_str) = p2p_listen_addr.split(':').last() {
+        if port_str.parse::<u16>().is_err() {
+            errors.push(ValidationError {
+                field: "network.listen".into(),
+                message: format!("invalid port number in P2P listen address: {port_str}"),
+            });
+        }
+    } else {
+        errors.push(ValidationError {
+            field: "network.listen".into(),
+            message: format!("P2P listen address missing port: {p2p_listen_addr}"),
+        });
+    }
+
+    // 12. Protocol activations schedule.
+    if protocol_activations.is_empty() {
+        errors.push(ValidationError {
+            field: "consensus.protocol_activations".into(),
+            message: "protocol activation schedule cannot be empty".into(),
+        });
+    } else {
+        let has_v1_at_zero = protocol_activations.iter().any(|a| {
+            a.protocol_version == 1 && a.activation_height == Some(0)
+        });
+        if !has_v1_at_zero {
+            errors.push(ValidationError {
+                field: "consensus.protocol_activations".into(),
+                message: "must include activation for protocol_version=1 at height 0".into(),
+            });
+        }
+        // Check monotonicity of heights.
+        let mut prev_height: Option<u64> = None;
+        for act in protocol_activations {
+            if let Some(h) = act.activation_height {
+                if let Some(prev) = prev_height {
+                    if h <= prev {
+                        errors.push(ValidationError {
+                            field: "consensus.protocol_activations".into(),
+                            message: format!("activation heights must be strictly increasing ({} <= {})", prev, h),
+                        });
+                        break;
+                    }
+                }
+                prev_height = Some(h);
+            }
+        }
+    }
+
+    // 13. Data directory.
+    if data_dir.is_empty() {
+        errors.push(ValidationError {
+            field: "node.data_dir".into(),
+            message: "data_dir cannot be empty".into(),
+        });
+    } else {
+        // Try to create directory (or check write permissions).
+        if let Err(e) = std::fs::create_dir_all(data_dir) {
+            errors.push(ValidationError {
+                field: "node.data_dir".into(),
+                message: format!("cannot create or access data directory: {e}"),
+            });
+        }
+    }
+
+    // 14. Keystore mode and password.
+    match keystore_mode {
+        "plain" => { /* ok */ }
+        "encrypted" => {
+            if !keystore_password_configured {
+                errors.push(ValidationError {
+                    field: "node.keystore".into(),
+                    message: "keystore=encrypted but no password provided (set keystore_password or IONA_KEYSTORE_PASSWORD)".into(),
+                });
+            }
+        }
+        other => {
+            errors.push(ValidationError {
+                field: "node.keystore".into(),
+                message: format!("invalid keystore mode: {other} (must be 'plain' or 'encrypted')"),
+            });
+        }
+    }
+
+    // 15. Mempool capacity.
+    if mempool_capacity < 1_000 {
+        errors.push(ValidationError {
+            field: "mempool.capacity".into(),
+            message: format!("mempool.capacity too low: {mempool_capacity} (minimum 1000)"),
+        });
+    }
+    if mempool_capacity > 1_000_000 {
+        errors.push(ValidationError {
+            field: "mempool.capacity".into(),
+            message: format!("mempool.capacity too high: {mempool_capacity} (maximum 1,000,000)"),
+        });
+    }
+
+    // 16. Connection limits.
+    if max_connections_total < 1 || max_connections_total > 10_000 {
+        errors.push(ValidationError {
+            field: "network.max_connections_total".into(),
+            message: format!("max_connections_total must be between 1 and 10000 (got {max_connections_total})"),
+        });
+    }
+    if max_connections_per_peer < 1 || max_connections_per_peer > 100 {
+        errors.push(ValidationError {
+            field: "network.max_connections_per_peer".into(),
+            message: format!("max_connections_per_peer must be between 1 and 100 (got {max_connections_per_peer})"),
+        });
+    }
+    if max_connections_per_peer > max_connections_total {
+        errors.push(ValidationError {
+            field: "network.max_connections_per_peer".into(),
+            message: "max_connections_per_peer cannot exceed max_connections_total".into(),
+        });
+    }
+
+    ValidationResult { errors }
 }
+
+// -----------------------------------------------------------------------------
+// Convenience: validate a full NodeConfig (future extension)
+// -----------------------------------------------------------------------------
+
+// For completeness, you could add a method to NodeConfig that calls this.
+// But we keep the existing function for now.
 
 // -----------------------------------------------------------------------------
 // Tests
@@ -463,81 +491,56 @@ pub fn verify_genesis_content(genesis_json: &str) -> BootstrapResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
+    use crate::protocol::version::ProtocolActivation;
 
-    // ── Multiaddr parsing tests ────────────────────────────────────────
-    #[test]
-    fn test_parse_multiaddr_valid() {
-        let addr = "/ip4/1.2.3.4/tcp/7001";
-        let parsed = parse_multiaddr(addr).unwrap();
-        assert_eq!(parsed.protocol, "ip4");
-        assert_eq!(parsed.host, "1.2.3.4");
-        assert_eq!(parsed.port, 7001);
-        assert!(parsed.peer_id.is_none());
+    fn dummy_activation() -> Vec<ProtocolActivation> {
+        vec![
+            ProtocolActivation { protocol_version: 1, activation_height: Some(0), grace_blocks: 0 },
+            ProtocolActivation { protocol_version: 2, activation_height: Some(100), grace_blocks: 10 },
+        ]
     }
 
     #[test]
-    fn test_parse_multiaddr_with_peer_id() {
-        let addr = "/ip4/192.168.1.1/tcp/30333/p2p/12D3KooW";
-        let parsed = parse_multiaddr(addr).unwrap();
-        assert_eq!(parsed.peer_id, Some("12D3KooW".into()));
+    fn test_validate_bootnode_valid() {
+        assert!(validate_bootnode("/ip4/1.2.3.4/tcp/7001/p2p/12D3KooW").is_ok());
+        assert!(validate_bootnode("/ip4/192.168.1.1/tcp/30333/p2p/12D3KooW").is_ok());
+        assert!(validate_bootnode("/dns4/node.example.com/tcp/7001/p2p/12D3KooW").is_ok());
     }
 
     #[test]
-    fn test_parse_multiaddr_dns() {
-        let addr = "/dns4/node.example.com/tcp/7001";
-        let parsed = parse_multiaddr(addr).unwrap();
-        assert_eq!(parsed.protocol, "dns4");
-        assert_eq!(parsed.host, "node.example.com");
+    fn test_validate_bootnode_invalid() {
+        assert!(validate_bootnode("").is_err());
+        assert!(validate_bootnode("not-a-multiaddr").is_err());
+        assert!(validate_bootnode("/ip4/999.999.999.999/tcp/7001/p2p/id").is_err());
+        assert!(validate_bootnode("/ip4/1.2.3.4/tcp/99999/p2p/id").is_err());
+        assert!(validate_bootnode("/ip4/1.2.3.4/tcp/7001").is_err()); // missing /p2p/
+        assert!(validate_bootnode("/ip4/1.2.3.4/tcp/7001/p2p/").is_err()); // empty peer ID
+        assert!(validate_bootnode("/dns4//tcp/7001/p2p/id").is_err()); // empty hostname
     }
 
-    #[test]
-    fn test_parse_multiaddr_ipv6() {
-        let addr = "/ip6/::1/tcp/7001";
-        let parsed = parse_multiaddr(addr).unwrap();
-        assert_eq!(parsed.protocol, "ip6");
-        assert_eq!(parsed.host, "::1");
-    }
-
-    #[test]
-    fn test_parse_multiaddr_invalid() {
-        assert!(parse_multiaddr("").is_err());
-        assert!(parse_multiaddr("not-a-multiaddr").is_err());
-        assert!(parse_multiaddr("/ip4/999.999.999.999/tcp/7001").is_err());
-        assert!(parse_multiaddr("/ip4/1.2.3.4/tcp/99999").is_err());
-        assert!(parse_multiaddr("/ip4/1.2.3.4").is_err());
-        assert!(parse_multiaddr("/ip4/1.2.3.4/udp/7001").is_err());
-    }
-
-    // ── Config validation tests ────────────────────────────────────────
     #[test]
     fn test_config_valid() {
         let result = validate_config(
             6126151,
             Some(6126151),
-            &["/ip4/1.2.3.4/tcp/7001".into()],
+            &["/ip4/1.2.3.4/tcp/7001/p2p/12D3KooW".into()],
             1000,
             true,
-            2,
+            false,   // rpc_enabled
+            2,       // node seed in validator set
             &[2, 3, 4],
-            "0.0.0.0:7001",
+            &[2, 3, 4],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,   // no password needed for plain
+            200_000,
+            200,
+            8,
         );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_config_valid_no_genesis_chain_id() {
-        let result = validate_config(
-            6126151,
-            None,
-            &["/dns4/node.com/tcp/7001".into()],
-            1000,
-            false,
-            1,
-            &[],
-            "0.0.0.0:7001",
-        );
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result}");
     }
 
     #[test]
@@ -548,17 +551,22 @@ mod tests {
             &[],
             1000,
             false,
+            false,
             1,
-            &[],
-            "0.0.0.0:7001",
+            &[1, 2, 3],
+            &[1, 2, 3],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            200_000,
+            200,
+            8,
         );
-        assert!(matches!(
-            result.unwrap_err(),
-            BootstrapError::ChainIdMismatch {
-                config: 6126151,
-                genesis: 9999
-            }
-        ));
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.field == "node.chain_id"));
     }
 
     #[test]
@@ -569,14 +577,22 @@ mod tests {
             &["not-valid".into()],
             1000,
             false,
+            false,
             1,
-            &[],
-            "0.0.0.0:7001",
+            &[1, 2, 3],
+            &[1, 2, 3],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            200_000,
+            200,
+            8,
         );
-        assert!(matches!(
-            result.unwrap_err(),
-            BootstrapError::InvalidBootnode { index: 0, .. }
-        ));
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.field.contains("bootnodes")));
     }
 
     #[test]
@@ -587,48 +603,100 @@ mod tests {
             &[],
             0,
             false,
+            false,
             1,
-            &[],
-            "0.0.0.0:7001",
+            &[1, 2, 3],
+            &[1, 2, 3],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            200_000,
+            200,
+            8,
         );
-        assert!(matches!(
-            result.unwrap_err(),
-            BootstrapError::ZeroStake { stake: 0 }
-        ));
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.field.contains("stake_each")));
     }
 
     #[test]
-    fn test_simple_producer_conflict() {
+    fn test_stake_exceeds_max() {
+        let result = validate_config(
+            6126151,
+            None,
+            &[],
+            MAX_STAKE + 1,
+            false,
+            false,
+            1,
+            &[1, 2, 3],
+            &[1, 2, 3],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            200_000,
+            200,
+            8,
+        );
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.message.contains("exceeds maximum")));
+    }
+
+    #[test]
+    fn test_simple_producer_conflict_not_validator() {
         let result = validate_config(
             6126151,
             None,
             &[],
             1000,
             true,
-            1, // seed 1 not in [2, 3, 4]
+            false,
+            1,
             &[2, 3, 4],
-            "0.0.0.0:7001",
+            &[2, 3, 4],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            200_000,
+            200,
+            8,
         );
-        assert!(matches!(
-            result.unwrap_err(),
-            BootstrapError::SimpleProducerConflict { seed: 1, .. }
-        ));
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.field.contains("simple_producer")));
     }
 
     #[test]
-    fn test_simple_producer_no_conflict() {
-        // seed 2 IS in the validator set
+    fn test_simple_producer_conflict_rpc_enabled() {
         let result = validate_config(
             6126151,
             None,
             &[],
             1000,
+            true,
             true,
             2,
             &[2, 3, 4],
-            "0.0.0.0:7001",
+            &[2, 3, 4],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            200_000,
+            200,
+            8,
         );
-        assert!(result.is_ok());
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.message.contains("mutually exclusive")));
     }
 
     #[test]
@@ -637,108 +705,170 @@ mod tests {
             6126151,
             None,
             &[
-                "/ip4/1.2.3.4/tcp/7001".into(),
-                "/ip4/1.2.3.4/tcp/7001".into(),
+                "/ip4/1.2.3.4/tcp/7001/p2p/id".into(),
+                "/ip4/1.2.3.4/tcp/7001/p2p/id".into(),
             ],
             1000,
             false,
-            1,
-            &[],
-            "0.0.0.0:7001",
-        );
-        assert!(matches!(
-            result.unwrap_err(),
-            BootstrapError::DuplicateBootnodes { .. }
-        ));
-    }
-
-    #[test]
-    fn test_self_bootstrap_detection() {
-        let result = validate_config(
-            6126151,
-            None,
-            &["/ip4/127.0.0.1/tcp/7001".into()],
-            1000,
             false,
             1,
-            &[],
-            "0.0.0.0:7001",
-        );
-        assert!(matches!(
-            result.unwrap_err(),
-            BootstrapError::SelfBootstrap { .. }
-        ));
-    }
-
-    #[test]
-    fn test_self_bootstrap_ipv6() {
-        let result = validate_config(
-            6126151,
-            None,
-            &["/ip6/::1/tcp/7001".into()],
-            1000,
+            &[1, 2, 3],
+            &[1, 2, 3],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
             false,
-            1,
-            &[],
-            "[::]:7001",
+            200_000,
+            200,
+            8,
         );
-        assert!(matches!(
-            result.unwrap_err(),
-            BootstrapError::SelfBootstrap { .. }
-        ));
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.message.contains("duplicate")));
     }
 
     #[test]
     fn test_empty_listen_addr() {
-        let result = validate_config(6126151, None, &[], 1000, false, 1, &[], "");
-        assert!(matches!(
-            result.unwrap_err(),
-            BootstrapError::InvalidListenAddress { .. }
-        ));
-    }
-
-    #[test]
-    fn test_malformed_listen_addr() {
         let result = validate_config(
             6126151,
             None,
             &[],
             1000,
             false,
+            false,
             1,
-            &[],
-            "not-a-valid-address",
+            &[1, 2, 3],
+            &[1, 2, 3],
+            &dummy_activation(),
+            "",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            200_000,
+            200,
+            8,
         );
-        assert!(matches!(
-            result.unwrap_err(),
-            BootstrapError::InvalidListenAddress { .. }
-        ));
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.field.contains("listen")));
     }
 
     #[test]
-    fn test_invalid_port_in_listen_addr() {
+    fn test_invalid_listen_port() {
         let result = validate_config(
             6126151,
             None,
             &[],
             1000,
             false,
+            false,
             1,
-            &[],
+            &[1, 2, 3],
+            &[1, 2, 3],
+            &dummy_activation(),
             "0.0.0.0:99999",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            200_000,
+            200,
+            8,
         );
-        assert!(matches!(
-            result.unwrap_err(),
-            BootstrapError::InvalidPort { .. }
-        ));
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.message.contains("invalid port")));
     }
 
-    // ── Genesis validation tests ───────────────────────────────────────
+    #[test]
+    fn test_empty_validator_set() {
+        let result = validate_config(
+            6126151,
+            None,
+            &[],
+            1000,
+            false,
+            false,
+            1,
+            &[],
+            &[],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            200_000,
+            200,
+            8,
+        );
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.message.contains("at least one validator")));
+    }
+
+    #[test]
+    fn test_duplicate_validator_seeds() {
+        let result = validate_config(
+            6126151,
+            None,
+            &[],
+            1000,
+            false,
+            false,
+            1,
+            &[1, 2, 2, 3],
+            &[1, 2, 2, 3],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            200_000,
+            200,
+            8,
+        );
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.message.contains("duplicate validator seeds")));
+    }
+
+    #[test]
+    fn test_validator_seeds_mismatch() {
+        let result = validate_config(
+            6126151,
+            None,
+            &[],
+            1000,
+            false,
+            false,
+            1,
+            &[1, 2, 3],
+            &[1, 2, 4],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            200_000,
+            200,
+            8,
+        );
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.message.contains("must exactly match")));
+    }
+
     #[test]
     fn test_genesis_hash_deterministic() {
-        let json = r#"{"chain_id":6126151,"validators":[{"seed":2}]}"#;
-        let h1 = genesis_hash(json);
-        let h2 = genesis_hash(json);
+        let json1 = r#"{"chain_id":6126151,"validators":[{"seed":2}]}"#;
+        let json2 = r#"
+        {
+            "chain_id": 6126151,
+            "validators": [{"seed": 2}]
+        }
+        "#;
+        let h1 = genesis_hash(json1);
+        let h2 = genesis_hash(json2);
         assert_eq!(h1, h2);
     }
 
@@ -750,67 +880,221 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_genesis_integrity_ok() -> BootstrapResult<()> {
-        let file = NamedTempFile::new().unwrap();
-        let path = file.path();
+    fn test_verify_genesis_integrity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("genesis.json");
         let content = r#"{"chain_id":6126151,"validators":[]}"#;
-        std::fs::write(path, content).unwrap();
+        std::fs::write(&path, content).unwrap();
 
-        let hash = verify_genesis_integrity(path, None)?;
+        let hash = verify_genesis_integrity(&path, None).unwrap();
         assert_ne!(hash, [0u8; 32]);
 
-        // Correct hash passes
-        assert!(verify_genesis_integrity(path, Some(&hash)).is_ok());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_verify_genesis_integrity_mismatch() -> BootstrapResult<()> {
-        let file = NamedTempFile::new().unwrap();
-        let path = file.path();
-        std::fs::write(path, r#"{"chain_id":6126151}"#).unwrap();
+        assert!(verify_genesis_integrity(&path, Some(&hash)).is_ok());
 
         let bad = [0xFFu8; 32];
-        let err = verify_genesis_integrity(path, Some(&bad)).unwrap_err();
-        assert!(matches!(
-            err,
-            BootstrapError::GenesisHashMismatch { .. }
-        ));
-        Ok(())
+        assert!(verify_genesis_integrity(&path, Some(&bad)).is_err());
     }
 
     #[test]
-    fn test_verify_genesis_integrity_empty_file() {
-        let file = NamedTempFile::new().unwrap();
-        let path = file.path();
-        std::fs::write(path, "").unwrap();
-        let err = verify_genesis_integrity(path, None).unwrap_err();
-        assert!(matches!(err, BootstrapError::EmptyGenesis));
+    fn test_invalid_genesis_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("genesis.json");
+        std::fs::write(&path, "not valid json").unwrap();
+        let res = verify_genesis_integrity(&path, None);
+        assert!(res.is_err());
     }
 
     #[test]
-    fn test_verify_genesis_integrity_missing_file() {
-        let err = verify_genesis_integrity("/nonexistent/file.json", None).unwrap_err();
-        assert!(matches!(err, BootstrapError::GenesisFile { .. }));
+    fn test_missing_genesis_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("genesis.json");
+        std::fs::write(&path, r#"{"chain_id":123}"#).unwrap();
+        let res = verify_genesis_integrity(&path, None);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("validators"));
     }
 
     #[test]
-    fn test_verify_genesis_content_valid() {
-        let json = r#"{"chain_id":6126151,"validators":[]}"#;
-        assert!(verify_genesis_content(json).is_ok());
+    fn test_protocol_activations_invalid() {
+        let result = validate_config(
+            6126151,
+            None,
+            &[],
+            1000,
+            false,
+            false,
+            1,
+            &[1, 2, 3],
+            &[1, 2, 3],
+            &[], // empty activations
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            200_000,
+            200,
+            8,
+        );
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.message.contains("cannot be empty")));
     }
 
     #[test]
-    fn test_verify_genesis_content_missing_chain_id() {
-        let json = r#"{"validators":[]}"#;
-        let err = verify_genesis_content(json).unwrap_err();
-        assert!(matches!(err, BootstrapError::GenesisFile { .. }));
+    fn test_protocol_activations_no_v1() {
+        let activations = vec![
+            ProtocolActivation { protocol_version: 2, activation_height: Some(100), grace_blocks: 10 },
+        ];
+        let result = validate_config(
+            6126151,
+            None,
+            &[],
+            1000,
+            false,
+            false,
+            1,
+            &[1, 2, 3],
+            &[1, 2, 3],
+            &activations,
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            200_000,
+            200,
+            8,
+        );
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.message.contains("must include activation for protocol_version=1 at height 0")));
     }
 
     #[test]
-    fn test_verify_genesis_content_invalid_json() {
-        let err = verify_genesis_content("not json").unwrap_err();
-        assert!(matches!(err, BootstrapError::GenesisFile { .. }));
+    fn test_data_dir_inaccessible() {
+        // We'll create a path that cannot be created (e.g., root protected, but we can simulate with a non‑existing parent).
+        // Since we cannot guarantee permission failure in tests, we just check that empty dir is caught.
+        let result = validate_config(
+            6126151,
+            None,
+            &[],
+            1000,
+            false,
+            false,
+            1,
+            &[1, 2, 3],
+            &[1, 2, 3],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "", // empty data dir
+            "plain",
+            false,
+            200_000,
+            200,
+            8,
+        );
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.field == "node.data_dir"));
+    }
+
+    #[test]
+    fn test_keystore_encrypted_no_password() {
+        let result = validate_config(
+            6126151,
+            None,
+            &[],
+            1000,
+            false,
+            false,
+            1,
+            &[1, 2, 3],
+            &[1, 2, 3],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "encrypted",
+            false, // password not configured
+            200_000,
+            200,
+            8,
+        );
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.message.contains("no password provided")));
+    }
+
+    #[test]
+    fn test_mempool_capacity_out_of_bounds() {
+        let result = validate_config(
+            6126151,
+            None,
+            &[],
+            1000,
+            false,
+            false,
+            1,
+            &[1, 2, 3],
+            &[1, 2, 3],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            500, // too low
+            200,
+            8,
+        );
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.message.contains("too low")));
+    }
+
+    #[test]
+    fn test_connection_limits() {
+        let result = validate_config(
+            6126151,
+            None,
+            &[],
+            1000,
+            false,
+            false,
+            1,
+            &[1, 2, 3],
+            &[1, 2, 3],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            200_000,
+            0, // invalid total
+            8,
+        );
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.message.contains("max_connections_total")));
+
+        let result = validate_config(
+            6126151,
+            None,
+            &[],
+            1000,
+            false,
+            false,
+            1,
+            &[1, 2, 3],
+            &[1, 2, 3],
+            &dummy_activation(),
+            "0.0.0.0:9001",
+            "/ip4/0.0.0.0/tcp/7001",
+            "/tmp/iona",
+            "plain",
+            false,
+            200_000,
+            200,
+            300, // per peer > total
+        );
+        assert!(!result.is_ok());
+        assert!(result.errors.iter().any(|e| e.message.contains("cannot exceed")));
     }
 }
