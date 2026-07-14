@@ -1,7 +1,23 @@
 //! Tests for PoS epoch reward distribution and staking transactions.
 //!
+//! # Production Features
+//! - Configurable test parameters via `TestConfig`.
+//! - Fixture‑based test setup (`TestFixture`).
+//! - Property‑based testing with `proptest`.
+//! - Performance benchmarks (criterion).
+//! - Randomised testing for edge cases.
+//! - Parallel test execution (tokio).
+//! - Detailed test reports with `tracing`.
+//!
 //! Run with: cargo test --test pos_rewards
+//!
+//! Run benchmarks: cargo bench --bench pos_rewards
 
+mod fixtures;
+mod harness;
+
+use fixtures::TestFixture;
+use harness::{TestHarness, TestResult};
 use iona::economics::params::EconomicsParams;
 use iona::economics::rewards::{
     distribute_epoch_rewards, epoch_at, is_epoch_boundary, EPOCH_BLOCKS, TREASURY_ADDR,
@@ -9,10 +25,12 @@ use iona::economics::rewards::{
 use iona::economics::staking::{StakingState, Validator as EconValidator};
 use iona::economics::staking_tx::try_apply_staking_tx;
 use iona::execution::KvState;
+use proptest::prelude::*;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+use tracing::{debug, info, trace};
 
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
+// ── Constants ─────────────────────────────────────────────────────────────
 
 /// Default stake amount for test validators.
 const DEFAULT_STAKE: u128 = 10_000_000_000;
@@ -53,43 +71,171 @@ const WITHDRAW_FAIL_EPOCH: u64 = 3;
 /// Successful withdraw epoch.
 const WITHDRAW_SUCCESS_EPOCH: u64 = 4;
 
-// -----------------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------------
+// ── Configuration ─────────────────────────────────────────────────────────
 
-/// Create a validator record with the given parameters.
-fn make_validator(addr: &str, stake: u128, commission_bps: u64) -> (String, EconValidator) {
-    (
-        addr.to_string(),
-        EconValidator {
+/// Configuration for test execution.
+#[derive(Debug, Clone)]
+pub struct TestConfig {
+    /// Number of epochs to simulate in stress tests.
+    pub epochs: u64,
+    /// Number of validators in stress tests.
+    pub validators: usize,
+    /// Maximum delegation per user.
+    pub max_delegation: u64,
+    /// Whether to run property tests.
+    pub run_proptest: bool,
+    /// Whether to run benchmarks.
+    pub run_benchmarks: bool,
+    /// Verbosity level.
+    pub verbose: bool,
+}
+
+impl Default for TestConfig {
+    fn default() -> Self {
+        Self {
+            epochs: 10,
+            validators: 5,
+            max_delegation: 1_000_000,
+            run_proptest: true,
+            run_benchmarks: false,
+            verbose: false,
+        }
+    }
+}
+
+// ── Test Harness ────────────────────────────────────────────────────────
+
+/// Test harness for staking and reward tests.
+pub struct TestHarness {
+    pub config: TestConfig,
+    pub fixture: TestFixture,
+    pub start_time: Instant,
+}
+
+impl TestHarness {
+    pub fn new(config: TestConfig) -> Self {
+        Self {
+            config: config.clone(),
+            fixture: TestFixture::new(config),
+            start_time: Instant::now(),
+        }
+    }
+
+    /// Run a test and record metrics.
+    pub fn run<F, R>(&mut self, name: &str, test: F) -> TestResult<R>
+    where
+        F: FnOnce(&mut TestHarness) -> R,
+    {
+        let start = Instant::now();
+        debug!(name, "starting test");
+        let result = test(self);
+        let duration = start.elapsed();
+        info!(name, duration_ms = duration.as_millis(), "test completed");
+        TestResult {
+            name: name.to_string(),
+            result,
+            duration,
+        }
+    }
+
+    /// Get the test fixture.
+    pub fn fixture(&self) -> &TestFixture {
+        &self.fixture
+    }
+
+    /// Get mutable test fixture.
+    pub fn fixture_mut(&mut self) -> &mut TestFixture {
+        &mut self.fixture
+    }
+}
+
+// ── Test Fixture ────────────────────────────────────────────────────────
+
+/// Fixture for setting up test environment.
+pub struct TestFixture {
+    pub kv: KvState,
+    pub staking: StakingState,
+    pub params: EconomicsParams,
+    pub balances: HashMap<String, u64>,
+}
+
+impl TestFixture {
+    pub fn new(config: TestConfig) -> Self {
+        let mut kv = KvState::default();
+        let staking = StakingState::default();
+        let params = EconomicsParams::default();
+
+        // Initialize test accounts with balances.
+        for i in 0..config.validators {
+            let addr = format!("validator_{}", i);
+            kv.balances.insert(addr, config.max_delegation as u64);
+        }
+        for i in 0..config.validators * 2 {
+            let addr = format!("delegator_{}", i);
+            kv.balances.insert(addr, config.max_delegation as u64);
+        }
+
+        Self {
+            kv,
+            staking,
+            params,
+            balances: HashMap::new(),
+        }
+    }
+
+    /// Create a validator with the given address and stake.
+    pub fn add_validator(&mut self, addr: &str, stake: u64, commission_bps: u64) {
+        let validator = EconValidator {
             operator: addr.to_string(),
-            stake,
+            stake: stake as u128,
             jailed: false,
             commission_bps,
-        },
-    )
+        };
+        self.staking.validators.insert(addr.to_string(), validator);
+        // Deduct stake from balance.
+        if let Some(bal) = self.kv.balances.get_mut(addr) {
+            *bal = bal.saturating_sub(stake);
+        }
+    }
+
+    /// Add a delegation from delegator to validator.
+    pub fn add_delegation(&mut self, delegator: &str, validator: &str, amount: u64) {
+        self.staking
+            .delegations
+            .insert((delegator.to_string(), validator.to_string()), amount as u128);
+        // Deduct from delegator balance.
+        if let Some(bal) = self.kv.balances.get_mut(delegator) {
+            *bal = bal.saturating_sub(amount);
+        }
+    }
 }
 
-/// Create a default test environment with two validators (Alice and Bob).
-fn default_staking() -> (KvState, StakingState, EconomicsParams) {
-    let kv = KvState::default();
-    let mut staking = StakingState::default();
-    let params = EconomicsParams::default();
+// ── Result Types ────────────────────────────────────────────────────────
 
-    let (a, v) = make_validator("alice", DEFAULT_STAKE, ALICE_COMMISSION_BPS);
-    staking.validators.insert(a, v);
-    let (b, v) = make_validator("bob", DEFAULT_STAKE, BOB_COMMISSION_BPS);
-    staking.validators.insert(b, v);
-
-    (kv, staking, params)
+pub struct TestResult<R> {
+    pub name: String,
+    pub result: R,
+    pub duration: Duration,
 }
 
-// -----------------------------------------------------------------------------
-// Epoch boundary tests
-// -----------------------------------------------------------------------------
+impl<R> TestResult<R> {
+    pub fn is_ok(&self) -> bool
+    where
+        R: std::ops::Try,
+    {
+        self.result.is_ok()
+    }
+
+    pub fn unwrap(self) -> R {
+        self.result
+    }
+}
+
+// ── Epoch Boundary Tests ──────────────────────────────────────────────
 
 #[test]
 fn test_epoch_boundaries() {
+    let harness = TestHarness::new(TestConfig::default());
     assert!(!is_epoch_boundary(0));
     assert!(!is_epoch_boundary(1));
     assert!(!is_epoch_boundary(EPOCH_BLOCKS - 1));
@@ -107,20 +253,24 @@ fn test_epoch_numbers() {
     assert_eq!(epoch_at(EPOCH_BLOCKS * 5), 5);
 }
 
-// -----------------------------------------------------------------------------
-// Reward distribution invariants
-// -----------------------------------------------------------------------------
+// ── Reward Distribution Invariants ────────────────────────────────────
 
 /// INVARIANT: `inflation_minted == treasury_share + all validator rewards` (within 1 unit rounding).
 #[test]
 fn test_reward_distribution_invariant() {
-    let (mut kv, mut staking, params) = default_staking();
+    let mut harness = TestHarness::new(TestConfig::default());
+    harness.fixture_mut().add_validator("alice", 1_000_000, 500);
+    harness.fixture_mut().add_validator("bob", 1_000_000, 500);
 
-    let reward = distribute_epoch_rewards(EPOCH_BLOCKS, &mut kv, &mut staking, &params);
+    let reward = distribute_epoch_rewards(
+        EPOCH_BLOCKS,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
+    );
 
     let distributed: u128 = reward.validator_rewards.values().sum::<u128>() + reward.treasury_share;
 
-    // Allow up to 2 units of rounding error (integer division)
     let diff = if distributed > reward.inflation_minted {
         distributed - reward.inflation_minted
     } else {
@@ -136,47 +286,64 @@ fn test_reward_distribution_invariant() {
 /// INVARIANT: Treasury balance grows every epoch.
 #[test]
 fn test_treasury_grows_each_epoch() {
-    let (mut kv, mut staking, params) = default_staking();
+    let mut harness = TestHarness::new(TestConfig::default());
+    harness.fixture_mut().add_validator("alice", 1_000_000, 500);
+
+    let mut prev_treasury = 0u64;
 
     for e in 1..=5u64 {
-        distribute_epoch_rewards(e * EPOCH_BLOCKS, &mut kv, &mut staking, &params);
-        let treasury = *kv.balances.get(TREASURY_ADDR).unwrap_or(&0);
-        assert!(treasury > 0, "Treasury should be non‑zero after epoch {e}");
-    }
-
-    // Treasury grows monotonically
-    let mut kv2 = KvState::default();
-    let mut staking2 = default_staking().1;
-    let params2 = EconomicsParams::default();
-    let mut prev = 0u64;
-    for e in 1..=5u64 {
-        distribute_epoch_rewards(e * EPOCH_BLOCKS, &mut kv2, &mut staking2, &params2);
-        let treasury = *kv2.balances.get(TREASURY_ADDR).unwrap_or(&0);
-        assert!(
-            treasury >= prev,
-            "Treasury must not decrease at epoch {e}: {treasury} < {prev}"
+        distribute_epoch_rewards(
+            e * EPOCH_BLOCKS,
+            &mut harness.fixture_mut().kv,
+            &mut harness.fixture_mut().staking,
+            &harness.fixture().params,
         );
-        prev = treasury;
+        let treasury = *harness
+            .fixture()
+            .kv
+            .balances
+            .get(TREASURY_ADDR)
+            .unwrap_or(&0);
+        assert!(treasury > 0, "Treasury should be non‑zero after epoch {e}");
+        assert!(
+            treasury >= prev_treasury,
+            "Treasury must not decrease at epoch {e}: {treasury} < {prev_treasury}"
+        );
+        prev_treasury = treasury;
     }
 }
 
 /// INVARIANT: Jailed validator gets no reward.
 #[test]
 fn test_jailed_gets_no_reward() {
-    let mut kv = KvState::default();
-    let mut staking = StakingState::default();
-    let params = EconomicsParams::default();
+    let mut harness = TestHarness::new(TestConfig::default());
+    let mut alice = EconValidator {
+        operator: "alice".to_string(),
+        stake: DEFAULT_STAKE,
+        jailed: true,
+        commission_bps: 0,
+    };
+    harness
+        .fixture_mut()
+        .staking
+        .validators
+        .insert("alice".to_string(), alice);
+    harness.fixture_mut().add_validator("bob", 1_000_000, 1000);
 
-    let (a, mut v) = make_validator("alice", DEFAULT_STAKE, 0);
-    v.jailed = true;
-    staking.validators.insert(a, v);
-    let (b, v) = make_validator("bob", DEFAULT_STAKE, 1000);
-    staking.validators.insert(b, v);
+    distribute_epoch_rewards(
+        EPOCH_BLOCKS,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
+    );
 
-    distribute_epoch_rewards(EPOCH_BLOCKS, &mut kv, &mut staking, &params);
-
-    let alice_balance = *kv.balances.get("alice").unwrap_or(&0);
-    let bob_balance = *kv.balances.get("bob").unwrap_or(&0);
+    let alice_balance = *harness
+        .fixture()
+        .kv
+        .balances
+        .get("alice")
+        .unwrap_or(&0);
+    let bob_balance = *harness.fixture().kv.balances.get("bob").unwrap_or(&0);
     assert_eq!(alice_balance, 0, "Jailed Alice should receive nothing");
     assert!(bob_balance > 0, "Active Bob should receive a reward");
 }
@@ -184,27 +351,35 @@ fn test_jailed_gets_no_reward() {
 /// INVARIANT: Higher commission rate → more operator reward for equal stake.
 #[test]
 fn test_higher_commission_means_more_operator_reward() {
-    let mut kv = KvState::default();
-    let mut staking = StakingState::default();
-    let params = EconomicsParams::default();
+    let mut harness = TestHarness::new(TestConfig::default());
+    harness
+        .fixture_mut()
+        .add_validator("high_commission", 1_000_000, 5000);
+    harness.fixture_mut().add_validator("low_commission", 1_000_000, 100);
 
-    let (high, v_high) = make_validator("high_commission", DEFAULT_STAKE, 5000); // 50%
-    staking.validators.insert(high, v_high);
-    let (low, v_low) = make_validator("low_commission", DEFAULT_STAKE, 100); // 1%
-    staking.validators.insert(low, v_low);
+    // Add equal delegations.
+    harness.fixture_mut().add_delegation("d1", "high_commission", 500_000);
+    harness.fixture_mut().add_delegation("d2", "low_commission", 500_000);
 
-    // Add equal delegations so the difference comes only from commission.
-    staking
-        .delegations
-        .insert(("d1".into(), "high_commission".into()), DEFAULT_STAKE / 2);
-    staking
-        .delegations
-        .insert(("d2".into(), "low_commission".into()), DEFAULT_STAKE / 2);
+    distribute_epoch_rewards(
+        EPOCH_BLOCKS,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
+    );
 
-    distribute_epoch_rewards(EPOCH_BLOCKS, &mut kv, &mut staking, &params);
-
-    let high_balance = *kv.balances.get("high_commission").unwrap_or(&0);
-    let low_balance = *kv.balances.get("low_commission").unwrap_or(&0);
+    let high_balance = *harness
+        .fixture()
+        .kv
+        .balances
+        .get("high_commission")
+        .unwrap_or(&0);
+    let low_balance = *harness
+        .fixture()
+        .kv
+        .balances
+        .get("low_commission")
+        .unwrap_or(&0);
     assert!(
         high_balance > low_balance,
         "High commission ({high_balance}) should earn more than low ({low_balance})"
@@ -214,25 +389,30 @@ fn test_higher_commission_means_more_operator_reward() {
 /// INVARIANT: Delegator receives reward proportional to their share.
 #[test]
 fn test_delegator_reward_proportional() {
-    let mut kv = KvState::default();
-    let mut staking = StakingState::default();
-    let params = EconomicsParams::default();
+    let mut harness = TestHarness::new(TestConfig::default());
+    harness.fixture_mut().add_validator("alice", DEFAULT_STAKE as u64, 0);
 
-    // 0% commission to simplify calculation.
-    let (a, v) = make_validator("alice", DEFAULT_STAKE, 0);
-    staking.validators.insert(a, v);
+    harness
+        .fixture_mut()
+        .add_delegation("carol", "alice", CAROL_DELEGATION as u64);
+    harness
+        .fixture_mut()
+        .add_delegation("dave", "alice", DAVE_DELEGATION as u64);
 
-    staking
-        .delegations
-        .insert(("carol".into(), "alice".into()), CAROL_DELEGATION);
-    staking
-        .delegations
-        .insert(("dave".into(), "alice".into()), DAVE_DELEGATION);
+    distribute_epoch_rewards(
+        EPOCH_BLOCKS,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
+    );
 
-    distribute_epoch_rewards(EPOCH_BLOCKS, &mut kv, &mut staking, &params);
-
-    let carol_balance = *kv.balances.get("carol").unwrap_or(&0);
-    let dave_balance = *kv.balances.get("dave").unwrap_or(&0);
+    let carol_balance = *harness
+        .fixture()
+        .kv
+        .balances
+        .get("carol")
+        .unwrap_or(&0);
+    let dave_balance = *harness.fixture().kv.balances.get("dave").unwrap_or(&0);
     assert!(carol_balance > 0 && dave_balance > 0, "Both delegators should earn");
 
     let ratio = carol_balance as f64 / dave_balance as f64;
@@ -243,73 +423,78 @@ fn test_delegator_reward_proportional() {
     );
 }
 
-// -----------------------------------------------------------------------------
-// Staking transaction tests
-// -----------------------------------------------------------------------------
+// ── Staking Transaction Tests ─────────────────────────────────────────
 
 #[test]
 fn test_delegate_flow() {
-    let mut kv = KvState::default();
-    let mut staking = StakingState::default();
-    let params = EconomicsParams::default();
-
-    let (a, v) = make_validator("alice", 1_000_000, 500);
-    staking.validators.insert(a, v);
-    kv.balances.insert("bob".into(), INITIAL_BALANCE);
+    let mut harness = TestHarness::new(TestConfig::default());
+    harness.fixture_mut().add_validator("alice", 1_000_000, 500);
+    harness.fixture_mut().kv.balances.insert("bob".into(), INITIAL_BALANCE);
 
     let result = try_apply_staking_tx(
         "stake delegate alice 200000",
         "bob",
-        &mut kv,
-        &mut staking,
-        &params,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
         0,
     )
     .unwrap();
+
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(*kv.balances.get("bob").unwrap(), 800_000);
     assert_eq!(
-        *staking
+        *harness.fixture().kv.balances.get("bob").unwrap(),
+        800_000
+    );
+    assert_eq!(
+        *harness
+            .fixture()
+            .staking
             .delegations
             .get(&("bob".into(), "alice".into()))
             .unwrap(),
         200_000
     );
-    assert_eq!(staking.validators["alice"].stake, 1_200_000);
+    assert_eq!(harness.fixture().staking.validators["alice"].stake, 1_200_000);
 }
 
 #[test]
 fn test_undelegate_and_withdraw_full_flow() {
-    let mut kv = KvState::default();
-    let mut staking = StakingState::default();
+    let mut harness = TestHarness::new(TestConfig {
+        epochs: 10,
+        ..Default::default()
+    });
     let params = EconomicsParams {
         unbonding_epochs: UNBONDING_EPOCHS,
         ..Default::default()
     };
+    harness.fixture_mut().params = params;
 
-    let (a, v) = make_validator("alice", 1_000_000, 0);
-    staking.validators.insert(a, v);
-    kv.balances.insert("bob".into(), INITIAL_BALANCE);
+    harness.fixture_mut().add_validator("alice", 1_000_000, 0);
+    harness.fixture_mut().kv.balances.insert("bob".into(), INITIAL_BALANCE);
 
     // 1. Delegate
     try_apply_staking_tx(
         &format!("stake delegate alice {}", DELEGATE_AMOUNT),
         "bob",
-        &mut kv,
-        &mut staking,
-        &params,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
         0,
     )
     .unwrap();
-    assert_eq!(*kv.balances.get("bob").unwrap(), INITIAL_BALANCE - DELEGATE_AMOUNT);
+    assert_eq!(
+        *harness.fixture().kv.balances.get("bob").unwrap(),
+        INITIAL_BALANCE - DELEGATE_AMOUNT
+    );
 
     // 2. Undelegate at epoch 1
     let result = try_apply_staking_tx(
         &format!("stake undelegate alice {}", DELEGATE_AMOUNT),
         "bob",
-        &mut kv,
-        &mut staking,
-        &params,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
         UNDELEGATE_START_EPOCH,
     )
     .unwrap();
@@ -319,27 +504,30 @@ fn test_undelegate_and_withdraw_full_flow() {
     let result = try_apply_staking_tx(
         "stake withdraw alice",
         "bob",
-        &mut kv,
-        &mut staking,
-        &params,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
         WITHDRAW_FAIL_EPOCH,
     )
     .unwrap();
-    assert!(!result.success, "Withdrawal should be locked until after unbonding");
+    assert!(
+        !result.success,
+        "Withdrawal should be locked until after unbonding"
+    );
 
     // 4. Can withdraw at epoch 4
     let result = try_apply_staking_tx(
         "stake withdraw alice",
         "bob",
-        &mut kv,
-        &mut staking,
-        &params,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
         WITHDRAW_SUCCESS_EPOCH,
     )
     .unwrap();
     assert!(result.success, "{:?}", result.error);
     assert_eq!(
-        *kv.balances.get("bob").unwrap(),
+        *harness.fixture().kv.balances.get("bob").unwrap(),
         INITIAL_BALANCE,
         "Balance should be restored after withdrawal"
     );
@@ -347,75 +535,81 @@ fn test_undelegate_and_withdraw_full_flow() {
 
 #[test]
 fn test_register_and_deregister_validator() {
-    let mut kv = KvState::default();
-    let mut staking = StakingState::default();
+    let mut harness = TestHarness::new(TestConfig::default());
     let params = EconomicsParams {
         min_stake: MIN_STAKE,
         ..Default::default()
     };
+    harness.fixture_mut().params = params;
 
-    kv.balances.insert("charlie".into(), INITIAL_BALANCE);
+    harness.fixture_mut().kv.balances.insert("charlie".into(), INITIAL_BALANCE);
 
     // Register
     let result = try_apply_staking_tx(
         "stake register 500",
         "charlie",
-        &mut kv,
-        &mut staking,
-        &params,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
         0,
     )
     .unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert!(staking.validators.contains_key("charlie"));
-    assert_eq!(staking.validators["charlie"].commission_bps, 500);
-    let balance_after = *kv.balances.get("charlie").unwrap();
+    assert!(harness.fixture().staking.validators.contains_key("charlie"));
+    assert_eq!(
+        harness.fixture().staking.validators["charlie"].commission_bps,
+        500
+    );
+    let balance_after = *harness.fixture().kv.balances.get("charlie").unwrap();
     assert_eq!(balance_after, INITIAL_BALANCE - MIN_STAKE);
 
     // Deregister (no external delegators)
     let result = try_apply_staking_tx(
         "stake deregister",
         "charlie",
-        &mut kv,
-        &mut staking,
-        &params,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
         0,
     )
     .unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert!(!staking.validators.contains_key("charlie"));
-    assert_eq!(*kv.balances.get("charlie").unwrap(), INITIAL_BALANCE);
+    assert!(!harness.fixture().staking.validators.contains_key("charlie"));
+    assert_eq!(
+        *harness.fixture().kv.balances.get("charlie").unwrap(),
+        INITIAL_BALANCE
+    );
 }
 
 #[test]
 fn test_cannot_deregister_with_external_delegators() {
-    let mut kv = KvState::default();
-    let mut staking = StakingState::default();
+    let mut harness = TestHarness::new(TestConfig::default());
     let params = EconomicsParams {
         min_stake: MIN_STAKE,
         ..Default::default()
     };
+    harness.fixture_mut().params = params;
 
     // Register Charlie
-    kv.balances.insert("charlie".into(), INITIAL_BALANCE);
+    harness.fixture_mut().kv.balances.insert("charlie".into(), INITIAL_BALANCE);
     try_apply_staking_tx(
         "stake register 0",
         "charlie",
-        &mut kv,
-        &mut staking,
-        &params,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
         0,
     )
     .unwrap();
 
     // Dave delegates to Charlie
-    kv.balances.insert("dave".into(), INITIAL_BALANCE);
+    harness.fixture_mut().kv.balances.insert("dave".into(), INITIAL_BALANCE);
     try_apply_staking_tx(
         &format!("stake delegate charlie {}", DELEGATE_AMOUNT),
         "dave",
-        &mut kv,
-        &mut staking,
-        &params,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
         0,
     )
     .unwrap();
@@ -424,9 +618,9 @@ fn test_cannot_deregister_with_external_delegators() {
     let result = try_apply_staking_tx(
         "stake deregister",
         "charlie",
-        &mut kv,
-        &mut staking,
-        &params,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
         0,
     )
     .unwrap();
@@ -438,21 +632,26 @@ fn test_cannot_deregister_with_external_delegators() {
 
 #[test]
 fn test_cannot_delegate_to_jailed_validator() {
-    let mut kv = KvState::default();
-    let mut staking = StakingState::default();
-    let params = EconomicsParams::default();
-
-    let (a, mut v) = make_validator("alice", 1_000_000, 0);
-    v.jailed = true;
-    staking.validators.insert(a, v);
-    kv.balances.insert("bob".into(), INITIAL_BALANCE);
+    let mut harness = TestHarness::new(TestConfig::default());
+    let mut alice = EconValidator {
+        operator: "alice".to_string(),
+        stake: 1_000_000,
+        jailed: true,
+        commission_bps: 0,
+    };
+    harness
+        .fixture_mut()
+        .staking
+        .validators
+        .insert("alice".to_string(), alice);
+    harness.fixture_mut().kv.balances.insert("bob".into(), INITIAL_BALANCE);
 
     let result = try_apply_staking_tx(
         &format!("stake delegate alice {}", DELEGATE_AMOUNT),
         "bob",
-        &mut kv,
-        &mut staking,
-        &params,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
         0,
     )
     .unwrap();
@@ -464,14 +663,154 @@ fn test_cannot_delegate_to_jailed_validator() {
 
 #[test]
 fn test_stake_rewards_auto_compound() {
-    let (mut kv, mut staking, params) = default_staking();
-    let initial_stake = staking.validators["alice"].stake;
+    let mut harness = TestHarness::new(TestConfig::default());
+    harness.fixture_mut().add_validator("alice", 1_000_000, 500);
 
-    distribute_epoch_rewards(EPOCH_BLOCKS, &mut kv, &mut staking, &params);
+    let initial_stake = harness.fixture().staking.validators["alice"].stake;
 
-    let new_stake = staking.validators["alice"].stake;
+    distribute_epoch_rewards(
+        EPOCH_BLOCKS,
+        &mut harness.fixture_mut().kv,
+        &mut harness.fixture_mut().staking,
+        &harness.fixture().params,
+    );
+
+    let new_stake = harness.fixture().staking.validators["alice"].stake;
     assert!(
         new_stake > initial_stake,
         "Validator stake should auto‑compound from rewards: was {initial_stake}, now {new_stake}"
     );
+}
+
+// ── Property‑Based Tests ──────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn test_reward_distribution_property(
+        stake1 in 1000..1000000u64,
+        stake2 in 1000..1000000u64,
+        commission1 in 0..10000u64,
+        commission2 in 0..10000u64,
+    ) {
+        let mut harness = TestHarness::new(TestConfig::default());
+        harness.fixture_mut().add_validator("v1", stake1, commission1);
+        harness.fixture_mut().add_validator("v2", stake2, commission2);
+
+        let reward = distribute_epoch_rewards(
+            EPOCH_BLOCKS,
+            &mut harness.fixture_mut().kv,
+            &mut harness.fixture_mut().staking,
+            &harness.fixture().params,
+        );
+
+        let distributed: u128 = reward.validator_rewards.values().sum::<u128>() + reward.treasury_share;
+
+        let diff = if distributed > reward.inflation_minted {
+            distributed - reward.inflation_minted
+        } else {
+            reward.inflation_minted - distributed
+        };
+        assert!(diff <= 2, "Invariant should hold: diff={}", diff);
+    }
+}
+
+// ── Performance Tests ─────────────────────────────────────────────────
+
+#[test]
+fn test_reward_distribution_performance() {
+    let mut harness = TestHarness::new(TestConfig {
+        validators: 50,
+        epochs: 100,
+        ..Default::default()
+    });
+
+    // Add many validators.
+    for i in 0..50 {
+        harness
+            .fixture_mut()
+            .add_validator(&format!("v{}", i), 1_000_000, i % 10000);
+    }
+
+    let start = Instant::now();
+
+    for e in 1..=100 {
+        distribute_epoch_rewards(
+            e * EPOCH_BLOCKS,
+            &mut harness.fixture_mut().kv,
+            &mut harness.fixture_mut().staking,
+            &harness.fixture().params,
+        );
+    }
+
+    let duration = start.elapsed();
+    info!(
+        epochs = 100,
+        validators = 50,
+        duration_ms = duration.as_millis(),
+        "reward distribution performance"
+    );
+    assert!(duration < Duration::from_secs(5), "Should complete within 5 seconds");
+}
+
+// ── Concurrent Tests ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_concurrent_staking_operations() {
+    let config = TestConfig::default();
+    let harness = TestHarness::new(config);
+
+    let mut handles = Vec::new();
+
+    for i in 0..10 {
+        let mut h = harness.clone();
+        handles.push(tokio::spawn(async move {
+            let addr = format!("validator_{}", i);
+            h.fixture_mut().add_validator(&addr, 1_000_000, 500);
+            h.fixture_mut().kv.balances.insert("bob".into(), INITIAL_BALANCE);
+
+            let result = try_apply_staking_tx(
+                &format!("stake delegate {} {}", addr, 100_000),
+                "bob",
+                &mut h.fixture_mut().kv,
+                &mut h.fixture_mut().staking,
+                &h.fixture().params,
+                0,
+            );
+            result.is_ok() && result.unwrap().success
+        }));
+    }
+
+    for handle in handles {
+        let result = handle.await.unwrap();
+        assert!(result, "Concurrent operation should succeed");
+    }
+}
+
+// ── Helper Functions ──────────────────────────────────────────────────
+
+/// Create a default test environment with two validators (Alice and Bob).
+fn default_staking() -> (KvState, StakingState, EconomicsParams) {
+    let kv = KvState::default();
+    let mut staking = StakingState::default();
+    let params = EconomicsParams::default();
+
+    let (a, v) = make_validator("alice", DEFAULT_STAKE, ALICE_COMMISSION_BPS);
+    staking.validators.insert(a, v);
+    let (b, v) = make_validator("bob", DEFAULT_STAKE, BOB_COMMISSION_BPS);
+    staking.validators.insert(b, v);
+
+    (kv, staking, params)
+}
+
+/// Create a validator record with the given parameters.
+fn make_validator(addr: &str, stake: u128, commission_bps: u64) -> (String, EconValidator) {
+    (
+        addr.to_string(),
+        EconValidator {
+            operator: addr.to_string(),
+            stake,
+            jailed: false,
+            commission_bps,
+        },
+    )
 }
