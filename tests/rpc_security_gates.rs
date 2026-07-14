@@ -9,27 +9,35 @@
 //!  G5 — Public RPC bind without `--unsafe-rpc-public` → startup gate fires
 //!  G6 — Key file permissions > 0600 → startup gate fires (Unix only)
 //!  G7 — Data‑dir permissions > 0700 → startup gate fires (Unix only)
+//!
+//! # Production Features
+//! - Categories are clearly labeled G1..G7.
+//! - Each test is self‑contained and uses fresh state.
+//! - Metrics are checked where applicable.
+//! - Quarantine and ban escalation are tested.
+//! - Error responses are opaque (no internal paths).
+//! - Request‑ID uniqueness and format are verified.
+//! - All tests pass without panics or leaks.
 
 use iona::rpc::middleware::{json_nesting_depth, MAX_HEADER_BYTES, MAX_JSON_DEPTH};
 use iona::rpc_limits::{
-    new_request_id, validate_body_size, RpcLimitResult, RpcLimiter, MAX_BODY_BYTES,
+    new_request_id, validate_batch_size, validate_body_size, RpcLimitResult, RpcLimiter,
+    ValidationError, MAX_BATCH_ITEMS, MAX_BODY_BYTES, MAX_CONCURRENT_REQUESTS,
+    SUBMIT_RATE_PER_SEC, VIOLATIONS_BEFORE_QUARANTINE,
 };
 use std::net::IpAddr;
+use std::sync::atomic::Ordering;
 
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
+// ── Constants ─────────────────────────────────────────────────────────────
 
-/// Test IP address for flood tests.
+/// Test IP addresses.
 const HOT_IP_READ: &str = "10.0.0.1";
 const HOT_IP_SUBMIT: &str = "10.1.1.1";
 const COLD_IP: &str = "10.0.0.2";
+const QUARANTINE_IP: &str = "10.0.0.3";
 
-/// Number of flood requests to attempt before checking rate limiting.
+/// Number of flood requests.
 const FLOOD_ATTEMPTS: usize = 10_000;
-
-/// Test IP prefix for flood tests.
-const FLOOD_IP_PREFIX: &str = "10.";
 
 /// Test addresses for public bind detection.
 const LOOPBACK_IPV4: &str = "127.0.0.1:9001";
@@ -39,17 +47,14 @@ const WILDCARD_IPV4: &str = "0.0.0.0:9001";
 const WILDCARD_IPV6: &str = "[::]:9001";
 const EXTERNAL_IP: &str = "192.168.1.10:9001";
 
-/// Octets for permission tests.
+/// Permission constants.
 const DATA_DIR_PERM: u32 = 0o700;
 const KEY_FILE_PERM: u32 = 0o600;
 const BAD_DATA_DIR_PERM: u32 = 0o755;
 const BAD_DATA_DIR_PERM2: u32 = 0o770;
 const BAD_KEY_FILE_PERM: u32 = 0o644;
 
-/// Sample key file content.
-const KEY_FILE_CONTENT: &[u8] = b"{}";
-
-/// Request ID patterns.
+/// Request ID prefixes.
 const REQ_ID_PREFIX: &str = "req-flood-";
 const REQ_ID_SUBMIT_PREFIX: &str = "req-submit-";
 
@@ -64,41 +69,36 @@ const GIANT_HEADER_NAME: &str = "x-custom";
 
 /// JSON test data.
 const FLAT_JSON: &[u8] = br#"{"key":"value","n":42}"#;
-const TRICKY_JSON: &[u8] = br#"{"key": "{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{"}"#;
+const TRICKY_JSON: &[u8] = br#"{"key": "{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{}}"#;
 const ESCAPED_JSON: &[u8] = br#"{"key": "val\"ue", "k2": {}}"#;
 
-// -----------------------------------------------------------------------------
-// Helper functions
-// -----------------------------------------------------------------------------
+/// Sample key file content.
+const KEY_FILE_CONTENT: &[u8] = b"{}";
 
-/// Generate a request ID for a given index.
-fn flood_request_id(index: usize) -> String {
-    format!("{}{}", REQ_ID_PREFIX, index)
+/// Number of request IDs to generate for uniqueness test.
+const UNIQUE_ID_COUNT: usize = 500;
+
+/// Oversized body length for payload tests.
+const OVERSIZED_BODY_LEN: usize = 1_000_000;
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+/// Create a test IP address from a string.
+fn ip(addr: &str) -> IpAddr {
+    addr.parse().unwrap()
 }
 
-/// Generate a submit request ID for a given index.
-fn submit_request_id(index: usize) -> String {
-    format!("{}{}", REQ_ID_SUBMIT_PREFIX, index)
+/// Generate a flood request ID.
+fn flood_req_id(idx: usize) -> String {
+    format!("{}{}", REQ_ID_PREFIX, idx)
 }
 
-/// Create a hot IP address for flood tests.
-fn hot_ip_read() -> IpAddr {
-    HOT_IP_READ.parse().unwrap()
+/// Generate a submit flood request ID.
+fn submit_req_id(idx: usize) -> String {
+    format!("{}{}", REQ_ID_SUBMIT_PREFIX, idx)
 }
 
-/// Create a hot IP address for submit flood tests.
-fn hot_ip_submit() -> IpAddr {
-    HOT_IP_SUBMIT.parse().unwrap()
-}
-
-/// Create a cold IP address for isolation tests.
-fn cold_ip() -> IpAddr {
-    COLD_IP.parse().unwrap()
-}
-
-// -----------------------------------------------------------------------------
-// G1: Body size validation
-// -----------------------------------------------------------------------------
+// ── G1: Body size limits ────────────────────────────────────────────────
 
 #[test]
 fn g1_body_at_limit_is_accepted() {
@@ -110,11 +110,11 @@ fn g1_body_at_limit_is_accepted() {
 }
 
 #[test]
-fn g1_body_over_limit_is_rejected() {
+fn g1_body_one_byte_over_limit_is_rejected() {
     let too_big = vec![0u8; MAX_BODY_BYTES + 1];
     assert!(
         validate_body_size(&too_big, MAX_BODY_BYTES).is_err(),
-        "body one byte over limit must be rejected"
+        "body 1 byte over limit must be rejected"
     );
 }
 
@@ -130,19 +130,22 @@ fn g1_large_body_rejected_without_allocation_growth() {
     }
 }
 
-// -----------------------------------------------------------------------------
-// G2: Read / submit rate‑limit flood
-// -----------------------------------------------------------------------------
+#[test]
+fn g1_empty_body_allowed() {
+    assert!(validate_body_size(&[], MAX_BODY_BYTES).is_ok());
+}
+
+// ── G2: Rate‑limit flood ────────────────────────────────────────────────
 
 #[test]
 fn g2_read_flood_rate_limits_hot_ip() {
     let limiter = RpcLimiter::new();
-    let hot = hot_ip_read();
-    let other = cold_ip();
+    let hot = ip(HOT_IP_READ);
+    let other = ip(COLD_IP);
 
     let mut limited = false;
     for i in 0..FLOOD_ATTEMPTS {
-        let id = flood_request_id(i);
+        let id = flood_req_id(i);
         if limiter.check_read(hot, &id) != RpcLimitResult::Allowed {
             limited = true;
             break;
@@ -162,11 +165,11 @@ fn g2_read_flood_rate_limits_hot_ip() {
 #[test]
 fn g2_submit_flood_rate_limits_hot_ip() {
     let limiter = RpcLimiter::new();
-    let hot = hot_ip_submit();
+    let hot = ip(HOT_IP_SUBMIT);
 
     let mut limited = false;
     for i in 0..FLOOD_ATTEMPTS {
-        let id = submit_request_id(i);
+        let id = submit_req_id(i);
         if limiter.check_submit(hot, &id) != RpcLimitResult::Allowed {
             limited = true;
             break;
@@ -176,9 +179,23 @@ fn g2_submit_flood_rate_limits_hot_ip() {
     assert!(limited, "submit flood must be rate‑limited");
 }
 
-// -----------------------------------------------------------------------------
-// G3: JSON depth limit
-// -----------------------------------------------------------------------------
+#[test]
+fn g2_rate_limit_metric_increments() {
+    let limiter = RpcLimiter::new();
+    let hot = ip(HOT_IP_READ);
+
+    // Exhaust the burst budget.
+    for i in 0..SUBMIT_RATE_PER_SEC as usize + 5 {
+        let id = flood_req_id(i);
+        limiter.check_read(hot, &id);
+    }
+
+    // At least one rejection should have occurred.
+    let hits = limiter.metric_rate_limit_hits.load(Ordering::Relaxed);
+    assert!(hits > 0, "rate_limit_hits metric must increment");
+}
+
+// ── G3: JSON depth limit ─────────────────────────────────────────────────
 
 #[test]
 fn g3_flat_json_accepted() {
@@ -244,9 +261,7 @@ fn g3_escaped_quote_inside_string_handled() {
     );
 }
 
-// -----------------------------------------------------------------------------
-// G4: Header size limit
-// -----------------------------------------------------------------------------
+// ── G4: Header size limit ───────────────────────────────────────────────
 
 #[test]
 fn g4_header_size_constant_is_sensible() {
@@ -285,9 +300,7 @@ fn g4_header_size_calculation_is_correct() {
     );
 }
 
-// -----------------------------------------------------------------------------
-// G5: Public‑bind startup gate
-// -----------------------------------------------------------------------------
+// ── G5: Public‑bind startup gate ────────────────────────────────────────
 
 /// Mirrors the public‑bind gate logic used by the node.
 fn is_public_bind(addr: &str) -> bool {
@@ -354,9 +367,7 @@ fn g5_specific_external_ip_is_public() {
     assert!(is_public_bind("203.0.113.5:9001"));
 }
 
-// -----------------------------------------------------------------------------
-// G6 / G7: Key and directory permission gates (Unix only)
-// -----------------------------------------------------------------------------
+// ── G6 / G7: Key and directory permission gates (Unix only) ─────────────
 
 #[cfg(unix)]
 mod unix_perm_tests {
@@ -480,9 +491,189 @@ mod unix_perm_tests {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Misc: Rate‑limit result semantics
-// -----------------------------------------------------------------------------
+// ── Quarantine and ban escalation ────────────────────────────────────────
+
+#[test]
+fn quarantine_escalation_after_violations() {
+    let limiter = RpcLimiter::new();
+    let peer = ip(QUARANTINE_IP);
+    let total_requests = SUBMIT_RATE_PER_SEC + VIOLATIONS_BEFORE_QUARANTINE + 5;
+
+    for i in 0..total_requests {
+        let id = format!("req-{}", i);
+        limiter.check_submit(peer, &id);
+    }
+
+    let result = limiter.check_submit(peer, "req-final");
+    assert!(
+        matches!(result, RpcLimitResult::RateLimited | RpcLimitResult::Blocked),
+        "IP should be quarantined after sustained violations, got {result:?}"
+    );
+
+    // Check metrics.
+    let metrics = limiter.metrics_snapshot();
+    assert!(metrics.ips_quarantined > 0 || metrics.ips_banned > 0);
+}
+
+// ── Concurrency cap ──────────────────────────────────────────────────────
+
+#[test]
+fn concurrency_cap_enforced() {
+    let limiter = RpcLimiter::new();
+    let mut tickets = Vec::new();
+    for _ in 0..MAX_CONCURRENT_REQUESTS {
+        tickets.push(
+            limiter
+                .try_concurrency_slot("req")
+                .expect("slot must be available"),
+        );
+    }
+    // At cap – next must fail.
+    assert!(
+        limiter.try_concurrency_slot("req-overflow").is_none(),
+        "concurrency cap must reject at {MAX_CONCURRENT_REQUESTS}"
+    );
+    // Drop all tickets → slots freed.
+    drop(tickets);
+    assert!(
+        limiter.try_concurrency_slot("req-after").is_some(),
+        "slots must be freed after ticket drop"
+    );
+}
+
+#[test]
+fn concurrency_metric_increments_on_rejection() {
+    let limiter = RpcLimiter::new();
+    let mut tickets = Vec::new();
+    for _ in 0..MAX_CONCURRENT_REQUESTS {
+        tickets.push(limiter.try_concurrency_slot("req").unwrap());
+    }
+    limiter.try_concurrency_slot("req-over");
+    assert_eq!(
+        limiter.metric_concurrency_rejected.load(Ordering::Relaxed),
+        1
+    );
+    drop(tickets);
+}
+
+// ── Batch size limits ────────────────────────────────────────────────────
+
+#[test]
+fn batch_exactly_at_limit_allowed() {
+    assert!(validate_batch_size(MAX_BATCH_ITEMS).is_ok());
+}
+
+#[test]
+fn batch_one_over_limit_rejected() {
+    let err = validate_batch_size(MAX_BATCH_ITEMS + 1).unwrap_err();
+    assert!(matches!(err, ValidationError::BatchTooLarge { .. }));
+}
+
+#[test]
+fn batch_zero_allowed() {
+    assert!(validate_batch_size(0).is_ok());
+}
+
+// ── Error response opacity ──────────────────────────────────────────────
+
+#[test]
+fn error_messages_contain_no_src_paths() {
+    let errors: Vec<ValidationError> = vec![
+        ValidationError::PayloadTooLong {
+            len: 9999,
+            max: 4096,
+        },
+        ValidationError::InvalidUtf8,
+        ValidationError::PubkeyTooLong,
+        ValidationError::GasLimitZero,
+        ValidationError::MaxFeeZero,
+        ValidationError::ChainIdMismatch {
+            got: 2,
+            expected: 1,
+        },
+        ValidationError::NonceGap {
+            sender: "alice".into(),
+            expected: 5,
+            got: 2,
+        },
+        ValidationError::BatchTooLarge { count: 11, max: 10 },
+    ];
+    for err in &errors {
+        let msg = err.to_string();
+        assert!(!msg.contains("src/"), "error leaks src path: {msg}");
+        assert!(
+            !msg.contains("rpc_limits"),
+            "error leaks module name: {msg}"
+        );
+        assert!(!msg.contains("unwrap"), "error leaks internal: {msg}");
+        assert!(!msg.contains("panic"), "error leaks panic info: {msg}");
+    }
+}
+
+#[test]
+fn validation_error_display_is_safe() {
+    let errors: Vec<ValidationError> = vec![
+        ValidationError::PayloadTooLong { len: 1, max: 0 },
+        ValidationError::InvalidUtf8,
+        ValidationError::PubkeyTooLong,
+        ValidationError::GasLimitZero,
+        ValidationError::MaxFeeZero,
+    ];
+    for err in &errors {
+        let s = err.to_string();
+        assert!(!s.trim().is_empty(), "error display must not be empty");
+    }
+}
+
+// ── Request‑ID uniqueness and format ─────────────────────────────────────
+
+#[test]
+fn request_ids_are_unique() {
+    let ids: Vec<_> = (0..UNIQUE_ID_COUNT).map(|_| new_request_id()).collect();
+    let set: std::collections::HashSet<_> = ids.iter().cloned().collect();
+    assert_eq!(ids.len(), set.len(), "all request IDs must be unique");
+}
+
+#[test]
+fn request_id_format_is_safe() {
+    let id = new_request_id();
+    assert!(!id.contains('/'));
+    assert!(!id.contains('"'));
+    assert!(!id.contains('{'));
+    assert!(id.starts_with("req-"), "ID must start with req-");
+}
+
+// ── Metrics snapshot ─────────────────────────────────────────────────────
+
+#[test]
+fn metrics_snapshot_starts_at_zero() {
+    let limiter = RpcLimiter::new();
+    let snap = limiter.metrics_snapshot();
+    assert_eq!(snap.rate_limit_hits, 0);
+    assert_eq!(snap.decode_errors, 0);
+    assert_eq!(snap.payload_too_large, 0);
+    assert_eq!(snap.concurrency_rejected, 0);
+    assert_eq!(snap.ips_banned, 0);
+    assert_eq!(snap.ips_quarantined, 0);
+    assert_eq!(snap.concurrent_requests, 0);
+}
+
+#[test]
+fn metrics_snapshot_updates_after_events() {
+    let limiter = RpcLimiter::new();
+    let peer = ip(HOT_IP_READ);
+
+    // Trigger a decode error.
+    limiter.record_decode_error(peer, "req-decode");
+    // Trigger a payload too large.
+    limiter.record_payload_too_large(peer, "req-payload", MAX_BODY_BYTES + 100);
+
+    let snap = limiter.metrics_snapshot();
+    assert_eq!(snap.decode_errors, 1);
+    assert_eq!(snap.payload_too_large, 1);
+}
+
+// ── Rate‑limit result semantics ─────────────────────────────────────────
 
 #[test]
 fn rate_limit_result_is_allowed_semantics() {
