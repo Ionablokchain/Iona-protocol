@@ -1,4 +1,4 @@
-//! IONA v78 — Full ERC-4337 Account Abstraction.
+//! Full ERC-4337 Account Abstraction.
 //!
 //! This module implements the complete account abstraction stack:
 //! - **EntryPoint** native precompile (v0.7) – handles UserOperation validation and execution
