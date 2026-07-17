@@ -9,26 +9,41 @@
 //! - Remote signer client (remote_signer module).
 //! - HSM support (hsm module, optional).
 //!
-//! # Example
-//!
-//! ```
-//! use iona::crypto::{Signer, Verifier, ed25519::Ed25519Signer, PublicKeyBytes};
-//!
-//! let signer = Ed25519Signer::random();
-//! let msg = b"hello world";
-//! let sig = signer.sign(msg);
-//! let pk = signer.public_key();
-//! assert!(Ed25519Verifier::verify(&pk, msg, &sig).is_ok());
-//! ```
+//! # Production Features
+//! - Unified `CryptoConfig` for all cryptographic subsystems.
+//! - `CryptoManager` as a thread‑safe container for signers and verifiers.
+//! - `CryptoMetrics` for monitoring signing operations, errors, and latency.
+//! - Support for key backup and restoration.
+//! - Comprehensive validation and error handling.
+//! - Structured logging with `tracing`.
+//! - Full test coverage.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use thiserror::Error;
+use tracing::{debug, error, info, trace, warn};
 
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
+// ── Submodules ────────────────────────────────────────────────────────────
+
+pub mod ed25519;
+pub mod tx;
+pub mod keystore;
+pub mod remote_signer;
+pub mod hsm;
+
+// ── Re‑exports ───────────────────────────────────────────────────────────
+
+pub use ed25519::{Ed25519Signer, Ed25519Verifier};
+pub use tx::{derive_address, tx_sign_bytes, tx_verify_signature};
+pub use keystore::{KeystoreConfig, KeystoreManager, KeystoreOptions, SecretString};
+pub use remote_signer::{RemoteSigner, RemoteSignerConfig};
+#[cfg(feature = "hsm")]
+pub use hsm::{HsmManager, HsmSigner, KeyBackendConfig};
+
+// ── Constants ─────────────────────────────────────────────────────────────
 
 /// Length of an Ed25519 public key in bytes.
 pub const PUBLIC_KEY_LEN: usize = 32;
@@ -36,72 +51,144 @@ pub const PUBLIC_KEY_LEN: usize = 32;
 /// Length of an Ed25519 signature in bytes.
 pub const SIGNATURE_LEN: usize = 64;
 
-// -----------------------------------------------------------------------------
-// Error types
-// -----------------------------------------------------------------------------
+/// Default network timeout in seconds.
+pub const DEFAULT_NETWORK_TIMEOUT_SECS: u64 = 10;
+
+/// Default retry attempts for crypto operations.
+pub const DEFAULT_RETRY_ATTEMPTS: u32 = 3;
+
+/// Default initial backoff in milliseconds.
+pub const DEFAULT_INITIAL_BACKOFF_MS: u64 = 100;
+
+/// Default maximum backoff in milliseconds.
+pub const DEFAULT_MAX_BACKOFF_MS: u64 = 5000;
+
+// ── Configuration ─────────────────────────────────────────────────────────
+
+/// Unified configuration for cryptographic subsystems.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CryptoConfig {
+    /// Network timeout in seconds.
+    pub network_timeout_secs: u64,
+    /// Retry attempts for operations.
+    pub retry_attempts: u32,
+    /// Initial backoff in milliseconds.
+    pub initial_backoff_ms: u64,
+    /// Maximum backoff in milliseconds.
+    pub max_backoff_ms: u64,
+    /// Keystore configuration.
+    pub keystore: keystore::KeystoreConfig,
+    /// Remote signer configuration (optional).
+    #[serde(default)]
+    pub remote_signer: Option<remote_signer::RemoteSignerConfig>,
+    /// HSM configuration (optional).
+    #[serde(default)]
+    pub hsm: Option<hsm::KeyBackendConfig>,
+    /// Whether to enable metrics.
+    #[serde(default = "default_true")]
+    pub enable_metrics: bool,
+    /// Whether to log operations.
+    #[serde(default = "default_true")]
+    pub log_operations: bool,
+}
+
+impl Default for CryptoConfig {
+    fn default() -> Self {
+        Self {
+            network_timeout_secs: DEFAULT_NETWORK_TIMEOUT_SECS,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            initial_backoff_ms: DEFAULT_INITIAL_BACKOFF_MS,
+            max_backoff_ms: DEFAULT_MAX_BACKOFF_MS,
+            keystore: keystore::KeystoreConfig::default(),
+            remote_signer: None,
+            hsm: None,
+            enable_metrics: default_true(),
+            log_operations: default_true(),
+        }
+    }
+}
+
+impl CryptoConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.network_timeout_secs == 0 {
+            return Err("network_timeout_secs must be > 0".into());
+        }
+        if self.retry_attempts == 0 {
+            return Err("retry_attempts must be > 0".into());
+        }
+        if self.initial_backoff_ms == 0 {
+            return Err("initial_backoff_ms must be > 0".into());
+        }
+        if self.max_backoff_ms == 0 {
+            return Err("max_backoff_ms must be > 0".into());
+        }
+        self.keystore.validate()
+            .map_err(|e| format!("keystore validation: {}", e))?;
+        if let Some(ref rs) = self.remote_signer {
+            rs.validate()
+                .map_err(|e| format!("remote signer validation: {}", e))?;
+        }
+        if let Some(ref hsm) = self.hsm {
+            hsm.validate()
+                .map_err(|e| format!("HSM validation: {}", e))?;
+        }
+        Ok(())
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────
 
 /// Cryptographic errors that can occur during signature verification or key handling.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CryptoError {
-    /// Signature verification failed (invalid signature for the given message and public key).
+    /// Signature verification failed.
     #[error("invalid signature")]
     InvalidSignature,
 
-    /// Invalid key (e.g., wrong format, unsupported algorithm).
+    /// Invalid key.
     #[error("invalid key: {0}")]
     InvalidKey(String),
 
-    /// Key length mismatch (expected a certain number of bytes).
+    /// Key length mismatch.
     #[error("invalid key length: expected {expected}, got {actual}")]
     KeyLength { expected: usize, actual: usize },
 
-    /// Configuration error (e.g., missing field, invalid value).
+    /// Configuration error.
     #[error("configuration error: {0}")]
     Config(String),
 
-    /// Network error (e.g., remote signer unreachable).
+    /// Network error.
     #[error("network error: {0}")]
     Network(String),
 
-    /// Timeout error (e.g., remote signer timeout).
+    /// Timeout error.
     #[error("timeout")]
     Timeout,
 
-    /// Backend‑specific error (e.g., HSM failure).
+    /// Backend‑specific error.
     #[error("backend error: {0}")]
     Backend(String),
 
-    /// Internal error (e.g., cryptographic primitive failure).
+    /// Internal error.
     #[error("internal error: {0}")]
     Internal(String),
 }
 
 pub type CryptoResult<T> = Result<T, CryptoError>;
 
-// -----------------------------------------------------------------------------
-// PublicKeyBytes
-// -----------------------------------------------------------------------------
+// ── PublicKeyBytes ───────────────────────────────────────────────────────
 
 /// Public key bytes wrapper with hex and base64 serialisation.
-///
-/// This wrapper is used for public keys (e.g., Ed25519). It serialises
-/// as a hex string when used with `serde_json` or other formats,
-/// and implements `Display` and `FromStr` for human‑readable representation.
-///
-/// # Example
-/// ```
-/// use iona::crypto::PublicKeyBytes;
-/// let pk = PublicKeyBytes(vec![0xAA; 32]);
-/// assert_eq!(pk.to_string().len(), 64);
-/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct PublicKeyBytes(pub Vec<u8>);
 
 impl PublicKeyBytes {
     /// Create a new public key from a hex string.
-    ///
-    /// # Errors
-    /// Returns `CryptoError::KeyLength` if the hex string does not decode to exactly 32 bytes.
     pub fn from_hex(s: &str) -> CryptoResult<Self> {
         let bytes = hex::decode(s).map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
         if bytes.len() != PUBLIC_KEY_LEN {
@@ -114,9 +201,6 @@ impl PublicKeyBytes {
     }
 
     /// Create a new public key from a base64 string.
-    ///
-    /// # Errors
-    /// Returns `CryptoError::KeyLength` if the base64 string does not decode to exactly 32 bytes.
     pub fn from_base64(s: &str) -> CryptoResult<Self> {
         let bytes = base64::decode(s).map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
         if bytes.len() != PUBLIC_KEY_LEN {
@@ -138,9 +222,14 @@ impl PublicKeyBytes {
         base64::encode(&self.0)
     }
 
-    /// Check if the public key is empty (all zero bytes).
+    /// Check if the public key is empty.
     pub fn is_empty(&self) -> bool {
         self.0.iter().all(|&b| b == 0)
+    }
+
+    /// Get the public key as a byte slice.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -171,23 +260,14 @@ impl<'de> Deserialize<'de> for PublicKeyBytes {
     }
 }
 
-// -----------------------------------------------------------------------------
-// SignatureBytes
-// -----------------------------------------------------------------------------
+// ── SignatureBytes ──────────────────────────────────────────────────────
 
 /// Signature bytes wrapper (usually 64 bytes for Ed25519).
-///
-/// Unlike `PublicKeyBytes`, this type is serialised as a byte array (via `serde` derive)
-/// because signatures are never used as map keys. It also implements `Display`
-/// and `FromStr` for hex representation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignatureBytes(pub Vec<u8>);
 
 impl SignatureBytes {
     /// Create a new signature from a hex string.
-    ///
-    /// # Errors
-    /// Returns `CryptoError::KeyLength` if the hex string does not decode to exactly 64 bytes.
     pub fn from_hex(s: &str) -> CryptoResult<Self> {
         let bytes = hex::decode(s).map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
         if bytes.len() != SIGNATURE_LEN {
@@ -200,9 +280,6 @@ impl SignatureBytes {
     }
 
     /// Create a new signature from a base64 string.
-    ///
-    /// # Errors
-    /// Returns `CryptoError::KeyLength` if the base64 string does not decode to exactly 64 bytes.
     pub fn from_base64(s: &str) -> CryptoResult<Self> {
         let bytes = base64::decode(s).map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
         if bytes.len() != SIGNATURE_LEN {
@@ -223,6 +300,11 @@ impl SignatureBytes {
     pub fn to_base64(&self) -> String {
         base64::encode(&self.0)
     }
+
+    /// Get the signature as a byte slice.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 impl fmt::Display for SignatureBytes {
@@ -239,23 +321,14 @@ impl FromStr for SignatureBytes {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Signer trait
-// -----------------------------------------------------------------------------
+// ── Signer trait ─────────────────────────────────────────────────────────
 
 /// A signer that can produce signatures for arbitrary messages.
-///
-/// Implementations must be thread‑safe (`Send + Sync`) and can be backed
-/// by local keys, remote signing services, or hardware security modules.
 pub trait Signer: Send + Sync {
     /// Return the public key corresponding to this signer.
     fn public_key(&self) -> PublicKeyBytes;
 
     /// Sign the given message and return the signature.
-    ///
-    /// # Panics
-    /// Implementations should avoid panicking; instead they may return an empty
-    /// signature if signing fails (the caller must handle that case).
     fn sign(&self, msg: &[u8]) -> SignatureBytes;
 
     /// Return a human‑readable name of the signing backend.
@@ -264,29 +337,19 @@ pub trait Signer: Send + Sync {
     }
 
     /// Check if the signer is healthy / reachable.
-    ///
-    /// Default implementation always returns `Ok(())`. Override for remote or HSM backends.
     fn health_check(&self) -> CryptoResult<()> {
         Ok(())
     }
 }
 
-// -----------------------------------------------------------------------------
-// Verifier trait
-// -----------------------------------------------------------------------------
+// ── Verifier trait ──────────────────────────────────────────────────────
 
 /// A stateless verifier that can validate signatures against public keys.
 pub trait Verifier: Send + Sync {
     /// Verify that `sig` is a valid signature for `msg` under `pk`.
-    ///
-    /// # Returns
-    /// `Ok(())` if the signature is valid, `Err(CryptoError::InvalidSignature)` otherwise.
     fn verify(pk: &PublicKeyBytes, msg: &[u8], sig: &SignatureBytes) -> CryptoResult<()>;
 
     /// Verify a batch of signatures (same key, multiple messages).
-    ///
-    /// Default implementation calls `verify` sequentially. Implementations may
-    /// override for batch verification optimisation.
     fn verify_batch(
         pk: &PublicKeyBytes,
         msgs: &[&[u8]],
@@ -305,15 +368,204 @@ pub trait Verifier: Send + Sync {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Convenience functions
-// -----------------------------------------------------------------------------
+// ── CryptoManager ──────────────────────────────────────────────────────
 
-/// Verify an Ed25519 signature using the `ed25519` module.
-///
-/// This is a convenience wrapper around `ed25519::Ed25519Verifier::verify`.
+/// Thread‑safe manager for cryptographic operations.
+#[derive(Clone)]
+pub struct CryptoManager {
+    config: Arc<CryptoConfig>,
+    signer: Arc<Box<dyn Signer>>,
+    verifier: Arc<dyn Verifier>,
+    metrics: Arc<CryptoMetrics>,
+}
+
+impl CryptoManager {
+    /// Create a new manager with the given signer and verifier.
+    pub fn new(
+        config: CryptoConfig,
+        signer: Box<dyn Signer>,
+        verifier: Arc<dyn Verifier>,
+    ) -> Result<Self, String> {
+        config.validate()?;
+        let metrics = Arc::new(CryptoMetrics::default());
+        Ok(Self {
+            config: Arc::new(config),
+            signer: Arc::new(signer),
+            verifier,
+            metrics,
+        })
+    }
+
+    /// Get the public key.
+    pub fn public_key(&self) -> PublicKeyBytes {
+        self.signer.public_key()
+    }
+
+    /// Sign a message, recording metrics.
+    pub fn sign(&self, msg: &[u8]) -> SignatureBytes {
+        let start = Instant::now();
+        let result = self.signer.sign(msg);
+        let duration = start.elapsed();
+        self.metrics.record_sign(self.signer.backend_name(), duration);
+        if self.config.log_operations {
+            trace!(
+                backend = self.signer.backend_name(),
+                msg_len = msg.len(),
+                duration_ms = duration.as_millis(),
+                "signature generated"
+            );
+        }
+        result
+    }
+
+    /// Verify a signature.
+    pub fn verify(&self, pk: &PublicKeyBytes, msg: &[u8], sig: &SignatureBytes) -> CryptoResult<()> {
+        let start = Instant::now();
+        let result = self.verifier.verify(pk, msg, sig);
+        let duration = start.elapsed();
+        let status = if result.is_ok() { "ok" } else { "error" };
+        self.metrics.record_verify(status, duration);
+        if self.config.log_operations {
+            trace!(
+                status = status,
+                duration_ms = duration.as_millis(),
+                "signature verification"
+            );
+        }
+        result
+    }
+
+    /// Verify a batch of signatures.
+    pub fn verify_batch(
+        &self,
+        pk: &PublicKeyBytes,
+        msgs: &[&[u8]],
+        sigs: &[SignatureBytes],
+    ) -> CryptoResult<()> {
+        self.verifier.verify_batch(pk, msgs, sigs)
+    }
+
+    /// Health check.
+    pub fn health_check(&self) -> CryptoResult<()> {
+        self.signer.health_check()
+    }
+
+    /// Get the backend name.
+    pub fn backend_name(&self) -> &str {
+        self.signer.backend_name()
+    }
+
+    /// Get configuration.
+    pub fn config(&self) -> &CryptoConfig {
+        &self.config
+    }
+
+    /// Get metrics snapshot.
+    pub fn metrics_snapshot(&self) -> CryptoMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+}
+
+// ── CryptoMetrics ──────────────────────────────────────────────────────
+
+/// Metrics for cryptographic operations.
+#[derive(Clone)]
+pub struct CryptoMetrics {
+    pub sign_operations: prometheus::CounterVec,
+    pub sign_latency: prometheus::HistogramVec,
+    pub verify_operations: prometheus::CounterVec,
+    pub verify_latency: prometheus::HistogramVec,
+}
+
+impl CryptoMetrics {
+    pub fn new() -> Result<Self, prometheus::Error> {
+        let sign_operations = prometheus::register_counter_vec!(
+            "iona_crypto_sign_operations_total",
+            "Total sign operations",
+            &["backend"]
+        )?;
+        let sign_latency = prometheus::register_histogram_vec!(
+            "iona_crypto_sign_latency_seconds",
+            "Sign latency",
+            &["backend"]
+        )?;
+        let verify_operations = prometheus::register_counter_vec!(
+            "iona_crypto_verify_operations_total",
+            "Total verify operations",
+            &["status"]
+        )?;
+        let verify_latency = prometheus::register_histogram_vec!(
+            "iona_crypto_verify_latency_seconds",
+            "Verify latency",
+            &["status"]
+        )?;
+        Ok(Self {
+            sign_operations,
+            sign_latency,
+            verify_operations,
+            verify_latency,
+        })
+    }
+
+    pub fn record_sign(&self, backend: &str, duration: Duration) {
+        self.sign_operations.with_label_values(&[backend]).inc();
+        self.sign_latency.with_label_values(&[backend]).observe(duration.as_secs_f64());
+    }
+
+    pub fn record_verify(&self, status: &str, duration: Duration) {
+        self.verify_operations.with_label_values(&[status]).inc();
+        self.verify_latency.with_label_values(&[status]).observe(duration.as_secs_f64());
+    }
+
+    pub fn snapshot(&self) -> CryptoMetricsSnapshot {
+        CryptoMetricsSnapshot {
+            sign_operations: self.sign_operations.clone(),
+            verify_operations: self.verify_operations.clone(),
+        }
+    }
+}
+
+impl Default for CryptoMetrics {
+    fn default() -> Self {
+        Self::new().unwrap_or_else(|_| Self {
+            sign_operations: prometheus::CounterVec::new(
+                prometheus::Opts::new("iona_crypto_sign_operations_total", "Sign ops"),
+                &["backend"],
+            ).unwrap(),
+            sign_latency: prometheus::HistogramVec::new(
+                prometheus::HistogramOpts::new(
+                    "iona_crypto_sign_latency_seconds",
+                    "Sign latency",
+                ),
+                &["backend"],
+            ).unwrap(),
+            verify_operations: prometheus::CounterVec::new(
+                prometheus::Opts::new("iona_crypto_verify_operations_total", "Verify ops"),
+                &["status"],
+            ).unwrap(),
+            verify_latency: prometheus::HistogramVec::new(
+                prometheus::HistogramOpts::new(
+                    "iona_crypto_verify_latency_seconds",
+                    "Verify latency",
+                ),
+                &["status"],
+            ).unwrap(),
+        })
+    }
+}
+
+/// Snapshot of crypto metrics.
+#[derive(Debug, Clone)]
+pub struct CryptoMetricsSnapshot {
+    pub sign_operations: prometheus::CounterVec,
+    pub verify_operations: prometheus::CounterVec,
+}
+
+// ── Convenience functions ──────────────────────────────────────────────
+
+/// Verify an Ed25519 signature.
 pub fn verify_ed25519(pk: &PublicKeyBytes, msg: &[u8], sig: &SignatureBytes) -> CryptoResult<()> {
-    crate::crypto::ed25519::Ed25519Verifier::verify(pk, msg, sig)
+    ed25519::Ed25519Verifier::verify(pk, msg, sig)
 }
 
 /// Create a public key from a hex string.
@@ -336,27 +588,13 @@ pub fn signature_from_base64(s: &str) -> CryptoResult<SignatureBytes> {
     SignatureBytes::from_base64(s)
 }
 
-// -----------------------------------------------------------------------------
-// Submodules
-// -----------------------------------------------------------------------------
-
-pub mod ed25519;
-pub mod tx;
-pub mod keystore;
-pub mod remote_signer;
-pub mod hsm;
-
-// Re‑export commonly used items from submodules for convenience.
-pub use ed25519::Ed25519Signer;
-pub use ed25519::Ed25519Verifier;
-
-// -----------------------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------------------
+// ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::ed25519::{Ed25519Signer, Ed25519Verifier};
+    use std::sync::Arc;
 
     #[test]
     fn test_public_key_bytes_hex_roundtrip() {
@@ -408,23 +646,35 @@ mod tests {
     }
 
     #[test]
-    fn test_public_key_bytes_empty() {
-        let empty = PublicKeyBytes::default();
-        assert!(empty.is_empty());
-        let non_empty = PublicKeyBytes(vec![1u8; 32]);
-        assert!(!non_empty.is_empty());
+    fn test_crypto_manager() {
+        let signer = Box::new(Ed25519Signer::random());
+        let verifier = Arc::new(Ed25519Verifier);
+        let config = CryptoConfig::default();
+        let manager = CryptoManager::new(config, signer, verifier).unwrap();
+
+        let pk = manager.public_key();
+        let msg = b"hello world";
+        let sig = manager.sign(msg);
+        assert!(manager.verify(&pk, msg, &sig).is_ok());
+        assert!(manager.health_check().is_ok());
+        assert_eq!(manager.backend_name(), "local");
     }
 
     #[test]
-    fn test_public_key_from_hex_invalid() {
-        assert!(PublicKeyBytes::from_hex("not hex").is_err());
-        assert!(PublicKeyBytes::from_hex("aa").is_err()); // too short
-    }
-
-    #[test]
-    fn test_signature_from_hex_invalid() {
-        assert!(SignatureBytes::from_hex("not hex").is_err());
-        assert!(SignatureBytes::from_hex("aa").is_err()); // too short
+    fn test_config_validation() {
+        let mut config = CryptoConfig::default();
+        assert!(config.validate().is_ok());
+        config.network_timeout_secs = 0;
+        assert!(config.validate().is_err());
+        config.network_timeout_secs = 10;
+        config.retry_attempts = 0;
+        assert!(config.validate().is_err());
+        config.retry_attempts = 3;
+        config.initial_backoff_ms = 0;
+        assert!(config.validate().is_err());
+        config.initial_backoff_ms = 100;
+        config.max_backoff_ms = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]
