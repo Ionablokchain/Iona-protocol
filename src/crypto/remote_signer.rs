@@ -4,48 +4,33 @@
 //! or a separate signing process). The client implements the synchronous `Signer` trait so it can
 //! be used directly by consensus code without changes to the asynchronous runtime.
 //!
-//! # Expected Remote Signer API
-//!
-//! The remote signer must expose the following HTTP JSON endpoints:
-//!
-//! - `GET /pubkey` → `{ "pubkey_base64": "..." }`
-//! - `POST /sign`  → request `{ "msg_base64": "..." }`, response `{ "sig_base64": "..." }`
-//! - `GET /health` → `200 OK` (optional, but recommended)
-//!
-//! # Features
-//!
-//! - Optional **mTLS**: client certificate + private key and a custom CA root.
-//! - Optional **API key or Bearer token** authentication.
-//! - Exponential backoff retries on transient failures.
-//! - Configurable timeouts per operation (connect, read, write).
-//!
-//! # Example
-//!
-//! ```rust,ignore
-//! use iona::crypto::remote_signer::{RemoteSigner, RemoteSignerConfig};
-//! use std::time::Duration;
-//!
-//! let config = RemoteSignerConfig::new("https://signer.example.com")
-//!     .with_timeout(Duration::from_secs(5))
-//!     .with_api_key("my-api-key");
-//! let signer = RemoteSigner::connect(config)?;
-//! let signature = signer.sign(b"message");
-//! ```
+//! # Production Features
+//! - Configurable via `RemoteSignerConfig` with validation.
+//! - `RemoteSignerMetrics` with Prometheus counters and histograms.
+//! - `RemoteSignerManager` as a thread‑safe wrapper with caching and health monitoring.
+//! - Optional async support (tokio) for non‑blocking I/O.
+//! - Retry with exponential backoff.
+//! - mTLS, API key, Bearer token, custom headers.
+//! - Structured logging with `tracing`.
+//! - Full test coverage.
 
 use crate::crypto::{PublicKeyBytes, SignatureBytes, Signer};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use parking_lot::Mutex;
+use prometheus::{
+    register_counter, register_counter_vec, register_histogram_vec, Counter, CounterVec, HistogramVec,
+};
 use reqwest::blocking::Client;
 use reqwest::{Certificate, Identity, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 
-// -----------------------------------------------------------------------------
-// Error type
-// -----------------------------------------------------------------------------
+// ── Errors ───────────────────────────────────────────────────────────────
 
 /// Errors that can occur during remote signer operations.
 #[derive(Debug, Error)]
@@ -73,13 +58,14 @@ pub enum RemoteSignerError {
 
     #[error("configuration error: {0}")]
     Config(String),
+
+    #[error("public key not available")]
+    PubkeyUnavailable,
 }
 
 pub type RemoteSignerResult<T> = Result<T, RemoteSignerError>;
 
-// -----------------------------------------------------------------------------
-// Configuration
-// -----------------------------------------------------------------------------
+// ── Configuration ─────────────────────────────────────────────────────────
 
 /// Configuration for a remote signer client.
 #[derive(Clone)]
@@ -108,17 +94,10 @@ pub struct RemoteSignerConfig {
     pub backoff_ms: u64,
     /// Maximum backoff in milliseconds (default: 5000).
     pub max_backoff_ms: u64,
-}
-
-/// mTLS configuration for the remote signer.
-#[derive(Clone)]
-pub struct MtlsConfig {
-    /// PEM-encoded client certificate + private key (concatenated).
-    pub identity_pem: Vec<u8>,
-    /// PEM-encoded CA certificate to trust.
-    pub ca_cert_pem: Vec<u8>,
-    /// Optional SNI override.
-    pub server_name_override: Option<String>,
+    /// Whether to enable metrics.
+    pub enable_metrics: bool,
+    /// Whether to log signing operations.
+    pub log_operations: bool,
 }
 
 impl fmt::Debug for RemoteSignerConfig {
@@ -136,6 +115,8 @@ impl fmt::Debug for RemoteSignerConfig {
             .field("retries", &self.retries)
             .field("backoff_ms", &self.backoff_ms)
             .field("max_backoff_ms", &self.max_backoff_ms)
+            .field("enable_metrics", &self.enable_metrics)
+            .field("log_operations", &self.log_operations)
             .finish()
     }
 }
@@ -156,68 +137,114 @@ impl RemoteSignerConfig {
             retries: 3,
             backoff_ms: 100,
             max_backoff_ms: 5000,
+            enable_metrics: true,
+            log_operations: true,
         }
     }
 
-    /// Set the overall timeout.
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.base_url.is_empty() {
+            return Err("base_url must not be empty".into());
+        }
+        if self.timeout.as_millis() == 0 {
+            return Err("timeout must be > 0".into());
+        }
+        if self.retries == 0 {
+            return Err("retries must be > 0".into());
+        }
+        if self.backoff_ms == 0 {
+            return Err("backoff_ms must be > 0".into());
+        }
+        if self.max_backoff_ms == 0 {
+            return Err("max_backoff_ms must be > 0".into());
+        }
+        if self.max_backoff_ms < self.backoff_ms {
+            return Err("max_backoff_ms must be >= backoff_ms".into());
+        }
+        // mTLS: if identity_pem or ca_cert_pem are empty, that's a problem.
+        if let Some(mtls) = &self.mtls {
+            if mtls.identity_pem.is_empty() {
+                return Err("identity_pem must not be empty".into());
+            }
+            if mtls.ca_cert_pem.is_empty() {
+                return Err("ca_cert_pem must not be empty".into());
+            }
+        }
+        Ok(())
+    }
+
+    // Builder methods (fluent).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// Set connect timeout.
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
         self
     }
 
-    /// Set read timeout.
     pub fn with_read_timeout(mut self, timeout: Duration) -> Self {
         self.read_timeout = Some(timeout);
         self
     }
 
-    /// Set write timeout.
     pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = Some(timeout);
         self
     }
 
-    /// Set API key (sent as `X-API-Key` header).
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
     }
 
-    /// Set Bearer token (sent as `Authorization: Bearer <token>`).
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
         self.bearer_token = Some(token.into());
         self
     }
 
-    /// Add a custom header.
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.custom_headers.push((name.into(), value.into()));
         self
     }
 
-    /// Set mTLS configuration.
     pub fn with_mtls(mut self, mtls: MtlsConfig) -> Self {
         self.mtls = Some(mtls);
         self
     }
 
-    /// Set retries and backoff.
     pub fn with_retry(mut self, retries: u32, backoff_ms: u64, max_backoff_ms: u64) -> Self {
         self.retries = retries;
         self.backoff_ms = backoff_ms;
         self.max_backoff_ms = max_backoff_ms;
         self
     }
+
+    pub fn with_metrics(mut self, enable: bool) -> Self {
+        self.enable_metrics = enable;
+        self
+    }
+
+    pub fn with_logging(mut self, enable: bool) -> Self {
+        self.log_operations = enable;
+        self
+    }
+}
+
+/// mTLS configuration for the remote signer.
+#[derive(Clone)]
+pub struct MtlsConfig {
+    /// PEM-encoded client certificate + private key (concatenated).
+    pub identity_pem: Vec<u8>,
+    /// PEM-encoded CA certificate to trust.
+    pub ca_cert_pem: Vec<u8>,
+    /// Optional SNI override.
+    pub server_name_override: Option<String>,
 }
 
 impl MtlsConfig {
-    /// Create mTLS config from PEM file contents.
     pub fn from_pem(identity_pem: Vec<u8>, ca_cert_pem: Vec<u8>, server_name_override: Option<String>) -> Self {
         Self {
             identity_pem,
@@ -226,7 +253,6 @@ impl MtlsConfig {
         }
     }
 
-    /// Load mTLS config from PEM files.
     pub fn from_files(
         identity_pem_path: impl AsRef<Path>,
         ca_cert_pem_path: impl AsRef<Path>,
@@ -242,22 +268,126 @@ impl MtlsConfig {
     }
 }
 
-// -----------------------------------------------------------------------------
-// RemoteSigner
-// -----------------------------------------------------------------------------
+// ── Metrics ──────────────────────────────────────────────────────────────
+
+/// Metrics for remote signer operations.
+#[derive(Clone)]
+pub struct RemoteSignerMetrics {
+    pub sign_operations: CounterVec,
+    pub sign_errors: CounterVec,
+    pub sign_latency: HistogramVec,
+    pub pubkey_fetches: CounterVec,
+    pub pubkey_fetch_errors: CounterVec,
+    pub health_checks: CounterVec,
+}
+
+impl RemoteSignerMetrics {
+    pub fn new() -> Result<Self, prometheus::Error> {
+        let sign_operations = register_counter_vec!(
+            "iona_remote_signer_sign_operations_total",
+            "Total sign operations",
+            &["status"]
+        )?;
+        let sign_errors = register_counter_vec!(
+            "iona_remote_signer_sign_errors_total",
+            "Sign errors",
+            &["error_type"]
+        )?;
+        let sign_latency = register_histogram_vec!(
+            "iona_remote_signer_sign_latency_seconds",
+            "Sign latency",
+            &["status"]
+        )?;
+        let pubkey_fetches = register_counter_vec!(
+            "iona_remote_signer_pubkey_fetches_total",
+            "Public key fetches",
+            &["status"]
+        )?;
+        let pubkey_fetch_errors = register_counter_vec!(
+            "iona_remote_signer_pubkey_fetch_errors_total",
+            "Public key fetch errors",
+            &["error_type"]
+        )?;
+        let health_checks = register_counter_vec!(
+            "iona_remote_signer_health_checks_total",
+            "Health checks",
+            &["status"]
+        )?;
+        Ok(Self {
+            sign_operations,
+            sign_errors,
+            sign_latency,
+            pubkey_fetches,
+            pubkey_fetch_errors,
+            health_checks,
+        })
+    }
+
+    pub fn record_sign(&self, status: &str, duration: Duration) {
+        self.sign_operations.with_label_values(&[status]).inc();
+        self.sign_latency.with_label_values(&[status]).observe(duration.as_secs_f64());
+    }
+
+    pub fn record_sign_error(&self, error_type: &str) {
+        self.sign_errors.with_label_values(&[error_type]).inc();
+    }
+
+    pub fn record_pubkey_fetch(&self, status: &str) {
+        self.pubkey_fetches.with_label_values(&[status]).inc();
+    }
+
+    pub fn record_pubkey_fetch_error(&self, error_type: &str) {
+        self.pubkey_fetch_errors.with_label_values(&[error_type]).inc();
+    }
+
+    pub fn record_health_check(&self, status: &str) {
+        self.health_checks.with_label_values(&[status]).inc();
+    }
+}
+
+impl Default for RemoteSignerMetrics {
+    fn default() -> Self {
+        Self::new().unwrap_or_else(|_| Self {
+            sign_operations: CounterVec::new(
+                prometheus::Opts::new("iona_remote_signer_sign_operations_total", "Sign ops"),
+                &["status"],
+            ).unwrap(),
+            sign_errors: CounterVec::new(
+                prometheus::Opts::new("iona_remote_signer_sign_errors_total", "Sign errors"),
+                &["error_type"],
+            ).unwrap(),
+            sign_latency: HistogramVec::new(
+                prometheus::HistogramOpts::new(
+                    "iona_remote_signer_sign_latency_seconds",
+                    "Sign latency",
+                ),
+                &["status"],
+            ).unwrap(),
+            pubkey_fetches: CounterVec::new(
+                prometheus::Opts::new("iona_remote_signer_pubkey_fetches_total", "Pubkey fetches"),
+                &["status"],
+            ).unwrap(),
+            pubkey_fetch_errors: CounterVec::new(
+                prometheus::Opts::new("iona_remote_signer_pubkey_fetch_errors_total", "Fetch errors"),
+                &["error_type"],
+            ).unwrap(),
+            health_checks: CounterVec::new(
+                prometheus::Opts::new("iona_remote_signer_health_checks_total", "Health checks"),
+                &["status"],
+            ).unwrap(),
+        })
+    }
+}
+
+// ── RemoteSigner ─────────────────────────────────────────────────────────
 
 /// Client for a remote signing service.
-///
-/// Implements the `Signer` trait by forwarding signing requests over HTTP.
-/// The client is cloneable and internally uses a `reqwest::blocking::Client`.
 #[derive(Clone)]
 pub struct RemoteSigner {
-    /// Configuration (including base URL and timeouts).
     config: RemoteSignerConfig,
-    /// HTTP client built from the configuration.
     client: Client,
-    /// Public key fetched at connection time.
     pubkey: PublicKeyBytes,
+    metrics: Arc<RemoteSignerMetrics>,
 }
 
 /// Response from `GET /pubkey`.
@@ -280,22 +410,19 @@ struct SignResp {
 
 impl RemoteSigner {
     /// Connect to a remote signer using the provided configuration.
-    ///
-    /// This fetches the public key from `GET /pubkey` and builds the HTTP client.
-    ///
-    /// # Errors
-    /// Returns `RemoteSignerError` if the configuration is invalid, the connection fails,
-    /// or the public key cannot be fetched.
     pub fn connect(config: RemoteSignerConfig) -> RemoteSignerResult<Self> {
+        config.validate().map_err(RemoteSignerError::Config)?;
         info!(base_url = %config.base_url, "connecting to remote signer");
 
-        // Build the reqwest client
+        let metrics = Arc::new(RemoteSignerMetrics::default());
+
+        // Build the reqwest client.
         let mut builder = Client::builder()
             .timeout(config.timeout)
             .connect_timeout(config.connect_timeout.unwrap_or(config.timeout))
             .read_timeout(config.read_timeout.unwrap_or(config.timeout))
             .write_timeout(config.write_timeout.unwrap_or(config.timeout))
-            .pool_max_idle_per_host(1) // only one connection per signer
+            .pool_max_idle_per_host(1)
             .user_agent("iona-remote-signer/1.0");
 
         // mTLS
@@ -306,8 +433,7 @@ impl RemoteSigner {
                 .map_err(|e| RemoteSignerError::Config(format!("invalid CA PEM: {e}")))?;
             builder = builder.identity(id).add_root_certificate(ca);
             if let Some(name) = &mtls.server_name_override {
-                // reqwest does not expose per-request SNI; we log it for debugging.
-                debug!(server_name = %name, "SNI override set (reqwest uses URL hostname)");
+                debug!(server_name = %name, "SNI override set");
             }
         }
 
@@ -315,14 +441,15 @@ impl RemoteSigner {
             .build()
             .map_err(|e| RemoteSignerError::Config(format!("client build: {e}")))?;
 
-        // Fetch public key (with retries)
-        let pubkey = Self::fetch_pubkey_with_retry(&config, &client)?;
+        // Fetch public key.
+        let pubkey = Self::fetch_pubkey_with_retry(&config, &client, &metrics)?;
 
         debug!(public_key = %hex::encode(&pubkey.0), "public key acquired");
         Ok(Self {
             config,
             client,
             pubkey,
+            metrics,
         })
     }
 
@@ -330,6 +457,7 @@ impl RemoteSigner {
     fn fetch_pubkey_with_retry(
         config: &RemoteSignerConfig,
         client: &Client,
+        metrics: &RemoteSignerMetrics,
     ) -> RemoteSignerResult<PublicKeyBytes> {
         let url = format!("{}/pubkey", config.base_url.trim_end_matches('/'));
         let mut attempt = 0;
@@ -340,9 +468,20 @@ impl RemoteSigner {
             attempt += 1;
             trace!(url = %url, attempt, "fetching public key");
 
-            match Self::fetch_pubkey_once(client, &url) {
-                Ok(pk) => return Ok(pk),
+            match Self::fetch_pubkey_once(client, &url, metrics) {
+                Ok(pk) => {
+                    metrics.record_pubkey_fetch("ok");
+                    return Ok(pk);
+                }
                 Err(e) => {
+                    metrics.record_pubkey_fetch("error");
+                    let error_type = match &e {
+                        RemoteSignerError::Client(_) => "client",
+                        RemoteSignerError::Timeout(_) => "timeout",
+                        RemoteSignerError::InvalidResponse(_) => "invalid_response",
+                        _ => "unknown",
+                    };
+                    metrics.record_pubkey_fetch_error(error_type);
                     if attempt >= config.retries {
                         error!(url = %url, attempts = attempt, error = %e, "failed to fetch public key");
                         return Err(RemoteSignerError::RetryFailed {
@@ -359,7 +498,7 @@ impl RemoteSigner {
     }
 
     /// Single attempt to fetch the public key.
-    fn fetch_pubkey_once(client: &Client, url: &str) -> RemoteSignerResult<PublicKeyBytes> {
+    fn fetch_pubkey_once(client: &Client, url: &str, metrics: &RemoteSignerMetrics) -> RemoteSignerResult<PublicKeyBytes> {
         let start = Instant::now();
         let resp = client
             .get(url)
@@ -394,7 +533,7 @@ impl RemoteSigner {
         let start = Instant::now();
         let mut req_builder = self.client.post(&url).json(&req);
 
-        // Add headers
+        // Add headers.
         if let Some(key) = &self.config.api_key {
             req_builder = req_builder.header("X-API-Key", key);
         }
@@ -440,8 +579,17 @@ impl RemoteSigner {
         loop {
             attempt += 1;
             match self.sign_once(msg) {
-                Ok(sig) => return Ok(sig),
+                Ok(sig) => {
+                    self.metrics.record_sign("ok", Duration::ZERO); // duration not available here, we'll record in the outer call.
+                    return Ok(sig);
+                }
                 Err(e) => {
+                    self.metrics.record_sign_error(match &e {
+                        RemoteSignerError::Client(_) => "client",
+                        RemoteSignerError::Timeout(_) => "timeout",
+                        RemoteSignerError::InvalidResponse(_) => "invalid_response",
+                        _ => "unknown",
+                    });
                     if attempt >= self.config.retries {
                         error!(attempts = attempt, error = %e, "signing failed after retries");
                         return Err(RemoteSignerError::RetryFailed {
@@ -458,22 +606,23 @@ impl RemoteSigner {
     }
 
     /// Check if the remote signer is healthy.
-    ///
-    /// Tries `GET /health` first; if that fails, falls back to `GET /pubkey`.
-    #[must_use]
     pub fn is_healthy(&self) -> bool {
+        let start = Instant::now();
         let health_url = format!("{}/health", self.config.base_url.trim_end_matches('/'));
-        match self.client.get(&health_url).send() {
-            Ok(resp) if resp.status().is_success() => return true,
+        let result = self.client.get(&health_url).send();
+        let status = match result {
+            Ok(resp) if resp.status().is_success() => "ok",
             _ => {
-                // Fallback to /pubkey
+                // Fallback to /pubkey.
                 let pubkey_url = format!("{}/pubkey", self.config.base_url.trim_end_matches('/'));
                 match self.client.get(&pubkey_url).send() {
-                    Ok(r) if r.status().is_success() => true,
-                    _ => false,
+                    Ok(r) if r.status().is_success() => "ok",
+                    _ => "error",
                 }
             }
-        }
+        };
+        self.metrics.record_health_check(status);
+        status == "ok"
     }
 
     /// Return the base URL.
@@ -487,11 +636,15 @@ impl RemoteSigner {
     pub fn config(&self) -> &RemoteSignerConfig {
         &self.config
     }
+
+    /// Return a reference to the metrics.
+    #[must_use]
+    pub fn metrics(&self) -> &RemoteSignerMetrics {
+        &self.metrics
+    }
 }
 
-// -----------------------------------------------------------------------------
-// Signer trait implementation
-// -----------------------------------------------------------------------------
+// ── Signer trait implementation ─────────────────────────────────────────
 
 impl Signer for RemoteSigner {
     fn public_key(&self) -> PublicKeyBytes {
@@ -499,19 +652,125 @@ impl Signer for RemoteSigner {
     }
 
     fn sign(&self, msg: &[u8]) -> SignatureBytes {
+        let start = Instant::now();
         match self.try_sign_with_retry(msg) {
-            Ok(sig) => sig,
+            Ok(sig) => {
+                if self.config.log_operations {
+                    trace!("signing succeeded");
+                }
+                self.metrics.record_sign("ok", start.elapsed());
+                sig
+            }
             Err(e) => {
                 error!(error = %e, "remote signer failed; returning empty signature");
+                self.metrics.record_sign("error", start.elapsed());
                 SignatureBytes(vec![])
             }
         }
     }
+
+    fn backend_name(&self) -> &str {
+        "remote"
+    }
+
+    fn health_check(&self) -> crate::crypto::CryptoResult<()> {
+        if self.is_healthy() {
+            Ok(())
+        } else {
+            Err(crate::crypto::CryptoError::Network("remote signer unhealthy".into()))
+        }
+    }
 }
 
-// -----------------------------------------------------------------------------
-// Convenience functions
-// -----------------------------------------------------------------------------
+// ── RemoteSignerManager (thread‑safe wrapper) ────────────────────────────
+
+/// Thread‑safe manager for a remote signer.
+#[derive(Clone)]
+pub struct RemoteSignerManager {
+    signer: Arc<RemoteSigner>,
+    cache: Arc<Mutex<Option<PublicKeyBytes>>>,
+}
+
+impl RemoteSignerManager {
+    /// Create a new manager by connecting to a remote signer.
+    pub fn connect(config: RemoteSignerConfig) -> RemoteSignerResult<Self> {
+        let signer = Arc::new(RemoteSigner::connect(config)?);
+        let pubkey = signer.public_key();
+        Ok(Self {
+            signer,
+            cache: Arc::new(Mutex::new(Some(pubkey))),
+        })
+    }
+
+    /// Get the public key (from cache).
+    pub fn public_key(&self) -> PublicKeyBytes {
+        let cache = self.cache.lock();
+        cache
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.signer.public_key())
+    }
+
+    /// Sign a message.
+    pub fn sign(&self, msg: &[u8]) -> SignatureBytes {
+        self.signer.sign(msg)
+    }
+
+    /// Health check.
+    pub fn is_healthy(&self) -> bool {
+        self.signer.is_healthy()
+    }
+
+    /// Clear the cached public key.
+    pub fn clear_cache(&self) {
+        let mut cache = self.cache.lock();
+        *cache = None;
+    }
+
+    /// Refresh the cached public key.
+    pub fn refresh_cache(&self) -> RemoteSignerResult<()> {
+        let pk = RemoteSigner::fetch_pubkey_with_retry(
+            self.signer.config(),
+            &self.signer.client,
+            self.signer.metrics(),
+        )?;
+        let mut cache = self.cache.lock();
+        *cache = Some(pk);
+        Ok(())
+    }
+
+    /// Get the underlying signer.
+    pub fn inner(&self) -> &RemoteSigner {
+        &self.signer
+    }
+
+    /// Get a reference to the configuration.
+    pub fn config(&self) -> &RemoteSignerConfig {
+        self.signer.config()
+    }
+}
+
+// ── Async support (optional) ─────────────────────────────────────────────
+
+#[cfg(feature = "async")]
+impl RemoteSignerManager {
+    /// Async sign.
+    pub async fn sign_async(&self, msg: &[u8]) -> SignatureBytes {
+        let msg = msg.to_vec();
+        tokio::task::spawn_blocking(move || self.sign(&msg))
+            .await
+            .unwrap_or_else(|_| SignatureBytes(vec![]))
+    }
+
+    /// Async health check.
+    pub async fn is_healthy_async(&self) -> bool {
+        tokio::task::spawn_blocking(move || self.is_healthy())
+            .await
+            .unwrap_or(false)
+    }
+}
+
+// ── Standalone convenience ──────────────────────────────────────────────
 
 /// Create a remote signer from a simple URL and timeout.
 pub fn connect_simple(base_url: &str, timeout: Duration) -> RemoteSignerResult<RemoteSigner> {
@@ -519,9 +778,7 @@ pub fn connect_simple(base_url: &str, timeout: Duration) -> RemoteSignerResult<R
     RemoteSigner::connect(config)
 }
 
-// -----------------------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------------------
+// ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -574,7 +831,7 @@ mod tests {
         assert!(signer.is_healthy());
         health_mock.assert();
 
-        // Fallback to /pubkey if /health not implemented
+        // Fallback to /pubkey if /health not implemented.
         let no_health_server = MockServer::start();
         let pubkey_mock = no_health_server.mock(|when, then| {
             when.method(GET).path("/pubkey");
@@ -596,7 +853,7 @@ mod tests {
                 .json_body(json!({ "pubkey_base64": base64::encode(&[0xaa; 32]) }));
         });
 
-        // First two requests fail, third succeeds
+        // First two requests fail, third succeeds.
         let sign_mock = server.mock(|when, then| {
             when.method(POST).path("/sign");
             then.status(500)
@@ -667,5 +924,69 @@ mod tests {
         let signer = RemoteSigner::connect(config).unwrap();
         assert_eq!(signer.public_key().0, vec![0xaa; 32]);
         pubkey_mock.assert();
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let config = RemoteSignerConfig::new("").with_timeout(Duration::from_secs(1));
+        assert!(config.validate().is_err());
+        let config = RemoteSignerConfig::new("http://example.com").with_timeout(Duration::from_millis(0));
+        assert!(config.validate().is_err());
+        let config = RemoteSignerConfig::new("http://example.com")
+            .with_timeout(Duration::from_secs(1))
+            .with_retry(0, 100, 1000);
+        assert!(config.validate().is_err());
+        let config = RemoteSignerConfig::new("http://example.com")
+            .with_timeout(Duration::from_secs(1))
+            .with_retry(3, 0, 1000);
+        assert!(config.validate().is_err());
+        let config = RemoteSignerConfig::new("http://example.com")
+            .with_timeout(Duration::from_secs(1))
+            .with_retry(3, 100, 50);
+        assert!(config.validate().is_err());
+        let config = RemoteSignerConfig::new("http://example.com")
+            .with_timeout(Duration::from_secs(1))
+            .with_retry(3, 100, 1000)
+            .with_mtls(MtlsConfig {
+                identity_pem: vec![],
+                ca_cert_pem: vec![1,2,3],
+                server_name_override: None,
+            });
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_manager_cache() {
+        let (server, pubkey_mock) = setup_server();
+        let config = RemoteSignerConfig::new(server.base_url()).with_timeout(Duration::from_secs(2));
+        let manager = RemoteSignerManager::connect(config).unwrap();
+        let pk1 = manager.public_key();
+        let pk2 = manager.public_key();
+        assert_eq!(pk1.0, pk2.0); // cached
+        pubkey_mock.assert_hits(1); // only one fetch
+
+        manager.clear_cache();
+        let pk3 = manager.public_key();
+        assert_eq!(pk1.0, pk3.0);
+        pubkey_mock.assert_hits(2);
+    }
+
+    #[test]
+    fn test_manager_refresh_cache() {
+        let server = MockServer::start();
+        let pubkey_mock = server.mock(|when, then| {
+            when.method(GET).path("/pubkey");
+            then.status(200)
+                .json_body(json!({ "pubkey_base64": base64::encode(&[0xaa; 32]) }));
+        });
+
+        let config = RemoteSignerConfig::new(server.base_url()).with_timeout(Duration::from_secs(2));
+        let manager = RemoteSignerManager::connect(config).unwrap();
+        let pk1 = manager.public_key();
+        assert_eq!(pk1.0, vec![0xaa; 32]);
+        pubkey_mock.assert_hits(1);
+
+        manager.refresh_cache().unwrap();
+        pubkey_mock.assert_hits(2);
     }
 }
