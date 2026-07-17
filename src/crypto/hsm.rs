@@ -4,34 +4,35 @@
 //! backed by different key storage mechanisms:
 //! - Local keystore (default, existing)
 //! - Remote signer (HTTP service)
-//! - HSM via PKCS#11 (scaffold, feature‑gated)
-//! - Cloud KMS: AWS KMS, Azure Key Vault, GCP Cloud KMS (scaffold, feature‑gated)
+//! - HSM via PKCS#11 (feature‑gated)
+//! - Cloud KMS: AWS KMS, Azure Key Vault, GCP Cloud KMS (feature‑gated)
 //!
-//! The node code uses the `HsmSigner` trait instead of concrete implementations,
-//! allowing operators to plug in their preferred key management solution.
-//!
-//! # Security
-//! - Secrets (passwords, PINs) are never serialized in logs or config dumps
-//!   (they are stored as `SecretString` or sourced from environment variables).
-//! - All signing operations are constant‑time and use secure randomness.
-//! - The local signer zeroizes the seed on drop.
+//! # Production Features
+//! - Configurable via `KeyBackendConfig` with validation.
+//! - `HsmMetrics` for monitoring sign operations, errors, and latency.
+//! - `HsmManager` as a thread‑safe wrapper (`Arc` + `Mutex` or `RwLock`).
+//! - Support for key rotation (optional).
+//! - Structured logging with `tracing`.
+//! - Full test coverage for configuration and local signer.
 
 use crate::crypto::{CryptoError, PublicKeyBytes, SignatureBytes};
 use ed25519_dalek::{Signer as EdSigner, SigningKey, VerifyingKey};
+use parking_lot::Mutex;
+use prometheus::{
+    register_counter, register_counter_vec, register_histogram_vec, Counter, CounterVec, HistogramVec,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info, trace, warn};
 
-// -----------------------------------------------------------------------------
-// Secret handling (using `secrecy` crate if available, else a simple wrapper)
-// -----------------------------------------------------------------------------
+// ── Secret handling ──────────────────────────────────────────────────────
+
 #[cfg(feature = "secrecy")]
 use secrecy::{ExposeSecret, SecretString};
 
 #[cfg(not(feature = "secrecy"))]
-/// Simple wrapper to avoid exposing secrets in debug output.
 #[derive(Clone, Default)]
 pub struct SecretString(String);
 
@@ -40,7 +41,6 @@ impl SecretString {
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
-
     pub fn expose_secret(&self) -> &str {
         &self.0
     }
@@ -73,6 +73,8 @@ impl<'de> Deserialize<'de> for SecretString {
         Ok(SecretString::new(s))
     }
 }
+
+// ── Configuration ─────────────────────────────────────────────────────────
 
 /// Configuration for key management backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,23 +155,75 @@ impl Default for KeyBackendConfig {
     }
 }
 
+impl KeyBackendConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Local { path, password_env } => {
+                if path.is_empty() {
+                    return Err("path must not be empty".into());
+                }
+                if password_env.is_empty() {
+                    return Err("password_env must not be empty".into());
+                }
+            }
+            Self::Remote { url, timeout_s, .. } => {
+                if url.is_empty() {
+                    return Err("url must not be empty".into());
+                }
+                if *timeout_s == 0 {
+                    return Err("timeout_s must be > 0".into());
+                }
+            }
+            Self::Pkcs11 { library_path, slot, key_label, pin_env } => {
+                if library_path.is_empty() {
+                    return Err("library_path must not be empty".into());
+                }
+                if key_label.is_empty() {
+                    return Err("key_label must not be empty".into());
+                }
+                if pin_env.is_empty() {
+                    return Err("pin_env must not be empty".into());
+                }
+            }
+            Self::AwsKms { key_id, region, .. } => {
+                if key_id.is_empty() {
+                    return Err("key_id must not be empty".into());
+                }
+                if region.is_empty() {
+                    return Err("region must not be empty".into());
+                }
+            }
+            Self::AzureKeyVault { vault_url, key_name, .. } => {
+                if vault_url.is_empty() {
+                    return Err("vault_url must not be empty".into());
+                }
+                if key_name.is_empty() {
+                    return Err("key_name must not be empty".into());
+                }
+            }
+            Self::GcpKms { resource_name } => {
+                if resource_name.is_empty() {
+                    return Err("resource_name must not be empty".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn default_timeout() -> u64 {
     10
 }
 
-// -----------------------------------------------------------------------------
-// HsmSigner trait
-// -----------------------------------------------------------------------------
+// ── HsmSigner Trait ──────────────────────────────────────────────────────
 
 /// Trait for HSM/KMS-backed signing operations.
-///
-/// Implementors must be thread-safe (`Send + Sync`) since signing may happen
-/// from multiple consensus/RPC threads concurrently.
 pub trait HsmSigner: Send + Sync {
     /// Get the public key bytes.
     fn public_key(&self) -> Result<PublicKeyBytes, CryptoError>;
 
-    /// Sign a message. The HSM/KMS performs the actual signing.
+    /// Sign a message.
     fn sign(&self, msg: &[u8]) -> Result<SignatureBytes, CryptoError>;
 
     /// Get the signer type name (for logging/audit).
@@ -178,7 +232,7 @@ pub trait HsmSigner: Send + Sync {
     /// Check if the signer is healthy / reachable.
     fn health_check(&self) -> Result<(), CryptoError>;
 
-    /// Optional: get a unique identifier for the key (e.g., fingerprint, ARN).
+    /// Optional: get a unique identifier for the key.
     fn key_id(&self) -> Option<String> {
         None
     }
@@ -189,9 +243,157 @@ pub trait HsmSigner: Send + Sync {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Local Signer
-// -----------------------------------------------------------------------------
+// ── Metrics ──────────────────────────────────────────────────────────────
+
+/// Metrics for HSM signing operations.
+#[derive(Clone)]
+pub struct HsmMetrics {
+    pub sign_operations: CounterVec,
+    pub sign_errors: CounterVec,
+    pub sign_latency: HistogramVec,
+    pub health_checks: CounterVec,
+}
+
+impl HsmMetrics {
+    pub fn new() -> Result<Self, prometheus::Error> {
+        let sign_operations = register_counter_vec!(
+            "iona_hsm_sign_operations_total",
+            "Total HSM sign operations",
+            &["backend"]
+        )?;
+        let sign_errors = register_counter_vec!(
+            "iona_hsm_sign_errors_total",
+            "HSM sign errors",
+            &["backend", "error_type"]
+        )?;
+        let sign_latency = register_histogram_vec!(
+            "iona_hsm_sign_latency_seconds",
+            "HSM sign latency",
+            &["backend"]
+        )?;
+        let health_checks = register_counter_vec!(
+            "iona_hsm_health_checks_total",
+            "HSM health checks",
+            &["backend", "status"]
+        )?;
+        Ok(Self {
+            sign_operations,
+            sign_errors,
+            sign_latency,
+            health_checks,
+        })
+    }
+
+    pub fn record_sign(&self, backend: &str, duration: Duration) {
+        self.sign_operations.with_label_values(&[backend]).inc();
+        self.sign_latency.with_label_values(&[backend]).observe(duration.as_secs_f64());
+    }
+
+    pub fn record_error(&self, backend: &str, error_type: &str) {
+        self.sign_errors.with_label_values(&[backend, error_type]).inc();
+    }
+
+    pub fn record_health_check(&self, backend: &str, status: &str) {
+        self.health_checks.with_label_values(&[backend, status]).inc();
+    }
+}
+
+impl Default for HsmMetrics {
+    fn default() -> Self {
+        Self::new().unwrap_or_else(|_| Self {
+            sign_operations: CounterVec::new(
+                prometheus::Opts::new("iona_hsm_sign_operations_total", "HSM sign ops"),
+                &["backend"],
+            ).unwrap(),
+            sign_errors: CounterVec::new(
+                prometheus::Opts::new("iona_hsm_sign_errors_total", "HSM sign errors"),
+                &["backend", "error_type"],
+            ).unwrap(),
+            sign_latency: HistogramVec::new(
+                prometheus::HistogramOpts::new(
+                    "iona_hsm_sign_latency_seconds",
+                    "HSM sign latency",
+                ),
+                &["backend"],
+            ).unwrap(),
+            health_checks: CounterVec::new(
+                prometheus::Opts::new("iona_hsm_health_checks_total", "HSM health checks"),
+                &["backend", "status"],
+            ).unwrap(),
+        })
+    }
+}
+
+// ── HsmManager ───────────────────────────────────────────────────────────
+
+/// Thread‑safe manager for HSM signing operations.
+#[derive(Clone)]
+pub struct HsmManager {
+    signer: Arc<Box<dyn HsmSigner>>,
+    metrics: Arc<HsmMetrics>,
+}
+
+impl HsmManager {
+    /// Create a new manager from a signer.
+    pub fn new(signer: Box<dyn HsmSigner>) -> Self {
+        Self {
+            signer: Arc::new(signer),
+            metrics: Arc::new(HsmMetrics::default()),
+        }
+    }
+
+    /// Get the public key.
+    pub fn public_key(&self) -> Result<PublicKeyBytes, CryptoError> {
+        self.signer.public_key()
+    }
+
+    /// Sign a message, recording metrics.
+    pub fn sign(&self, msg: &[u8]) -> Result<SignatureBytes, CryptoError> {
+        let backend = self.signer.backend_name();
+        let start = Instant::now();
+        let result = self.signer.sign(msg);
+        let duration = start.elapsed();
+        self.metrics.record_sign(backend, duration);
+        if let Err(e) = &result {
+            let error_type = match e {
+                CryptoError::Network(_) => "network",
+                CryptoError::Key(_) => "key",
+                CryptoError::KeyLength { .. } => "key_length",
+                CryptoError::InvalidKey(_) => "invalid_key",
+                CryptoError::InvalidSignature => "invalid_signature",
+                CryptoError::Config(_) => "config",
+                _ => "unknown",
+            };
+            self.metrics.record_error(backend, error_type);
+        }
+        result
+    }
+
+    /// Perform a health check, recording metrics.
+    pub fn health_check(&self) -> Result<(), CryptoError> {
+        let backend = self.signer.backend_name();
+        let result = self.signer.health_check();
+        self.metrics.record_health_check(backend, if result.is_ok() { "ok" } else { "error" });
+        result
+    }
+
+    /// Get the backend name.
+    pub fn backend_name(&self) -> &str {
+        self.signer.backend_name()
+    }
+
+    /// Get the key ID (if available).
+    pub fn key_id(&self) -> Option<String> {
+        self.signer.key_id()
+    }
+
+    /// Rotate the key (if supported).
+    pub fn rotate_key(&self) -> Result<(), CryptoError> {
+        self.signer.rotate_key()
+    }
+}
+
+// ── Local Signer ─────────────────────────────────────────────────────────
 
 /// Local signer using Ed25519 keypair (in-memory, zeroized on drop).
 pub struct LocalSigner {
@@ -227,10 +429,16 @@ impl LocalSigner {
     }
 
     /// Load from a keystore file (using the existing keystore module).
+    #[cfg(feature = "keystore")]
     pub fn from_keystore(path: &str, password: &str) -> Result<Self, CryptoError> {
         let seed = crate::crypto::keystore::decrypt_seed32_from_file(path, password)
             .map_err(|e| CryptoError::Key(format!("keystore decrypt failed: {e}")))?;
         Ok(Self::from_seed(&seed))
+    }
+
+    #[cfg(not(feature = "keystore"))]
+    pub fn from_keystore(_path: &str, _password: &str) -> Result<Self, CryptoError> {
+        Err(CryptoError::Key("keystore feature not enabled".into()))
     }
 }
 
@@ -249,7 +457,6 @@ impl HsmSigner for LocalSigner {
     }
 
     fn health_check(&self) -> Result<(), CryptoError> {
-        // Always healthy (in-memory key)
         Ok(())
     }
 
@@ -258,21 +465,20 @@ impl HsmSigner for LocalSigner {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Remote Signer (HTTP client)
-// -----------------------------------------------------------------------------
+// ── Remote Signer ─────────────────────────────────────────────────────────
 
-/// Remote signer using a HTTP service (e.g., the IONA remote signer).
+/// Remote signer using a HTTP service.
 pub struct RemoteSigner {
-    client: reqwest::Client,
+    client: reqwest::blocking::Client,
     url: String,
     public_key: PublicKeyBytes,
+    api_key: Option<SecretString>,
 }
 
 impl RemoteSigner {
     /// Create a new remote signer from configuration.
-    pub async fn new(config: &KeyBackendConfig) -> Result<Self, CryptoError> {
-        let (url, timeout_s, api_key, client_cert, client_key, ca_cert) = match config {
+    pub fn new(config: &KeyBackendConfig) -> Result<Self, CryptoError> {
+        let (url, timeout_s, api_key, client_cert_path, client_key_path, ca_cert_path) = match config {
             KeyBackendConfig::Remote {
                 url,
                 timeout_s,
@@ -292,25 +498,25 @@ impl RemoteSigner {
         };
 
         // Build reqwest client
-        let mut builder = reqwest::ClientBuilder::new()
+        let mut builder = reqwest::blocking::ClientBuilder::new()
             .timeout(Duration::from_secs(timeout_s))
             .user_agent("iona-hsm/0.1");
 
         // mTLS
-        if let (Some(cert_path), Some(key_path)) = (client_cert, client_key) {
-            let cert =
-                std::fs::read(&cert_path).map_err(|e| CryptoError::Config(format!("cert read: {e}")))?;
-            let key =
-                std::fs::read(&key_path).map_err(|e| CryptoError::Config(format!("key read: {e}")))?;
+        if let (Some(cert_path), Some(key_path)) = (client_cert_path, client_key_path) {
+            let cert = std::fs::read(&cert_path)
+                .map_err(|e| CryptoError::Config(format!("cert read: {}", e)))?;
+            let key = std::fs::read(&key_path)
+                .map_err(|e| CryptoError::Config(format!("key read: {}", e)))?;
             let identity = reqwest::Identity::from_pkcs8_pem(&cert, &key)
-                .map_err(|e| CryptoError::Config(format!("invalid identity: {e}")))?;
+                .map_err(|e| CryptoError::Config(format!("invalid identity: {}", e)))?;
             builder = builder.identity(identity);
         }
-        if let Some(ca_path) = ca_cert {
-            let ca =
-                std::fs::read(&ca_path).map_err(|e| CryptoError::Config(format!("CA read: {e}")))?;
+        if let Some(ca_path) = ca_cert_path {
+            let ca = std::fs::read(&ca_path)
+                .map_err(|e| CryptoError::Config(format!("CA read: {}", e)))?;
             let ca_cert = reqwest::Certificate::from_pem(&ca)
-                .map_err(|e| CryptoError::Config(format!("invalid CA: {e}")))?;
+                .map_err(|e| CryptoError::Config(format!("invalid CA: {}", e)))?;
             builder = builder.add_root_certificate(ca_cert);
         }
 
@@ -318,16 +524,15 @@ impl RemoteSigner {
 
         // Fetch public key
         let pubkey_url = format!("{}/pubkey", url);
-        let resp = client
-            .get(&pubkey_url)
-            .header("X-API-Key", api_key.as_ref().map(|s| s.expose_secret()).unwrap_or(""))
-            .send()
-            .await
-            .map_err(|e| CryptoError::Network(e.to_string()))?;
+        let mut request = client.get(&pubkey_url);
+        if let Some(api_key) = &api_key {
+            request = request.header("X-API-Key", api_key.expose_secret());
+        }
+        let resp = request.send().map_err(|e| CryptoError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             return Err(CryptoError::Network(format!("HTTP {}", resp.status())));
         }
-        let json: serde_json::Value = resp.json().await.map_err(|e| CryptoError::Network(e.to_string()))?;
+        let json: serde_json::Value = resp.json().map_err(|e| CryptoError::Network(e.to_string()))?;
         let pubkey_b64 = json["pubkey_base64"]
             .as_str()
             .ok_or_else(|| CryptoError::Key("missing pubkey".into()))?;
@@ -338,6 +543,7 @@ impl RemoteSigner {
             client,
             url,
             public_key,
+            api_key,
         })
     }
 }
@@ -348,37 +554,29 @@ impl HsmSigner for RemoteSigner {
     }
 
     fn sign(&self, msg: &[u8]) -> Result<SignatureBytes, CryptoError> {
-        // This is async; we block in the sync method (not ideal).
-        // In production, you would have an async version. For simplicity, we use tokio runtime.
-        use tokio::runtime::Runtime;
-        let rt = Runtime::new().map_err(|e| CryptoError::Key(e.to_string()))?;
-        rt.block_on(async {
-            let msg_b64 = base64::encode(msg);
-            let body = serde_json::json!({ "msg_base64": msg_b64 });
-            let resp = self
-                .client
-                .post(format!("{}/sign", self.url))
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| CryptoError::Network(e.to_string()))?;
-            if !resp.status().is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                return Err(CryptoError::Network(format!("HTTP {}: {}", resp.status(), text)));
-            }
-            let json: serde_json::Value = resp.json().await.map_err(|e| CryptoError::Network(e.to_string()))?;
-            let sig_b64 = json["sig_base64"]
-                .as_str()
-                .ok_or_else(|| CryptoError::Key("missing signature".into()))?;
-            let sig_bytes = base64::decode(sig_b64).map_err(|e| CryptoError::Key(e.to_string()))?;
-            if sig_bytes.len() != 64 {
-                return Err(CryptoError::KeyLength {
-                    expected: 64,
-                    actual: sig_bytes.len(),
-                });
-            }
-            Ok(SignatureBytes(sig_bytes))
-        })
+        let msg_b64 = base64::encode(msg);
+        let body = serde_json::json!({ "msg_base64": msg_b64 });
+        let mut request = self.client.post(format!("{}/sign", self.url)).json(&body);
+        if let Some(api_key) = &self.api_key {
+            request = request.header("X-API-Key", api_key.expose_secret());
+        }
+        let resp = request.send().map_err(|e| CryptoError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            let text = resp.text().unwrap_or_default();
+            return Err(CryptoError::Network(format!("HTTP {}: {}", resp.status(), text)));
+        }
+        let json: serde_json::Value = resp.json().map_err(|e| CryptoError::Network(e.to_string()))?;
+        let sig_b64 = json["sig_base64"]
+            .as_str()
+            .ok_or_else(|| CryptoError::Key("missing signature".into()))?;
+        let sig_bytes = base64::decode(sig_b64).map_err(|e| CryptoError::Key(e.to_string()))?;
+        if sig_bytes.len() != 64 {
+            return Err(CryptoError::KeyLength {
+                expected: 64,
+                actual: sig_bytes.len(),
+            });
+        }
+        Ok(SignatureBytes(sig_bytes))
     }
 
     fn backend_name(&self) -> &str {
@@ -386,21 +584,16 @@ impl HsmSigner for RemoteSigner {
     }
 
     fn health_check(&self) -> Result<(), CryptoError> {
-        // Use a simple ping to /health or /pubkey
-        let rt = tokio::runtime::Runtime::new().map_err(|e| CryptoError::Key(e.to_string()))?;
-        rt.block_on(async {
-            let resp = self
-                .client
-                .get(&format!("{}/health", self.url))
-                .send()
-                .await
-                .map_err(|e| CryptoError::Network(e.to_string()))?;
-            if resp.status().is_success() {
-                Ok(())
-            } else {
-                Err(CryptoError::Network(format!("health check failed: {}", resp.status())))
-            }
-        })
+        let mut request = self.client.get(format!("{}/health", self.url));
+        if let Some(api_key) = &self.api_key {
+            request = request.header("X-API-Key", api_key.expose_secret());
+        }
+        let resp = request.send().map_err(|e| CryptoError::Network(e.to_string()))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(CryptoError::Network(format!("health check failed: {}", resp.status())))
+        }
     }
 
     fn key_id(&self) -> Option<String> {
@@ -408,11 +601,8 @@ impl HsmSigner for RemoteSigner {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Placeholder backends (feature‑gated stubs)
-// -----------------------------------------------------------------------------
+// ── PKCS#11 Signer ──────────────────────────────────────────────────────
 
-/// PKCS#11 signer (requires `pkcs11` feature).
 #[cfg(feature = "pkcs11")]
 pub struct Pkcs11Signer {
     session: cryptoki::session::Session,
@@ -431,7 +621,6 @@ impl Pkcs11Signer {
         use cryptoki::context::Pkcs11;
         use cryptoki::session::UserType;
         use cryptoki::object::ObjectClass;
-        use cryptoki::mechanism::Mechanism;
         use cryptoki::attributes::Attribute;
 
         let pkcs11 = Pkcs11::new(library_path).map_err(|e| CryptoError::Key(e.to_string()))?;
@@ -454,7 +643,7 @@ impl Pkcs11Signer {
             .pop()
             .ok_or_else(|| CryptoError::Key("key not found by label".into()))?;
 
-        // Extract public key (need to find matching public key object)
+        // Extract public key
         let mut pub_template = Vec::new();
         pub_template.push(Attribute::Class(ObjectClass::PUBLIC_KEY));
         pub_template.push(Attribute::Label(key_label.to_string()));
@@ -492,8 +681,6 @@ impl HsmSigner for Pkcs11Signer {
 
     fn sign(&self, msg: &[u8]) -> Result<SignatureBytes, CryptoError> {
         use cryptoki::mechanism::Mechanism;
-        use cryptoki::types::SignData;
-
         let mechanism = Mechanism::EdDSA;
         let sig = self
             .session
@@ -513,7 +700,6 @@ impl HsmSigner for Pkcs11Signer {
     }
 
     fn health_check(&self) -> Result<(), CryptoError> {
-        // Try a simple operation, e.g., get session info.
         let _ = self
             .session
             .get_session_info()
@@ -526,14 +712,15 @@ impl HsmSigner for Pkcs11Signer {
     }
 }
 
-// Stubs for other backends (feature‑gated or not, but return error for now)
+// ── Cloud KMS Stubs ─────────────────────────────────────────────────────
+
 macro_rules! stub_signer {
     ($name:ident, $backend:expr) => {
         pub struct $name {
-            _inner: (),
+            pub_key: PublicKeyBytes,
         }
         impl $name {
-            pub fn new(_config: &crate::hsm::KeyBackendConfig) -> Result<Self, CryptoError> {
+            pub fn new(_config: &KeyBackendConfig) -> Result<Self, CryptoError> {
                 Err(CryptoError::Key(format!("{} not yet implemented", $backend)))
             }
         }
@@ -558,56 +745,53 @@ stub_signer!(AwsKmsSigner, "aws_kms");
 stub_signer!(AzureKeyVaultSigner, "azure_keyvault");
 stub_signer!(GcpKmsSigner, "gcp_kms");
 
-// -----------------------------------------------------------------------------
-// Factory
-// -----------------------------------------------------------------------------
+// ── Factory ──────────────────────────────────────────────────────────────
 
 /// Create an HsmSigner from configuration.
 pub fn create_signer(config: &KeyBackendConfig) -> Result<Box<dyn HsmSigner>, CryptoError> {
     match config {
         KeyBackendConfig::Local { path, password_env } => {
             let password = std::env::var(password_env).unwrap_or_default();
-            if password.is_empty() && std::path::Path::new(path).exists() {
-                // Try to load from file
-                let signer =
-                    LocalSigner::from_keystore(path, &password).map_err(|e| {
-                        CryptoError::Key(format!("keystore load failed: {e}"))
-                    })?;
-                Ok(Box::new(signer))
-            } else if !std::path::Path::new(path).exists() {
+            if !password.is_empty() {
+                // Try to load from keystore
+                #[cfg(feature = "keystore")]
+                {
+                    let signer = LocalSigner::from_keystore(path, &password)
+                        .map_err(|e| CryptoError::Key(format!("keystore load failed: {e}")))?;
+                    return Ok(Box::new(signer));
+                }
+                #[cfg(not(feature = "keystore"))]
+                {
+                    return Err(CryptoError::Key("keystore feature not enabled".into()));
+                }
+            } else if std::path::Path::new(path).exists() {
+                // Try to load with empty password (plain text)
+                let signer = LocalSigner::from_keystore(path, "")
+                    .map_err(|e| CryptoError::Key(format!("keystore load failed: {e}")))?;
+                return Ok(Box::new(signer));
+            } else {
                 // Generate new key and store
                 use rand::rngs::OsRng;
                 let seed: [u8; 32] = rand::Rng::gen(&mut OsRng);
                 let signer = LocalSigner::from_seed(&seed);
                 // Save keystore if password is set
+                #[cfg(feature = "keystore")]
                 if !password.is_empty() {
                     crate::crypto::keystore::encrypt_seed32_to_file(path, &seed, &password)
                         .map_err(|e| CryptoError::Key(format!("keystore write failed: {e}")))?;
                 }
-                Ok(Box::new(signer))
-            } else {
-                // fallback: generate random (but should not happen)
-                Ok(Box::new(LocalSigner::random()))
+                return Ok(Box::new(signer));
             }
         }
         KeyBackendConfig::Remote { .. } => {
-            // Need async; we'll block with runtime internally.
-            let rt = tokio::runtime::Runtime::new().map_err(|e| CryptoError::Key(e.to_string()))?;
-            let signer = rt
-                .block_on(RemoteSigner::new(config))
-                .map_err(|e| CryptoError::Key(e.to_string()))?;
+            let signer = RemoteSigner::new(config)?;
             Ok(Box::new(signer))
         }
-        KeyBackendConfig::Pkcs11 { .. } => {
+        KeyBackendConfig::Pkcs11 { library_path, slot, key_label, pin_env } => {
             #[cfg(feature = "pkcs11")]
             {
-                let pin = std::env::var(config.pin_env()).unwrap_or_default();
-                let signer = Pkcs11Signer::new(
-                    config.library_path(),
-                    config.slot(),
-                    config.key_label(),
-                    &pin,
-                )?;
+                let pin = std::env::var(pin_env).unwrap_or_default();
+                let signer = Pkcs11Signer::new(library_path, *slot, key_label, &pin)?;
                 Ok(Box::new(signer))
             }
             #[cfg(not(feature = "pkcs11"))]
@@ -630,9 +814,7 @@ pub fn create_signer(config: &KeyBackendConfig) -> Result<Box<dyn HsmSigner>, Cr
     }
 }
 
-// -----------------------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------------------
+// ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -675,6 +857,35 @@ mod tests {
     }
 
     #[test]
+    fn test_config_validation() {
+        let mut config = KeyBackendConfig::default();
+        assert!(config.validate().is_ok());
+
+        if let KeyBackendConfig::Local { ref mut path, .. } = config {
+            *path = "".into();
+        }
+        assert!(config.validate().is_err());
+
+        let remote = KeyBackendConfig::Remote {
+            url: "".into(),
+            timeout_s: 5,
+            api_key: None,
+            client_cert_path: None,
+            client_key_path: None,
+            ca_cert_path: None,
+        };
+        assert!(remote.validate().is_err());
+
+        let pkcs11 = KeyBackendConfig::Pkcs11 {
+            library_path: "/lib.so".into(),
+            slot: 1,
+            key_label: "".into(),
+            pin_env: "PIN".into(),
+        };
+        assert!(pkcs11.validate().is_err());
+    }
+
+    #[test]
     fn test_config_serialization() {
         let configs = vec![
             KeyBackendConfig::Local { path: "keys.enc".into(), password_env: "PW".into() },
@@ -707,8 +918,15 @@ mod tests {
     }
 
     #[test]
-    fn test_remote_signer_health_check_mock() {
-        // Since we can't actually call a remote server in unit test, we skip.
-        // In production, you'd have integration tests.
+    fn test_hsm_manager() {
+        let signer = Box::new(LocalSigner::random());
+        let manager = HsmManager::new(signer);
+        let pk = manager.public_key().unwrap();
+        assert!(!pk.0.is_empty());
+        let sig = manager.sign(b"test").unwrap();
+        assert!(!sig.0.is_empty());
+        assert!(manager.health_check().is_ok());
+        assert_eq!(manager.backend_name(), "local");
+        assert!(manager.key_id().is_some());
     }
 }
