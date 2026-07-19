@@ -1,60 +1,155 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  IONA Node Configuration — Production‑Grade v30                             ║
-# ║  Validator 2                                                               ║
+# ║  Validator 2                                                                ║
+# ║                                                                            ║
+# ║  All tunable parameters for a production validator node.                    ║
+# ║  Sensitive fields can be overridden via environment variables (see below).  ║
+# ║  Run `iona-node --check-compat --config <this-file>` to validate.           ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
+
+# ------------------------------------------------------------------------------
+# ENVIRONMENT VARIABLE OVERRIDES
+# ------------------------------------------------------------------------------
+# All string values can be overridden by environment variables with the prefix:
+#   IONA_<SECTION>_<FIELD>
+#
+# Example:
+#   export IONA_NODE_DATA_DIR=/data
+#   export IONA_NETWORK_LISTEN=0.0.0.0:7001
+#   export IONA_RPC_LISTEN=0.0.0.0:9001
+#
+# For nested fields, use double underscore:
+#   export IONA_NETWORK_GOSSIPSUB_MAX_PUBLISH_MSGS_PER_SEC=50
+#
+# Boolean: true/false, 0/1, yes/no
+# Numbers: integers or floats
+# Arrays: comma-separated (e.g., "val1,val2,val3")
 
 # ------------------------------------------------------------------------------
 # NODE IDENTITY
 # ------------------------------------------------------------------------------
 [node]
+# Unique chain identifier – must match the genesis file and all peers.
 chain_id = "iona-testnet-1"
+
+# Root directory for chain data, keys, and logs.
 data_dir = "/var/lib/iona"
+
+# Deterministic seed for key derivation (must be unique per validator).
+# Seed for Validator 2: 2002
 seed = 2002
+
+# Execution profile: "prod" | "validator" | "archive" | "dev"
+#   prod:      balanced for full nodes
+#   validator: optimised for consensus participation (higher CPU/network)
+#   archive:   keeps full history (more disk space)
+#   dev:       minimal for development (lower limits)
 profile = "prod"
+
+# Log level: trace | debug | info | warn | error
 log_level = "info"
+
+# Log format: "json" | "text" | "pretty"
+log_format = "text"
+
+# Keystore type: "plain" | "encrypted"
+#   plain:      keys stored in plain text (development only)
+#   encrypted:  encrypted with AES-256-GCM using password from env
 keystore = "encrypted"
+
+# Password for encrypted keystore (fallback if env var is not set).
+# Prefer the IONA_KEYSTORE_PASSWORD environment variable.
 keystore_password = ""
 keystore_password_env = "IONA_KEYSTORE_PASSWORD"
+
+# Node metadata (optional, used for monitoring)
+node_name = "validator-02"
+node_location = "aws-us-east-2"
 
 # ------------------------------------------------------------------------------
 # CONSENSUS ENGINE
 # ------------------------------------------------------------------------------
 [consensus]
-propose_timeout_ms   = 1000
-prevote_timeout_ms   = 1000
-precommit_timeout_ms = 1000
-commit_timeout_ms    = 100
-timeout_commit       = 1000
-max_txs_per_block    = 4096
-max_block_bytes      = 2_097_152
-gas_target           = 43_000_000
-initial_base_fee     = 1
-elasticity_multiplier = 2
-fast_quorum          = true
-stake_each           = 1000
-simple_producer      = true
-validator_seeds      = [1001, 1002, 1003, 1004]
+# Timeouts in milliseconds.
+# These control how long the engine waits before advancing to the next step.
+propose_timeout_ms   = 1000    # wait for proposal before nil‑voting
+prevote_timeout_ms   = 1000    # prevote phase timeout
+precommit_timeout_ms = 1000    # precommit phase timeout
+commit_timeout_ms    = 100     # time to finalise after quorum (kept short)
+
+# Adaptive timeouts (enable for sub‑second finality)
+adaptive_timeouts = true
+min_propose_ms   = 50          # minimum propose timeout
+max_propose_ms   = 500         # maximum propose timeout
+min_vote_ms      = 30
+max_vote_ms      = 300
+
+# Block construction limits.
+max_txs_per_block  = 4096
+max_block_bytes    = 2_097_152  # 2 MiB – hard limit for block size
+
+# EIP‑1559 gas parameters.
+gas_target           = 43_000_000   # target gas per block (50% of block gas limit)
+initial_base_fee     = 1            # initial base fee (in wei)
+elasticity_multiplier = 2           # max block gas = target * multiplier
+
+# Fast‑quorum: advance step immediately when 2/3+ votes arrive.
+fast_quorum = true
+
+# Stake assigned to each validator in simple‑producer mode (testnet only).
+stake_each = 1000
+
+# Simple‑producer mode – validators take turns proposing (set false for full BFT).
+simple_producer = true
+
+# Validator seeds used in simple‑producer mode (must match across all nodes).
+validator_seeds = [1001, 1002, 1003, 1004]
+
+# Protocol upgrade activation schedule.
+# [[consensus.protocol_activations]]
+# protocol_version = 2
+# activation_height = 1_000_000
+
+# Finality pipeline (pre‑compute next block for lower latency)
+pipeline_enabled = true
+pipeline_entanglement = 0.99    # entanglement strength (0.0 – 1.0)
 
 # ------------------------------------------------------------------------------
 # P2P NETWORKING
 # ------------------------------------------------------------------------------
 [network]
+# Listen multi‑address.
 listen = "0.0.0.0:7001"
+
+# Static peer list (multi‑addresses or host:port).
+# Validator 2 peers with the other validators.
 peers = [
   "validator-1:7001",
   "validator-3:7001",
   "validator-4:7001"
 ]
 bootnodes = []
+
+# Connection limits (anti‑DoS).
 max_connections_total       = 100
 max_connections_per_peer    = 8
 max_inbound_connections     = 80
 max_outbound_connections    = 80
-handshake_timeout_ms        = 5000
-message_buffer_size         = 1024
-enable_mdns = false
-enable_kad  = true
+
+# Handshake timeout in milliseconds.
+handshake_timeout_ms = 5000
+
+# Message buffer size per peer (in messages).
+message_buffer_size = 1024
+
+# Peer discovery.
+enable_mdns = false          # local network discovery (testnet only)
+enable_kad  = true           # Kademlia DHT (mainnet recommended)
+
+# Reconnect interval to static peers (seconds).
 reconnect_s = 30
+
+# Peer scoring / rate‑limiting (request‑response protocol).
 rr_max_req_per_sec            = 25
 rr_strikes_before_ban         = 3
 rr_strikes_before_quarantine  = 2
@@ -62,101 +157,271 @@ rr_quarantines_before_ban     = 2
 peer_quarantine_s             = 60
 peer_score_decay_s            = 60
 persist_quarantine            = true
+
+# Eclipse protection (peer diversity).
 eclipse_profile = "mainnet"
 
+# Gossipsub topic limits.
 [network.gossipsub]
 allowed_topics        = ["iona/tx", "iona/blocks", "iona/evidence"]
 deny_unknown_topics   = true
 max_publish_msgs_per_sec = 30
 max_in_msgs_per_sec   = 60
 
+# Bandwidth throttling (bytes per second)
+[network.bandwidth]
+max_inbound_bytes_per_sec  = 10_000_000  # 10 MB/s
+max_outbound_bytes_per_sec = 10_000_000
+
 # ------------------------------------------------------------------------------
 # RPC API
 # ------------------------------------------------------------------------------
 [rpc]
+# Listen address (loopback‑only for security).
 listen = "127.0.0.1:9001"
+
+# Enable WebSocket subscriptions (eth_subscribe).
 enable_websocket = true
 websocket_max_clients = 100
+websocket_read_buffer_size = 4096
+websocket_write_buffer_size = 4096
+
+# Request timeout (milliseconds).
 request_timeout_ms = 30000
+
+# CORS – restrict in production to your frontend domain(s).
 cors_allow_all = false
 cors_allowed_origins = ["https://explorer.iona.network"]
+
+# Rate‑limiting for RPC requests (per‑IP token bucket).
 rpc_rate_limit_enabled = true
 rpc_read_rate_per_sec  = 500
 rpc_submit_rate_per_sec = 100
+rpc_batch_size_limit   = 10
+rpc_max_body_bytes     = 4096
+
+# Faucet (testnet only – disable on mainnet).
 enable_faucet = false
+faucet_balance = 10_000_000_000_000_000  # 10 ETH in wei
+
+# Batch RPC support.
+enable_batch = true
 
 # ------------------------------------------------------------------------------
 # MEMPOOL
 # ------------------------------------------------------------------------------
 [mempool]
+# Maximum number of pending transactions.
 capacity = 200_000
+
+# Per‑sender limits.
 max_pending_per_sender = 64
+
+# Transaction TTL (blocks).
 ttl_blocks = 300
+
+# Replace‑by‑fee bump percentage (e.g. 10 = 10%).
 rbf_bump_percent = 10
+
+# Enable MEV‑resistant features (commit‑reveal, threshold encryption).
 mev_protection = false
 mev_commit_reveal = false
 mev_threshold_encryption = false
+
+# Mempool persistence (save to disk on shutdown).
+persist_on_shutdown = true
+persist_path = "/var/lib/iona/mempool.json"
 
 # ------------------------------------------------------------------------------
 # STORAGE
 # ------------------------------------------------------------------------------
 [storage]
+# Snapshot management.
 enable_snapshots          = true
 snapshot_every_n_blocks   = 500
 snapshot_keep             = 10
 snapshot_zstd_level       = 3
-db_backend                = "rocksdb"
+snapshot_compression      = "zstd"   # "zstd" | "lz4" | "none"
+
+# State database.
+db_backend                = "rocksdb"   # rocksdb | lmdb | memory (test only)
 db_cache_size_mb          = 512
 db_max_open_files         = 1024
+db_write_buffer_size_mb   = 128
+db_block_size_kb          = 16
+
+# Write‑ahead log (WAL) settings.
+wal_max_segment_bytes     = 67_108_864  # 64 MiB
+wal_keep_segments         = 3
+wal_sync_on_write         = true
+wal_enable_checksums      = true
+wal_track_coherence       = true
+
+# Chain pruning (keep last N blocks).
+prune_blocks = 0             # 0 = unlimited (archive)
+prune_interval_secs = 3600   # run every hour
 
 # ------------------------------------------------------------------------------
 # SECURITY
 # ------------------------------------------------------------------------------
 [security]
+# Role‑Based Access Control for admin endpoints.
 rbac_enabled = true
 rbac_policy_path = "/etc/iona/rbac.toml"
+rbac_cache_size = 128
+rbac_cache_ttl_secs = 60
+
+# Audit logging.
 audit_logging_enabled    = true
 audit_log_path           = "/var/log/iona/audit.log"
 max_audit_log_size_mb    = 512
 audit_log_retention_days = 30
+audit_log_compression    = true
+
+# Double‑sign protection.
 double_sign_guard_enabled = true
 double_sign_guard_path    = "/var/lib/iona/doublesign"
+double_sign_guard_ttl_secs = 300
+
+# API key authentication (optional, for non‑mTLS RPC endpoints).
+api_key_auth_enabled = false
+api_key_header = "X-API-Key"
+api_key_value = ""   # set via env: IONA_API_KEY_VALUE
+
+# Rate‑limit for API key endpoints.
+api_key_rate_limit_per_min = 60
 
 # ------------------------------------------------------------------------------
 # ADMINISTRATION
 # ------------------------------------------------------------------------------
 [admin]
+# Admin server (mTLS required in production).
 listen         = "127.0.0.1:9002"
 require_mtls   = true
 tls_cert_pem   = "/etc/iona/tls/admin-server.crt.pem"
 tls_key_pem    = "/etc/iona/tls/admin-server.key.pem"
 tls_ca_cert_pem = "/etc/iona/tls/ca.crt.pem"
+tls_min_version = "1.3"
+
+# Admin API rate‑limit.
+admin_rate_limit_per_min = 30
+
+# Admin session timeout (seconds).
+admin_session_timeout = 600
 
 # ------------------------------------------------------------------------------
 # SIGNING
 # ------------------------------------------------------------------------------
 [signing]
+# Signing mode: "local" (embedded key) or "remote" (external signer).
 mode = "local"
+
+# Remote signer configuration (when mode = "remote").
 remote_url = "http://127.0.0.1:9100"
 remote_timeout_s = 10
 remote_tls_client_cert_pem = ""
 remote_tls_client_key_pem  = ""
 remote_tls_ca_cert_pem     = ""
 remote_tls_server_name     = ""
+remote_api_key             = ""   # optional API key for remote signer
+
+# HSM / KMS configuration (when signing.mode = "hsm")
+# [signing.hsm]
+# type = "pkcs11" | "aws_kms" | "azure_keyvault" | "gcp_kms"
+# library_path = "/usr/lib/libpkcs11.so"
+# slot = 0
+# key_label = "iona-validator"
+# pin_env = "IONA_HSM_PIN"
 
 # ------------------------------------------------------------------------------
 # OBSERVABILITY
 # ------------------------------------------------------------------------------
 [observability]
+# Prometheus metrics.
 enable_metrics = true
 metrics_listen = "127.0.0.1:9090"
 metrics_path   = "/metrics"
+metrics_namespace = "iona"
+
+# OpenTelemetry tracing.
 enable_otel   = false
 otel_endpoint = "http://127.0.0.1:4317"
+otel_protocol = "grpc"   # "grpc" | "http"
 service_name  = "iona-node"
+otel_sampling_rate = 0.01
+
+# Health check endpoint (internal).
+health_listen = "127.0.0.1:9003"
+health_path   = "/health"
+
+# Profiling (pprof).
+enable_pprof = false
+pprof_listen = "127.0.0.1:6060"
 
 # ------------------------------------------------------------------------------
 # UPGRADES
 # ------------------------------------------------------------------------------
 [upgrades]
+# Allow automatic state‑schema migrations on boot.
 auto_migrate = true
+# Height at which the next hard‑fork protocol version activates.
+# activation_height = 0   # 0 = not scheduled
+
+# Rollback protection: prevent downgrading to older schema.
+prevent_downgrade = true
+
+# Migration timeout (seconds).
+migration_timeout_secs = 300
+
+# ------------------------------------------------------------------------------
+# FEATURE FLAGS (Experimental / Performance)
+# ------------------------------------------------------------------------------
+[features]
+# Enable concurrent state root computation (multi‑threaded).
+parallel_state_root = true
+parallel_execution = true
+parallel_signature_verification = true
+
+# Enable zero‑copy network transfers (requires io_uring).
+zero_copy_network = false
+
+# Enable speculative execution (predict next block while voting).
+speculative_execution = true
+
+# Enable quantum‑inspired metrics (purity, entanglement).
+quantum_metrics = true
+
+# ------------------------------------------------------------------------------
+# DISK / I/O TUNING
+# ------------------------------------------------------------------------------
+[io]
+# I/O concurrency (number of background threads).
+io_threads = 4
+# I/O priority (0 = lowest, 100 = highest, 50 = default).
+io_priority = 50
+# Direct I/O (bypass OS cache for data files).
+direct_io = false
+# Sync strategy: "fsync" | "fdatasync" | "none" (dangerous).
+sync_strategy = "fdatasync"
+
+# ------------------------------------------------------------------------------
+# GENESIS (optional, for bootstrapping)
+# ------------------------------------------------------------------------------
+[genesis]
+# Path to genesis JSON file.
+genesis_file = "/etc/iona/genesis.json"
+# Whether to re‑initialise the chain from genesis (dangerous).
+reinit_from_genesis = false
+
+# ------------------------------------------------------------------------------
+# VALIDATION (schema)
+# ------------------------------------------------------------------------------
+# The following section is not part of the runtime config but used for validation.
+# It defines the expected type and constraints for each field.
+# This is automatically checked by the config loader.
+[validation]
+# This is a meta‑section for the config checker.
+# Example:
+#   [validation.consensus]
+#   propose_timeout_ms = { type = "integer", min = 0, max = 10000 }
+#   max_txs_per_block = { type = "integer", min = 1, max = 100000 }
