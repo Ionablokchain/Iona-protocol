@@ -1,114 +1,418 @@
 # Deno CI for IONA TypeScript SDK
 #
-# This workflow runs Deno linter and tests on every push to `main` and on pull requests.
-# It uses caching for Deno’s dependency cache to speed up subsequent runs.
+# This workflow runs Deno linter, type checker, tests, benchmarks, and security audits
+# on every push to `main` and on pull requests.
+# It uses caching for Deno's dependency cache and test artifacts to speed up subsequent runs.
 #
 # Environment variables:
 #   - DENO_VERSION: Deno version to use (default: v1.x)
+#   - DENO_FMT_CHECK: Whether to check formatting (default: true)
 #
 # Secrets:
 #   - CODECOV_TOKEN: token for uploading coverage to Codecov (optional)
+#   - SLACK_WEBHOOK_URL: Slack webhook for notifications (optional)
 
 name: Deno
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "release/**"]
   pull_request:
-    branches: ["main"]
-  # Allow manual trigger from Actions tab
+    branches: ["main", "release/**"]
+  schedule:
+    - cron: "0 3 * * 1"   # Weekly on Monday 03:00 UTC
   workflow_dispatch:
+    inputs:
+      deno_version:
+        description: "Deno version to use (e.g., v1.x, v2.x)"
+        required: false
+        default: "v1.x"
+      run_benchmarks:
+        description: "Run benchmarks"
+        required: false
+        default: "true"
+      slack_notify:
+        description: "Enable Slack notifications"
+        required: false
+        default: "true"
 
 permissions:
   contents: read
+  pull-requests: write   # For PR comments
 
 env:
-  DENO_VERSION: v1.x
+  DENO_VERSION: ${{ github.event.inputs.deno_version || 'v1.x' }}
+  DENO_FMT_CHECK: true
+  CARGO_TERM_COLOR: always
 
 jobs:
-  # -------------------------------------------------------------------------
-  # Lint and test Deno code
-  # -------------------------------------------------------------------------
-  lint-and-test:
-    name: Lint and Test
+  # ── 1. Lint, format, type check ───────────────────────────────────────
+  lint:
+    name: Lint & Type Check
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # Setup Deno with a specific version (pinned for reproducibility)
       - name: Setup Deno
         uses: denoland/setup-deno@v2
         with:
           deno-version: ${{ env.DENO_VERSION }}
 
-      # Cache Deno's dependency cache (deno.land and other remote modules)
       - name: Cache Deno dependencies
         uses: actions/cache@v4
         with:
           path: |
             ~/.cache/deno/deps
             ~/.cache/deno/npm
-          key: ${{ runner.os }}-deno-${{ hashFiles('**/deno.lock', '**/deps.ts') }}
+          key: ${{ runner.os }}-deno-${{ env.DENO_VERSION }}-${{ hashFiles('deno.lock', 'deps.ts') }}
           restore-keys: |
+            ${{ runner.os }}-deno-${{ env.DENO_VERSION }}-
             ${{ runner.os }}-deno-
 
-      # Verify formatting (optional, can be uncommented)
       - name: Check formatting
+        if: env.DENO_FMT_CHECK == 'true'
         run: deno fmt --check
 
-      # Run linter
       - name: Run linter
         run: deno lint
 
-      # Run tests with coverage collection
-      - name: Run tests with coverage
-        run: deno test -A --coverage=coverage
+      - name: Type check
+        run: deno check $(find . -name "*.ts" -not -path "./target/*" -not -path "./node_modules/*" | head -100)
 
-      # Generate coverage report (as text and lcov)
-      - name: Generate coverage report
-        run: deno coverage coverage --lcov > coverage.lcov
-
-      # Optional: upload coverage to Codecov (requires CODECOV_TOKEN secret)
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        if: github.event_name != 'pull_request' && secrets.CODECOV_TOKEN != ''
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          file: ./coverage.lcov
-          flags: deno
-          name: deno-coverage
-          fail_ci_if_error: false
-
-      # Optional: run with `--doc` to check documentation examples
       - name: Check documentation examples
         run: deno test --doc
 
-      # Optional: run slow tests separately (e.g., integration tests)
-      # - name: Run integration tests
-      #   run: deno test -A -- --unstable ./tests/integration
-
-  # -------------------------------------------------------------------------
-  # Security audit (using Deno's built-in audit)
-  # -------------------------------------------------------------------------
-  security-audit:
-    name: Security Audit
+  # ── 2. Unit tests with coverage ───────────────────────────────────────
+  test:
+    name: Unit Tests (Deno ${{ matrix.deno-version }})
     runs-on: ubuntu-latest
-    needs: lint-and-test
-    if: github.event_name != 'pull_request'
-
+    needs: lint
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        deno-version: [v1.x, v2.x]
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: ${{ matrix.deno-version }}
+
+      - name: Cache Deno dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/deno/deps
+            ~/.cache/deno/npm
+          key: ${{ runner.os }}-deno-${{ matrix.deno-version }}-${{ hashFiles('deno.lock', 'deps.ts') }}
+          restore-keys: |
+            ${{ runner.os }}-deno-${{ matrix.deno-version }}-
+            ${{ runner.os }}-deno-
+
+      - name: Run tests with coverage
+        id: test
+        run: |
+          deno test -A --coverage=coverage --parallel --junit=test-results.xml 2>&1 | tee test_output.txt
+          # Capture exit code
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "test_failed=true" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "test_failed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate coverage report (lcov)
+        run: deno coverage coverage --lcov > coverage.lcov
+
+      - name: Generate coverage report (summary)
+        run: deno coverage coverage
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.deno-version }}
+          path: |
+            test-results.xml
+            test_output.txt
+            coverage.lcov
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: github.event_name != 'pull_request' && env.CODECOV_TOKEN != ''
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          file: ./coverage.lcov
+          flags: deno,${{ matrix.deno-version }}
+          name: deno-coverage-${{ matrix.deno-version }}
+          fail_ci_if_error: false
+
+  # ── 3. Integration tests ──────────────────────────────────────────────
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Setup Deno
         uses: denoland/setup-deno@v2
         with:
           deno-version: ${{ env.DENO_VERSION }}
 
-      # Check for known vulnerabilities in deno.land/x dependencies (experimental)
-      - name: Run Deno audit
-        run: deno info --unstable --json | jq '.modules | map(select(.version)) | .[]' || echo "Audit not yet supported"
+      - name: Cache Deno dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/deno/deps
+            ~/.cache/deno/npm
+          key: ${{ runner.os }}-deno-${{ env.DENO_VERSION }}-${{ hashFiles('deno.lock', 'deps.ts') }}
+          restore-keys: |
+            ${{ runner.os }}-deno-${{ env.DENO_VERSION }}-
+            ${{ runner.os }}-deno-
+
+      - name: Run integration tests
+        id: integration
+        run: |
+          if [ -d tests/integration ]; then
+            deno test -A --parallel --doc tests/integration 2>&1 | tee integration_output.txt
+            if [ ${PIPESTATUS[0]} -ne 0 ]; then
+              echo "integration_failed=true" >> $GITHUB_OUTPUT
+              exit 1
+            else
+              echo "integration_failed=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "::notice::No integration tests found, skipping"
+            echo "integration_failed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload integration logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs
+          path: integration_output.txt
+
+  # ── 4. Browser tests (if applicable) ──────────────────────────────────
+  browser:
+    name: Browser Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 15
+    continue-on-error: true   # Optional
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+
+      - name: Cache Deno dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/deno/deps
+            ~/.cache/deno/npm
+          key: ${{ runner.os }}-deno-${{ env.DENO_VERSION }}-${{ hashFiles('deno.lock', 'deps.ts') }}
+          restore-keys: |
+            ${{ runner.os }}-deno-${{ env.DENO_VERSION }}-
+            ${{ runner.os }}-deno-
+
+      - name: Run browser tests
+        run: |
+          if [ -d tests/browser ]; then
+            deno test -A --unstable --doc tests/browser 2>&1 | tee browser_output.txt
+          else
+            echo "::notice::No browser tests found, skipping"
+          fi
+
+      - name: Upload browser logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-logs
+          path: browser_output.txt
+
+  # ── 5. Benchmarks ──────────────────────────────────────────────────────
+  bench:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    needs: lint
+    if: github.event.inputs.run_benchmarks != 'false'
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+
+      - name: Cache Deno dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/deno/deps
+            ~/.cache/deno/npm
+          key: ${{ runner.os }}-deno-${{ env.DENO_VERSION }}-${{ hashFiles('deno.lock', 'deps.ts') }}
+          restore-keys: |
+            ${{ runner.os }}-deno-${{ env.DENO_VERSION }}-
+            ${{ runner.os }}-deno-
+
+      - name: Run benchmarks
+        run: |
+          if deno bench --help 2>&1 | grep -q "bench"; then
+            deno bench -A 2>&1 | tee bench_output.txt
+          else
+            echo "::warning::Deno bench not available in this version"
+            echo "Benchmarks skipped" > bench_output.txt
+          fi
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench_output.txt
+
+  # ── 6. Security audit ──────────────────────────────────────────────────
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+
+      - name: Cache Deno dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/deno/deps
+            ~/.cache/deno/npm
+          key: ${{ runner.os }}-deno-${{ env.DENO_VERSION }}-${{ hashFiles('deno.lock', 'deps.ts') }}
+          restore-keys: |
+            ${{ runner.os }}-deno-${{ env.DENO_VERSION }}-
+            ${{ runner.os }}-deno-
+
+      - name: Run Deno audit (experimental)
+        id: audit
+        run: |
+          deno info --unstable --json 2>/dev/null | jq '.modules | map(select(.version)) | .[]' > deps_info.json || echo "{}" > deps_info.json
+          echo "::notice::Deno audit complete"
+          # Future: use `deno audit` when stable
+
+      - name: Check for known vulnerabilities (manual)
+        run: |
+          if grep -q "vulnerable" deps_info.json; then
+            echo "::warning::Potential vulnerabilities detected in dependencies"
+          fi
+
+      - name: Upload audit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-results
+          path: deps_info.json
+
+  # ── 7. Slack notification ─────────────────────────────────────────────
+  slack-notify:
+    name: Slack notification
+    runs-on: ubuntu-latest
+    needs:
+      - lint
+      - test
+      - integration
+      - browser
+      - bench
+      - security-audit
+    if: always() && github.event.inputs.slack_notify != 'false'
+    steps:
+      - name: Determine overall status
+        id: status
+        run: |
+          ALL_JOBS="${{ toJson(needs) }}"
+          echo "$ALL_JOBS" | python3 -c "
+          import json, sys
+          needs = json.load(sys.stdin)
+          critical = ['lint', 'test']
+          failed_critical = [j for j in critical if needs[j]['result'] not in ('success', 'skipped')]
+          if failed_critical:
+              print('❌ Failure (critical jobs failed)')
+          else:
+              non_critical = [j for j in needs.keys() if j not in critical]
+              failed_non_critical = [j for j in non_critical if needs[j]['result'] == 'failure']
+              if failed_non_critical:
+                  print('⚠️ Warning (non-critical jobs failed)')
+              else:
+                  print('✅ Success')
+          " > status.txt
+          echo "status=$(cat status.txt)" >> $GITHUB_OUTPUT
+
+      - name: Send Slack notification
+        if: env.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "IONA Deno CI: ${{ steps.status.outputs.status }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*IONA Deno CI*\nStatus: ${{ steps.status.outputs.status }}\nBranch: ${{ github.ref_name }}\nCommit: <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\nRun: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ── 8. Final gate ──────────────────────────────────────────────────────
+  final-gate:
+    name: "✅ Deno CI Gate"
+    runs-on: ubuntu-latest
+    needs:
+      - lint
+      - test
+      - integration
+      - browser
+      - bench
+      - security-audit
+      - slack-notify
+    if: always()
+    steps:
+      - name: Aggregate results
+        run: |
+          ALL_JOBS="${{ toJson(needs) }}"
+          echo "$ALL_JOBS" | python3 -c "
+          import json, sys
+          needs = json.load(sys.stdin)
+          critical = ['lint', 'test']
+          failed_critical = [j for j in critical if needs[j]['result'] not in ('success', 'skipped')]
+          if failed_critical:
+              print(f'Critical jobs failed: {failed_critical}')
+              sys.exit(1)
+          # Non-critical failures are warnings
+          non_critical = [j for j in needs.keys() if j not in critical and j not in ['final-gate', 'slack-notify']]
+          failed_non_critical = [j for j in non_critical if needs[j]['result'] == 'failure']
+          if failed_non_critical:
+              print(f'Non-critical jobs failed (warnings): {failed_non_critical}')
+          print('All critical Deno jobs passed ✓')
+          " || exit 1
