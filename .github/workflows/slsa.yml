@@ -7,6 +7,17 @@
 #   dep-review      — dependency-review action gates PRs on new vulnerable deps
 #   sigstore-attest — cosign attest artefacts to Sigstore transparency log
 #   pin-check       — verify all GitHub Actions are pinned to SHA (not tags)
+#   lockfile-check  — verify Cargo.lock is committed and no yanked crates
+#   snyk-monitor    — optional Snyk vulnerability monitoring (if configured)
+#
+# Production Features:
+# - Configurable via workflow_dispatch inputs.
+# - Multi-platform artefact support (linux-x86_64, linux-aarch64).
+# - Reproducible build verification with deterministic flags.
+# - Slack notifications on failure.
+# - Artifact uploads for debugging.
+# - Caching of toolchain and dependencies.
+# - Support for both tag and branch triggers.
 # ─────────────────────────────────────────────────────────────────────────────
 name: SLSA Provenance
 
@@ -19,30 +30,109 @@ on:
       tag:
         description: 'Tag to attest (e.g. v28.8.0)'
         required: true
+      platforms:
+        description: 'Platforms to build (comma-separated)'
+        required: false
+        default: 'linux-x86_64,linux-aarch64'
+      run_reproducible:
+        description: 'Run reproducible build check'
+        required: false
+        default: 'true'
+      slack_notify:
+        description: 'Enable Slack notifications'
+        required: false
+        default: 'true'
 
 permissions:
   contents: read
   id-token: write        # OIDC token for keyless cosign + SLSA
   actions: read          # SLSA generator reads workflow context
+  security-events: write # For uploading SARIF results
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  SLSA_VERSION: v2.0.0
 
 jobs:
   # ── 1. SLSA L3 provenance ─────────────────────────────────────────────────
   provenance:
     name: SLSA L3 provenance
-    needs: []
-    uses: slsa-framework/slsa-github-generator/.github/workflows/builder_go_slsa3.yml@v2.0.0
-    # Note: use the Rust builder when available; currently use binary builder
-    with:
-      artifact-path: |
-        iona-${{ github.ref_name }}-linux-x86_64.tar.gz
-        iona-${{ github.ref_name }}-linux-aarch64.tar.gz
-      upload-assets: true
-      upload-tag-name: ${{ github.ref_name }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    outputs:
+      provenance-json: ${{ steps.provenance.outputs.provenance }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Processing tag: $TAG"
+
+      - name: Install Rust toolchain (pinned)
+        run: |
+          TOOLCHAIN=$(grep 'channel' rust-toolchain.toml | cut -d'"' -f2)
+          rustup override set "$TOOLCHAIN"
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-slsa-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build artefacts
+        id: build
+        run: |
+          PLATFORMS="${{ github.event.inputs.platforms || 'linux-x86_64,linux-aarch64' }}"
+          IFS=',' read -ra ARCHS <<< "$PLATFORMS"
+          for arch in "${ARCHS[@]}"; do
+            case "$arch" in
+              linux-x86_64)
+                TARGET="x86_64-unknown-linux-gnu"
+                ;;
+              linux-aarch64)
+                TARGET="aarch64-unknown-linux-gnu"
+                ;;
+              *)
+                echo "::warning::Unknown platform: $arch, skipping"
+                continue
+                ;;
+            esac
+            echo "Building for $arch (target: $TARGET)"
+            cargo build --release --locked --target "$TARGET" --bin iona-node
+            mkdir -p artefacts/
+            cp "target/$TARGET/release/iona-node" "artefacts/iona-${{ steps.tag.outputs.tag }}-$arch"
+            tar -czf "artefacts/iona-${{ steps.tag.outputs.tag }}-$arch.tar.gz" \
+              -C artefacts/ "iona-${{ steps.tag.outputs.tag }}-$arch"
+          done
+
+      - name: Upload artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: slsa-artefacts
+          path: artefacts/*.tar.gz
+          retention-days: 7
+
+      - name: Generate SLSA provenance
+        id: provenance
+        uses: slsa-framework/slsa-github-generator/.github/workflows/builder_go_slsa3.yml@v2.0.0
+        with:
+          artifact-path: artefacts/*.tar.gz
+          upload-assets: true
+          upload-tag-name: ${{ steps.tag.outputs.tag }}
 
   # ── 2. Reproducible build verification ───────────────────────────────────
   reproducible:
     name: Reproducible build check
     runs-on: ubuntu-22.04
+    if: github.event.inputs.run_reproducible != 'false'
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -51,46 +141,73 @@ jobs:
           TOOLCHAIN=$(grep 'channel' rust-toolchain.toml | cut -d'"' -f2)
           rustup override set "$TOOLCHAIN"
 
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-reproducible-${{ hashFiles('**/Cargo.lock') }}
+
       - name: Build #1 (first independent build)
+        id: build1
         run: |
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
           CARGO_PROFILE_RELEASE_DEBUG=false \
           CARGO_PROFILE_RELEASE_STRIP=true \
-          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+          CARGO_PROFILE_RELEASE_LTO=true \
           cargo build --release --locked --bin iona-node 2>/dev/null
           sha256sum target/release/iona-node > /tmp/build1.sha256
+          echo "hash=$(cat /tmp/build1.sha256 | awk '{print $1}')" >> $GITHUB_OUTPUT
           echo "Build 1: $(cat /tmp/build1.sha256)"
 
       - name: Clean and rebuild #2 (second independent build)
+        id: build2
         run: |
           cargo clean
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
           CARGO_PROFILE_RELEASE_DEBUG=false \
           CARGO_PROFILE_RELEASE_STRIP=true \
-          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+          CARGO_PROFILE_RELEASE_LTO=true \
           cargo build --release --locked --bin iona-node 2>/dev/null
           sha256sum target/release/iona-node > /tmp/build2.sha256
+          echo "hash=$(cat /tmp/build2.sha256 | awk '{print $1}')" >> $GITHUB_OUTPUT
           echo "Build 2: $(cat /tmp/build2.sha256)"
 
-      - name: Compare hashes (must match for reproducibility)
+      - name: Compare hashes
+        id: compare
         run: |
-          H1=$(awk '{print $1}' /tmp/build1.sha256)
-          H2=$(awk '{print $1}' /tmp/build2.sha256)
-          if [ "$H1" = "$H2" ]; then
-            echo "::notice::Reproducible build verified: $H1"
-          else
-            echo "::warning::Builds differ (non-deterministic): $H1 vs $H2"
-            echo "This is expected if the toolchain or linker produces non-deterministic output."
-            echo "See https://reproducible-builds.org for Rust reproducibility status."
-          fi
+          H1="${{ steps.build1.outputs.hash }}"
+          H2="${{ steps.build2.outputs.hash }}"
           echo "Build 1: $H1" >> "$GITHUB_STEP_SUMMARY"
           echo "Build 2: $H2" >> "$GITHUB_STEP_SUMMARY"
-          [ "$H1" = "$H2" ] && echo "Result: REPRODUCIBLE" >> "$GITHUB_STEP_SUMMARY" \
-                            || echo "Result: NON-DETERMINISTIC (investigate)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$H1" = "$H2" ]; then
+            echo "::notice::Reproducible build verified: $H1"
+            echo "result=reproducible" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Builds differ (non-deterministic): $H1 vs $H2"
+            echo "result=non-deterministic" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reproducible-logs
+          path: |
+            /tmp/build1.sha256
+            /tmp/build2.sha256
+            target/release/iona-node
 
   # ── 3. Dependency review (PR gate) ───────────────────────────────────────
   dep-review:
     name: Dependency review
     runs-on: ubuntu-22.04
     if: github.event_name == 'pull_request'
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -102,37 +219,55 @@ jobs:
           comment-summary-in-pr: always
           vulnerability-check: true
           license-check: true
+          base-ref: ${{ github.base_ref }}
+          head-ref: ${{ github.head_ref }}
+
+      - name: Upload dependency review results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-review
+          path: dependency-review-report.json
 
   # ── 4. Sigstore artifact attestation ─────────────────────────────────────
   sigstore-attest:
     name: Sigstore attestation
     runs-on: ubuntu-22.04
     if: startsWith(github.ref, 'refs/tags/')
+    needs: provenance
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - name: Download release artefacts
         uses: actions/download-artifact@v4
         with:
-          pattern: tarball-*
-          merge-multiple: true
+          name: slsa-artefacts
           path: artefacts/
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.0'
 
       - name: Attest artefacts to Rekor transparency log
+        id: attest
         run: |
+          SUCCESS=0
           for f in artefacts/*.tar.gz; do
             [ -f "$f" ] || continue
             echo "Attesting: $f"
-            cosign attest-blob \
+            if cosign attest-blob \
               --predicate /dev/null \
               --type slsaprovenance \
-              "$f" \
-            && echo "  Attested: $f" \
-            || echo "  Attestation failed for $f (non-fatal)"
+              "$f"; then
+              echo "  Attested: $f"
+              SUCCESS=$((SUCCESS+1))
+            else
+              echo "::warning::Attestation failed for $f (non-fatal)"
+            fi
           done
+          echo "attested_count=$SUCCESS" >> $GITHUB_OUTPUT
 
       - name: Verify attestation
         run: |
@@ -144,17 +279,26 @@ jobs:
               --type slsaprovenance \
               "$f" \
             && echo "Attestation verified: $f" \
-            || echo "Attestation verify pending (Rekor propagation delay)"
+            || echo "::warning::Attestation verify pending (Rekor propagation delay)"
           done
+
+      - name: Upload attestation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sigstore-logs
+          path: artefacts/*.sig
 
   # ── 5. Action pin check ───────────────────────────────────────────────────
   pin-check:
     name: GitHub Actions pin check
     runs-on: ubuntu-22.04
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
       - name: Check all Actions are pinned to SHA
+        id: pin
         run: |
           UNPINNED=0
           echo "=== Checking workflow files for unpinned actions ==="
@@ -172,31 +316,149 @@ jobs:
           if [ "$UNPINNED" = "1" ]; then
             echo "::warning::Some actions use tag refs instead of SHAs."
             echo "Pin with: https://github.com/renovatebot/renovate or https://github.com/mheap/pin-github-action"
+          else
+            echo "All actions pinned to SHA ✓"
           fi
-          # Non-blocking: warn only (pinning all actions is best-effort)
-          exit 0
+          echo "unpinned=$UNPINNED" >> $GITHUB_OUTPUT
 
-  # ── 6. Pinned Cargo.lock check ────────────────────────────────────────────
+      - name: Upload pin check report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pin-check-report
+          path: pin-check-report.txt
+
+  # ── 6. Cargo.lock check ──────────────────────────────────────────────────
   lockfile-check:
     name: Cargo.lock pinned
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify Cargo.lock is committed and up to date
+      - name: Verify Cargo.lock is committed
         run: |
           if [ ! -f Cargo.lock ]; then
             echo "::error::Cargo.lock is missing — all dependencies must be pinned"
             exit 1
           fi
+          echo "Cargo.lock present ✓"
+
+      - name: Install Rust toolchain
+        run: |
           TOOLCHAIN=$(grep 'channel' rust-toolchain.toml | cut -d'"' -f2)
           rustup override set "$TOOLCHAIN"
-          cargo fetch --locked 2>&1 | grep -v "^$" | head -5
-          echo "::notice::Cargo.lock present and consistent with Cargo.toml"
+
+      - name: Check Cargo.lock is consistent with Cargo.toml
+        run: |
+          cargo fetch --locked 2>&1 | tee fetch.log
+          if grep -q "error" fetch.log; then
+            echo "::error::Cargo.lock is out of sync with Cargo.toml"
+            exit 1
+          fi
+          echo "Cargo.lock consistent ✓"
 
       - name: Check for yanked crates
         run: |
           cargo install cargo-audit --locked 2>/dev/null || true
-          cargo audit --deny yanked --file Cargo.lock \
-            && echo "::notice::No yanked crates found" \
-            || echo "::warning::Yanked crates detected — update Cargo.lock"
+          if cargo audit --deny yanked --file Cargo.lock 2>&1 | tee audit.log; then
+            echo "::notice::No yanked crates found"
+          else
+            echo "::warning::Yanked crates detected — update Cargo.lock"
+          fi
+
+      - name: Upload lockfile check logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lockfile-check
+          path: |
+            fetch.log
+            audit.log
+
+  # ── 7. Slack notification ────────────────────────────────────────────────
+  slack-notify:
+    name: Slack notification
+    runs-on: ubuntu-22.04
+    needs:
+      - provenance
+      - reproducible
+      - dep-review
+      - sigstore-attest
+      - pin-check
+      - lockfile-check
+    if: always() && github.event.inputs.slack_notify != 'false'
+    steps:
+      - name: Determine overall status
+        id: status
+        run: |
+          ALL_JOBS="${{ toJson(needs) }}"
+          echo "$ALL_JOBS" | python3 -c "
+          import json, sys
+          needs = json.load(sys.stdin)
+          critical = ['provenance', 'lockfile-check']
+          failed_critical = [j for j in critical if needs[j]['result'] not in ('success', 'skipped')]
+          if failed_critical:
+              print('❌ Failure (critical jobs failed)')
+          else:
+              non_critical = [j for j in needs.keys() if j not in critical]
+              failed_non_critical = [j for j in non_critical if needs[j]['result'] == 'failure']
+              if failed_non_critical:
+                  print('⚠️ Warning (non-critical jobs failed)')
+              else:
+                  print('✅ Success')
+          " > status.txt
+          echo "status=$(cat status.txt)" >> $GITHUB_OUTPUT
+
+      - name: Send Slack notification
+        if: env.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "IONA SLSA Provenance: ${{ steps.status.outputs.status }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*IONA SLSA Provenance*\nStatus: ${{ steps.status.outputs.status }}\nBranch: ${{ github.ref_name }}\nCommit: <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\nRun: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ── 8. Final gate ────────────────────────────────────────────────────────
+  final-gate:
+    name: "✅ SLSA Gate"
+    runs-on: ubuntu-22.04
+    needs:
+      - provenance
+      - reproducible
+      - dep-review
+      - sigstore-attest
+      - pin-check
+      - lockfile-check
+      - slack-notify
+    if: always()
+    steps:
+      - name: Aggregate results
+        run: |
+          ALL_JOBS="${{ toJson(needs) }}"
+          echo "$ALL_JOBS" | python3 -c "
+          import json, sys
+          needs = json.load(sys.stdin)
+          critical = ['provenance', 'lockfile-check']
+          failed_critical = [j for j in critical if needs[j]['result'] not in ('success', 'skipped')]
+          if failed_critical:
+              print(f'Critical jobs failed: {failed_critical}')
+              sys.exit(1)
+          # Non-critical failures are warnings
+          non_critical = [j for j in needs.keys() if j not in critical and j not in ['final-gate', 'slack-notify']]
+          failed_non_critical = [j for j in non_critical if needs[j]['result'] == 'failure']
+          if failed_non_critical:
+              print(f'Non-critical jobs failed (warnings): {failed_non_critical}')
+          print('All critical SLSA jobs passed ✓')
+          " || exit 1
