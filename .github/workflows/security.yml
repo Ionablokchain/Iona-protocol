@@ -4,6 +4,19 @@ on:
   push:
     branches: ["**"]
   pull_request:
+    branches: ["main", "release/**"]
+  schedule:
+    - cron: "0 3 * * 1"   # Weekly on Monday 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      skip_fuzz:
+        description: "Skip fuzz corpus replay"
+        required: false
+        default: "false"
+      slack_notify:
+        description: "Enable Slack notifications"
+        required: false
+        default: "true"
 
 env:
   CARGO_TERM_COLOR: always
@@ -11,24 +24,52 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # ── 1. Supply-chain security ───────────────────────────────────────────
   supply-chain:
     name: Supply-chain (audit + deny)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: supply-chain
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
+
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
-      - name: cargo audit (advisories)
-        run: cargo audit --deny warnings || echo "Audit warnings ignored"
-      - name: cargo deny check (allow deprecated)
-        run: cargo deny check || echo "Deny warnings ignored"
-      - name: Cargo.lock is committed
+
+      - name: Run cargo audit (advisories)
+        id: audit
+        run: |
+          cargo audit --deny warnings 2>&1 | tee audit_output.txt
+          # Allow failures but capture them
+          if grep -q "error" audit_output.txt; then
+            echo "::warning::cargo audit found advisories"
+            echo "advisory_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "advisory_found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run cargo deny check
+        id: deny
+        run: |
+          cargo deny check 2>&1 | tee deny_output.txt
+          if grep -q "error" deny_output.txt; then
+            echo "::warning::cargo deny found issues"
+            echo "deny_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "deny_found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check Cargo.lock is committed
         run: |
           if [ ! -f Cargo.lock ]; then
             echo "::error::Cargo.lock is missing — must be committed for reproducible builds"
@@ -36,25 +77,45 @@ jobs:
           fi
           echo "Cargo.lock present ✓"
 
+      - name: Upload audit logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-logs
+          path: |
+            audit_output.txt
+            deny_output.txt
+
+  # ── 2. Locked build ─────────────────────────────────────────────────────
   locked-build:
     name: Locked build (--locked)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+
       - uses: Swatinem/rust-cache@v2
-      - name: cargo build --locked
+        with:
+          key: locked-build
+
+      - name: cargo build --locked --all-targets
         run: cargo build --locked --all-targets
-      - name: Release build --locked
+
+      - name: Release build --locked --bin iona-node
         run: cargo build --release --locked --bin iona-node
 
+  # ── 3. Unsafe code audit ───────────────────────────────────────────────
   unsafe-audit:
     name: Unsafe code audit (crypto/ + consensus/)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+
       - name: No unsafe in src/crypto/
         run: |
           COUNT=$(grep -rn --include="*.rs" "unsafe" src/crypto/ | grep -v "//.*unsafe" | wc -l)
@@ -64,6 +125,7 @@ jobs:
             exit 1
           fi
           echo "src/crypto/ is unsafe-free ✓"
+
       - name: No unsafe in src/consensus/
         run: |
           COUNT=$(grep -rn --include="*.rs" "unsafe" src/consensus/ | grep -v "//.*unsafe" | wc -l)
@@ -74,13 +136,16 @@ jobs:
           fi
           echo "src/consensus/ is unsafe-free ✓"
 
+  # ── 4. Unwrap audit ─────────────────────────────────────────────────────
   unwrap-audit:
     name: Unwrap audit (rpc/ + net/)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     continue-on-error: true   # Non‑fatal, just a warning
     steps:
       - uses: actions/checkout@v4
-      - name: No bare .unwrap() in src/rpc/
+
+      - name: Count bare .unwrap() in src/rpc/
         run: |
           COUNT=$(grep -rn --include="*.rs" "\.unwrap()" src/rpc/ \
                   | grep -v "#\[cfg(test)\]" \
@@ -90,7 +155,8 @@ jobs:
           if [ "$COUNT" -gt "0" ]; then
             echo "::warning::Found $COUNT .unwrap() call(s) in src/rpc/ — prefer .expect() or ?"
           fi
-      - name: No bare .unwrap() in src/net/
+
+      - name: Count bare .unwrap() in src/net/
         run: |
           COUNT=$(grep -rn --include="*.rs" "\.unwrap()" src/net/ \
                   | grep -v "#\[cfg(test)\]" \
@@ -101,40 +167,97 @@ jobs:
             echo "::warning::Found $COUNT .unwrap() call(s) in src/net/ — prefer .expect() or ?"
           fi
 
+  # ── 5. Security test suites ─────────────────────────────────────────────
   security-tests:
     name: Security test suites
     runs-on: ubuntu-latest
     needs: [supply-chain, locked-build]
+    timeout-minutes: 15
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Consensus adversarial tests
-        run: cargo test --locked --test consensus_adversarial -- --nocapture || echo "Test not found or failed"
-      - name: Security regression tests
-        run: cargo test --locked --test security_regression -- --nocapture || echo "Test not found or failed"
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: security-tests
+
+      - name: Consensus adversarial tests
+        id: adversarial
+        run: |
+          cargo test --locked --test consensus_adversarial -- --nocapture 2>&1 | tee adversarial.log
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "::warning::Consensus adversarial tests failed"
+            echo "failed=true" >> $GITHUB_OUTPUT
+          else
+            echo "failed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Security regression tests
+        id: regression
+        run: |
+          cargo test --locked --test security_regression -- --nocapture 2>&1 | tee regression.log
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "::warning::Security regression tests failed"
+            echo "failed=true" >> $GITHUB_OUTPUT
+          else
+            echo "failed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-test-logs
+          path: |
+            adversarial.log
+            regression.log
+
+  # ── 6. RPC hardening tests ─────────────────────────────────────────────
   rpc-hardening:
     name: RPC hardening tests
     runs-on: ubuntu-latest
     needs: [supply-chain, locked-build]
+    timeout-minutes: 15
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@v2
-      - name: RPC hardening tests
-        run: cargo test --locked --test rpc_hardening -- --nocapture || echo "Test not found or failed"
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rpc-hardening
+
+      - name: RPC hardening tests
+        id: rpc
+        run: |
+          cargo test --locked --test rpc_hardening -- --nocapture 2>&1 | tee rpc_hardening.log
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "::warning::RPC hardening tests failed"
+            echo "failed=true" >> $GITHUB_OUTPUT
+          else
+            echo "failed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload RPC test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpc-hardening-logs
+          path: rpc_hardening.log
+
+  # ── 7. Fuzz corpus replay ──────────────────────────────────────────────
   fuzz-replay:
     name: Fuzz corpus replay (${{ matrix.target }})
     runs-on: ubuntu-latest
     needs: [supply-chain, locked-build]
+    timeout-minutes: 20
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -147,16 +270,22 @@ jobs:
           - block_header
           - rpc_json
           - state_transition
+          - wasm_validation
+          - evm_bytecode
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: fuzz-replay-${{ matrix.target }}
+
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
+
       - name: Restore fuzz corpus
         uses: actions/cache/restore@v4
         with:
@@ -164,25 +293,33 @@ jobs:
           key: fuzz-corpus-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
+
       - name: Create corpus dir if absent
         run: mkdir -p fuzz/corpus/${{ matrix.target }}
+
       - name: Replay corpus (no new exploration)
+        id: replay
         run: |
           CORPUS_DIR="fuzz/corpus/${{ matrix.target }}"
           SEED_COUNT=$(find "$CORPUS_DIR" -type f | wc -l)
           echo "Replaying $SEED_COUNT corpus entries for ${{ matrix.target }}"
           if [ "$SEED_COUNT" -eq "0" ]; then
             echo "No corpus entries — skipping fuzz (optional)"
+            echo "skipped=true" >> $GITHUB_OUTPUT
           else
             cargo fuzz run ${{ matrix.target }} \
               "$CORPUS_DIR" \
               -- -runs=0 -max_len=65536 2>&1 | tee fuzz_output.txt
-            if grep -qE "CRASH|ERROR|AddressSanitizer" fuzz_output.txt; then
+            if grep -qE "CRASH|ERROR|AddressSanitizer|Segmentation fault" fuzz_output.txt; then
               echo "::warning::Corpus replay found a crash in ${{ matrix.target }}"
+              echo "crash=true" >> $GITHUB_OUTPUT
+            else
+              echo "crash=false" >> $GITHUB_OUTPUT
             fi
           fi
+
       - name: Upload crash artifacts
-        if: failure()
+        if: failure() || steps.replay.outputs.crash == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-replay-crash-${{ matrix.target }}
@@ -190,21 +327,131 @@ jobs:
             fuzz/artifacts/${{ matrix.target }}/
             fuzz_output.txt
 
-  clippy-sec:
-    name: Clippy (security paths, warnings allowed)
+      - name: Upload replay logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-replay-logs-${{ matrix.target }}
+          path: fuzz_output.txt
+
+  # ── 8. SAST (Semgrep) ──────────────────────────────────────────────────
+  sast:
+    name: SAST (Semgrep)
     runs-on: ubuntu-latest
-    needs: locked-build
-    continue-on-error: true   # Do not fail the workflow on clippy warnings
+    timeout-minutes: 10
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: |
+            p/default
+            p/rust
+          scan_parameters: --error
+
+  # ── 9. Secrets scanning ────────────────────────────────────────────────
+  secrets-scan:
+    name: Secrets scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  # ── 10. Clippy security paths ──────────────────────────────────────────
+  clippy-sec:
+    name: Clippy (security paths)
+    runs-on: ubuntu-latest
+    needs: locked-build
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: clippy
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-sec
+
       - name: Run clippy (allow warnings)
         run: cargo clippy --locked --all-targets -- -A warnings
 
+  # ── 11. Slack notification (on failure) ──────────────────────────────
+  slack-notify:
+    name: Slack notification
+    runs-on: ubuntu-latest
+    needs:
+      - supply-chain
+      - locked-build
+      - unsafe-audit
+      - unwrap-audit
+      - security-tests
+      - rpc-hardening
+      - fuzz-replay
+      - sast
+      - secrets-scan
+      - clippy-sec
+    if: always() && github.event.inputs.slack_notify != 'false'
+    steps:
+      - name: Determine overall status
+        id: status
+        run: |
+          # Critical jobs must pass
+          CRITICAL_JOBS="supply-chain locked-build unsafe-audit"
+          ALL_JOBS="${{ toJson(needs) }}"
+          echo "$ALL_JOBS" | python3 -c "
+          import json, sys
+          needs = json.load(sys.stdin)
+          critical = ['supply-chain', 'locked-build', 'unsafe-audit']
+          failed_critical = [j for j in critical if needs[j]['result'] not in ('success', 'skipped')]
+          if failed_critical:
+              print('❌ Failure (critical jobs failed)')
+              sys.exit(0)
+          # Check if any non-critical failed
+          non_critical = [j for j in needs.keys() if j not in critical]
+          failed_non_critical = [j for j in non_critical if needs[j]['result'] == 'failure']
+          if failed_non_critical:
+              print('⚠️ Warning (non-critical jobs failed)')
+          else:
+              print('✅ Success')
+          " > status.txt
+          cat status.txt
+          echo "status=$(cat status.txt)" >> $GITHUB_OUTPUT
+
+      - name: Send Slack notification
+        if: env.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "IONA Security Gate: ${{ steps.status.outputs.status }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*IONA Security Gate*\nStatus: ${{ steps.status.outputs.status }}\nBranch: ${{ github.ref_name }}\nCommit: <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>\nRun: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ── 12. Final security gate ────────────────────────────────────────────
   security-gate:
     name: "✅ Security Gate"
     runs-on: ubuntu-latest
@@ -216,20 +463,30 @@ jobs:
       - security-tests
       - rpc-hardening
       - fuzz-replay
+      - sast
+      - secrets-scan
       - clippy-sec
+      - slack-notify
     if: always()
     steps:
-      - name: Check all security jobs passed (non‑fatal jobs allowed)
+      - name: Aggregate results
+        id: aggregate
         run: |
-          RESULTS='${{ toJson(needs) }}'
-          echo "$RESULTS" | python3 -c "
+          # Critical jobs: supply-chain, locked-build, unsafe-audit must pass
+          CRITICAL_JOBS="supply-chain locked-build unsafe-audit"
+          ALL_JOBS="${{ toJson(needs) }}"
+          echo "$ALL_JOBS" | python3 -c "
           import json, sys
           needs = json.load(sys.stdin)
-          # Only fail if a required job (without continue-on-error) failed
-          fatal_jobs = ['supply-chain', 'locked-build', 'unsafe-audit']
-          failed_fatal = [k for k in fatal_jobs if needs[k]['result'] not in ('success', 'skipped')]
-          if failed_fatal:
-              print('FAILED critical jobs:', failed_fatal)
+          critical = ['supply-chain', 'locked-build', 'unsafe-audit']
+          failed_critical = [j for j in critical if needs[j]['result'] not in ('success', 'skipped')]
+          if failed_critical:
+              print(f'Critical jobs failed: {failed_critical}')
               sys.exit(1)
+          # Non-critical failures are warnings
+          non_critical = [j for j in needs.keys() if j not in critical and j != 'security-gate' and j != 'slack-notify']
+          failed_non_critical = [j for j in non_critical if needs[j]['result'] == 'failure']
+          if failed_non_critical:
+              print(f'Non-critical jobs failed (warnings): {failed_non_critical}')
           print('All critical security jobs passed ✓')
-          "
+          " || exit 1
