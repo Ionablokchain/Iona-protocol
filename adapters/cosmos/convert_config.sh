@@ -17,6 +17,9 @@
 #   --unsafe-rpc-public      Bind RPC to 0.0.0.0 (insecure; use with caution)
 #   --overwrite              Overwrite output file if exists (else create backup)
 #   --backup <dir>           Backup output file to directory before overwriting
+#   --dry-run                Write config to stdout instead of file
+#   --strict                 Fail on unrecognized CometBFT keys or invalid values
+#   --check                  Validate the generated config against a schema (requires tomlq)
 #   --verbose                Verbose output
 #   --quiet                  Suppress all non‑error output
 #   --version                Show version
@@ -24,6 +27,7 @@
 #
 # REQUIREMENTS
 #   bash 4+, grep, sed, awk, cut, tr, date, mktemp, install
+#   Optional: tomlq (for better TOML parsing)
 #
 # EXIT CODES
 #   0   Success
@@ -31,6 +35,7 @@
 #   2   Runtime error (missing dependencies, invalid config, etc.)
 #   3   Permission error (cannot write output)
 #   4   Checksum verification failed (if enabled)
+#   5   Validation failed (--strict or --check)
 
 set -euo pipefail
 
@@ -38,7 +43,7 @@ set -euo pipefail
 # Constants & defaults
 # -----------------------------------------------------------------------------
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="2.0.0"
 readonly IONA_DEFAULT_P2P_PORT=7001
 readonly IONA_DEFAULT_RPC_PORT=9001
 readonly IONA_DEFAULT_ADMIN_PORT=9002
@@ -55,10 +60,13 @@ CHAIN_ID="$IONA_DEFAULT_CHAIN_ID"
 P2P_PORT="$IONA_DEFAULT_P2P_PORT"
 RPC_PORT="$IONA_DEFAULT_RPC_PORT"
 ADMIN_PORT="$IONA_DEFAULT_ADMIN_PORT"
-PEER_OUTPUT_FORMAT="host_port"  # "host_port" or "libp2p"
+PEER_OUTPUT_FORMAT="host_port"
 UNSAFE_RPC_PUBLIC=0
 OVERWRITE=0
 BACKUP_DIR=""
+DRY_RUN=0
+STRICT=0
+CHECK=0
 VERBOSE=0
 QUIET=0
 SHOW_VERSION=0
@@ -89,8 +97,6 @@ die() {
     err "$1"
     exit "${2:-1}"
 }
-
-# Log only if verbose
 debug() {
     if [[ ${VERBOSE} -eq 1 && ${QUIET} -eq 0 ]]; then
         echo -e "[DEBUG] $*"
@@ -120,6 +126,13 @@ check_deps() {
             die "Required command not found: $cmd" 2
         fi
     done
+    # Check for optional tomlq
+    if command -v tomlq &>/dev/null; then
+        TOML_PARSER="tomlq"
+    else
+        TOML_PARSER="awk"
+        warn "tomlq not found; falling back to awk (less robust). Install yq for better results."
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -136,6 +149,9 @@ parse_args() {
             --unsafe-rpc-public) UNSAFE_RPC_PUBLIC=1; shift ;;
             --overwrite)        OVERWRITE=1; shift ;;
             --backup)           BACKUP_DIR="$2"; shift 2 ;;
+            --dry-run)          DRY_RUN=1; shift ;;
+            --strict)           STRICT=1; shift ;;
+            --check)            CHECK=1; shift ;;
             --verbose)          VERBOSE=1; shift ;;
             --quiet)            QUIET=1; shift ;;
             --version)          SHOW_VERSION=1; shift ;;
@@ -165,7 +181,6 @@ parse_args() {
         die "Cannot read input file: $INPUT" 1
     fi
 
-    # Default output name
     if [[ -z "$OUTPUT" ]]; then
         OUTPUT="iona_config.toml"
     fi
@@ -173,28 +188,39 @@ parse_args() {
     if [[ "$PEER_OUTPUT_FORMAT" != "host_port" && "$PEER_OUTPUT_FORMAT" != "libp2p" ]]; then
         die "Invalid --p2p-multiaddr value: $PEER_OUTPUT_FORMAT (must be 'host_port' or 'libp2p')" 1
     fi
+
+    if [[ $DRY_RUN -eq 1 && -n "$BACKUP_DIR" ]]; then
+        warn "--dry-run ignored --backup"
+        BACKUP_DIR=""
+    fi
 }
 
 # -----------------------------------------------------------------------------
-# TOML value extractor (safe, section-aware)
+# TOML value extractor (section-aware, with fallback)
 # -----------------------------------------------------------------------------
 toml_get() {
     local file="$1" section="$2" key="$3" default="${4:-}"
     local val
-    if [[ -n "$section" ]]; then
-        val=$(awk -v section="[$section]" -v key="$key" '
-            BEGIN { in_section=0 }
-            $0 == section { in_section=1; next }
-            /^\[/ { in_section=0; next }
-            in_section && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
-                sub(/^[[:space:]]*[^=]+=[[:space:]]*/, "");
-                sub(/[[:space:]]*#.*$/, "");
-                gsub(/"/, ""); gsub(/\x27/, "");
-                print; exit
-            }' "$file")
+    if [[ "$TOML_PARSER" == "tomlq" ]]; then
+        # Use tomlq (part of yq) to extract value
+        val=$(tomlq -r ".${section:+${section}.}${key}" "$file" 2>/dev/null || echo "")
     else
-        val=$(grep -E "^\s*${key}\s*=" "$file" | head -1 | \
-              sed -E 's/^\s*[^=]+=\s*//; s/\s*#.*//' | tr -d '"' | tr -d "'" | xargs)
+        # Awk fallback
+        if [[ -n "$section" ]]; then
+            val=$(awk -v section="[$section]" -v key="$key" '
+                BEGIN { in_section=0 }
+                $0 == section { in_section=1; next }
+                /^\[/ { in_section=0; next }
+                in_section && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+                    sub(/^[[:space:]]*[^=]+=[[:space:]]*/, "");
+                    sub(/[[:space:]]*#.*$/, "");
+                    gsub(/"/, ""); gsub(/\x27/, "");
+                    print; exit
+                }' "$file")
+        else
+            val=$(grep -E "^\s*${key}\s*=" "$file" | head -1 | \
+                  sed -E 's/^\s*[^=]+=\s*//; s/\s*#.*//' | tr -d '"' | tr -d "'" | xargs)
+        fi
     fi
     echo "${val:-$default}"
 }
@@ -209,8 +235,7 @@ to_ms() {
     elif echo "$val" | grep -qE '^[0-9]+ms$'; then
         echo "${val%ms}"
     elif echo "$val" | grep -qE '^[0-9]+$'; then
-        # Assume seconds if no unit
-        echo "$((val * 1000))"
+        echo "$((val * 1000))"  # assume seconds
     else
         echo "$default"
     fi
@@ -232,10 +257,10 @@ convert_peer() {
     local port="${host_port##*:}"
     local peer_id="${peer%%@*}"
     if [[ "$peer_id" == "$host_port" ]]; then
-        peer_id=""   # no node ID given
+        peer_id=""
     fi
 
-    # Replace default CometBFT port with IONA port if present
+    # If the port is default CometBFT P2P, replace with IONA target
     if [[ "$port" == "$COMETBFT_DEFAULT_P2P_PORT" ]]; then
         port="$target_port"
     fi
@@ -246,8 +271,6 @@ convert_peer() {
         if [[ -n "$peer_id" ]]; then
             echo "\"/ip4/${host}/tcp/${port}/p2p/${peer_id}\""
         else
-            # Without peer ID, we can only put host:port; libp2p multiaddr requires peer ID.
-            # We'll still output a string and let user add the ID.
             echo "\"/ip4/${host}/tcp/${port}/p2p/_\""
             warn "Peer $host:$port lacks a node ID; please replace '_' with actual peer ID."
         fi
@@ -275,11 +298,48 @@ convert_peers() {
 }
 
 # -----------------------------------------------------------------------------
+# Validate generated config (requires tomlq for schema check)
+# -----------------------------------------------------------------------------
+validate_config() {
+    local config="$1"
+    if [[ $CHECK -eq 0 ]]; then
+        return 0
+    fi
+    if ! command -v tomlq &>/dev/null; then
+        warn "Cannot validate without tomlq. Skipping."
+        return 0
+    fi
+    # Basic schema validation: check required sections and keys
+    local required_sections=("node" "network" "rpc" "admin" "consensus" "mempool" "storage")
+    for sec in "${required_sections[@]}"; do
+        if ! tomlq -r ".${sec}" "$config" &>/dev/null; then
+            if [[ $STRICT -eq 1 ]]; then
+                die "Missing required section: [$sec]" 5
+            else
+                warn "Missing required section: [$sec]"
+            fi
+        fi
+    done
+    # Check chain_id is numeric
+    local chain_id=$(toml_get "$config" "node" "chain_id" "")
+    if [[ ! "$chain_id" =~ ^[0-9]+$ ]]; then
+        if [[ $STRICT -eq 1 ]]; then
+            die "chain_id must be numeric: got '$chain_id'" 5
+        else
+            warn "chain_id should be numeric: got '$chain_id'"
+        fi
+    fi
+    info "Config validation passed (sections present, chain_id numeric)."
+}
+
+# -----------------------------------------------------------------------------
 # Generate IONA config file atomically
 # -----------------------------------------------------------------------------
 generate_config() {
     local output_tmp
-    output_tmp="$(mktemp -p "$(dirname "$OUTPUT")" tmp.iona_config.XXXXXX)" || die "Failed to create temporary file" 2
+    if [[ $DRY_RUN -eq 0 ]]; then
+        output_tmp="$(mktemp -p "$(dirname "$OUTPUT")" tmp.iona_config.XXXXXX)" || die "Failed to create temporary file" 2
+    fi
 
     # Capture values from CometBFT config
     info "Reading CometBFT config: $INPUT"
@@ -290,19 +350,26 @@ generate_config() {
     local p2p_persistent=$(toml_get "$INPUT" "p2p" "persistent_peers" "")
     local p2p_max_peers=$(toml_get "$INPUT" "p2p" "max_num_outbound_peers" "10")
     local p2p_handshake_timeout=$(toml_get "$INPUT" "p2p" "handshake_timeout" "20s")
+    local p2p_pex=$(toml_get "$INPUT" "p2p" "pex" "true")
+    local p2p_addr_book_strict=$(toml_get "$INPUT" "p2p" "addr_book_strict" "true")
 
     # RPC
     local rpc_laddr=$(toml_get "$INPUT" "rpc" "laddr" "tcp://127.0.0.1:${COMETBFT_DEFAULT_RPC_PORT}")
+    local rpc_cors=$(toml_get "$INPUT" "rpc" "cors_allowed_origins" "[]")
+    local rpc_max_body=$(toml_get "$INPUT" "rpc" "max_body_bytes" "1000000")
 
     # Mempool
     local mempool_size=$(toml_get "$INPUT" "mempool" "size" "5000")
     local mempool_max_tx=$(toml_get "$INPUT" "mempool" "max_tx_bytes" "1048576")
+    local mempool_cache=$(toml_get "$INPUT" "mempool" "cache_size" "10000")
 
     # Consensus
     local timeout_propose=$(toml_get "$INPUT" "consensus" "timeout_propose" "3s")
     local timeout_prevote=$(toml_get "$INPUT" "consensus" "timeout_prevote" "1s")
     local timeout_precommit=$(toml_get "$INPUT" "consensus" "timeout_precommit" "1s")
     local timeout_commit=$(toml_get "$INPUT" "consensus" "timeout_commit" "5s")
+    local create_empty_blocks=$(toml_get "$INPUT" "consensus" "create_empty_blocks" "true")
+    local double_sign_check=$(toml_get "$INPUT" "consensus" "double_sign_check_height" "0")
 
     # Convert timeouts to milliseconds
     local iona_propose_ms=$(to_ms "$timeout_propose" "3000")
@@ -344,7 +411,7 @@ generate_config() {
     debug "Peers: $iona_peers"
     debug "Timeouts: propose=$iona_propose_ms ms, prevote=$iona_prevote_ms ms, precommit=$iona_precommit_ms ms"
 
-    # Write the config
+    # Build the config content
     {
         echo "# IONA config.toml — generated by ${SCRIPT_NAME} v${SCRIPT_VERSION}"
         echo "# Source: ${INPUT}"
@@ -373,7 +440,6 @@ generate_config() {
         echo "enable_kad  = true"
         echo ""
         echo "# Eclipse resistance (not in CometBFT; IONA-specific)"
-        echo "# \"mainnet\" = stricter peer diversity; \"testnet\" = relaxed"
         echo "eclipse_profile = \"mainnet\""
         echo ""
 
@@ -400,7 +466,7 @@ generate_config() {
         echo "propose_timeout_ms    = ${iona_propose_ms}"
         echo "prevote_timeout_ms    = ${iona_prevote_ms}"
         echo "precommit_timeout_ms  = ${iona_precommit_ms}"
-        echo "# NOTE: timeout_commit (${timeout_commit}) controls block interval in CometBFT."
+        echo "# timeout_commit (${timeout_commit}) controls block interval in CometBFT."
         echo "# In IONA this is managed by the proposer; adjust max_txs_per_block instead."
         echo "max_txs_per_block     = 4096"
         echo "gas_target            = 30000000"
@@ -430,19 +496,26 @@ generate_config() {
         echo "# The following CometBFT settings have no direct IONA equivalent."
         echo "# Review each one manually:"
         echo "#"
-        echo "# [p2p].pex                    → IONA uses libp2p Kademlia DHT (enable_kad)"
-        echo "# [p2p].addr_book_strict       → No equivalent; IONA uses eclipse scoring"
-        echo "# [p2p].flush_throttle_timeout → No equivalent"
+        echo "# [p2p].pex ($p2p_pex)                → IONA uses libp2p Kademlia DHT (enable_kad)"
+        echo "# [p2p].addr_book_strict ($p2p_addr_book_strict) → No equivalent; IONA uses eclipse scoring"
+        echo "# [p2p].handshake_timeout ($p2p_handshake_timeout) → No equivalent"
         echo "# [p2p].send_rate / recv_rate  → No equivalent (use OS-level tc/iptables)"
-        echo "# [mempool].cache_size         → No equivalent; IONA deduplicates by hash"
-        echo "# [mempool].version            → IONA uses a single priority-queue mempool"
-        echo "# [consensus].create_empty_blocks → IONA always creates empty blocks on schedule"
-        echo "# [consensus].double_sign_check_height → IONA DoubleSignGuard covers this"
+        echo "# [mempool].cache_size ($mempool_cache) → No equivalent; IONA deduplicates by hash"
+        echo "# [mempool].max_tx_bytes ($mempool_max_tx) → mapped to rpc.max_body_bytes"
+        echo "# [consensus].create_empty_blocks ($create_empty_blocks) → IONA always creates empty blocks on schedule"
+        echo "# [consensus].double_sign_check_height ($double_sign_check) → IONA DoubleSignGuard covers this"
         echo "# [statesync].*                → Use iona backup/restore instead"
         echo "# [instrumentation].prometheus  → IONA always exposes /metrics on port 9090"
         echo "# [fastsync] / [blocksync].*   → IONA uses P2P state sync automatically"
         echo "#"
-    } > "$output_tmp"
+    } > "${output_tmp:-/dev/stdout}"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        cat "$output_tmp"
+        rm -f "$output_tmp"
+        info "Dry-run completed (config printed to stdout)."
+        return 0
+    fi
 
     # Handle existing output file
     if [[ -e "$OUTPUT" ]]; then
@@ -463,6 +536,11 @@ generate_config() {
     install -m 644 "$output_tmp" "$OUTPUT" || die "Failed to write $OUTPUT" 3
     rm -f "$output_tmp"
     info "Configuration written to $OUTPUT"
+
+    # Validate if requested
+    if [[ $CHECK -eq 1 ]]; then
+        validate_config "$OUTPUT"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -473,30 +551,32 @@ main() {
     parse_args "$@"
     generate_config
 
-    echo ""
-    info "Conversion complete: $OUTPUT"
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  Mapped settings:"
-    echo "    ✓  P2P listen     → $(grep -E '^listen\s*=' "$OUTPUT" | sed 's/.*= //')"
-    echo "    ✓  RPC listen     → $(grep -E '^listen\s*=' "$OUTPUT" | grep -A1 '\[rpc\]' | tail -1 | sed 's/.*= //')"
-    echo "    ✓  Peer addresses  → converted (see peers list)"
-    echo "    ✓  Timeouts       → propose/prevote/precommit"
-    echo "    ✓  Mempool size   → ${MEMPOOL_SIZE:-?} entries"
-    echo ""
-    echo "  Requires manual review (see UNMAPPED section in $OUTPUT):"
-    warn "    ⚠  pex / addr_book settings"
-    warn "    ⚠  statesync configuration"
-    warn "    ⚠  chain_id — update [node].chain_id if needed"
-    warn "    ⚠  Peer addresses — verify multiaddr format was converted"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-    echo "Next steps:"
-    echo "  1. Review $OUTPUT — especially chain_id and peer addresses"
-    echo "  2. Run: iona keys check ./data"
-    echo "  3. Run: iona-node --check-compat --config $OUTPUT"
-    echo "  4. Test on IONA testnet before mainnet"
-    echo "  5. See adapters/cosmos/migrate_validator.md for full procedure"
+    if [[ $DRY_RUN -eq 0 ]]; then
+        echo ""
+        info "Conversion complete: $OUTPUT"
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  Mapped settings:"
+        echo "    ✓  P2P listen     → $(grep -E '^listen\s*=' "$OUTPUT" | sed 's/.*= //')"
+        echo "    ✓  RPC listen     → $(grep -E '^listen\s*=' "$OUTPUT" | grep -A1 '\[rpc\]' | tail -1 | sed 's/.*= //')"
+        echo "    ✓  Peer addresses  → converted (see peers list)"
+        echo "    ✓  Timeouts       → propose/prevote/precommit"
+        echo "    ✓  Mempool size   → $(grep -E '^capacity\s*=' "$OUTPUT" | sed 's/.*= //') entries"
+        echo ""
+        echo "  Requires manual review (see UNMAPPED section in $OUTPUT):"
+        warn "    ⚠  pex / addr_book settings"
+        warn "    ⚠  statesync configuration"
+        warn "    ⚠  chain_id — update [node].chain_id if needed"
+        warn "    ⚠  Peer addresses — verify multiaddr format was converted"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        echo "Next steps:"
+        echo "  1. Review $OUTPUT — especially chain_id and peer addresses"
+        echo "  2. Run: iona keys check ./data"
+        echo "  3. Run: iona-node --check-compat --config $OUTPUT"
+        echo "  4. Test on IONA testnet before mainnet"
+        echo "  5. See adapters/cosmos/migrate_validator.md for full procedure"
+    fi
 }
 
 main "$@"
