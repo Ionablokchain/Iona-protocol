@@ -35,6 +35,8 @@
 //! }
 //! ```
 
+#![allow(dead_code)]
+
 use crate::protocol::version::{
     version_for_height, ProtocolActivation, CURRENT_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
@@ -46,537 +48,613 @@ use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 // -----------------------------------------------------------------------------
-// Constants
+// Submodules (embedded)
 // -----------------------------------------------------------------------------
 
-/// Default minimum lead blocks for pre‑activation signalling.
-pub const DEFAULT_MIN_LEAD_BLOCKS: u64 = 100;
+pub mod config {
+    //! Configuration for activation guarantee checks.
+    use serde::{Deserialize, Serialize};
 
-/// Maximum allowed grace window in blocks.
-pub const MAX_GRACE_BLOCKS: u64 = 100_000;
+    /// Configuration parameters for the guarantee validator.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct GuaranteeConfig {
+        /// Minimum lead blocks for pre‑activation signalling (AG‑4).
+        pub min_lead_blocks: u64,
+        /// Maximum allowed grace window in blocks (AG‑5).
+        pub max_grace_blocks: u64,
+        /// Maximum height range for determinism checks (AG‑1).
+        pub max_determinism_range: u64,
+        /// Whether to perform all checks (or only critical ones).
+        pub full_checks: bool,
+    }
 
-/// Maximum height range for determinism checks.
-pub const MAX_DETERMINISM_RANGE: u64 = 1000;
+    impl Default for GuaranteeConfig {
+        fn default() -> Self {
+            Self {
+                min_lead_blocks: 100,
+                max_grace_blocks: 100_000,
+                max_determinism_range: 1000,
+                full_checks: true,
+            }
+        }
+    }
 
-// -----------------------------------------------------------------------------
-// Error types
-// -----------------------------------------------------------------------------
-
-/// Errors that can occur during activation guarantee checks.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum GuaranteeError {
-    #[error("AG-1 violation: PV({height}) returned {pv1} then {pv2}")]
-    DeterminismViolation { height: Height, pv1: u32, pv2: u32 },
-
-    #[error("AG-2 violation: PV decreased from {prev} to {curr} at height {height}")]
-    MonotonicViolation { prev: u32, curr: u32, height: Height },
-
-    #[error("AG-3 violation: PV={0} appears multiple times in activation schedule")]
-    DuplicateActivation(u32),
-
-    #[error("AG-4 violation: PV={0} activates in {distance} blocks (minimum lead time: {min})")]
-    InsufficientLead { pv: u32, distance: u64, min: u64 },
-
-    #[error("AG-5 violation: PV={0} has grace_blocks={grace} > max={max}")]
-    GraceTooLarge { pv: u32, grace: u64, max: u64 },
-
-    #[error("AG-6 violation: block PV={block_pv} at height {height}, but PV={expected_pv} mandatory (grace expired)")]
-    PostActivationViolation { height: Height, block_pv: u32, expected_pv: u32 },
-
-    #[error("AG-7 violation: PV={0} has different activation heights: {h1:?} vs {h2:?}")]
-    ImmutabilityViolation { pv: u32, h1: Option<Height>, h2: Option<Height> },
-
-    #[error("AG-8 violation: rollback unsafe for PV={0} at height {height} (activation already passed)")]
-    RollbackUnsafe { pv: u32, height: Height },
-
-    #[error("AG-9 violation: activation heights are not strictly increasing: PV={prev_pv} at {prev_h} before PV={curr_pv} at {curr_h}")]
-    NonIncreasingHeight { prev_pv: u32, prev_h: Height, curr_pv: u32, curr_h: Height },
-
-    #[error("AG-10 violation: grace windows overlap for PV={pv1} and PV={pv2}")]
-    GraceOverlap { pv1: u32, pv2: u32 },
-
-    #[error("validation error: {0}")]
-    Generic(String),
-}
-
-pub type GuaranteeResult<T> = Result<T, GuaranteeError>;
-
-// -----------------------------------------------------------------------------
-// Activation check result
-// -----------------------------------------------------------------------------
-
-/// Result of a single guarantee check.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GuaranteeCheck {
-    pub id: String,
-    pub name: String,
-    pub passed: bool,
-    pub detail: String,
-    pub duration_ms: u64,
-}
-
-impl GuaranteeCheck {
-    /// Create a new check result.
-    pub fn new(id: &str, name: &str, passed: bool, detail: impl Into<String>, duration_ms: u64) -> Self {
-        Self {
-            id: id.to_string(),
-            name: name.to_string(),
-            passed,
-            detail: detail.into(),
-            duration_ms,
+    impl GuaranteeConfig {
+        /// Validate the configuration.
+        pub fn validate(&self) -> Result<(), &'static str> {
+            if self.min_lead_blocks == 0 {
+                return Err("min_lead_blocks must be > 0");
+            }
+            if self.max_grace_blocks == 0 {
+                return Err("max_grace_blocks must be > 0");
+            }
+            if self.max_determinism_range == 0 {
+                return Err("max_determinism_range must be > 0");
+            }
+            Ok(())
         }
     }
 }
 
-// -----------------------------------------------------------------------------
-// Activation report
-// -----------------------------------------------------------------------------
+pub mod error {
+    //! Error types for activation guarantee checks.
+    use super::config::GuaranteeConfig;
+    use crate::types::Height;
+    use thiserror::Error;
 
-/// Result of all activation guarantee checks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActivationReport {
-    pub checks: Vec<GuaranteeCheck>,
-    pub all_passed: bool,
-    pub timestamp_ms: u64,
+    /// Errors that can occur during activation guarantee checks.
+    #[derive(Debug, Error, Clone, PartialEq, Eq)]
+    pub enum GuaranteeError {
+        #[error("AG-1 violation: PV({height}) returned {pv1} then {pv2}")]
+        DeterminismViolation { height: Height, pv1: u32, pv2: u32 },
+
+        #[error("AG-2 violation: PV decreased from {prev} to {curr} at height {height}")]
+        MonotonicViolation { prev: u32, curr: u32, height: Height },
+
+        #[error("AG-3 violation: PV={0} appears multiple times in activation schedule")]
+        DuplicateActivation(u32),
+
+        #[error("AG-4 violation: PV={pv} activates in {distance} blocks (minimum lead time: {min})")]
+        InsufficientLead { pv: u32, distance: u64, min: u64 },
+
+        #[error("AG-5 violation: PV={pv} has grace_blocks={grace} > max={max}")]
+        GraceTooLarge { pv: u32, grace: u64, max: u64 },
+
+        #[error("AG-6 violation: block PV={block_pv} at height {height}, but PV={expected_pv} mandatory (grace expired)")]
+        PostActivationViolation { height: Height, block_pv: u32, expected_pv: u32 },
+
+        #[error("AG-7 violation: PV={0} has different activation heights: {h1:?} vs {h2:?}")]
+        ImmutabilityViolation { pv: u32, h1: Option<Height>, h2: Option<Height> },
+
+        #[error("AG-8 violation: rollback unsafe for PV={0} at height {height} (activation already passed)")]
+        RollbackUnsafe { pv: u32, height: Height },
+
+        #[error("AG-9 violation: activation heights are not strictly increasing: PV={prev_pv} at {prev_h} before PV={curr_pv} at {curr_h}")]
+        NonIncreasingHeight { prev_pv: u32, prev_h: Height, curr_pv: u32, curr_h: Height },
+
+        #[error("AG-10 violation: grace windows overlap for PV={pv1} and PV={pv2}")]
+        GraceOverlap { pv1: u32, pv2: u32 },
+
+        #[error("validation error: {0}")]
+        Generic(String),
+
+        #[error("configuration error: {0}")]
+        ConfigError(String),
+    }
+
+    pub type GuaranteeResult<T> = Result<T, GuaranteeError>;
 }
 
-impl ActivationReport {
-    /// Create a new report with the given checks and duration.
-    pub fn new(checks: Vec<GuaranteeCheck>, duration: Duration) -> Self {
-        let all_passed = checks.iter().all(|c| c.passed);
-        let timestamp_ms = duration.as_millis() as u64;
-        Self {
-            checks,
-            all_passed,
-            timestamp_ms,
+pub mod report {
+    //! Reports for activation guarantee checks.
+    use super::error::GuaranteeError;
+    use serde::{Deserialize, Serialize};
+    use std::time::Duration;
+
+    /// Result of a single guarantee check.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct GuaranteeCheck {
+        pub id: String,
+        pub name: String,
+        pub passed: bool,
+        pub detail: String,
+        pub duration_ms: u64,
+    }
+
+    impl GuaranteeCheck {
+        pub fn new(id: &str, name: &str, passed: bool, detail: impl Into<String>, duration_ms: u64) -> Self {
+            Self {
+                id: id.to_string(),
+                name: name.to_string(),
+                passed,
+                detail: detail.into(),
+                duration_ms,
+            }
         }
     }
 
-    /// Return the list of failed checks, if any.
-    pub fn failures(&self) -> Vec<&GuaranteeCheck> {
-        self.checks.iter().filter(|c| !c.passed).collect()
+    /// Result of all activation guarantee checks.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ActivationReport {
+        pub checks: Vec<GuaranteeCheck>,
+        pub all_passed: bool,
+        pub timestamp_ms: u64,
     }
 
-    /// Return the total number of checks.
-    pub fn total_checks(&self) -> usize {
-        self.checks.len()
-    }
-}
+    impl ActivationReport {
+        pub fn new(checks: Vec<GuaranteeCheck>, duration: Duration) -> Self {
+            let all_passed = checks.iter().all(|c| c.passed);
+            let timestamp_ms = duration.as_millis() as u64;
+            Self {
+                checks,
+                all_passed,
+                timestamp_ms,
+            }
+        }
 
-impl std::fmt::Display for ActivationReport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(
-            f,
-            "Activation Guarantees: {} ({} checks in {}ms)",
-            if self.all_passed { "ALL SATISFIED" } else { "ISSUES DETECTED" },
-            self.checks.len(),
-            self.timestamp_ms
-        )?;
-        for c in &self.checks {
-            let mark = if c.passed { "✓" } else { "✗" };
+        pub fn failures(&self) -> Vec<&GuaranteeCheck> {
+            self.checks.iter().filter(|c| !c.passed).collect()
+        }
+
+        pub fn total_checks(&self) -> usize {
+            self.checks.len()
+        }
+    }
+
+    impl std::fmt::Display for ActivationReport {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             writeln!(
                 f,
-                "  [{}] {}: {} — {} [{}ms]",
-                mark, c.id, c.name, c.detail, c.duration_ms
+                "Activation Guarantees: {} ({} checks in {}ms)",
+                if self.all_passed { "ALL SATISFIED" } else { "ISSUES DETECTED" },
+                self.checks.len(),
+                self.timestamp_ms
             )?;
+            for c in &self.checks {
+                let mark = if c.passed { "✓" } else { "✗" };
+                writeln!(
+                    f,
+                    "  [{}] {}: {} — {} [{}ms]",
+                    mark, c.id, c.name, c.detail, c.duration_ms
+                )?;
+            }
+            Ok(())
         }
-        Ok(())
     }
 }
 
-// -----------------------------------------------------------------------------
-// Schedule validator
-// -----------------------------------------------------------------------------
+pub mod validator {
+    //! Schedule validator that checks all guarantees.
+    use super::{
+        config::GuaranteeConfig,
+        error::{GuaranteeError, GuaranteeResult},
+        report::{ActivationReport, GuaranteeCheck},
+    };
+    use crate::protocol::version::{version_for_height, ProtocolActivation};
+    use crate::types::Height;
+    use std::collections::{BTreeMap, HashSet};
+    use std::time::Instant;
+    use tracing::{debug, error, info, warn};
 
-/// A reusable validator for protocol activation schedules.
-#[derive(Debug, Clone)]
-pub struct ScheduleValidator {
-    /// The activation schedule.
-    activations: Vec<ProtocolActivation>,
-    /// Lookup table for fast access by PV.
-    lookup: BTreeMap<u32, ProtocolActivation>,
-    /// Sorted activation heights (for monotonicity checks).
-    sorted_by_height: Vec<(Height, u32)>,
-}
+    /// A reusable validator for protocol activation schedules.
+    #[derive(Debug, Clone)]
+    pub struct ScheduleValidator {
+        /// The activation schedule.
+        activations: Vec<ProtocolActivation>,
+        /// Lookup table for fast access by PV.
+        lookup: BTreeMap<u32, ProtocolActivation>,
+        /// Sorted activation heights (for monotonicity checks).
+        sorted_by_height: Vec<(Height, u32)>,
+        /// Configuration.
+        config: GuaranteeConfig,
+    }
 
-impl ScheduleValidator {
-    /// Create a new validator from an activation schedule.
-    pub fn new(activations: &[ProtocolActivation]) -> Self {
-        let mut lookup = BTreeMap::new();
-        let mut sorted = Vec::with_capacity(activations.len());
+    impl ScheduleValidator {
+        /// Create a new validator from an activation schedule.
+        pub fn new(activations: &[ProtocolActivation]) -> Self {
+            Self::with_config(activations, GuaranteeConfig::default())
+        }
 
-        for a in activations {
-            lookup.insert(a.protocol_version, a.clone());
-            if let Some(h) = a.activation_height {
-                sorted.push((h, a.protocol_version));
+        /// Create a new validator with a custom configuration.
+        pub fn with_config(activations: &[ProtocolActivation], config: GuaranteeConfig) -> Self {
+            if let Err(e) = config.validate() {
+                warn!("Invalid GuaranteeConfig: {}", e);
+            }
+            let mut lookup = BTreeMap::new();
+            let mut sorted = Vec::with_capacity(activations.len());
+
+            for a in activations {
+                lookup.insert(a.protocol_version, a.clone());
+                if let Some(h) = a.activation_height {
+                    sorted.push((h, a.protocol_version));
+                }
+            }
+            sorted.sort_by_key(|(h, _)| *h);
+
+            Self {
+                activations: activations.to_vec(),
+                lookup,
+                sorted_by_height: sorted,
+                config,
             }
         }
-        sorted.sort_by_key(|(h, _)| *h);
 
-        Self {
-            activations: activations.to_vec(),
-            lookup,
-            sorted_by_height: sorted,
+        /// Get the activation for a specific protocol version.
+        pub fn get_activation(&self, pv: u32) -> Option<&ProtocolActivation> {
+            self.lookup.get(&pv)
         }
-    }
 
-    /// Get the activation for a specific protocol version.
-    pub fn get_activation(&self, pv: u32) -> Option<&ProtocolActivation> {
-        self.lookup.get(&pv)
-    }
+        /// Get the schedule as a slice.
+        pub fn schedule(&self) -> &[ProtocolActivation] {
+            &self.activations
+        }
 
-    /// Get the schedule as a slice.
-    pub fn schedule(&self) -> &[ProtocolActivation] {
-        &self.activations
-    }
+        /// Get the current configuration.
+        pub fn config(&self) -> &GuaranteeConfig {
+            &self.config
+        }
 
-    /// Check all guarantees against the current height.
-    pub fn check_all_guarantees(&self, current_height: Height) -> ActivationReport {
-        let start = Instant::now();
-        let mut checks = Vec::new();
+        /// Update the configuration at runtime.
+        pub fn set_config(&mut self, config: GuaranteeConfig) -> Result<(), &'static str> {
+            config.validate()?;
+            self.config = config;
+            Ok(())
+        }
 
-        // AG-1: Deterministic activation
-        checks.push(self.check_deterministic(current_height));
+        /// Check all guarantees against the current height.
+        pub fn check_all_guarantees(&self, current_height: Height) -> ActivationReport {
+            let start = Instant::now();
+            let mut checks = Vec::new();
 
-        // AG-2: Monotonic PV
-        checks.push(self.check_monotonic(current_height));
+            // AG-1: Deterministic activation
+            checks.push(self.check_deterministic(current_height));
 
-        // AG-3: Exactly-once activation
-        checks.push(self.check_exactly_once());
+            // AG-2: Monotonic PV
+            checks.push(self.check_monotonic(current_height));
 
-        // AG-4: Pre-activation signalling
-        checks.push(self.check_signal_distance(current_height));
+            // AG-3: Exactly-once activation
+            checks.push(self.check_exactly_once());
 
-        // AG-5: Grace window bounded
-        checks.push(self.check_grace_bounded());
+            // AG-4: Pre-activation signalling
+            checks.push(self.check_signal_distance(current_height));
 
-        // AG-6: Post-activation mandatory (check at some heights)
-        checks.push(self.check_post_activation(current_height));
+            // AG-5: Grace window bounded
+            checks.push(self.check_grace_bounded());
 
-        // AG-7: Activation height immutable (check against itself, always passes)
-        checks.push(self.check_immutable());
+            // AG-6: Post-activation mandatory (check at some heights)
+            checks.push(self.check_post_activation(current_height));
 
-        // AG-8: Rollback window defined
-        checks.push(self.check_rollback(current_height));
+            // AG-7: Activation height immutable (check against itself, always passes)
+            checks.push(self.check_immutable());
 
-        // AG-9: Strictly increasing heights
-        checks.push(self.check_strictly_increasing());
+            // AG-8: Rollback window defined
+            checks.push(self.check_rollback(current_height));
 
-        // AG-10: Non‑overlapping grace windows
-        checks.push(self.check_grace_overlap());
+            // AG-9: Strictly increasing heights
+            checks.push(self.check_strictly_increasing());
 
-        ActivationReport::new(checks, start.elapsed())
-    }
+            // AG-10: Non‑overlapping grace windows
+            checks.push(self.check_grace_overlap());
 
-    // -------------------------------------------------------------------------
-    // Individual check implementations
-    // -------------------------------------------------------------------------
+            ActivationReport::new(checks, start.elapsed())
+        }
 
-    /// AG-1: Deterministic activation.
-    fn check_deterministic(&self, current_height: Height) -> GuaranteeCheck {
-        let start = Instant::now();
-        let test_heights = [
-            0,
-            1,
-            100,
-            current_height,
-            current_height + 1,
-            current_height + 100,
-        ];
-        let mut passed = true;
-        let mut detail = String::new();
+        // -------------------------------------------------------------------------
+        // Individual check implementations
+        // -------------------------------------------------------------------------
 
-        for &h in &test_heights {
-            let pv1 = version_for_height(h, &self.activations);
-            let pv2 = version_for_height(h, &self.activations);
-            if pv1 != pv2 {
-                passed = false;
-                detail = format!(
-                    "PV({}) returned {} then {}",
-                    h, pv1, pv2
-                );
-                error!("AG-1 violation at height {}", h);
-                break;
+        /// AG-1: Deterministic activation.
+        fn check_deterministic(&self, current_height: Height) -> GuaranteeCheck {
+            let start = Instant::now();
+            let test_heights = [
+                0,
+                1,
+                100,
+                current_height,
+                current_height + 1,
+                current_height + 100,
+            ];
+            let mut passed = true;
+            let mut detail = String::new();
+
+            for &h in &test_heights {
+                let pv1 = version_for_height(h, &self.activations);
+                let pv2 = version_for_height(h, &self.activations);
+                if pv1 != pv2 {
+                    passed = false;
+                    detail = format!(
+                        "PV({}) returned {} then {}",
+                        h, pv1, pv2
+                    );
+                    error!("AG-1 violation at height {}", h);
+                    break;
+                }
             }
-        }
-        if passed {
-            detail = format!("PV deterministic across {} test heights", test_heights.len());
-        }
-        GuaranteeCheck::new("AG-1", "Deterministic activation", passed, detail, start.elapsed().as_millis() as u64)
-    }
-
-    /// AG-2: Monotonic PV.
-    fn check_monotonic(&self, current_height: Height) -> GuaranteeCheck {
-        let start = Instant::now();
-        let mut passed = true;
-        let mut detail = String::new();
-
-        // Check from 0 to current_height + some buffer.
-        let mut prev_pv = version_for_height(0, &self.activations);
-        for h in 1..=current_height + 10 {
-            let pv = version_for_height(h, &self.activations);
-            if pv < prev_pv {
-                passed = false;
-                detail = format!(
-                    "PV decreased from {} to {} at height {}",
-                    prev_pv, pv, h
-                );
-                error!("AG-2 violation at height {}", h);
-                break;
+            if passed {
+                detail = format!("PV deterministic across {} test heights", test_heights.len());
             }
-            prev_pv = pv;
+            GuaranteeCheck::new("AG-1", "Deterministic activation", passed, detail, start.elapsed().as_millis() as u64)
         }
-        if passed {
-            detail = format!("PV non‑decreasing up to height {}", current_height + 10);
-        }
-        GuaranteeCheck::new("AG-2", "Monotonic PV", passed, detail, start.elapsed().as_millis() as u64)
-    }
 
-    /// AG-3: Exactly-once activation.
-    fn check_exactly_once(&self) -> GuaranteeCheck {
-        let start = Instant::now();
-        let mut seen = HashSet::new();
-        let mut passed = true;
-        let mut detail = String::new();
+        /// AG-2: Monotonic PV.
+        fn check_monotonic(&self, current_height: Height) -> GuaranteeCheck {
+            let start = Instant::now();
+            let mut passed = true;
+            let mut detail = String::new();
 
-        for a in &self.activations {
-            if !seen.insert(a.protocol_version) {
-                passed = false;
-                detail = format!(
-                    "PV={} appears multiple times in activation schedule",
-                    a.protocol_version
-                );
-                error!("AG-3 violation: duplicate PV={}", a.protocol_version);
-                break;
+            // Check from 0 to current_height + some buffer.
+            let mut prev_pv = version_for_height(0, &self.activations);
+            let range = current_height + 10;
+            for h in 1..=range {
+                let pv = version_for_height(h, &self.activations);
+                if pv < prev_pv {
+                    passed = false;
+                    detail = format!(
+                        "PV decreased from {} to {} at height {}",
+                        prev_pv, pv, h
+                    );
+                    error!("AG-2 violation at height {}", h);
+                    break;
+                }
+                prev_pv = pv;
             }
+            if passed {
+                detail = format!("PV non‑decreasing up to height {}", range);
+            }
+            GuaranteeCheck::new("AG-2", "Monotonic PV", passed, detail, start.elapsed().as_millis() as u64)
         }
-        if passed {
-            detail = format!("{} unique PVs in schedule", seen.len());
+
+        /// AG-3: Exactly-once activation.
+        fn check_exactly_once(&self) -> GuaranteeCheck {
+            let start = Instant::now();
+            let mut seen = HashSet::new();
+            let mut passed = true;
+            let mut detail = String::new();
+
+            for a in &self.activations {
+                if !seen.insert(a.protocol_version) {
+                    passed = false;
+                    detail = format!(
+                        "PV={} appears multiple times in activation schedule",
+                        a.protocol_version
+                    );
+                    error!("AG-3 violation: duplicate PV={}", a.protocol_version);
+                    break;
+                }
+            }
+            if passed {
+                detail = format!("{} unique PVs in schedule", seen.len());
+            }
+            GuaranteeCheck::new("AG-3", "Exactly-once activation", passed, detail, start.elapsed().as_millis() as u64)
         }
-        GuaranteeCheck::new("AG-3", "Exactly-once activation", passed, detail, start.elapsed().as_millis() as u64)
-    }
 
-    /// AG-4: Pre-activation signalling.
-    fn check_signal_distance(&self, current_height: Height) -> GuaranteeCheck {
-        let start = Instant::now();
-        let mut passed = true;
-        let mut detail = String::new();
+        /// AG-4: Pre-activation signalling.
+        fn check_signal_distance(&self, current_height: Height) -> GuaranteeCheck {
+            let start = Instant::now();
+            let mut passed = true;
+            let mut detail = String::new();
+            let min_lead = self.config.min_lead_blocks;
 
-        for a in &self.activations {
-            if let Some(ah) = a.activation_height {
-                if ah > current_height {
-                    let distance = ah - current_height;
-                    if distance < DEFAULT_MIN_LEAD_BLOCKS {
-                        passed = false;
-                        detail = format!(
-                            "PV={} activates in {} blocks (minimum lead time: {})",
-                            a.protocol_version, distance, DEFAULT_MIN_LEAD_BLOCKS
-                        );
-                        warn!("AG-4 violation: PV={} too close", a.protocol_version);
+            for a in &self.activations {
+                if let Some(ah) = a.activation_height {
+                    if ah > current_height {
+                        let distance = ah - current_height;
+                        if distance < min_lead {
+                            passed = false;
+                            detail = format!(
+                                "PV={} activates in {} blocks (minimum lead time: {})",
+                                a.protocol_version, distance, min_lead
+                            );
+                            warn!("AG-4 violation: PV={} too close", a.protocol_version);
+                            break;
+                        }
+                    }
+                }
+            }
+            if passed {
+                detail = format!("all activations have >= {} blocks lead time", min_lead);
+            }
+            GuaranteeCheck::new("AG-4", "Pre-activation signalling", passed, detail, start.elapsed().as_millis() as u64)
+        }
+
+        /// AG-5: Grace window bounded.
+        fn check_grace_bounded(&self) -> GuaranteeCheck {
+            let start = Instant::now();
+            let mut passed = true;
+            let mut detail = String::new();
+            let max_grace = self.config.max_grace_blocks;
+
+            for a in &self.activations {
+                if a.grace_blocks > max_grace {
+                    passed = false;
+                    detail = format!(
+                        "PV={} has grace_blocks={} > max={}",
+                        a.protocol_version, a.grace_blocks, max_grace
+                    );
+                    error!("AG-5 violation: PV={}", a.protocol_version);
+                    break;
+                }
+            }
+            if passed {
+                detail = format!("all grace windows <= {} blocks", max_grace);
+            }
+            GuaranteeCheck::new("AG-5", "Grace window bounded", passed, detail, start.elapsed().as_millis() as u64)
+        }
+
+        /// AG-6: Post-activation mandatory.
+        fn check_post_activation(&self, current_height: Height) -> GuaranteeCheck {
+            let start = Instant::now();
+            let mut passed = true;
+            let mut detail = String::new();
+
+            // Check a range of heights after each activation.
+            for a in &self.activations {
+                if let Some(ah) = a.activation_height {
+                    // Check immediately after the grace window.
+                    let check_heights = vec![
+                        ah + a.grace_blocks,
+                        ah + a.grace_blocks + 1,
+                        ah + a.grace_blocks + 10,
+                    ];
+                    for &h in &check_heights {
+                        if h > current_height + 10 {
+                            continue;
+                        }
+                        let block_pv = a.protocol_version; // assuming a block with old PV
+                        let expected = version_for_height(h, &self.activations);
+                        if block_pv < expected {
+                            // The old PV should be rejected.
+                            passed = false;
+                            detail = format!(
+                                "block PV={} at height {} after grace (expected PV={})",
+                                block_pv, h, expected
+                            );
+                            error!("AG-6 violation at height {}", h);
+                            break;
+                        }
+                    }
+                    if !passed {
                         break;
                     }
                 }
             }
-        }
-        if passed {
-            detail = format!("all activations have >= {} blocks lead time", DEFAULT_MIN_LEAD_BLOCKS);
-        }
-        GuaranteeCheck::new("AG-4", "Pre-activation signalling", passed, detail, start.elapsed().as_millis() as u64)
-    }
-
-    /// AG-5: Grace window bounded.
-    fn check_grace_bounded(&self) -> GuaranteeCheck {
-        let start = Instant::now();
-        let mut passed = true;
-        let mut detail = String::new();
-
-        for a in &self.activations {
-            if a.grace_blocks > MAX_GRACE_BLOCKS {
-                passed = false;
-                detail = format!(
-                    "PV={} has grace_blocks={} > max={}",
-                    a.protocol_version, a.grace_blocks, MAX_GRACE_BLOCKS
-                );
-                error!("AG-5 violation: PV={}", a.protocol_version);
-                break;
+            if passed {
+                detail = "post-activation checks passed".to_string();
             }
+            GuaranteeCheck::new("AG-6", "Post-activation mandatory", passed, detail, start.elapsed().as_millis() as u64)
         }
-        if passed {
-            detail = format!("all grace windows <= {} blocks", MAX_GRACE_BLOCKS);
+
+        /// AG-7: Activation height immutable (check against itself).
+        fn check_immutable(&self) -> GuaranteeCheck {
+            let start = Instant::now();
+            GuaranteeCheck::new(
+                "AG-7",
+                "Activation height immutable",
+                true,
+                "schedule consistent with itself",
+                start.elapsed().as_millis() as u64,
+            )
         }
-        GuaranteeCheck::new("AG-5", "Grace window bounded", passed, detail, start.elapsed().as_millis() as u64)
-    }
 
-    /// AG-6: Post-activation mandatory.
-    fn check_post_activation(&self, current_height: Height) -> GuaranteeCheck {
-        let start = Instant::now();
-        let mut passed = true;
-        let mut detail = String::new();
+        /// AG-8: Rollback window defined.
+        fn check_rollback(&self, current_height: Height) -> GuaranteeCheck {
+            let start = Instant::now();
+            let mut passed = true;
+            let mut detail = String::new();
 
-        // Check a range of heights after each activation.
-        for a in &self.activations {
-            if let Some(ah) = a.activation_height {
-                // Check immediately after the grace window.
-                let check_heights = vec![
-                    ah + a.grace_blocks,
-                    ah + a.grace_blocks + 1,
-                    ah + a.grace_blocks + 10,
-                ];
-                for &h in &check_heights {
-                    if h > current_height + 10 {
+            if self.sorted_by_height.is_empty() {
+                passed = false;
+                detail = "no activations with defined heights, rollback impossible".to_string();
+            } else {
+                let mut safe = false;
+                for (h, pv) in &self.sorted_by_height {
+                    if h <= &current_height {
                         continue;
-                    }
-                    let block_pv = a.protocol_version; // assuming a block with old PV
-                    let expected = version_for_height(h, &self.activations);
-                    if block_pv < expected {
-                        // The old PV should be rejected.
-                        passed = false;
-                        detail = format!(
-                            "block PV={} at height {} after grace (expected PV={})",
-                            block_pv, h, expected
-                        );
-                        error!("AG-6 violation at height {}", h);
+                    } else {
+                        safe = true;
+                        detail = format!("rollback safe up to height {}", h - 1);
                         break;
                     }
                 }
-                if !passed {
+                if !safe {
+                    passed = false;
+                    detail = "no future activation; rollback may be unsafe".to_string();
+                }
+            }
+            GuaranteeCheck::new("AG-8", "Rollback window defined", passed, detail, start.elapsed().as_millis() as u64)
+        }
+
+        /// AG-9: Strictly increasing heights.
+        fn check_strictly_increasing(&self) -> GuaranteeCheck {
+            let start = Instant::now();
+            let mut passed = true;
+            let mut detail = String::new();
+
+            for i in 1..self.sorted_by_height.len() {
+                let (prev_h, prev_pv) = self.sorted_by_height[i - 1];
+                let (curr_h, curr_pv) = self.sorted_by_height[i];
+                if curr_h <= prev_h {
+                    passed = false;
+                    detail = format!(
+                        "height {} (PV={}) is not strictly greater than {} (PV={})",
+                        curr_h, curr_pv, prev_h, prev_pv
+                    );
+                    error!("AG-9 violation: non‑increasing heights");
                     break;
                 }
             }
+            if passed {
+                detail = format!("{} activation heights strictly increasing", self.sorted_by_height.len());
+            }
+            GuaranteeCheck::new("AG-9", "Strictly increasing heights", passed, detail, start.elapsed().as_millis() as u64)
         }
-        if passed {
-            detail = "post-activation checks passed".to_string();
-        }
-        GuaranteeCheck::new("AG-6", "Post-activation mandatory", passed, detail, start.elapsed().as_millis() as u64)
-    }
 
-    /// AG-7: Activation height immutable (check against itself).
-    fn check_immutable(&self) -> GuaranteeCheck {
-        let start = Instant::now();
-        // Self-check always passes.
-        GuaranteeCheck::new(
-            "AG-7",
-            "Activation height immutable",
-            true,
-            "schedule consistent with itself",
-            start.elapsed().as_millis() as u64,
-        )
-    }
+        /// AG-10: Non‑overlapping grace windows.
+        fn check_grace_overlap(&self) -> GuaranteeCheck {
+            let start = Instant::now();
+            let mut passed = true;
+            let mut detail = String::new();
 
-    /// AG-8: Rollback window defined.
-    fn check_rollback(&self, current_height: Height) -> GuaranteeCheck {
-        let start = Instant::now();
-        let mut passed = true;
-        let mut detail = String::new();
+            let mut intervals = Vec::new();
+            for a in &self.activations {
+                if let Some(h) = a.activation_height {
+                    intervals.push((h, h + a.grace_blocks, a.protocol_version));
+                }
+            }
+            intervals.sort_by_key(|(start, _, _)| *start);
 
-        // Check that at least one activation has a rollback window.
-        if self.sorted_by_height.is_empty() {
-            passed = false;
-            detail = "no activations with defined heights, rollback impossible".to_string();
-        } else {
-            // Find the latest activation before current_height.
-            let mut safe = false;
-            for (h, pv) in &self.sorted_by_height {
-                if h <= &current_height {
-                    // This activation is in the past; rollback to before it is unsafe.
-                    continue;
-                } else {
-                    // Found a future activation; rollback is safe before it.
-                    safe = true;
-                    detail = format!("rollback safe up to height {}", h - 1);
+            for i in 1..intervals.len() {
+                let (prev_start, prev_end, prev_pv) = intervals[i - 1];
+                let (curr_start, curr_end, curr_pv) = intervals[i];
+                if curr_start < prev_end {
+                    passed = false;
+                    detail = format!(
+                        "grace window for PV={} [{}, {}] overlaps with PV={} [{}, {}]",
+                        prev_pv, prev_start, prev_end, curr_pv, curr_start, curr_end
+                    );
+                    warn!("AG-10 violation: grace overlap");
                     break;
                 }
             }
-            if !safe {
-                passed = false;
-                detail = "no future activation; rollback may be unsafe".to_string();
+            if passed {
+                detail = format!("no overlapping grace windows ({} intervals)", intervals.len());
             }
+            GuaranteeCheck::new("AG-10", "Non‑overlapping grace windows", passed, detail, start.elapsed().as_millis() as u64)
         }
-        GuaranteeCheck::new("AG-8", "Rollback window defined", passed, detail, start.elapsed().as_millis() as u64)
-    }
 
-    /// AG-9: Strictly increasing heights.
-    fn check_strictly_increasing(&self) -> GuaranteeCheck {
-        let start = Instant::now();
-        let mut passed = true;
-        let mut detail = String::new();
+        // -------------------------------------------------------------------------
+        // Public convenience methods
+        // -------------------------------------------------------------------------
 
-        for i in 1..self.sorted_by_height.len() {
-            let (prev_h, prev_pv) = self.sorted_by_height[i - 1];
-            let (curr_h, curr_pv) = self.sorted_by_height[i];
-            if curr_h <= prev_h {
-                passed = false;
-                detail = format!(
-                    "height {} (PV={}) is not strictly greater than {} (PV={})",
-                    curr_h, curr_pv, prev_h, prev_pv
-                );
-                error!("AG-9 violation: non‑increasing heights");
-                break;
-            }
+        /// Validate the schedule and return a report.
+        pub fn validate(&self, current_height: Height) -> ActivationReport {
+            self.check_all_guarantees(current_height)
         }
-        if passed {
-            detail = format!("{} activation heights strictly increasing", self.sorted_by_height.len());
+
+        /// Check if the schedule is valid.
+        pub fn is_valid(&self, current_height: Height) -> bool {
+            self.check_all_guarantees(current_height).all_passed
         }
-        GuaranteeCheck::new("AG-9", "Strictly increasing heights", passed, detail, start.elapsed().as_millis() as u64)
-    }
 
-    /// AG-10: Non‑overlapping grace windows.
-    fn check_grace_overlap(&self) -> GuaranteeCheck {
-        let start = Instant::now();
-        let mut passed = true;
-        let mut detail = String::new();
-
-        // Build intervals for each activation with a defined height.
-        let mut intervals = Vec::new();
-        for a in &self.activations {
-            if let Some(h) = a.activation_height {
-                intervals.push((h, h + a.grace_blocks, a.protocol_version));
-            }
+        /// Get the last safe rollback height for a target PV.
+        pub fn rollback_height(&self, target_pv: u32) -> Option<Height> {
+            let activation = self.get_activation(target_pv)?;
+            activation.activation_height.map(|h| h.saturating_sub(1))
         }
-        intervals.sort_by_key(|(start, _, _)| *start);
-
-        for i in 1..intervals.len() {
-            let (prev_start, prev_end, prev_pv) = intervals[i - 1];
-            let (curr_start, curr_end, curr_pv) = intervals[i];
-            if curr_start < prev_end {
-                passed = false;
-                detail = format!(
-                    "grace window for PV={} [{}, {}] overlaps with PV={} [{}, {}]",
-                    prev_pv, prev_start, prev_end, curr_pv, curr_start, curr_end
-                );
-                warn!("AG-10 violation: grace overlap");
-                break;
-            }
-        }
-        if passed {
-            detail = format!("no overlapping grace windows ({} intervals)", intervals.len());
-        }
-        GuaranteeCheck::new("AG-10", "Non‑overlapping grace windows", passed, detail, start.elapsed().as_millis() as u64)
-    }
-
-    // -------------------------------------------------------------------------
-    // Public convenience methods
-    // -------------------------------------------------------------------------
-
-    /// Validate the schedule and return a report.
-    pub fn validate(&self, current_height: Height) -> ActivationReport {
-        self.check_all_guarantees(current_height)
-    }
-
-    /// Check if the schedule is valid.
-    pub fn is_valid(&self, current_height: Height) -> bool {
-        self.check_all_guarantees(current_height).all_passed
-    }
-
-    /// Get the last safe rollback height for a target PV.
-    pub fn rollback_height(&self, target_pv: u32) -> Option<Height> {
-        let activation = self.get_activation(target_pv)?;
-        activation.activation_height.map(|h| h.saturating_sub(1))
     }
 }
 
 // -----------------------------------------------------------------------------
-// Standalone check functions (kept for backward compatibility)
+// Public exports
+// -----------------------------------------------------------------------------
+
+pub use config::GuaranteeConfig;
+pub use error::{GuaranteeError, GuaranteeResult};
+pub use report::{ActivationReport, GuaranteeCheck};
+pub use validator::ScheduleValidator;
+
+// -----------------------------------------------------------------------------
+// Standalone functions (kept for backward compatibility)
 // -----------------------------------------------------------------------------
 
 /// Check all guarantees and return a report.
@@ -592,9 +670,13 @@ pub fn check_all_guarantees(
 pub fn validate_activation_schedule(
     activations: &[ProtocolActivation],
     current_height: Height,
-    _min_lead_blocks: u64,
+    min_lead_blocks: u64,
 ) -> Result<(), Vec<String>> {
-    let validator = ScheduleValidator::new(activations);
+    let config = GuaranteeConfig {
+        min_lead_blocks,
+        ..Default::default()
+    };
+    let validator = ScheduleValidator::with_config(activations, config);
     let report = validator.check_all_guarantees(current_height);
     if report.all_passed {
         Ok(())
@@ -604,7 +686,7 @@ pub fn validate_activation_schedule(
 }
 
 // -----------------------------------------------------------------------------
-// Deprecated functions (kept for backward compatibility)
+// Deprecated functions
 // -----------------------------------------------------------------------------
 
 #[deprecated(since = "1.0.0", note = "use ScheduleValidator::check_all_guarantees instead")]
@@ -650,6 +732,18 @@ mod tests {
         assert_eq!(validator.schedule().len(), 3);
         assert!(validator.get_activation(2).is_some());
         assert!(validator.get_activation(99).is_none());
+        assert_eq!(validator.config().min_lead_blocks, 100);
+    }
+
+    #[test]
+    fn test_with_config() {
+        let schedule = test_schedule();
+        let config = GuaranteeConfig {
+            min_lead_blocks: 200,
+            ..Default::default()
+        };
+        let validator = ScheduleValidator::with_config(&schedule, config);
+        assert_eq!(validator.config().min_lead_blocks, 200);
     }
 
     #[test]
@@ -763,5 +857,34 @@ mod tests {
         assert!(result.is_err());
         let errs = result.unwrap_err();
         assert!(errs.len() >= 2);
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let config = GuaranteeConfig {
+            min_lead_blocks: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        let config2 = GuaranteeConfig::default();
+        assert!(config2.validate().is_ok());
+    }
+
+    #[test]
+    fn test_set_config() {
+        let schedule = test_schedule();
+        let mut validator = ScheduleValidator::new(&schedule);
+        let new_config = GuaranteeConfig {
+            min_lead_blocks: 300,
+            ..Default::default()
+        };
+        assert!(validator.set_config(new_config).is_ok());
+        assert_eq!(validator.config().min_lead_blocks, 300);
+        // Invalid config
+        let bad_config = GuaranteeConfig {
+            min_lead_blocks: 0,
+            ..Default::default()
+        };
+        assert!(validator.set_config(bad_config).is_err());
     }
 }
