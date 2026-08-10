@@ -18,12 +18,8 @@
 //! let addr = hex_to_address("0x742d35Cc6634C0532925a3b844Bc9e7595f2bD28").unwrap();
 //! ```
 
-use revm::primitives::{Address, Bytes, B256, U256};
-use std::str::FromStr;
-use thiserror::Error;
-
 // -----------------------------------------------------------------------------
-// Core re‑exports
+// Re‑exports from revm
 // -----------------------------------------------------------------------------
 
 pub use revm::primitives::{
@@ -42,6 +38,8 @@ pub use revm::primitives::{
 // -----------------------------------------------------------------------------
 // Error types
 // -----------------------------------------------------------------------------
+
+use thiserror::Error;
 
 /// Errors that can occur when parsing or handling EVM primitive types.
 #[derive(Debug, Error)]
