@@ -18,6 +18,7 @@
 //! - Component health monitoring with quantum-inspired metrics.
 //! - Atomic configuration loading with validation.
 //! - Persistent state with atomic writes.
+//! - Prometheus metrics for observability.
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
@@ -59,6 +60,8 @@ use thiserror::Error;
 use tokio::signal;
 use tokio::sync::watch;
 use tracing::{error, info, warn, debug};
+use parking_lot::Mutex;
+use prometheus::{register_gauge, register_counter, Gauge, Counter};
 
 // -----------------------------------------------------------------------------
 // Quantum Constants
@@ -130,6 +133,12 @@ pub enum NodeError {
 
     #[error("unexpected error: {0}")]
     Unexpected(String),
+
+    #[error("metrics error: {0}")]
+    Metrics(#[from] prometheus::Error),
+
+    #[error("integer overflow")]
+    IntegerOverflow,
 }
 
 /// Alias for `Result<T, NodeError>`.
@@ -216,9 +225,13 @@ impl QuantumNodeState {
     }
 
     /// Record an uptime cycle.
-    fn tick(&mut self) {
-        self.uptime_cycles = self.uptime_cycles.wrapping_add(1);
+    fn tick(&mut self) -> NodeResult<()> {
+        self.uptime_cycles = self
+            .uptime_cycles
+            .checked_add(1)
+            .ok_or(NodeError::IntegerOverflow)?;
         self.apply_decoherence(1.0 / NODE_COHERENCE_TIME as f64);
+        Ok(())
     }
 
     /// Enter shutdown state.
@@ -251,6 +264,88 @@ pub trait NodeComponent: Send + Sync + 'static {
 
     /// Check if the component is running.
     fn is_running(&self) -> bool;
+}
+
+// -----------------------------------------------------------------------------
+// Node Metrics
+// -----------------------------------------------------------------------------
+
+/// Prometheus metrics for the quantum node.
+#[derive(Clone)]
+pub struct NodeMetrics {
+    /// Node coherence gauge.
+    pub coherence: Gauge,
+    /// Node entanglement entropy gauge.
+    pub entanglement_entropy: Gauge,
+    /// Node health metric gauge.
+    pub health_metric: Gauge,
+    /// Number of running components gauge.
+    pub running_components: Gauge,
+    /// Total components gauge.
+    pub total_components: Gauge,
+    /// Node uptime in seconds (counter).
+    pub uptime_seconds: Counter,
+    /// Total number of shutdowns.
+    pub shutdowns_total: Counter,
+}
+
+impl NodeMetrics {
+    /// Create and register metrics.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            coherence: register_gauge!(
+                "iona_node_coherence",
+                "Current quantum coherence of the node"
+            )?,
+            entanglement_entropy: register_gauge!(
+                "iona_node_entanglement_entropy",
+                "Current entanglement entropy of the node"
+            )?,
+            health_metric: register_gauge!(
+                "iona_node_health_metric",
+                "Overall health metric (0-1)"
+            )?,
+            running_components: register_gauge!(
+                "iona_node_running_components",
+                "Number of currently running components"
+            )?,
+            total_components: register_gauge!(
+                "iona_node_total_components",
+                "Total registered components"
+            )?,
+            uptime_seconds: register_counter!(
+                "iona_node_uptime_seconds_total",
+                "Total uptime in seconds"
+            )?,
+            shutdowns_total: register_counter!(
+                "iona_node_shutdowns_total",
+                "Total number of node shutdowns"
+            )?,
+        })
+    }
+
+    /// Create an unregistered metrics instance (for tests).
+    pub fn new_unregistered() -> Self {
+        Self {
+            coherence: Gauge::new("iona_node_coherence", "Coherence").unwrap(),
+            entanglement_entropy: Gauge::new("iona_node_entanglement_entropy", "Entropy").unwrap(),
+            health_metric: Gauge::new("iona_node_health_metric", "Health").unwrap(),
+            running_components: Gauge::new("iona_node_running_components", "Running").unwrap(),
+            total_components: Gauge::new("iona_node_total_components", "Total").unwrap(),
+            uptime_seconds: Counter::new("iona_node_uptime_seconds_total", "Uptime").unwrap(),
+            shutdowns_total: Counter::new("iona_node_shutdowns_total", "Shutdowns").unwrap(),
+        }
+    }
+
+    /// Update all metrics from node state.
+    fn update(&self, stats: &NodeStats) {
+        self.coherence.set(stats.coherence);
+        self.entanglement_entropy.set(stats.entanglement_entropy);
+        self.health_metric.set(stats.health_metric);
+        self.running_components.set(stats.running_components as f64);
+        self.total_components.set(stats.total_components as f64);
+        self.uptime_seconds.inc_by(stats.uptime.as_secs_f64());
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -320,7 +415,7 @@ pub struct Node {
     /// Node configuration (classical observable).
     config: config::NodeConfig,
     /// Quantum state of the node.
-    quantum_state: Arc<std::sync::Mutex<QuantumNodeState>>,
+    quantum_state: Arc<Mutex<QuantumNodeState>>,
     /// Registered components.
     components: Vec<Box<dyn NodeComponent>>,
     /// Shutdown signal sender (triggers projective measurement).
@@ -335,6 +430,8 @@ pub struct Node {
     health_handle: Option<tokio::task::JoinHandle<()>>,
     /// Whether the node has been started.
     started: bool,
+    /// Prometheus metrics (if enabled).
+    metrics: Option<Arc<NodeMetrics>>,
 }
 
 impl Node {
@@ -375,6 +472,13 @@ impl Node {
         // Create shutdown channel
         let (shutdown_tx, shutdown_rx) = watch::channel(());
 
+        // Create metrics if enabled
+        let metrics = if config.observability.enable_metrics {
+            Some(Arc::new(NodeMetrics::new()?))
+        } else {
+            None
+        };
+
         info!(
             "Quantum node initialised: coherence={:.4}, entropy={:.4}, components={}",
             qstate.coherence,
@@ -384,7 +488,7 @@ impl Node {
 
         Ok(Self {
             config,
-            quantum_state: Arc::new(std::sync::Mutex::new(qstate)),
+            quantum_state: Arc::new(Mutex::new(qstate)),
             components,
             shutdown_tx,
             shutdown_rx,
@@ -392,6 +496,7 @@ impl Node {
             shutdown_timeout,
             health_handle: None,
             started: false,
+            metrics,
         })
     }
 
@@ -433,7 +538,7 @@ impl Node {
 
         // Update component fidelities after startup
         for comp in &self.components {
-            let mut qstate = self.quantum_state.lock().unwrap();
+            let mut qstate = self.quantum_state.lock();
             qstate.update_component_fidelity(comp.name(), comp.fidelity());
         }
 
@@ -480,7 +585,7 @@ impl Node {
 
         // Apply final startup decoherence
         {
-            let mut qstate = self.quantum_state.lock().unwrap();
+            let mut qstate = self.quantum_state.lock();
             qstate.apply_decoherence(0.0001);
         }
 
@@ -512,13 +617,16 @@ impl Node {
 
         // Final decoherence on shutdown
         {
-            let mut qstate = self.quantum_state.lock().unwrap();
+            let mut qstate = self.quantum_state.lock();
             qstate.apply_decoherence(0.1);
             info!(
                 "Final coherence: γ={:.4}, uptime: {} cycles",
                 qstate.coherence,
                 qstate.uptime_cycles
             );
+            if let Some(metrics) = &self.metrics {
+                metrics.shutdowns_total.inc();
+            }
         }
 
         info!("Quantum node shutdown complete");
@@ -528,7 +636,7 @@ impl Node {
     /// Begin shutdown sequence.
     async fn begin_shutdown(&mut self) -> NodeResult<()> {
         {
-            let mut qstate = self.quantum_state.lock().unwrap();
+            let mut qstate = self.quantum_state.lock();
             qstate.begin_shutdown();
         }
 
@@ -569,7 +677,7 @@ impl Node {
             loop {
                 tokio::select! {
                     _ = interval_timer.tick() => {
-                        let qstate = quantum_state.lock().unwrap();
+                        let qstate = quantum_state.lock();
                         if !qstate.is_healthy() {
                             warn!(
                                 coherence = qstate.coherence,
@@ -614,27 +722,27 @@ impl Node {
 
     /// Get current node coherence.
     pub fn coherence(&self) -> f64 {
-        self.quantum_state.lock().unwrap().coherence
+        self.quantum_state.lock().coherence
     }
 
     /// Get entanglement entropy.
     pub fn entanglement_entropy(&self) -> f64 {
-        self.quantum_state.lock().unwrap().entanglement_entropy
+        self.quantum_state.lock().entanglement_entropy
     }
 
     /// Get overall health metric.
     pub fn health_metric(&self) -> f64 {
-        self.quantum_state.lock().unwrap().health_metric()
+        self.quantum_state.lock().health_metric()
     }
 
     /// Check if node is in healthy quantum state.
     pub fn is_healthy(&self) -> bool {
-        self.quantum_state.lock().unwrap().is_healthy()
+        self.quantum_state.lock().is_healthy()
     }
 
     /// Get component fidelity.
     pub fn component_fidelity(&self, component: &str) -> Option<f64> {
-        self.quantum_state.lock().unwrap().component_fidelity(component)
+        self.quantum_state.lock().component_fidelity(component)
     }
 
     /// Get node uptime.
@@ -644,7 +752,7 @@ impl Node {
 
     /// Get quantum node statistics.
     pub fn stats(&self) -> NodeStats {
-        let qstate = self.quantum_state.lock().unwrap();
+        let qstate = self.quantum_state.lock();
         NodeStats {
             coherence: qstate.coherence,
             entanglement_entropy: qstate.entanglement_entropy,
