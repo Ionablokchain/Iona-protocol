@@ -14,11 +14,13 @@
 //! - Validation of packets, channels, and transfers.
 //! - Proper error handling with descriptive variants.
 //! - Structured logging with `tracing`.
+//! - Prometheus metrics for observability.
 
 use crate::ibc::{ClientId, IbcHeight};
 use crate::types::Height;
 use fs2::FileExt;
 use parking_lot::Mutex;
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -26,7 +28,7 @@ use std::{
     io::{BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -83,6 +85,8 @@ pub struct Ics020Config {
     pub persist_state: bool,
     /// Lock timeout in seconds.
     pub lock_timeout_secs: u64,
+    /// Whether to enable Prometheus metrics.
+    pub enable_metrics: bool,
 }
 
 impl Default for Ics020Config {
@@ -95,6 +99,7 @@ impl Default for Ics020Config {
             max_packet_age_secs: DEFAULT_MAX_PACKET_AGE_SECS,
             persist_state: true,
             lock_timeout_secs: LOCK_TIMEOUT_SECS,
+            enable_metrics: true,
         }
     }
 }
@@ -121,6 +126,111 @@ impl Ics020Config {
             return Err("lock_timeout_secs must be > 0".into());
         }
         Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Metrics
+// -----------------------------------------------------------------------------
+
+/// Metrics for the ICS-020 transfer module.
+#[derive(Clone)]
+pub struct Ics020Metrics {
+    pub transfers_sent: Counter,
+    pub transfers_received: Counter,
+    pub transfers_timed_out: Counter,
+    pub channels_opened: Counter,
+    pub packets_acknowledged: Counter,
+    pub total_escrow: Gauge,
+    pub in_flight_packets: Gauge,
+    pub voucher_total: Gauge,
+    pub module_coherence: Gauge,
+}
+
+impl Ics020Metrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            transfers_sent: register_counter!(
+                "iona_ics020_transfers_sent_total",
+                "Total transfers sent"
+            )?,
+            transfers_received: register_counter!(
+                "iona_ics020_transfers_received_total",
+                "Total transfers received"
+            )?,
+            transfers_timed_out: register_counter!(
+                "iona_ics020_transfers_timed_out_total",
+                "Total transfers timed out"
+            )?,
+            channels_opened: register_counter!(
+                "iona_ics020_channels_opened_total",
+                "Total channels opened"
+            )?,
+            packets_acknowledged: register_counter!(
+                "iona_ics020_packets_acknowledged_total",
+                "Total packets acknowledged"
+            )?,
+            total_escrow: register_gauge!(
+                "iona_ics020_total_escrow",
+                "Total amount in escrow"
+            )?,
+            in_flight_packets: register_gauge!(
+                "iona_ics020_in_flight_packets",
+                "Number of in-flight packets"
+            )?,
+            voucher_total: register_gauge!(
+                "iona_ics020_voucher_total",
+                "Total voucher balance"
+            )?,
+            module_coherence: register_gauge!(
+                "iona_ics020_module_coherence",
+                "Overall module quantum coherence"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or when disabled).
+    pub fn new_unregistered() -> Self {
+        Self {
+            transfers_sent: Counter::new("iona_ics020_transfers_sent_total", "Sent").unwrap(),
+            transfers_received: Counter::new("iona_ics020_transfers_received_total", "Received").unwrap(),
+            transfers_timed_out: Counter::new("iona_ics020_transfers_timed_out_total", "Timed out").unwrap(),
+            channels_opened: Counter::new("iona_ics020_channels_opened_total", "Opened").unwrap(),
+            packets_acknowledged: Counter::new("iona_ics020_packets_acknowledged_total", "Acked").unwrap(),
+            total_escrow: Gauge::new("iona_ics020_total_escrow", "Escrow").unwrap(),
+            in_flight_packets: Gauge::new("iona_ics020_in_flight_packets", "In-flight").unwrap(),
+            voucher_total: Gauge::new("iona_ics020_voucher_total", "Vouchers").unwrap(),
+            module_coherence: Gauge::new("iona_ics020_module_coherence", "Coherence").unwrap(),
+        }
+    }
+
+    pub fn record_transfer_sent(&self) {
+        self.transfers_sent.inc();
+    }
+    pub fn record_transfer_received(&self) {
+        self.transfers_received.inc();
+    }
+    pub fn record_transfer_timed_out(&self) {
+        self.transfers_timed_out.inc();
+    }
+    pub fn record_channel_opened(&self) {
+        self.channels_opened.inc();
+    }
+    pub fn record_packet_acknowledged(&self) {
+        self.packets_acknowledged.inc();
+    }
+    pub fn set_total_escrow(&self, amount: u64) {
+        self.total_escrow.set(amount as f64);
+    }
+    pub fn set_in_flight(&self, count: usize) {
+        self.in_flight_packets.set(count as f64);
+    }
+    pub fn set_voucher_total(&self, amount: u64) {
+        self.voucher_total.set(amount as f64);
+    }
+    pub fn set_coherence(&self, val: f64) {
+        self.module_coherence.set(val);
     }
 }
 
@@ -200,8 +310,10 @@ impl FungibleTokenPacket {
         if self.receiver.is_empty() {
             return Err("receiver cannot be empty".into());
         }
-        if self.amount.parse::<u64>().is_err() {
-            return Err("amount must be a valid u64".into());
+        // Amount must be a valid positive integer
+        let amount = self.amount.parse::<u64>().map_err(|_| "amount must be a valid u64".to_string())?;
+        if amount == 0 {
+            return Err("amount must be > 0".into());
         }
         if self.coherence < 0.0 || self.coherence > 1.0 {
             return Err("coherence must be between 0.0 and 1.0".into());
@@ -342,6 +454,9 @@ pub enum Ics020Error {
 
     #[error("invalid channel state transition from {from:?} to {to:?}")]
     InvalidStateTransition { from: ChannelState, to: ChannelState },
+
+    #[error("integer overflow")]
+    IntegerOverflow,
 }
 
 pub type Ics020Result<T> = Result<T, Ics020Error>;
@@ -424,12 +539,12 @@ fn acquire_lock(path: &Path, timeout_secs: u64) -> Result<File, Ics020Error> {
         .open(&lock_path)
         .map_err(|e| Ics020Error::LockFailed(e.to_string()))?;
     let timeout = Duration::from_secs(timeout_secs);
-    let start = SystemTime::now();
+    let start = Instant::now();
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
             Err(_) => {
-                if start.elapsed().unwrap_or_default() > timeout {
+                if start.elapsed() > timeout {
                     return Err(Ics020Error::LockFailed(format!(
                         "timeout after {}s",
                         timeout_secs
@@ -439,10 +554,6 @@ fn acquire_lock(path: &Path, timeout_secs: u64) -> Result<File, Ics020Error> {
             }
         }
     }
-}
-
-fn release_lock(file: File) -> Result<(), Ics020Error> {
-    file.unlock().map_err(|e| Ics020Error::LockFailed(e.to_string()))
 }
 
 fn load_state(path: &Path, config: &Ics020Config) -> Result<Ics020State, Ics020Error> {
@@ -508,9 +619,12 @@ impl Ics020State {
         counterparty_port: PortId,
         client_id: ClientId,
         ordering: ChannelOrdering,
-    ) -> ChannelId {
+    ) -> Result<ChannelId, Ics020Error> {
         let channel_id = format!("channel-{}", self.next_channel_seq);
-        self.next_channel_seq = self.next_channel_seq.wrapping_add(1);
+        self.next_channel_seq = self
+            .next_channel_seq
+            .checked_add(1)
+            .ok_or(Ics020Error::IntegerOverflow)?;
 
         self.channels.insert(
             channel_id.clone(),
@@ -529,8 +643,8 @@ impl Ics020State {
             },
         );
 
-        self.coherence *= 0.9999;
-        channel_id
+        self.coherence = (self.coherence * 0.9999).clamp(0.0, 1.0);
+        Ok(channel_id)
     }
 
     /// Send tokens via quantum IBC.
@@ -556,6 +670,10 @@ impl Ics020State {
             return Err(Ics020Error::ChannelNotOpen(channel.state));
         }
 
+        if amount == 0 {
+            return Err(Ics020Error::InvalidPacket("amount must be > 0".into()));
+        }
+
         let bal = sender_balances.get(&sender).copied().unwrap_or(0);
         if bal < amount {
             return Err(Ics020Error::InsufficientBalance {
@@ -565,14 +683,20 @@ impl Ics020State {
         }
 
         // Lock tokens in escrow
-        *sender_balances.entry(sender.clone()).or_insert(0) -= amount;
-        *self.escrow.entry(denom.clone()).or_insert(0) += amount;
+        let new_bal = bal.checked_sub(amount).ok_or(Ics020Error::IntegerOverflow)?;
+        sender_balances.insert(sender.clone(), new_bal);
+
+        let escrow_entry = self.escrow.entry(denom.clone()).or_insert(0);
+        *escrow_entry = escrow_entry.checked_add(amount).ok_or(Ics020Error::IntegerOverflow)?;
 
         let esc_coh = self.escrow_coherence.entry(denom.clone()).or_insert(1.0);
-        *esc_coh *= 1.0 - config.decoherence_rate;
+        *esc_coh = (*esc_coh * (1.0 - config.decoherence_rate)).clamp(0.0, 1.0);
 
         let seq = self.send_sequence;
-        self.send_sequence = self.send_sequence.wrapping_add(1);
+        self.send_sequence = self
+            .send_sequence
+            .checked_add(1)
+            .ok_or(Ics020Error::IntegerOverflow)?;
 
         let packet = Packet {
             sequence: seq,
@@ -588,12 +712,10 @@ impl Ics020State {
         };
 
         self.in_flight.insert(seq, packet);
-        self.coherence *= 1.0 - config.decoherence_rate;
+        self.coherence = (self.coherence * (1.0 - config.decoherence_rate)).clamp(0.0, 1.0);
 
         info!(
             channel = %channel_id,
-            sender = %sender,
-            receiver = %receiver,
             denom = %denom,
             amount = amount,
             seq = seq,
@@ -619,7 +741,7 @@ impl Ics020State {
             });
         }
 
-        let amount: u64 = packet.amount.parse().unwrap_or(0);
+        let amount = packet.amount_u64().map_err(Ics020Error::InvalidPacket)?;
         let is_native_return = packet.denom.starts_with("transfer/");
 
         if is_native_return {
@@ -638,11 +760,14 @@ impl Ics020State {
                 });
             }
 
-            *self.escrow.entry(native_denom.clone()).or_insert(0) -= amount;
-            *receiver_balances.entry(packet.receiver.clone()).or_insert(0) += amount;
+            let new_escrow = escrowed.checked_sub(amount).ok_or(Ics020Error::IntegerOverflow)?;
+            self.escrow.insert(native_denom.clone(), new_escrow);
+
+            let receiver_bal = receiver_balances.entry(packet.receiver.clone()).or_insert(0);
+            *receiver_bal = receiver_bal.checked_add(amount).ok_or(Ics020Error::IntegerOverflow)?;
 
             if let Some(coh) = self.escrow_coherence.get_mut(&native_denom) {
-                *coh *= 0.999;
+                *coh = (*coh * 0.999).clamp(0.0, 1.0);
             }
 
             info!(
@@ -655,10 +780,11 @@ impl Ics020State {
             let voucher_denom = format!("transfer/{}", packet.denom);
             let key = (voucher_denom.clone(), packet.receiver.clone());
 
-            *self.vouchers.entry(key).or_insert(0) += amount;
+            let voucher_entry = self.vouchers.entry(key).or_insert(0);
+            *voucher_entry = voucher_entry.checked_add(amount).ok_or(Ics020Error::IntegerOverflow)?;
 
             let v_coh = self.voucher_coherence.entry(voucher_denom.clone()).or_insert(1.0);
-            *v_coh *= 0.999;
+            *v_coh = (*v_coh * 0.999).clamp(0.0, 1.0);
 
             info!(
                 receiver = %packet.receiver,
@@ -668,7 +794,7 @@ impl Ics020State {
             );
         }
 
-        self.coherence *= 0.9999;
+        self.coherence = (self.coherence * 0.9999).clamp(0.0, 1.0);
         Ok(())
     }
 
@@ -684,7 +810,7 @@ impl Ics020State {
             .remove(&seq)
             .ok_or(Ics020Error::PacketNotFound(seq))?;
 
-        let amount: u64 = packet.data.amount.parse().unwrap_or(0);
+        let amount = packet.data.amount_u64().map_err(Ics020Error::InvalidPacket)?;
         let denom = packet.data.denom.clone();
         let sender = packet.data.sender.clone();
 
@@ -696,14 +822,17 @@ impl Ics020State {
             });
         }
 
-        *self.escrow.entry(denom.clone()).or_insert(0) -= amount;
-        *sender_balances.entry(sender.clone()).or_insert(0) += amount;
+        let new_escrow = escrowed.checked_sub(amount).ok_or(Ics020Error::IntegerOverflow)?;
+        self.escrow.insert(denom.clone(), new_escrow);
+
+        let sender_bal = sender_balances.entry(sender.clone()).or_insert(0);
+        *sender_bal = sender_bal.checked_add(amount).ok_or(Ics020Error::IntegerOverflow)?;
 
         if let Some(coh) = self.escrow_coherence.get_mut(&denom) {
-            *coh *= 1.0 - config.decoherence_rate * 2.0;
+            *coh = (*coh * (1.0 - config.decoherence_rate * 2.0)).clamp(0.0, 1.0);
         }
 
-        self.coherence *= 1.0 - config.decoherence_rate;
+        self.coherence = (self.coherence * (1.0 - config.decoherence_rate)).clamp(0.0, 1.0);
 
         warn!(
             seq = seq,
@@ -797,23 +926,35 @@ pub struct Ics020Manager {
     config: Arc<Ics020Config>,
     path: Option<PathBuf>,
     balances: Arc<Mutex<BTreeMap<String, u64>>>,
+    metrics: Arc<Ics020Metrics>,
 }
 
 impl Ics020Manager {
     /// Create a new manager with configuration.
     pub fn new(config: Ics020Config) -> Result<Self, Ics020Error> {
         config.validate().map_err(Ics020Error::Config)?;
+        let metrics = if config.enable_metrics {
+            Arc::new(Ics020Metrics::new().map_err(|e| Ics020Error::Config(e.to_string()))?)
+        } else {
+            Arc::new(Ics020Metrics::new_unregistered())
+        };
         Ok(Self {
             state: Arc::new(Mutex::new(Ics020State::default())),
             config: Arc::new(config),
             path: None,
             balances: Arc::new(Mutex::new(BTreeMap::new())),
+            metrics,
         })
     }
 
     /// Create a manager with persistence.
     pub fn with_persistence(data_dir: &str, config: Ics020Config) -> Result<Self, Ics020Error> {
         config.validate().map_err(Ics020Error::Config)?;
+        let metrics = if config.enable_metrics {
+            Arc::new(Ics020Metrics::new().map_err(|e| Ics020Error::Config(e.to_string()))?)
+        } else {
+            Arc::new(Ics020Metrics::new_unregistered())
+        };
         let path = PathBuf::from(data_dir).join("ics020_state.json");
         let state = if path.exists() {
             load_state(&path, &config)?
@@ -826,15 +967,15 @@ impl Ics020Manager {
         let manager = Self {
             state: Arc::new(Mutex::new(state)),
             config: Arc::new(config),
-            path: Some(path),
+            path: Some(path.clone()),
             balances: Arc::new(Mutex::new(BTreeMap::new())),
+            metrics,
         };
-        if let Some(p) = &manager.path {
+        if manager.config.persist_state {
             let st = manager.state.lock();
-            if manager.config.persist_state {
-                let _ = save_state(p, &st, &manager.config);
-            }
+            let _ = save_state(&path, &st, &manager.config);
         }
+        manager.update_metrics();
         Ok(manager)
     }
 
@@ -846,15 +987,17 @@ impl Ics020Manager {
         counterparty_port: PortId,
         client_id: ClientId,
         ordering: ChannelOrdering,
-    ) -> ChannelId {
+    ) -> Ics020Result<ChannelId> {
         let mut state = self.state.lock();
-        let id = state.open_channel(port_id, counterparty_channel, counterparty_port, client_id, ordering);
+        let id = state.open_channel(port_id, counterparty_channel, counterparty_port, client_id, ordering)?;
+        self.metrics.record_channel_opened();
+        self.update_metrics();
         if self.config.persist_state {
             if let Some(path) = &self.path {
                 let _ = save_state(path, &state, &self.config);
             }
         }
-        id
+        Ok(id)
     }
 
     /// Send a transfer.
@@ -881,6 +1024,8 @@ impl Ics020Manager {
             timeout_timestamp,
             &self.config,
         )?;
+        self.metrics.record_transfer_sent();
+        self.update_metrics();
         if self.config.persist_state {
             if let Some(path) = &self.path {
                 let _ = save_state(path, &state, &self.config);
@@ -897,6 +1042,8 @@ impl Ics020Manager {
         let mut state = self.state.lock();
         let mut balances = self.balances.lock();
         state.receive_packet(packet, &mut balances, &self.config)?;
+        self.metrics.record_transfer_received();
+        self.update_metrics();
         if self.config.persist_state {
             if let Some(path) = &self.path {
                 let _ = save_state(path, &state, &self.config);
@@ -910,6 +1057,8 @@ impl Ics020Manager {
         let mut state = self.state.lock();
         let mut balances = self.balances.lock();
         state.timeout_packet(seq, &mut balances, &self.config)?;
+        self.metrics.record_transfer_timed_out();
+        self.update_metrics();
         if self.config.persist_state {
             if let Some(path) = &self.path {
                 let _ = save_state(path, &state, &self.config);
@@ -922,6 +1071,8 @@ impl Ics020Manager {
     pub fn acknowledge_packet(&self, seq: u64) -> Ics020Result<()> {
         let mut state = self.state.lock();
         state.acknowledge_packet(seq)?;
+        self.metrics.record_packet_acknowledged();
+        self.update_metrics();
         if self.config.persist_state {
             if let Some(path) = &self.path {
                 let _ = save_state(path, &state, &self.config);
@@ -1002,6 +1153,44 @@ impl Ics020Manager {
     pub fn balance(&self, addr: &str) -> u64 {
         self.balances.lock().get(addr).copied().unwrap_or(0)
     }
+
+    /// Update metrics from current state.
+    fn update_metrics(&self) {
+        let state = self.state.lock();
+        self.metrics.set_total_escrow(state.escrow.values().sum());
+        self.metrics.set_in_flight(state.in_flight.len());
+        self.metrics.set_voucher_total(state.vouchers.values().sum());
+        self.metrics.set_coherence(state.coherence);
+    }
+
+    /// Get a snapshot of metrics (for testing or external monitoring).
+    pub fn metrics_snapshot(&self) -> Ics020MetricsSnapshot {
+        Ics020MetricsSnapshot {
+            transfers_sent: self.metrics.transfers_sent.get(),
+            transfers_received: self.metrics.transfers_received.get(),
+            transfers_timed_out: self.metrics.transfers_timed_out.get(),
+            channels_opened: self.metrics.channels_opened.get(),
+            packets_acknowledged: self.metrics.packets_acknowledged.get(),
+            total_escrow: self.metrics.total_escrow.get() as u64,
+            in_flight_packets: self.metrics.in_flight_packets.get() as usize,
+            voucher_total: self.metrics.voucher_total.get() as u64,
+            module_coherence: self.metrics.module_coherence.get(),
+        }
+    }
+}
+
+/// Snapshot of metrics for external use.
+#[derive(Debug, Clone)]
+pub struct Ics020MetricsSnapshot {
+    pub transfers_sent: u64,
+    pub transfers_received: u64,
+    pub transfers_timed_out: u64,
+    pub channels_opened: u64,
+    pub packets_acknowledged: u64,
+    pub total_escrow: u64,
+    pub in_flight_packets: usize,
+    pub voucher_total: u64,
+    pub module_coherence: f64,
 }
 
 // -----------------------------------------------------------------------------
@@ -1016,6 +1205,7 @@ mod tests {
     fn test_config() -> Ics020Config {
         let mut cfg = Ics020Config::default();
         cfg.persist_state = true;
+        cfg.enable_metrics = false; // avoid global registration conflicts
         cfg.min_packet_fidelity = 0.5;
         cfg
     }
@@ -1032,7 +1222,7 @@ mod tests {
             "transfer".into(),
             "client-0".into(),
             ChannelOrdering::Unordered,
-        );
+        ).unwrap();
 
         let seq = manager
             .send_transfer(
@@ -1074,7 +1264,7 @@ mod tests {
             "transfer".into(),
             "client-0".into(),
             ChannelOrdering::Unordered,
-        );
+        ).unwrap();
 
         let seq = manager
             .send_transfer(
@@ -1120,7 +1310,7 @@ mod tests {
             "transfer".into(),
             "client-0".into(),
             ChannelOrdering::Unordered,
-        );
+        ).unwrap();
 
         let stats = manager.stats();
         assert_eq!(stats.total_channels, 1);
@@ -1143,7 +1333,7 @@ mod tests {
                 "transfer".into(),
                 "client-p".into(),
                 ChannelOrdering::Unordered,
-            );
+            ).unwrap();
             manager
                 .send_transfer(
                     &ch,
@@ -1180,7 +1370,7 @@ mod tests {
             "transfer".into(),
             "client-0".into(),
             ChannelOrdering::Unordered,
-        );
+        ).unwrap();
 
         for i in 0..10 {
             manager
@@ -1245,7 +1435,7 @@ mod tests {
             "transfer".into(),
             "client-ack".into(),
             ChannelOrdering::Unordered,
-        );
+        ).unwrap();
 
         let seq = manager
             .send_transfer(
