@@ -18,6 +18,7 @@
 
 use fs2::FileExt;
 use parking_lot::Mutex;
+use prometheus::{register_counter, register_counter_vec, register_gauge, Counter, CounterVec, Gauge};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -87,6 +88,8 @@ pub struct IbcConfig {
     pub prune_threshold: usize,
     /// Lock timeout in seconds.
     pub lock_timeout_secs: u64,
+    /// Whether to enable Prometheus metrics.
+    pub enable_metrics: bool,
 }
 
 impl Default for IbcConfig {
@@ -100,6 +103,7 @@ impl Default for IbcConfig {
             persist_state: true,
             prune_threshold: DEFAULT_PRUNING_THRESHOLD,
             lock_timeout_secs: LOCK_TIMEOUT_SECS,
+            enable_metrics: true,
         }
     }
 }
@@ -129,6 +133,120 @@ impl IbcConfig {
             return Err("lock_timeout_secs must be > 0".into());
         }
         Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Metrics
+// -----------------------------------------------------------------------------
+
+/// Metrics for the IBC light client subsystem.
+#[derive(Clone)]
+pub struct IbcMetrics {
+    pub clients_created: Counter,
+    pub clients_updated: Counter,
+    pub clients_frozen: Counter,
+    pub misbehaviours_submitted: Counter,
+    pub headers_verified: Counter,
+    pub header_failures: Counter,
+    pub consensus_states_pruned: Counter,
+    pub total_clients: Gauge,
+    pub frozen_clients: Gauge,
+    pub registry_coherence: Gauge,
+}
+
+impl IbcMetrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            clients_created: register_counter!(
+                "iona_ibc_clients_created_total",
+                "Total IBC clients created"
+            )?,
+            clients_updated: register_counter!(
+                "iona_ibc_clients_updated_total",
+                "Total IBC client updates"
+            )?,
+            clients_frozen: register_counter!(
+                "iona_ibc_clients_frozen_total",
+                "Total IBC clients frozen"
+            )?,
+            misbehaviours_submitted: register_counter!(
+                "iona_ibc_misbehaviours_submitted_total",
+                "Total misbehaviours submitted"
+            )?,
+            headers_verified: register_counter!(
+                "iona_ibc_headers_verified_total",
+                "Total headers verified successfully"
+            )?,
+            header_failures: register_counter!(
+                "iona_ibc_header_failures_total",
+                "Total header verification failures"
+            )?,
+            consensus_states_pruned: register_counter!(
+                "iona_ibc_consensus_pruned_total",
+                "Total consensus states pruned"
+            )?,
+            total_clients: register_gauge!(
+                "iona_ibc_total_clients",
+                "Number of active IBC clients"
+            )?,
+            frozen_clients: register_gauge!(
+                "iona_ibc_frozen_clients",
+                "Number of frozen IBC clients"
+            )?,
+            registry_coherence: register_gauge!(
+                "iona_ibc_registry_coherence",
+                "Overall IBC registry quantum coherence"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or when metrics disabled).
+    pub fn new_unregistered() -> Self {
+        Self {
+            clients_created: Counter::new("iona_ibc_clients_created_total", "Created").unwrap(),
+            clients_updated: Counter::new("iona_ibc_clients_updated_total", "Updated").unwrap(),
+            clients_frozen: Counter::new("iona_ibc_clients_frozen_total", "Frozen").unwrap(),
+            misbehaviours_submitted: Counter::new("iona_ibc_misbehaviours_submitted_total", "Misbehaviours").unwrap(),
+            headers_verified: Counter::new("iona_ibc_headers_verified_total", "Verified").unwrap(),
+            header_failures: Counter::new("iona_ibc_header_failures_total", "Failures").unwrap(),
+            consensus_states_pruned: Counter::new("iona_ibc_consensus_pruned_total", "Pruned").unwrap(),
+            total_clients: Gauge::new("iona_ibc_total_clients", "Total clients").unwrap(),
+            frozen_clients: Gauge::new("iona_ibc_frozen_clients", "Frozen clients").unwrap(),
+            registry_coherence: Gauge::new("iona_ibc_registry_coherence", "Coherence").unwrap(),
+        }
+    }
+
+    pub fn record_client_created(&self) {
+        self.clients_created.inc();
+    }
+    pub fn record_client_updated(&self) {
+        self.clients_updated.inc();
+    }
+    pub fn record_client_frozen(&self) {
+        self.clients_frozen.inc();
+    }
+    pub fn record_misbehaviour(&self) {
+        self.misbehaviours_submitted.inc();
+    }
+    pub fn record_header_verified(&self) {
+        self.headers_verified.inc();
+    }
+    pub fn record_header_failure(&self) {
+        self.header_failures.inc();
+    }
+    pub fn record_pruned(&self) {
+        self.consensus_states_pruned.inc();
+    }
+    pub fn set_total_clients(&self, count: usize) {
+        self.total_clients.set(count as f64);
+    }
+    pub fn set_frozen_clients(&self, count: usize) {
+        self.frozen_clients.set(count as f64);
+    }
+    pub fn set_coherence(&self, val: f64) {
+        self.registry_coherence.set(val);
     }
 }
 
@@ -470,6 +588,7 @@ struct PersistentRegistryV1 {
     consensus_states: BTreeMap<(ClientId, IbcHeight), ConsensusState>,
     next_client_seq: u64,
     coherence: f64,
+    misbehaviours: Vec<Misbehaviour>,
     last_modified: u64,
 }
 
@@ -481,6 +600,7 @@ impl PersistentRegistryV1 {
             consensus_states: reg.consensus_states.clone(),
             next_client_seq: reg.next_client_seq,
             coherence: reg.coherence,
+            misbehaviours: reg.misbehaviours.clone(),
             last_modified: current_timestamp(),
         }
     }
@@ -491,6 +611,7 @@ impl PersistentRegistryV1 {
             consensus_states: self.consensus_states,
             next_client_seq: self.next_client_seq,
             coherence: self.coherence,
+            misbehaviours: self.misbehaviours,
         }
     }
 }
@@ -514,12 +635,12 @@ fn acquire_lock(path: &Path, timeout_secs: u64) -> Result<File, IbcError> {
         .open(&lock_path)
         .map_err(|e| IbcError::LockFailed(e.to_string()))?;
     let timeout = Duration::from_secs(timeout_secs);
-    let start = SystemTime::now();
+    let start = Instant::now();
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
             Err(_) => {
-                if start.elapsed().unwrap_or_default() > timeout {
+                if start.elapsed() > timeout {
                     return Err(IbcError::LockFailed(format!(
                         "timeout after {}s",
                         timeout_secs
@@ -529,10 +650,6 @@ fn acquire_lock(path: &Path, timeout_secs: u64) -> Result<File, IbcError> {
             }
         }
     }
-}
-
-fn release_lock(file: File) -> Result<(), IbcError> {
-    file.unlock().map_err(|e| IbcError::LockFailed(e.to_string()))
 }
 
 fn load_registry(path: &Path, config: &IbcConfig) -> Result<LightClientRegistry, IbcError> {
@@ -561,7 +678,11 @@ fn load_registry(path: &Path, config: &IbcConfig) -> Result<LightClientRegistry,
     }
 }
 
-fn save_registry(path: &Path, registry: &LightClientRegistry, config: &IbcConfig) -> Result<(), IbcError> {
+fn save_registry(
+    path: &Path,
+    registry: &LightClientRegistry,
+    config: &IbcConfig,
+) -> Result<(), IbcError> {
     let st = PersistentRegistryV1::from_registry(registry);
     let json = serde_json::to_string_pretty(&st)?;
     let _lock = acquire_lock(path, config.lock_timeout_secs)?;
@@ -572,16 +693,29 @@ fn save_registry(path: &Path, registry: &LightClientRegistry, config: &IbcConfig
 }
 
 // -----------------------------------------------------------------------------
-// Light Client Registry (thread‑safe)
+// Light Client Registry (thread-safe)
 // -----------------------------------------------------------------------------
 
 /// On-chain registry of quantum IBC light clients.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightClientRegistry {
     pub clients: BTreeMap<ClientId, ClientState>,
     pub consensus_states: BTreeMap<(ClientId, IbcHeight), ConsensusState>,
     pub next_client_seq: u64,
     pub coherence: f64,
+    pub misbehaviours: Vec<Misbehaviour>,
+}
+
+impl Default for LightClientRegistry {
+    fn default() -> Self {
+        Self {
+            clients: BTreeMap::new(),
+            consensus_states: BTreeMap::new(),
+            next_client_seq: 0,
+            coherence: 1.0,
+            misbehaviours: Vec::new(),
+        }
+    }
 }
 
 impl LightClientRegistry {
@@ -597,7 +731,9 @@ impl LightClientRegistry {
         max_clock_drift_s: u64,
     ) -> Result<ClientId, IbcError> {
         let client_id = format!("{}-{}", chain_id, self.next_client_seq);
-        self.next_client_seq = self.next_client_seq.wrapping_add(1);
+        self.next_client_seq = self.next_client_seq.checked_add(1).ok_or_else(|| {
+            IbcError::Config("client sequence overflow".into())
+        })?;
 
         let client = ClientState::new(
             chain_id,
@@ -649,23 +785,33 @@ impl LightClientRegistry {
             .clone();
 
         // Quantum verification
-        let fidelity = Self::verify_header_quantum(
+        let fidelity = match Self::verify_header_quantum(
             &client,
             &header,
             &trusted_cs,
             current_time_s,
             config,
-        )?;
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                // Increment failure count
+                if let Some(c) = self.clients.get_mut(client_id) {
+                    c.failures_count = c.failures_count.saturating_add(1);
+                }
+                return Err(e);
+            }
+        };
 
         let new_height = header.height;
         let new_cs = ConsensusState::from_header(&header, fidelity);
 
         // Update client
         if new_height > client.latest_height {
-            let client_mut = self.clients.get_mut(client_id).unwrap();
-            client_mut.latest_height = new_height;
-            client_mut.updates_count += 1;
-            client_mut.apply_decoherence();
+            if let Some(client_mut) = self.clients.get_mut(client_id) {
+                client_mut.latest_height = new_height;
+                client_mut.updates_count = client_mut.updates_count.saturating_add(1);
+                client_mut.apply_decoherence();
+            }
         }
 
         self.consensus_states
@@ -681,17 +827,10 @@ impl LightClientRegistry {
 
     /// Prune old consensus states for a client.
     fn prune_consensus_states(&mut self, client_id: &str, keep: usize) {
-        let prefix = (client_id.to_string(), IbcHeight::zero());
         let mut heights: Vec<IbcHeight> = self
             .consensus_states
             .keys()
-            .filter_map(|(id, h)| {
-                if id == client_id {
-                    Some(*h)
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(id, h)| if id == client_id { Some(*h) } else { None })
             .collect();
         heights.sort_unstable();
         if heights.len() > keep {
@@ -747,9 +886,13 @@ impl LightClientRegistry {
         misbehaviour.detection_confidence = witness;
 
         let freeze_height = misbehaviour.header_1.height;
-        let client_mut = self.clients.get_mut(client_id).unwrap();
-        client_mut.freeze(freeze_height);
+        if let Some(client_mut) = self.clients.get_mut(client_id) {
+            client_mut.freeze(freeze_height);
+        }
         self.coherence *= 0.99;
+
+        // Store misbehaviour for audit
+        self.misbehaviours.push(misbehaviour);
 
         info!(
             client_id = %client_id,
@@ -869,7 +1012,13 @@ impl LightClientRegistry {
             coherence: self.coherence,
             total_updates: self.clients.values().map(|c| c.updates_count).sum(),
             total_failures: self.clients.values().map(|c| c.failures_count).sum(),
+            misbehaviours_count: self.misbehaviours.len(),
         }
+    }
+
+    /// Get misbehaviours.
+    pub fn misbehaviours(&self) -> &[Misbehaviour] {
+        &self.misbehaviours
     }
 }
 
@@ -886,56 +1035,68 @@ pub struct IbcStats {
     pub coherence: f64,
     pub total_updates: u64,
     pub total_failures: u64,
+    pub misbehaviours_count: usize,
 }
 
 // -----------------------------------------------------------------------------
-// IBC Light Client Manager (thread‑safe, persistent)
+// IBC Light Client Manager (thread-safe, persistent)
 // -----------------------------------------------------------------------------
 
-/// Manages IBC light clients with persistence and thread‑safety.
+/// Manages IBC light clients with persistence and thread-safety.
 #[derive(Clone)]
 pub struct IbcManager {
     registry: Arc<Mutex<LightClientRegistry>>,
     config: Arc<IbcConfig>,
     path: Option<PathBuf>,
+    metrics: Arc<IbcMetrics>,
 }
 
 impl IbcManager {
     /// Create a new manager with configuration.
     pub fn new(config: IbcConfig) -> Result<Self, IbcError> {
         config.validate().map_err(IbcError::Config)?;
+        let metrics = if config.enable_metrics {
+            Arc::new(IbcMetrics::new().map_err(|e| IbcError::Config(e.to_string()))?)
+        } else {
+            Arc::new(IbcMetrics::new_unregistered())
+        };
         Ok(Self {
             registry: Arc::new(Mutex::new(LightClientRegistry::default())),
             config: Arc::new(config),
             path: None,
+            metrics,
         })
     }
 
     /// Create a manager with persistence.
     pub fn with_persistence(data_dir: &str, config: IbcConfig) -> Result<Self, IbcError> {
         config.validate().map_err(IbcError::Config)?;
+        let metrics = if config.enable_metrics {
+            Arc::new(IbcMetrics::new().map_err(|e| IbcError::Config(e.to_string()))?)
+        } else {
+            Arc::new(IbcMetrics::new_unregistered())
+        };
         let path = PathBuf::from(data_dir).join("ibc_registry.json");
         let registry = if path.exists() {
             load_registry(&path, &config)?
         } else {
             LightClientRegistry::default()
         };
-        // Ensure directory exists
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let manager = Self {
             registry: Arc::new(Mutex::new(registry)),
             config: Arc::new(config),
-            path: Some(path),
+            path: Some(path.clone()),
+            metrics,
         };
         // Save initial state if new
-        if let Some(p) = &manager.path {
+        if manager.config.persist_state {
             let reg = manager.registry.lock();
-            if manager.config.persist_state {
-                let _ = save_registry(p, &reg, &manager.config);
-            }
+            let _ = save_registry(&path, &reg, &manager.config);
         }
+        manager.update_metrics();
         Ok(manager)
     }
 
@@ -977,6 +1138,8 @@ impl IbcManager {
             trust_period,
             max_drift,
         )?;
+        self.metrics.record_client_created();
+        self.update_metrics();
         if self.config.persist_state {
             if let Some(path) = &self.path {
                 let _ = save_registry(path, &reg, &self.config);
@@ -994,6 +1157,16 @@ impl IbcManager {
     ) -> IbcResult<IbcHeight> {
         let mut reg = self.registry.lock();
         let result = reg.update_client(client_id, header, current_time_s, &self.config);
+        match &result {
+            Ok(_) => {
+                self.metrics.record_client_updated();
+                self.metrics.record_header_verified();
+            }
+            Err(_) => {
+                self.metrics.record_header_failure();
+            }
+        }
+        self.update_metrics();
         if self.config.persist_state {
             if let Some(path) = &self.path {
                 let _ = save_registry(path, &reg, &self.config);
@@ -1006,6 +1179,11 @@ impl IbcManager {
     pub fn submit_misbehaviour(&self, misbehaviour: Misbehaviour) -> IbcResult<()> {
         let mut reg = self.registry.lock();
         let result = reg.submit_misbehaviour(misbehaviour, &self.config);
+        if result.is_ok() {
+            self.metrics.record_misbehaviour();
+            self.metrics.record_client_frozen();
+        }
+        self.update_metrics();
         if self.config.persist_state {
             if let Some(path) = &self.path {
                 let _ = save_registry(path, &reg, &self.config);
@@ -1039,6 +1217,11 @@ impl IbcManager {
         self.registry.lock().stats()
     }
 
+    /// Get misbehaviours.
+    pub fn misbehaviours(&self) -> Vec<Misbehaviour> {
+        self.registry.lock().misbehaviours().to_vec()
+    }
+
     /// Flush state to disk.
     pub fn flush(&self) -> IbcResult<()> {
         if let Some(path) = &self.path {
@@ -1057,12 +1240,22 @@ impl IbcManager {
     pub fn prune_client(&self, client_id: &str, keep: usize) -> IbcResult<()> {
         let mut reg = self.registry.lock();
         reg.prune_consensus_states(client_id, keep);
+        self.metrics.record_pruned();
         if self.config.persist_state {
             if let Some(path) = &self.path {
                 let _ = save_registry(path, &reg, &self.config);
             }
         }
         Ok(())
+    }
+
+    /// Update metrics from current registry.
+    fn update_metrics(&self) {
+        let reg = self.registry.lock();
+        self.metrics.set_total_clients(reg.clients.len());
+        self.metrics
+            .set_frozen_clients(reg.clients.values().filter(|c| c.frozen).count());
+        self.metrics.set_coherence(reg.coherence);
     }
 }
 
@@ -1120,7 +1313,8 @@ mod tests {
 
     fn test_config() -> IbcConfig {
         let mut cfg = IbcConfig::default();
-        cfg.persist_state = true;
+        cfg.persist_state = false; // Disable persistence for most tests to avoid file I/O overhead
+        cfg.enable_metrics = false; // Disable metrics to avoid global registry clashes
         cfg.min_fidelity = 0.5;
         cfg
     }
@@ -1196,6 +1390,45 @@ mod tests {
         let state = manager.client(&id).unwrap();
         assert_eq!(state.latest_height, IbcHeight::new(4, 101));
         assert_eq!(state.updates_count, 1);
+        assert_eq!(state.failures_count, 0);
+    }
+
+    #[test]
+    fn test_update_client_failure_increments_failures() {
+        let cfg = test_config();
+        let manager = IbcManager::new(cfg).unwrap();
+        let trusted_h = IbcHeight::new(4, 100);
+        let trusted_ts = 1_700_000_000u64;
+        let cs = make_consensus(trusted_ts);
+
+        let id = manager
+            .create_client(
+                "chain-1".into(),
+                trusted_h,
+                cs,
+                None, None, None, None,
+            )
+            .unwrap();
+
+        // Header with wrong validators hash (should fail)
+        let header = Header {
+            chain_id: "chain-1".into(),
+            height: IbcHeight::new(4, 101),
+            timestamp: trusted_ts + 6,
+            validators_hash: vec![0x00u8; 32], // wrong
+            next_validators_hash: vec![0xCDu8; 32],
+            app_hash: vec![2u8; 32],
+            last_commit_hash: vec![3u8; 32],
+            trusted_height: trusted_h,
+            trusted_validators_hash: vec![0xABu8; 32], // original
+            quantum_signature: vec![],
+        };
+
+        let result = manager.update_client(&id, header, trusted_ts + 10);
+        assert!(result.is_err());
+        let state = manager.client(&id).unwrap();
+        assert_eq!(state.failures_count, 1);
+        assert_eq!(state.updates_count, 0);
     }
 
     #[test]
@@ -1246,13 +1479,16 @@ mod tests {
         let state = manager.client(&id).unwrap();
         assert!(state.frozen);
         assert!((state.coherence - 0.0).abs() < 1e-10);
+        assert_eq!(manager.misbehaviours().len(), 1);
     }
 
     #[test]
     fn test_persistence() {
         let dir = tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
-        let cfg = test_config();
+        let mut cfg = test_config();
+        cfg.persist_state = true;
+        cfg.enable_metrics = false;
 
         {
             let manager = IbcManager::with_persistence(path, cfg.clone()).unwrap();
