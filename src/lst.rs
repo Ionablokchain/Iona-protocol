@@ -14,9 +14,11 @@
 //! - Validation of all operations.
 //! - Proper error handling with descriptive variants.
 //! - Structured logging with `tracing`.
+//! - Prometheus metrics for observability.
 
 use fs2::FileExt;
 use parking_lot::Mutex;
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -24,7 +26,7 @@ use std::{
     io::{BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -90,6 +92,8 @@ pub struct LstConfig {
     pub persist_state: bool,
     /// Lock timeout in seconds.
     pub lock_timeout_secs: u64,
+    /// Whether to enable Prometheus metrics.
+    pub enable_metrics: bool,
 }
 
 impl Default for LstConfig {
@@ -102,6 +106,7 @@ impl Default for LstConfig {
             default_unbonding_blocks: DEFAULT_UNBONDING_BLOCKS,
             persist_state: true,
             lock_timeout_secs: LOCK_TIMEOUT_SECS,
+            enable_metrics: true,
         }
     }
 }
@@ -175,9 +180,119 @@ pub enum LstError {
 
     #[error("pool is frozen (coherence = 0)")]
     PoolFrozen,
+
+    #[error("integer overflow")]
+    IntegerOverflow,
+
+    #[error("metrics error: {0}")]
+    Metrics(#[from] prometheus::Error),
 }
 
 pub type LstResult<T> = Result<T, LstError>;
+
+// -----------------------------------------------------------------------------
+// LST Metrics
+// -----------------------------------------------------------------------------
+
+/// Metrics for the liquid staking pool.
+#[derive(Clone)]
+pub struct LstMetrics {
+    pub total_staked: Gauge,
+    pub total_shares: Gauge,
+    pub exchange_rate: Gauge,
+    pub total_holders: Gauge,
+    pub pending_withdrawals: Gauge,
+    pub coherence: Gauge,
+    pub entanglement_entropy: Gauge,
+    pub stake_operations: Counter,
+    pub unstake_operations: Counter,
+    pub rewards_distributed: Counter,
+}
+
+impl LstMetrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            total_staked: register_gauge!(
+                "iona_lst_total_staked",
+                "Total IONA staked in the pool"
+            )?,
+            total_shares: register_gauge!(
+                "iona_lst_total_shares",
+                "Total stIONA shares in circulation"
+            )?,
+            exchange_rate: register_gauge!(
+                "iona_lst_exchange_rate",
+                "Current exchange rate (IONA per stIONA)"
+            )?,
+            total_holders: register_gauge!(
+                "iona_lst_total_holders",
+                "Number of stIONA holders"
+            )?,
+            pending_withdrawals: register_gauge!(
+                "iona_lst_pending_withdrawals",
+                "Number of pending unstaking requests"
+            )?,
+            coherence: register_gauge!(
+                "iona_lst_coherence",
+                "Quantum coherence of the pool"
+            )?,
+            entanglement_entropy: register_gauge!(
+                "iona_lst_entanglement_entropy",
+                "Entanglement entropy of the pool"
+            )?,
+            stake_operations: register_counter!(
+                "iona_lst_stake_operations_total",
+                "Total stake operations"
+            )?,
+            unstake_operations: register_counter!(
+                "iona_lst_unstake_operations_total",
+                "Total unstake operations"
+            )?,
+            rewards_distributed: register_counter!(
+                "iona_lst_rewards_distributed_total",
+                "Total rewards distributed"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or when metrics disabled).
+    pub fn new_unregistered() -> Self {
+        Self {
+            total_staked: Gauge::new("iona_lst_total_staked", "Staked").unwrap(),
+            total_shares: Gauge::new("iona_lst_total_shares", "Shares").unwrap(),
+            exchange_rate: Gauge::new("iona_lst_exchange_rate", "Rate").unwrap(),
+            total_holders: Gauge::new("iona_lst_total_holders", "Holders").unwrap(),
+            pending_withdrawals: Gauge::new("iona_lst_pending_withdrawals", "Pending").unwrap(),
+            coherence: Gauge::new("iona_lst_coherence", "Coherence").unwrap(),
+            entanglement_entropy: Gauge::new("iona_lst_entanglement_entropy", "Entropy").unwrap(),
+            stake_operations: Counter::new("iona_lst_stake_operations_total", "Stakes").unwrap(),
+            unstake_operations: Counter::new("iona_lst_unstake_operations_total", "Unstakes").unwrap(),
+            rewards_distributed: Counter::new("iona_lst_rewards_distributed_total", "Rewards").unwrap(),
+        }
+    }
+
+    /// Update all metrics from pool stats.
+    fn update(&self, stats: &LstStats) {
+        self.total_staked.set(stats.total_staked as f64);
+        self.total_shares.set(stats.total_shares as f64);
+        self.exchange_rate.set(stats.exchange_rate_f64);
+        self.total_holders.set(stats.total_holders as f64);
+        self.pending_withdrawals.set(stats.pending_withdrawals as f64);
+        self.coherence.set(stats.coherence);
+        self.entanglement_entropy.set(stats.entanglement_entropy);
+    }
+
+    pub fn record_stake(&self) {
+        self.stake_operations.inc();
+    }
+    pub fn record_unstake(&self) {
+        self.unstake_operations.inc();
+    }
+    pub fn record_reward(&self, amount: u64) {
+        self.rewards_distributed.inc_by(amount as f64);
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Persistent State (versioned)
@@ -252,12 +367,12 @@ fn acquire_lock(path: &Path, timeout_secs: u64) -> Result<File, LstError> {
         .open(&lock_path)
         .map_err(|e| LstError::LockFailed(e.to_string()))?;
     let timeout = Duration::from_secs(timeout_secs);
-    let start = SystemTime::now();
+    let start = Instant::now();
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
             Err(_) => {
-                if start.elapsed().unwrap_or_default() > timeout {
+                if start.elapsed() > timeout {
                     return Err(LstError::LockFailed(format!(
                         "timeout after {}s",
                         timeout_secs
@@ -267,10 +382,6 @@ fn acquire_lock(path: &Path, timeout_secs: u64) -> Result<File, LstError> {
             }
         }
     }
-}
-
-fn release_lock(file: File) -> Result<(), LstError> {
-    file.unlock().map_err(|e| LstError::LockFailed(e.to_string()))
 }
 
 fn load_state(path: &Path, config: &LstConfig) -> Result<LstPool, LstError> {
@@ -394,20 +505,36 @@ impl LstPool {
         }
 
         let rate = self.exchange_rate();
-        let shares = (iona_amount as u128)
-            .saturating_mul(RATE_SCALING_FACTOR)
+        // Compute shares with checked arithmetic
+        let numerator = (iona_amount as u128)
+            .checked_mul(RATE_SCALING_FACTOR)
+            .ok_or(LstError::IntegerOverflow)?;
+        let shares = numerator
             .checked_div(rate)
-            .unwrap_or(0);
+            .ok_or(LstError::IntegerOverflow)?;
 
         if shares == 0 {
             return Err(LstError::ZeroShares);
         }
 
-        self.total_staked = self.total_staked.saturating_add(iona_amount);
-        self.total_shares = self.total_shares.saturating_add(shares);
-        *self.balances.entry(staker.to_string()).or_insert(0) += shares;
+        // Update total staked and shares with checked add
+        self.total_staked = self
+            .total_staked
+            .checked_add(iona_amount)
+            .ok_or(LstError::IntegerOverflow)?;
+        self.total_shares = self
+            .total_shares
+            .checked_add(shares)
+            .ok_or(LstError::IntegerOverflow)?;
 
-        self.total_stake_operations += 1;
+        // Update balance with checked add
+        let bal = self.balances.entry(staker.to_string()).or_insert(0);
+        *bal = bal.checked_add(shares).ok_or(LstError::IntegerOverflow)?;
+
+        self.total_stake_operations = self
+            .total_stake_operations
+            .checked_add(1)
+            .ok_or(LstError::IntegerOverflow)?;
         self.apply_decoherence(config);
 
         info!(
@@ -448,20 +575,30 @@ impl LstPool {
         }
 
         let rate = self.exchange_rate();
-        let iona_amount =
-            (shares.saturating_mul(rate) / RATE_SCALING_FACTOR) as u64;
+        let iona_amount = (shares.saturating_mul(rate) / RATE_SCALING_FACTOR) as u64;
 
-        *self.balances.entry(staker.to_string()).or_insert(0) =
-            balance.saturating_sub(shares);
-        self.total_shares = self.total_shares.saturating_sub(shares);
-        self.total_staked = self.total_staked.saturating_sub(iona_amount);
+        // Update balance with checked sub
+        let new_balance = balance
+            .checked_sub(shares)
+            .ok_or(LstError::IntegerOverflow)?;
+        self.balances.insert(staker.to_string(), new_balance);
+
+        self.total_shares = self
+            .total_shares
+            .checked_sub(shares)
+            .ok_or(LstError::IntegerOverflow)?;
+        self.total_staked = self
+            .total_staked
+            .checked_sub(iona_amount)
+            .ok_or(LstError::IntegerOverflow)?;
 
         let tunneling = config.tunneling_coefficient
             * (1.0 - self.entanglement_entropy).max(0.0);
         let effective_unbonding = (unbonding_blocks as f64 * tunneling.max(0.5)) as u64;
         let completion_height = current_height
-            .saturating_add(effective_unbonding)
-            .max(current_height + 1);
+            .checked_add(effective_unbonding)
+            .and_then(|h| h.checked_add(1))
+            .ok_or(LstError::IntegerOverflow)?;
 
         self.pending_withdrawals.push((
             staker.to_string(),
@@ -469,7 +606,10 @@ impl LstPool {
             completion_height,
         ));
 
-        self.total_unstake_operations += 1;
+        self.total_unstake_operations = self
+            .total_unstake_operations
+            .checked_add(1)
+            .ok_or(LstError::IntegerOverflow)?;
         self.apply_decoherence(config);
 
         info!(
@@ -508,10 +648,15 @@ impl LstPool {
 
     // ── Rewards ────────────────────────────────────────────────────────
 
-    pub fn add_rewards(&mut self, reward_iona: u64, config: &LstConfig) {
-        self.total_staked = self.total_staked.saturating_add(reward_iona);
-        self.total_rewards_distributed =
-            self.total_rewards_distributed.saturating_add(reward_iona);
+    pub fn add_rewards(&mut self, reward_iona: u64, config: &LstConfig) -> LstResult<()> {
+        self.total_staked = self
+            .total_staked
+            .checked_add(reward_iona)
+            .ok_or(LstError::IntegerOverflow)?;
+        self.total_rewards_distributed = self
+            .total_rewards_distributed
+            .checked_add(reward_iona)
+            .ok_or(LstError::IntegerOverflow)?;
 
         // Rewards slightly increase coherence
         self.coherence = (self.coherence * 1.0001).min(1.0);
@@ -523,6 +668,8 @@ impl LstPool {
             coherence = self.coherence,
             "rewards added"
         );
+
+        Ok(())
     }
 
     // ── Transfer ──────────────────────────────────────────────────────
@@ -546,9 +693,13 @@ impl LstPool {
             });
         }
 
-        *self.balances.entry(from.to_string()).or_insert(0) =
-            from_bal.saturating_sub(shares);
-        *self.balances.entry(to.to_string()).or_insert(0) += shares;
+        let new_from_bal = from_bal
+            .checked_sub(shares)
+            .ok_or(LstError::IntegerOverflow)?;
+        self.balances.insert(from.to_string(), new_from_bal);
+
+        let to_bal = self.balances.entry(to.to_string()).or_insert(0);
+        *to_bal = to_bal.checked_add(shares).ok_or(LstError::IntegerOverflow)?;
 
         self.apply_decoherence(config);
 
@@ -636,22 +787,34 @@ pub struct LstManager {
     pool: Arc<Mutex<LstPool>>,
     config: Arc<LstConfig>,
     path: Option<PathBuf>,
+    metrics: Arc<LstMetrics>,
 }
 
 impl LstManager {
     /// Create a new manager with configuration.
     pub fn new(config: LstConfig) -> Result<Self, LstError> {
         config.validate().map_err(LstError::Config)?;
+        let metrics = if config.enable_metrics {
+            Arc::new(LstMetrics::new()?)
+        } else {
+            Arc::new(LstMetrics::new_unregistered())
+        };
         Ok(Self {
             pool: Arc::new(Mutex::new(LstPool::default())),
             config: Arc::new(config),
             path: None,
+            metrics,
         })
     }
 
     /// Create a manager with persistence.
     pub fn with_persistence(data_dir: &str, config: LstConfig) -> Result<Self, LstError> {
         config.validate().map_err(LstError::Config)?;
+        let metrics = if config.enable_metrics {
+            Arc::new(LstMetrics::new()?)
+        } else {
+            Arc::new(LstMetrics::new_unregistered())
+        };
         let path = PathBuf::from(data_dir).join("lst_pool.json");
         let pool = if path.exists() {
             load_state(&path, &config)?
@@ -664,20 +827,24 @@ impl LstManager {
         let manager = Self {
             pool: Arc::new(Mutex::new(pool)),
             config: Arc::new(config),
-            path: Some(path),
+            path: Some(path.clone()),
+            metrics,
         };
-        if let Some(p) = &manager.path {
+        if manager.config.persist_state {
             let pool = manager.pool.lock();
-            if manager.config.persist_state {
-                let _ = save_state(p, &pool, &manager.config);
-            }
+            let _ = save_state(&path, &pool, &manager.config);
         }
+        manager.update_metrics();
         Ok(manager)
     }
 
     pub fn stake(&self, staker: &str, iona_amount: u64) -> LstResult<u128> {
         let mut pool = self.pool.lock();
         let result = pool.stake(staker, iona_amount, &self.config);
+        if result.is_ok() {
+            self.metrics.record_stake();
+        }
+        self.update_metrics();
         if self.config.persist_state {
             if let Some(path) = &self.path {
                 let _ = save_state(path, &pool, &self.config);
@@ -696,6 +863,10 @@ impl LstManager {
         let unbonding = unbonding_blocks.unwrap_or(self.config.default_unbonding_blocks);
         let mut pool = self.pool.lock();
         let result = pool.request_unstake(staker, shares, current_height, unbonding, &self.config);
+        if result.is_ok() {
+            self.metrics.record_unstake();
+        }
+        self.update_metrics();
         if self.config.persist_state {
             if let Some(path) = &self.path {
                 let _ = save_state(path, &pool, &self.config);
@@ -707,6 +878,7 @@ impl LstManager {
     pub fn process_withdrawals(&self, current_height: u64) -> Vec<(String, u64)> {
         let mut pool = self.pool.lock();
         let result = pool.process_withdrawals(current_height, &self.config);
+        self.update_metrics();
         if self.config.persist_state {
             if let Some(path) = &self.path {
                 let _ = save_state(path, &pool, &self.config);
@@ -715,19 +887,25 @@ impl LstManager {
         result
     }
 
-    pub fn add_rewards(&self, reward_iona: u64) {
+    pub fn add_rewards(&self, reward_iona: u64) -> LstResult<()> {
         let mut pool = self.pool.lock();
-        pool.add_rewards(reward_iona, &self.config);
+        let result = pool.add_rewards(reward_iona, &self.config);
+        if result.is_ok() {
+            self.metrics.record_reward(reward_iona);
+        }
+        self.update_metrics();
         if self.config.persist_state {
             if let Some(path) = &self.path {
                 let _ = save_state(path, &pool, &self.config);
             }
         }
+        result
     }
 
     pub fn transfer(&self, from: &str, to: &str, shares: u128) -> LstResult<()> {
         let mut pool = self.pool.lock();
         let result = pool.transfer(from, to, shares, &self.config);
+        self.update_metrics();
         if self.config.persist_state {
             if let Some(path) = &self.path {
                 let _ = save_state(path, &pool, &self.config);
@@ -775,6 +953,44 @@ impl LstManager {
     pub fn pool(&self) -> LstPool {
         self.pool.lock().clone()
     }
+
+    /// Update Prometheus metrics from current pool state.
+    fn update_metrics(&self) {
+        let pool = self.pool.lock();
+        let stats = pool.stats();
+        self.metrics.update(&stats);
+    }
+
+    /// Get a snapshot of metrics (for testing or external monitoring).
+    pub fn metrics_snapshot(&self) -> LstMetricsSnapshot {
+        LstMetricsSnapshot {
+            total_staked: self.metrics.total_staked.get() as u64,
+            total_shares: self.metrics.total_shares.get() as u128,
+            exchange_rate: self.metrics.exchange_rate.get(),
+            total_holders: self.metrics.total_holders.get() as usize,
+            pending_withdrawals: self.metrics.pending_withdrawals.get() as usize,
+            coherence: self.metrics.coherence.get(),
+            entanglement_entropy: self.metrics.entanglement_entropy.get(),
+            stake_operations: self.metrics.stake_operations.get(),
+            unstake_operations: self.metrics.unstake_operations.get(),
+            rewards_distributed: self.metrics.rewards_distributed.get() as u64,
+        }
+    }
+}
+
+/// Snapshot of LST metrics.
+#[derive(Debug, Clone)]
+pub struct LstMetricsSnapshot {
+    pub total_staked: u64,
+    pub total_shares: u128,
+    pub exchange_rate: f64,
+    pub total_holders: usize,
+    pub pending_withdrawals: usize,
+    pub coherence: f64,
+    pub entanglement_entropy: f64,
+    pub stake_operations: u64,
+    pub unstake_operations: u64,
+    pub rewards_distributed: u64,
 }
 
 // -----------------------------------------------------------------------------
@@ -789,6 +1005,7 @@ mod tests {
     fn test_config() -> LstConfig {
         let mut cfg = LstConfig::default();
         cfg.persist_state = true;
+        cfg.enable_metrics = false; // avoid global registration conflicts
         cfg.min_coherence = 0.5;
         cfg
     }
@@ -802,7 +1019,7 @@ mod tests {
         assert!(shares > 0);
         assert_eq!(manager.balance_of("alice"), shares);
 
-        manager.add_rewards(100_000);
+        manager.add_rewards(100_000).unwrap();
 
         let iona_back = manager
             .request_unstake("alice", shares, 0, Some(1))
@@ -821,7 +1038,7 @@ mod tests {
 
         manager.stake("alice", 1_000_000).unwrap();
         let rate_before = manager.exchange_rate();
-        manager.add_rewards(100_000);
+        manager.add_rewards(100_000).unwrap();
         let rate_after = manager.exchange_rate();
 
         assert!(rate_after > rate_before);
@@ -857,7 +1074,7 @@ mod tests {
         {
             let manager = LstManager::with_persistence(path, cfg.clone()).unwrap();
             manager.stake("alice", 1_000_000).unwrap();
-            manager.add_rewards(50_000);
+            manager.add_rewards(50_000).unwrap();
             manager.flush().unwrap();
         }
 
@@ -875,7 +1092,7 @@ mod tests {
         let manager = LstManager::new(cfg).unwrap();
 
         manager.stake("alice", 1_000_000).unwrap();
-        manager.add_rewards(50_000);
+        manager.add_rewards(50_000).unwrap();
 
         let stats = manager.stats();
         assert!(stats.total_staked > 0);
@@ -928,5 +1145,19 @@ mod tests {
         cfg.tunneling_coefficient = 0.5;
         cfg.operation_decoherence = -0.1;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_metrics_snapshot() {
+        let cfg = test_config();
+        let manager = LstManager::new(cfg).unwrap();
+
+        manager.stake("alice", 1_000_000).unwrap();
+        let snapshot = manager.metrics_snapshot();
+
+        assert_eq!(snapshot.stake_operations, 1);
+        assert_eq!(snapshot.total_holders, 1);
+        assert!(snapshot.total_staked > 0);
+        assert!(snapshot.coherence < 1.0);
     }
 }
