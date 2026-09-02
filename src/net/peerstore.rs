@@ -127,6 +127,7 @@ pub struct PeerstoreMetrics {
 }
 
 impl PeerstoreMetrics {
+    /// Create and register metrics with the global Prometheus registry.
     pub fn new() -> Result<Self, prometheus::Error> {
         let peer_count = register_gauge!(
             "iona_peerstore_peers",
@@ -181,6 +182,33 @@ impl PeerstoreMetrics {
         })
     }
 
+    /// Create an unregistered instance (for tests or disabled metrics).
+    pub fn new_unregistered() -> Self {
+        Self {
+            peer_count: Gauge::new("iona_peerstore_peers", "Peer count").unwrap(),
+            add_total: Counter::new("iona_peerstore_adds_total", "Adds").unwrap(),
+            remove_total: Counter::new("iona_peerstore_removes_total", "Removes").unwrap(),
+            update_total: Counter::new("iona_peerstore_updates_total", "Updates").unwrap(),
+            success_total: CounterVec::new(
+                prometheus::Opts::new("iona_peerstore_successes_total", "Successes"),
+                &["peer_id"],
+            ).unwrap(),
+            failure_total: CounterVec::new(
+                prometheus::Opts::new("iona_peerstore_failures_total", "Failures"),
+                &["peer_id"],
+            ).unwrap(),
+            prune_total: Counter::new("iona_peerstore_prunes_total", "Prunes").unwrap(),
+            save_total: CounterVec::new(
+                prometheus::Opts::new("iona_peerstore_saves_total", "Saves"),
+                &["status"],
+            ).unwrap(),
+            load_total: CounterVec::new(
+                prometheus::Opts::new("iona_peerstore_loads_total", "Loads"),
+                &["status"],
+            ).unwrap(),
+        }
+    }
+
     pub fn set_peer_count(&self, count: usize) {
         self.peer_count.set(count as f64);
     }
@@ -220,29 +248,7 @@ impl PeerstoreMetrics {
 
 impl Default for PeerstoreMetrics {
     fn default() -> Self {
-        Self::new().unwrap_or_else(|_| Self {
-            peer_count: Gauge::new("iona_peerstore_peers", "Peer count").unwrap(),
-            add_total: Counter::new("iona_peerstore_adds_total", "Adds").unwrap(),
-            remove_total: Counter::new("iona_peerstore_removes_total", "Removes").unwrap(),
-            update_total: Counter::new("iona_peerstore_updates_total", "Updates").unwrap(),
-            success_total: CounterVec::new(
-                prometheus::Opts::new("iona_peerstore_successes_total", "Successes"),
-                &["peer_id"],
-            ).unwrap(),
-            failure_total: CounterVec::new(
-                prometheus::Opts::new("iona_peerstore_failures_total", "Failures"),
-                &["peer_id"],
-            ).unwrap(),
-            prune_total: Counter::new("iona_peerstore_prunes_total", "Prunes").unwrap(),
-            save_total: CounterVec::new(
-                prometheus::Opts::new("iona_peerstore_saves_total", "Saves"),
-                &["status"],
-            ).unwrap(),
-            load_total: CounterVec::new(
-                prometheus::Opts::new("iona_peerstore_loads_total", "Loads"),
-                &["status"],
-            ).unwrap(),
-        })
+        Self::new().unwrap_or_else(|_| Self::new_unregistered())
     }
 }
 
@@ -288,7 +294,7 @@ pub struct Peerstore {
     #[serde(skip)]
     pub config: Option<PeerstoreConfig>,
     #[serde(skip)]
-    pub metrics: Arc<PeerstoreMetrics>,
+    pub metrics: Option<Arc<PeerstoreMetrics>>,
 }
 
 impl Peerstore {
@@ -297,12 +303,12 @@ impl Peerstore {
         Self {
             peers: BTreeMap::new(),
             config: None,
-            metrics: Arc::new(PeerstoreMetrics::default()),
+            metrics: None,
         }
     }
 
-    /// Create a peerstore with configuration and metrics.
-    pub fn with_config(config: PeerstoreConfig, metrics: Arc<PeerstoreMetrics>) -> Self {
+    /// Create a peerstore with configuration and optional metrics.
+    pub fn with_config(config: PeerstoreConfig, metrics: Option<Arc<PeerstoreMetrics>>) -> Self {
         Self {
             peers: BTreeMap::new(),
             config: Some(config),
@@ -311,26 +317,37 @@ impl Peerstore {
     }
 
     /// Load from a JSON file (returns empty store if file doesn't exist).
-    pub fn load(path: &Path, metrics: &PeerstoreMetrics) -> PeerstoreResult<Self> {
+    pub fn load(
+        path: &Path,
+        metrics: Option<Arc<PeerstoreMetrics>>,
+    ) -> PeerstoreResult<Self> {
         let _lock = acquire_lock(path).map_err(PeerstoreError::LockFailed)?;
 
         if !path.exists() {
             debug!(path = %path.display(), "peerstore file not found, using empty");
-            metrics.record_load("empty");
-            return Ok(Self::new());
+            if let Some(m) = &metrics {
+                m.record_load("empty");
+            }
+            return Ok(Self {
+                peers: BTreeMap::new(),
+                config: None,
+                metrics,
+            });
         }
 
         let file = File::open(path).map_err(PeerstoreError::Io)?;
         let reader = BufReader::new(file);
-        let store: Self = serde_json::from_reader(reader)
+        let mut store: Self = serde_json::from_reader(reader)
             .map_err(PeerstoreError::Serialization)?;
 
         // Apply metrics to loaded store.
-        store.metrics = Arc::new(PeerstoreMetrics::default());
-        store.metrics.set_peer_count(store.len());
+        store.metrics = metrics.clone();
+        if let Some(m) = &metrics {
+            m.set_peer_count(store.len());
+            m.record_load("ok");
+        }
 
         info!(path = %path.display(), peers = store.len(), "peerstore loaded");
-        metrics.record_load("ok");
         Ok(store)
     }
 
@@ -346,8 +363,8 @@ impl Peerstore {
         fs::rename(&temp_path, path)
             .map_err(PeerstoreError::Io)?;
 
-        if let Some(metrics) = self.metrics.as_ref() {
-            metrics.record_save("ok");
+        if let Some(m) = &self.metrics {
+            m.record_save("ok");
         }
         trace!(path = %path.display(), "peerstore saved");
         Ok(())
@@ -386,7 +403,7 @@ impl Peerstore {
             });
 
         entry.last_seen = now;
-        entry.success_count += 1;
+        entry.success_count = entry.success_count.saturating_add(1);
 
         // Merge addresses (deduplicate).
         for addr in addrs {
@@ -395,9 +412,11 @@ impl Peerstore {
             }
         }
 
-        self.metrics.record_success(peer_id);
-        self.metrics.record_update();
-        self.metrics.set_peer_count(self.len());
+        if let Some(m) = &self.metrics {
+            m.record_success(peer_id);
+            m.record_update();
+            m.set_peer_count(self.len());
+        }
 
         trace!(peer_id, success_count = entry.success_count, "recorded success");
         Ok(())
@@ -406,8 +425,10 @@ impl Peerstore {
     /// Record a failed connection attempt.
     pub fn record_failure(&mut self, peer_id: &str) {
         if let Some(entry) = self.peers.get_mut(peer_id) {
-            entry.fail_count += 1;
-            self.metrics.record_failure(peer_id);
+            entry.fail_count = entry.fail_count.saturating_add(1);
+            if let Some(m) = &self.metrics {
+                m.record_failure(peer_id);
+            }
             trace!(peer_id, fail_count = entry.fail_count, "recorded failure");
         } else {
             debug!(peer_id, "attempted to record failure for unknown peer");
@@ -427,15 +448,19 @@ impl Peerstore {
                 label: String::new(),
             });
         entry.label = label.to_string();
-        self.metrics.record_update();
+        if let Some(m) = &self.metrics {
+            m.record_update();
+        }
         trace!(peer_id, label, "updated label");
     }
 
     /// Remove a peer from the store.
     pub fn remove(&mut self, peer_id: &str) -> Option<PeerEntry> {
         if let Some(entry) = self.peers.remove(peer_id) {
-            self.metrics.record_remove();
-            self.metrics.set_peer_count(self.len());
+            if let Some(m) = &self.metrics {
+                m.record_remove();
+                m.set_peer_count(self.len());
+            }
             trace!(peer_id, "removed peer");
             Some(entry)
         } else {
@@ -479,8 +504,10 @@ impl Peerstore {
 
         let removed = before - self.peers.len();
         if removed > 0 {
-            self.metrics.record_prune(removed);
-            self.metrics.set_peer_count(self.len());
+            if let Some(m) = &self.metrics {
+                m.record_prune(removed);
+                m.set_peer_count(self.len());
+            }
             trace!(removed, max_age_secs, "pruned old peers");
         }
         removed
@@ -509,7 +536,9 @@ impl Peerstore {
                 self.peers.insert(id.clone(), entry.clone());
             }
         }
-        self.metrics.set_peer_count(self.len());
+        if let Some(m) = &self.metrics {
+            m.set_peer_count(self.len());
+        }
     }
 
     /// Get all peers (for iteration).
@@ -570,14 +599,20 @@ pub struct PeerstoreManager {
     inner: Arc<Mutex<Peerstore>>,
     config: Arc<PeerstoreConfig>,
     path: PathBuf,
-    metrics: Arc<PeerstoreMetrics>,
+    metrics: Option<Arc<PeerstoreMetrics>>,
 }
 
 impl PeerstoreManager {
     /// Create a new manager with the given configuration.
     pub fn new(config: PeerstoreConfig) -> Result<Self, PeerstoreError> {
         config.validate().map_err(PeerstoreError::Config)?;
-        let metrics = Arc::new(PeerstoreMetrics::default());
+
+        // Create metrics if enabled.
+        let metrics = if config.enable_metrics {
+            Some(Arc::new(PeerstoreMetrics::default()))
+        } else {
+            None
+        };
 
         // Ensure directory exists.
         if let Some(parent) = config.persist_path.parent() {
@@ -587,27 +622,27 @@ impl PeerstoreManager {
 
         // Load existing store or create new.
         let store = if config.persist_path.exists() {
-            Peerstore::load(&config.persist_path, &metrics)
+            Peerstore::load(&config.persist_path, metrics.clone())
                 .unwrap_or_else(|_| {
                     warn!("failed to load peerstore, starting fresh");
-                    Peerstore::new()
+                    Peerstore::with_config(config.clone(), metrics.clone())
                 })
         } else {
-            Peerstore::new()
+            Peerstore::with_config(config.clone(), metrics.clone())
         };
 
-        // Apply config and metrics to store.
-        let mut store = store;
-        store.config = Some(config.clone());
-        store.metrics = metrics.clone();
-        store.metrics.set_peer_count(store.len());
-
+        // Apply config and metrics to store (already done in with_config/load).
         let manager = Self {
             inner: Arc::new(Mutex::new(store)),
             config: Arc::new(config),
             path: config.persist_path.clone(),
-            metrics,
+            metrics: metrics.clone(),
         };
+
+        // Update initial peer count metric.
+        if let Some(m) = &metrics {
+            m.set_peer_count(manager.len());
+        }
 
         // Start background tasks if enabled.
         if manager.config.auto_prune {
@@ -629,9 +664,7 @@ impl PeerstoreManager {
     /// Record a successful connection.
     pub fn record_success(&self, peer_id: &str, addrs: &[String]) -> PeerstoreResult<()> {
         let mut store = self.inner.lock();
-        store.record_success(peer_id, addrs)?;
-        // Auto‑save if configured (save will be triggered by background saver).
-        Ok(())
+        store.record_success(peer_id, addrs)
     }
 
     /// Record a failed connection.
@@ -695,9 +728,9 @@ impl PeerstoreManager {
         store.merge(other);
     }
 
-    /// Get metrics snapshot.
-    pub fn metrics_snapshot(&self) -> PeerstoreMetrics {
-        self.metrics.clone()
+    /// Get metrics snapshot (only if metrics enabled).
+    pub fn metrics_snapshot(&self) -> Option<PeerstoreMetrics> {
+        self.metrics.as_ref().map(|m| m.clone())
     }
 
     /// Get configuration.
@@ -852,7 +885,7 @@ mod tests {
         ps.record_success("peer1", &["/ip4/1.2.3.4/tcp/7001".into()])?;
         ps.save(&path)?;
 
-        let ps2 = Peerstore::load(&path, &PeerstoreMetrics::default())?;
+        let ps2 = Peerstore::load(&path, None)?;
         assert_eq!(ps2.len(), 1);
         assert!(ps2.peers.contains_key("peer1"));
         Ok(())
@@ -936,7 +969,7 @@ mod tests {
             lock_timeout_secs: 10,
             persist_path: tempdir().unwrap().path().join("peers.json"),
         };
-        let mut ps = Peerstore::with_config(config, Arc::new(PeerstoreMetrics::default()));
+        let mut ps = Peerstore::with_config(config, Some(Arc::new(PeerstoreMetrics::default())));
         ps.record_success("a", &[]).unwrap();
         ps.record_success("b", &[]).unwrap();
         let err = ps.record_success("c", &[]).unwrap_err();
