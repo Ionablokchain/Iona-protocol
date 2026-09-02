@@ -13,18 +13,20 @@
 //! - Multi-peer fallback: on timeouts/mismatches, switch to the next best peer; retries can re-request partial
 //!   tails or whole chunks without discarding previously verified data.
 //! - Delta sync: if local snapshots exist, the client attempts to download delta updates instead of a full snapshot.
+//! - Optional Prometheus metrics for observability.
+//! - Configurable timeouts, chunk sizes, and peer selection limits.
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use iona::net::state_sync::try_p2p_restore_state;
+//! use iona::net::state_sync::{try_p2p_restore_state, StateSyncConfig};
 //!
+//! let config = StateSyncConfig::default();
 //! let restored = try_p2p_restore_state(
 //!     "./data/node",
 //!     "./data/node/state_full.json",
 //!     vec![multiaddr1, multiaddr2],
-//!     30,
-//!     1024 * 1024,
+//!     config,
 //! ).await?;
 //! ```
 
@@ -45,12 +47,142 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, Swarm, Transport,
 };
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
+
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
+
+/// Configuration for state sync client.
+#[derive(Debug, Clone)]
+pub struct StateSyncConfig {
+    /// Timeout for individual requests (seconds).
+    pub request_timeout_secs: u64,
+    /// Maximum chunk size to request (bytes). The manifest's chunk size takes precedence.
+    pub max_chunk_bytes: usize,
+    /// Maximum number of candidate peers to consider before ranking.
+    pub max_candidates: usize,
+    /// Probe length for throughput measurement (bytes).
+    pub probe_len: u32,
+    /// Whether to enable Prometheus metrics.
+    pub enable_metrics: bool,
+}
+
+impl Default for StateSyncConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_secs: 30,
+            max_chunk_bytes: 1024 * 1024,
+            max_candidates: 6,
+            probe_len: 262_144, // 256 KiB
+            enable_metrics: false,
+        }
+    }
+}
+
+impl StateSyncConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.request_timeout_secs == 0 {
+            return Err("request_timeout_secs must be > 0".into());
+        }
+        if self.max_chunk_bytes == 0 {
+            return Err("max_chunk_bytes must be > 0".into());
+        }
+        if self.max_candidates == 0 {
+            return Err("max_candidates must be > 0".into());
+        }
+        if self.probe_len == 0 {
+            return Err("probe_len must be > 0".into());
+        }
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Metrics
+// -----------------------------------------------------------------------------
+
+/// Prometheus metrics for state sync operations.
+#[derive(Clone)]
+pub struct StateSyncMetrics {
+    /// Number of snapshot manifests received.
+    pub manifests_received: Counter,
+    /// Number of full snapshot downloads started.
+    pub full_snapshot_downloads: Counter,
+    /// Number of delta sync attempts.
+    pub delta_sync_attempts: Counter,
+    /// Number of delta sync successes.
+    pub delta_sync_successes: Counter,
+    /// Total bytes downloaded (across all methods).
+    pub bytes_downloaded: Counter,
+    /// Number of chunk verification failures.
+    pub chunk_verification_failures: Counter,
+    /// Number of peer timeouts encountered.
+    pub peer_timeouts: Counter,
+    /// Current number of connected peers during sync.
+    pub active_peers: Gauge,
+}
+
+impl StateSyncMetrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            manifests_received: register_counter!(
+                "iona_statesync_manifests_received_total",
+                "Total snapshot manifests received"
+            )?,
+            full_snapshot_downloads: register_counter!(
+                "iona_statesync_full_snapshot_downloads_total",
+                "Total full snapshot download attempts"
+            )?,
+            delta_sync_attempts: register_counter!(
+                "iona_statesync_delta_sync_attempts_total",
+                "Total delta sync attempts"
+            )?,
+            delta_sync_successes: register_counter!(
+                "iona_statesync_delta_sync_successes_total",
+                "Total successful delta syncs"
+            )?,
+            bytes_downloaded: register_counter!(
+                "iona_statesync_bytes_downloaded_total",
+                "Total bytes downloaded"
+            )?,
+            chunk_verification_failures: register_counter!(
+                "iona_statesync_chunk_verification_failures_total",
+                "Total chunk verification failures"
+            )?,
+            peer_timeouts: register_counter!(
+                "iona_statesync_peer_timeouts_total",
+                "Total peer timeouts"
+            )?,
+            active_peers: register_gauge!(
+                "iona_statesync_active_peers",
+                "Number of active peers during state sync"
+            )?,
+        })
+    }
+
+    /// Create an unregistered metrics instance (for tests or disabled metrics).
+    pub fn new_unregistered() -> Self {
+        Self {
+            manifests_received: Counter::new("iona_statesync_manifests_received_total", "Manifests").unwrap(),
+            full_snapshot_downloads: Counter::new("iona_statesync_full_snapshot_downloads_total", "Full downloads").unwrap(),
+            delta_sync_attempts: Counter::new("iona_statesync_delta_sync_attempts_total", "Delta attempts").unwrap(),
+            delta_sync_successes: Counter::new("iona_statesync_delta_sync_successes_total", "Delta successes").unwrap(),
+            bytes_downloaded: Counter::new("iona_statesync_bytes_downloaded_total", "Bytes").unwrap(),
+            chunk_verification_failures: Counter::new("iona_statesync_chunk_verification_failures_total", "Verification failures").unwrap(),
+            peer_timeouts: Counter::new("iona_statesync_peer_timeouts_total", "Timeouts").unwrap(),
+            active_peers: Gauge::new("iona_statesync_active_peers", "Active peers").unwrap(),
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Network behaviour
@@ -239,8 +371,8 @@ async fn wait_for_state_manifest_response(
     peer: PeerId,
     timeout_s: u64,
 ) -> Option<StateManifestResponse> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_s.max(3));
-    while tokio::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(timeout_s.max(3));
+    while Instant::now() < deadline {
         let ev = timeout(Duration::from_millis(250), swarm.select_next_some()).await;
         let Ok(ev) = ev else {
             continue;
@@ -269,8 +401,8 @@ async fn wait_for_state_chunk_response(
     expected_offset: u64,
     timeout_s: u64,
 ) -> Option<StateChunkResponse> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_s.max(3));
-    while tokio::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(timeout_s.max(3));
+    while Instant::now() < deadline {
         let ev = timeout(Duration::from_millis(250), swarm.select_next_some()).await;
         let Ok(ev) = ev else {
             continue;
@@ -300,8 +432,8 @@ async fn wait_for_state_index_response(
     peer: PeerId,
     timeout_s: u64,
 ) -> Option<StateIndexResponse> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_s.max(3));
-    while tokio::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(timeout_s.max(3));
+    while Instant::now() < deadline {
         let ev = timeout(Duration::from_millis(250), swarm.select_next_some()).await;
         let Ok(ev) = ev else {
             continue;
@@ -329,8 +461,8 @@ async fn wait_for_delta_manifest_response(
     peer: PeerId,
     timeout_s: u64,
 ) -> Option<DeltaManifestResponse> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_s.max(3));
-    while tokio::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(timeout_s.max(3));
+    while Instant::now() < deadline {
         let ev = timeout(Duration::from_millis(250), swarm.select_next_some()).await;
         let Ok(ev) = ev else {
             continue;
@@ -359,8 +491,8 @@ async fn wait_for_delta_chunk_response(
     expected_offset: u64,
     timeout_s: u64,
 ) -> Option<DeltaChunkResponse> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_s.max(3));
-    while tokio::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(timeout_s.max(3));
+    while Instant::now() < deadline {
         let ev = timeout(Duration::from_millis(250), swarm.select_next_some()).await;
         let Ok(ev) = ev else {
             continue;
@@ -398,7 +530,7 @@ async fn probe_throughput_bps(
     probe_len: u32,
     timeout_s: u64,
 ) -> u64 {
-    let start = tokio::time::Instant::now();
+    let start = Instant::now();
     let req = Req::State(StateReq::Chunk(StateChunkRequest {
         height,
         offset: 0,
@@ -422,12 +554,8 @@ async fn probe_throughput_bps(
 /// Returns `Ok(true)` if the state was restored, `Ok(false)` if no snapshot was found
 /// or no suitable peer, and `Err` on network or I/O errors.
 ///
-/// # Arguments
-/// * `data_dir` – Node data directory (where snapshots are stored).
-/// * `state_full_path` – Path to the `state_full.json` file.
-/// * `peers` – List of peer multiaddresses to try.
-/// * `timeout_s` – Timeout in seconds for requests.
-/// * `chunk_bytes` – Maximum chunk size in bytes (used for fallback; manifest chunk size is preferred).
+/// This is a convenience wrapper around [`try_p2p_restore_state_with_config`] using
+/// default configuration.
 pub async fn try_p2p_restore_state(
     data_dir: &str,
     state_full_path: &str,
@@ -435,6 +563,26 @@ pub async fn try_p2p_restore_state(
     timeout_s: u64,
     chunk_bytes: usize,
 ) -> anyhow::Result<bool> {
+    let config = StateSyncConfig {
+        request_timeout_secs: timeout_s,
+        max_chunk_bytes: chunk_bytes,
+        ..Default::default()
+    };
+    try_p2p_restore_state_with_config(data_dir, state_full_path, peers, config).await
+}
+
+/// Try to download the latest snapshot via P2P and materialize `state_full.json`.
+///
+/// Returns `Ok(true)` if the state was restored, `Ok(false)` if no snapshot was found
+/// or no suitable peer, and `Err` on network or I/O errors.
+pub async fn try_p2p_restore_state_with_config(
+    data_dir: &str,
+    state_full_path: &str,
+    peers: Vec<Multiaddr>,
+    config: StateSyncConfig,
+) -> anyhow::Result<bool> {
+    config.validate().map_err(|e| anyhow::anyhow!("invalid state sync config: {}", e))?;
+
     if Path::new(state_full_path).exists() {
         debug!("state_full.json already exists, skipping restore");
         return Ok(false);
@@ -459,9 +607,7 @@ pub async fn try_p2p_restore_state(
 
     let protocols = vec![(proto_state(), ProtocolSupport::Full)];
     let mut rr_cfg = request_response::Config::default();
-    // Some libp2p versions expose different config methods; keep this compatible.
-    #[allow(deprecated)]
-    rr_cfg.set_request_timeout(Duration::from_secs(timeout_s.max(3)));
+    rr_cfg.set_request_timeout(Duration::from_secs(config.request_timeout_secs.max(3)));
     let rr = RequestResponse::with_codec(Codec, protocols, rr_cfg);
 
     let behaviour = Behaviour { rr };
@@ -477,13 +623,20 @@ pub async fn try_p2p_restore_state(
         let _ = swarm.dial(addr);
     }
 
+    // Metrics setup
+    let metrics = if config.enable_metrics {
+        Some(StateSyncMetrics::new()?)
+    } else {
+        None
+    };
+
     // Phase 1: collect manifests + RTT
-    let mut inflight_manifest: BTreeMap<PeerId, tokio::time::Instant> = BTreeMap::new();
+    let mut inflight_manifest: BTreeMap<PeerId, Instant> = BTreeMap::new();
     let mut candidates: Vec<Candidate> = vec![];
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_s.max(3) * 2);
+    let deadline = Instant::now() + Duration::from_secs(config.request_timeout_secs.max(3) * 2);
 
-    while tokio::time::Instant::now() < deadline {
+    while Instant::now() < deadline {
         let ev = timeout(Duration::from_millis(250), swarm.select_next_some()).await;
         let Ok(ev) = ev else {
             continue;
@@ -493,7 +646,7 @@ pub async fn try_p2p_restore_state(
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 debug!(%peer_id, "statesync: connection established");
                 let req = Req::State(StateReq::Manifest(StateManifestRequest {}));
-                inflight_manifest.insert(peer_id, tokio::time::Instant::now());
+                inflight_manifest.insert(peer_id, Instant::now());
                 swarm.behaviour_mut().rr.send_request(&peer_id, req);
             }
             SwarmEvent::Behaviour(BehaviourEvent::Rr(RequestResponseEvent::Message {
@@ -517,6 +670,9 @@ pub async fn try_p2p_restore_state(
                                 rtt_ms,
                                 throughput_bps: 0,
                             });
+                            if let Some(metrics) = &metrics {
+                                metrics.manifests_received.inc();
+                            }
                         } else {
                             debug!(%peer, "statesync: invalid manifest, ignoring");
                         }
@@ -526,7 +682,7 @@ pub async fn try_p2p_restore_state(
             _ => {}
         }
 
-        if candidates.len() >= 6 {
+        if candidates.len() >= config.max_candidates {
             debug!("statesync: collected enough candidates, stopping discovery");
             break;
         }
@@ -550,11 +706,14 @@ pub async fn try_p2p_restore_state(
         .filter(|c| c.mani.height == best_height)
         .collect();
 
+    if let Some(metrics) = &metrics {
+        metrics.active_peers.set(best.len() as f64);
+    }
+
     // Throughput probe (best-effort) on a few best RTT peers.
-    let probe_len: u32 = 262_144; // 256 KiB
     for c in best.iter_mut().take(3) {
         let tp =
-            probe_throughput_bps(&mut swarm, c.peer, c.mani.height, probe_len, timeout_s).await;
+            probe_throughput_bps(&mut swarm, c.peer, c.mani.height, config.probe_len, config.request_timeout_secs).await;
         c.throughput_bps = tp;
         debug!(%c.peer, throughput = tp, "statesync: throughput probe");
     }
@@ -579,11 +738,13 @@ pub async fn try_p2p_restore_state(
                 to = manifest.height,
                 "statesync: attempting delta-chain sync"
             );
+            if let Some(metrics) = &metrics {
+                metrics.delta_sync_attempts.inc();
+            }
 
             // Collect state indexes from a few best peers.
             let mut all_edges: Vec<(u64, u64)> = vec![];
-            let mut edge_peers: std::collections::HashMap<(u64, u64), Vec<PeerId>> =
-                HashMap::new();
+            let mut edge_peers: HashMap<(u64, u64), Vec<PeerId>> = HashMap::new();
 
             for c in best.iter().take(6) {
                 let peer = c.peer;
@@ -591,10 +752,14 @@ pub async fn try_p2p_restore_state(
                     .behaviour_mut()
                     .rr
                     .send_request(&peer, Req::State(StateReq::Index(StateIndexRequest {})));
-                if let Some(ix) = wait_for_state_index_response(&mut swarm, peer, timeout_s).await {
+                if let Some(ix) = wait_for_state_index_response(&mut swarm, peer, config.request_timeout_secs).await {
                     for e in ix.delta_edges {
                         all_edges.push(e);
                         edge_peers.entry(e).or_default().push(peer);
+                    }
+                } else {
+                    if let Some(metrics) = &metrics {
+                        metrics.peer_timeouts.inc();
                     }
                 }
             }
@@ -646,13 +811,16 @@ pub async fn try_p2p_restore_state(
                         })),
                     );
                     let Some(dm) =
-                        wait_for_delta_manifest_response(&mut swarm, peer, timeout_s).await
+                        wait_for_delta_manifest_response(&mut swarm, peer, config.request_timeout_secs).await
                     else {
                         warn!(
                             from = from_h,
                             to = to_h,
                             "statesync: delta manifest timeout; falling back"
                         );
+                        if let Some(metrics) = &metrics {
+                            metrics.peer_timeouts.inc();
+                        }
                         ok = false;
                         break;
                     };
@@ -686,7 +854,7 @@ pub async fn try_p2p_restore_state(
                             })),
                         );
                         let Some(chunk) =
-                            wait_for_delta_chunk_response(&mut swarm, peer, off, timeout_s).await
+                            wait_for_delta_chunk_response(&mut swarm, peer, off, config.request_timeout_secs).await
                         else {
                             warn!(
                                 from = from_h,
@@ -694,6 +862,9 @@ pub async fn try_p2p_restore_state(
                                 offset = off,
                                 "statesync: delta chunk timeout; falling back"
                             );
+                            if let Some(metrics) = &metrics {
+                                metrics.peer_timeouts.inc();
+                            }
                             ok = false;
                             break;
                         };
@@ -704,11 +875,17 @@ pub async fn try_p2p_restore_state(
                                 offset = off,
                                 "statesync: delta chunk hash mismatch; falling back"
                             );
+                            if let Some(metrics) = &metrics {
+                                metrics.chunk_verification_failures.inc();
+                            }
                             ok = false;
                             break;
                         }
                         use std::io::Write;
                         f.write_all(&chunk.data)?;
+                        if let Some(metrics) = &metrics {
+                            metrics.bytes_downloaded.inc_by(chunk.data.len() as u64);
+                        }
                         off = off.saturating_add(chunk.data.len() as u64);
                         if chunk.done {
                             break;
@@ -749,6 +926,9 @@ pub async fn try_p2p_restore_state(
                             height = manifest.height,
                             "statesync: delta-chain sync completed"
                         );
+                        if let Some(metrics) = &metrics {
+                            metrics.delta_sync_successes.inc();
+                        }
                         return Ok(true);
                     } else {
                         warn!(
@@ -768,11 +948,15 @@ pub async fn try_p2p_restore_state(
     }
 
     // Full snapshot download (fallback or no local snapshot)
-    let req_chunk = (manifest.chunk_size as usize).min(chunk_bytes.max(1));
+    if let Some(metrics) = &metrics {
+        metrics.full_snapshot_downloads.inc();
+    }
+
+    let req_chunk = (manifest.chunk_size as usize).min(config.max_chunk_bytes.max(1));
     if req_chunk != manifest.chunk_size as usize {
         warn!(
             manifest_chunk = manifest.chunk_size,
-            local_chunk = chunk_bytes as u32,
+            local_chunk = config.max_chunk_bytes as u32,
             "statesync: local chunk_bytes differs; using manifest chunk_size for correctness"
         );
     }
@@ -830,9 +1014,12 @@ pub async fn try_p2p_restore_state(
             swarm.behaviour_mut().rr.send_request(&peer, req);
 
             let Some(chunk) =
-                wait_for_state_chunk_response(&mut swarm, peer, tail_off, timeout_s).await
+                wait_for_state_chunk_response(&mut swarm, peer, tail_off, config.request_timeout_secs).await
             else {
                 warn!(%peer, offset = tail_off, "statesync: tail timeout; switching peer");
+                if let Some(metrics) = &metrics {
+                    metrics.peer_timeouts.inc();
+                }
                 peer_idx += 1;
                 continue;
             };
@@ -840,6 +1027,9 @@ pub async fn try_p2p_restore_state(
             f.seek(SeekFrom::Start(tail_off))?;
             f.write_all(&chunk.data)?;
             f.flush()?;
+            if let Some(metrics) = &metrics {
+                metrics.bytes_downloaded.inc_by(chunk.data.len() as u64);
+            }
 
             // Verify assembled full chunk (read from disk).
             if (tail_off + chunk.data.len() as u64) >= (offset + cs).min(total) {
@@ -852,6 +1042,9 @@ pub async fn try_p2p_restore_state(
                         && !verify_full_chunk_hash(&manifest, offset, &buf)
                     {
                         warn!(%peer, chunk_start = offset, "statesync: assembled chunk hash mismatch; re-requesting whole chunk");
+                        if let Some(metrics) = &metrics {
+                            metrics.chunk_verification_failures.inc();
+                        }
                         peer_idx += 1;
                         continue 'tail;
                     }
@@ -881,15 +1074,21 @@ pub async fn try_p2p_restore_state(
         }));
         swarm.behaviour_mut().rr.send_request(&peer, req);
 
-        let Some(chunk) = wait_for_state_chunk_response(&mut swarm, peer, offset, timeout_s).await
+        let Some(chunk) = wait_for_state_chunk_response(&mut swarm, peer, offset, config.request_timeout_secs).await
         else {
             warn!(%peer, offset, "statesync: chunk timeout; switching peer");
+            if let Some(metrics) = &metrics {
+                metrics.peer_timeouts.inc();
+            }
             peer_idx += 1;
             continue;
         };
 
         if (len as u64) == cs && !verify_full_chunk_hash(&manifest, offset, &chunk.data) {
             warn!(%peer, offset, "statesync: chunk hash mismatch; switching peer");
+            if let Some(metrics) = &metrics {
+                metrics.chunk_verification_failures.inc();
+            }
             peer_idx += 1;
             continue;
         }
@@ -897,6 +1096,9 @@ pub async fn try_p2p_restore_state(
         f.seek(SeekFrom::Start(offset))?;
         f.write_all(&chunk.data)?;
         f.flush()?;
+        if let Some(metrics) = &metrics {
+            metrics.bytes_downloaded.inc_by(chunk.data.len() as u64);
+        }
 
         offset += chunk.data.len() as u64;
         peer_idx = 0; // reset to best peer on success
