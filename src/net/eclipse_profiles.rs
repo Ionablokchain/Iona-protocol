@@ -35,7 +35,10 @@
 //! - `|prod⟩` = strict diversity (min 3 buckets, low caps) — **pure state**
 //! - `|testnet⟩` = relaxed diversity (min 1 bucket, higher caps) — **mixed state**
 
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 // -----------------------------------------------------------------------------
 // Quantum Constants
@@ -208,6 +211,9 @@ impl EclipseParams {
         if self.max_connections_per_peer == 0 {
             return Err("max_connections_per_peer must be > 0".into());
         }
+        if self.reseed_cooldown_s == 0 {
+            return Err("reseed_cooldown_s must be > 0".into());
+        }
         Ok(())
     }
 
@@ -333,7 +339,7 @@ impl EclipseSecurityState {
     pub fn record_eclipse(&mut self) {
         if !self.eclipse_detected {
             self.eclipse_detected = true;
-            self.eclipse_detections = self.eclipse_detections.wrapping_add(1);
+            self.eclipse_detections = self.eclipse_detections.saturating_add(1);
             self.purity = (self.purity * (-ECLIPSE_DECOHERENCE_RATE).exp()).clamp(0.0, 1.0);
             self.is_safe = false;
         }
@@ -341,13 +347,267 @@ impl EclipseSecurityState {
 
     /// Record a reseed operation.
     pub fn record_reseed(&mut self, cooldown_s: u64) {
-        self.reseed_count = self.reseed_count.wrapping_add(1);
+        self.reseed_count = self.reseed_count.saturating_add(1);
         self.cooldown_remaining_s = cooldown_s;
         // Reseed restores some coherence
         self.purity = (self.purity * 1.1).min(1.0);
         self.fidelity = (self.fidelity * 1.05).min(1.0);
         self.eclipse_detected = false;
     }
+
+    /// Decrement cooldown (call periodically).
+    pub fn tick_cooldown(&mut self, elapsed_s: u64) {
+        self.cooldown_remaining_s = self.cooldown_remaining_s.saturating_sub(elapsed_s);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Eclipse Metrics (Prometheus)
+// -----------------------------------------------------------------------------
+
+/// Prometheus metrics for eclipse protection.
+#[derive(Clone)]
+pub struct EclipseMetrics {
+    /// Current purity gauge.
+    pub purity: Gauge,
+    /// Current fidelity gauge.
+    pub fidelity: Gauge,
+    /// Distinct buckets gauge.
+    pub distinct_buckets: Gauge,
+    /// Safe state gauge (1 if safe, 0 otherwise).
+    pub is_safe: Gauge,
+    /// Eclipse detected gauge (1 if detected, 0 otherwise).
+    pub eclipse_detected: Gauge,
+    /// Total eclipse detections counter.
+    pub eclipse_detections_total: Counter,
+    /// Total reseed operations counter.
+    pub reseed_total: Counter,
+    /// Cooldown remaining seconds gauge.
+    pub cooldown_remaining: Gauge,
+}
+
+impl EclipseMetrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            purity: register_gauge!(
+                "iona_eclipse_purity",
+                "Current quantum purity of eclipse protection"
+            )?,
+            fidelity: register_gauge!(
+                "iona_eclipse_fidelity",
+                "Current entanglement fidelity with ideal profile"
+            )?,
+            distinct_buckets: register_gauge!(
+                "iona_eclipse_distinct_buckets",
+                "Number of distinct connection buckets"
+            )?,
+            is_safe: register_gauge!(
+                "iona_eclipse_is_safe",
+                "Whether the node is in a safe diversity state (1=safe, 0=unsafe)"
+            )?,
+            eclipse_detected: register_gauge!(
+                "iona_eclipse_detected",
+                "Whether an eclipse is currently detected (1=detected, 0=not)"
+            )?,
+            eclipse_detections_total: register_counter!(
+                "iona_eclipse_detections_total",
+                "Total number of eclipse detections"
+            )?,
+            reseed_total: register_counter!(
+                "iona_eclipse_reseed_total",
+                "Total number of reseed operations"
+            )?,
+            cooldown_remaining: register_gauge!(
+                "iona_eclipse_cooldown_remaining_seconds",
+                "Cooldown remaining before next reseed (seconds)"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or when metrics disabled).
+    pub fn new_unregistered() -> Self {
+        Self {
+            purity: Gauge::new("iona_eclipse_purity", "Purity").unwrap(),
+            fidelity: Gauge::new("iona_eclipse_fidelity", "Fidelity").unwrap(),
+            distinct_buckets: Gauge::new("iona_eclipse_distinct_buckets", "Buckets").unwrap(),
+            is_safe: Gauge::new("iona_eclipse_is_safe", "Is safe").unwrap(),
+            eclipse_detected: Gauge::new("iona_eclipse_detected", "Detected").unwrap(),
+            eclipse_detections_total: Counter::new("iona_eclipse_detections_total", "Detections").unwrap(),
+            reseed_total: Counter::new("iona_eclipse_reseed_total", "Reseeds").unwrap(),
+            cooldown_remaining: Gauge::new("iona_eclipse_cooldown_remaining_seconds", "Cooldown").unwrap(),
+        }
+    }
+
+    /// Update metrics from the current security state.
+    pub fn update(&self, state: &EclipseSecurityState) {
+        self.purity.set(state.purity);
+        self.fidelity.set(state.fidelity);
+        self.distinct_buckets.set(state.distinct_buckets as f64);
+        self.is_safe.set(if state.is_safe { 1.0 } else { 0.0 });
+        self.eclipse_detected.set(if state.eclipse_detected { 1.0 } else { 0.0 });
+        self.eclipse_detections_total.reset(); // reset? Typically we increment; but we can set via inc_by
+        self.eclipse_detections_total.inc_by(state.eclipse_detections as f64);
+        self.reseed_total.reset();
+        self.reseed_total.inc_by(state.reseed_count as f64);
+        self.cooldown_remaining.set(state.cooldown_remaining_s as f64);
+    }
+
+    /// Record a single eclipse detection.
+    pub fn record_eclipse(&self) {
+        self.eclipse_detections_total.inc();
+    }
+
+    /// Record a reseed operation.
+    pub fn record_reseed(&self) {
+        self.reseed_total.inc();
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Eclipse Manager (Thread-safe)
+// -----------------------------------------------------------------------------
+
+/// Manages eclipse protection state, parameters, and metrics.
+///
+/// This is the main interface for the node's networking layer to
+/// interact with the eclipse protection subsystem.
+pub struct EclipseManager {
+    params: EclipseParams,
+    state: std::sync::Mutex<EclipseSecurityState>,
+    metrics: Arc<EclipseMetrics>,
+}
+
+impl EclipseManager {
+    /// Create a new manager from a profile.
+    pub fn new(profile: EclipseProfile, enable_metrics: bool) -> Result<Self, String> {
+        let params = EclipseParams::from_profile(profile);
+        params.validate()?;
+        let metrics = if enable_metrics {
+            Arc::new(EclipseMetrics::new().map_err(|e| e.to_string())?)
+        } else {
+            Arc::new(EclipseMetrics::new_unregistered())
+        };
+        Ok(Self {
+            params,
+            state: std::sync::Mutex::new(EclipseSecurityState::new()),
+            metrics,
+        })
+    }
+
+    /// Create a manager with explicit parameters.
+    pub fn with_params(params: EclipseParams, enable_metrics: bool) -> Result<Self, String> {
+        params.validate()?;
+        let metrics = if enable_metrics {
+            Arc::new(EclipseMetrics::new().map_err(|e| e.to_string())?)
+        } else {
+            Arc::new(EclipseMetrics::new_unregistered())
+        };
+        Ok(Self {
+            params,
+            state: std::sync::Mutex::new(EclipseSecurityState::new()),
+            metrics,
+        })
+    }
+
+    /// Get the current parameters.
+    pub fn params(&self) -> &EclipseParams {
+        &self.params
+    }
+
+    /// Get a snapshot of the current security state.
+    pub fn state(&self) -> EclipseSecurityState {
+        self.state.lock().unwrap().clone()
+    }
+
+    /// Update the security state with the current number of distinct buckets.
+    pub fn update(&self, distinct_buckets: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.update(&self.params, distinct_buckets);
+        self.metrics.update(&state);
+
+        if state.eclipse_detected && state.is_safe == false {
+            warn!(
+                distinct_buckets,
+                purity = state.purity,
+                "eclipse detected: insufficient bucket diversity"
+            );
+        } else {
+            debug!(
+                distinct_buckets,
+                purity = state.purity,
+                "eclipse protection healthy"
+            );
+        }
+    }
+
+    /// Record an eclipse detection event (should be called when detection logic fires).
+    pub fn record_eclipse(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.record_eclipse();
+        self.metrics.record_eclipse();
+        self.metrics.update(&state);
+        warn!("eclipse recorded, total detections: {}", state.eclipse_detections);
+    }
+
+    /// Record a reseed operation.
+    pub fn record_reseed(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.record_reseed(self.params.reseed_cooldown_s);
+        self.metrics.record_reseed();
+        self.metrics.update(&state);
+        info!("reseed triggered, cooldown: {}s", self.params.reseed_cooldown_s);
+    }
+
+    /// Tick cooldown (call periodically).
+    pub fn tick_cooldown(&self, elapsed_s: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.tick_cooldown(elapsed_s);
+        self.metrics.update(&state);
+    }
+
+    /// Check if the node is in a safe state.
+    pub fn is_safe(&self) -> bool {
+        self.state.lock().unwrap().is_safe
+    }
+
+    /// Check if an eclipse is currently detected.
+    pub fn eclipse_detected(&self) -> bool {
+        self.state.lock().unwrap().eclipse_detected
+    }
+
+    /// Get current security level percentage.
+    pub fn security_level_pct(&self) -> f64 {
+        let state = self.state.lock().unwrap();
+        self.params.security_level_pct(state.distinct_buckets)
+    }
+
+    /// Get a snapshot of metrics (for testing or external monitoring).
+    pub fn metrics_snapshot(&self) -> EclipseMetricsSnapshot {
+        EclipseMetricsSnapshot {
+            purity: self.metrics.purity.get(),
+            fidelity: self.metrics.fidelity.get(),
+            distinct_buckets: self.metrics.distinct_buckets.get() as usize,
+            is_safe: self.metrics.is_safe.get() > 0.5,
+            eclipse_detected: self.metrics.eclipse_detected.get() > 0.5,
+            eclipse_detections_total: self.metrics.eclipse_detections_total.get(),
+            reseed_total: self.metrics.reseed_total.get(),
+            cooldown_remaining: self.metrics.cooldown_remaining.get() as u64,
+        }
+    }
+}
+
+/// Snapshot of eclipse metrics.
+#[derive(Debug, Clone)]
+pub struct EclipseMetricsSnapshot {
+    pub purity: f64,
+    pub fidelity: f64,
+    pub distinct_buckets: usize,
+    pub is_safe: bool,
+    pub eclipse_detected: bool,
+    pub eclipse_detections_total: u64,
+    pub reseed_total: u64,
+    pub cooldown_remaining: u64,
 }
 
 // -----------------------------------------------------------------------------
@@ -547,5 +807,49 @@ mod tests {
     fn test_profile_min_safe_purity() {
         assert!((EclipseProfile::Prod.min_safe_purity() - 0.9).abs() < 1e-10);
         assert!((EclipseProfile::Testnet.min_safe_purity() - 0.8).abs() < 1e-10);
+    }
+
+    // ── Eclipse Manager Tests ─────────────────────────────────────────
+    #[test]
+    fn test_manager_creation() {
+        let manager = EclipseManager::new(EclipseProfile::Prod, false).unwrap();
+        assert_eq!(manager.params().profile, EclipseProfile::Prod);
+        assert!(manager.is_safe()); // initial state safe
+    }
+
+    #[test]
+    fn test_manager_update_and_detection() {
+        let manager = EclipseManager::new(EclipseProfile::Prod, false).unwrap();
+        manager.update(3);
+        assert!(manager.is_safe());
+        assert!(!manager.eclipse_detected());
+
+        manager.update(1);
+        assert!(!manager.is_safe());
+        assert!(manager.eclipse_detected());
+    }
+
+    #[test]
+    fn test_manager_record_eclipse_and_reseed() {
+        let manager = EclipseManager::new(EclipseProfile::Prod, false).unwrap();
+        manager.record_eclipse();
+        assert!(manager.eclipse_detected());
+        let snapshot = manager.metrics_snapshot();
+        assert_eq!(snapshot.eclipse_detections_total, 1);
+
+        manager.record_reseed();
+        assert!(!manager.eclipse_detected());
+        let snapshot = manager.metrics_snapshot();
+        assert_eq!(snapshot.reseed_total, 1);
+        assert_eq!(snapshot.cooldown_remaining, 60);
+    }
+
+    #[test]
+    fn test_manager_tick_cooldown() {
+        let manager = EclipseManager::new(EclipseProfile::Prod, false).unwrap();
+        manager.record_reseed();
+        manager.tick_cooldown(30);
+        let snapshot = manager.metrics_snapshot();
+        assert_eq!(snapshot.cooldown_remaining, 30);
     }
 }
