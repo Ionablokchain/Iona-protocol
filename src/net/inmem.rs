@@ -53,10 +53,13 @@ use crate::consensus::ConsensusMsg;
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc,
 };
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+use thiserror::Error;
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 
 pub type NodeId = u64;
 
@@ -68,25 +71,193 @@ pub type NodeId = u64;
 const HBAR: f64 = 1.0;
 
 /// Decoherence rate per message broadcast.
-const BROADCAST_DECOHERENCE_RATE: f64 = 0.0001;
+const DEFAULT_BROADCAST_DECOHERENCE_RATE: f64 = 0.0001;
 
 /// Decoherence rate per unicast message.
-const UNICAST_DECOHERENCE_RATE: f64 = 0.00005;
+const DEFAULT_UNICAST_DECOHERENCE_RATE: f64 = 0.00005;
 
 /// Decoherence rate per node disconnection.
-const DISCONNECT_DECOHERENCE_RATE: f64 = 0.001;
+const DEFAULT_DISCONNECT_DECOHERENCE_RATE: f64 = 0.001;
 
 /// Entanglement strength between connected nodes.
-const NODE_ENTANGLEMENT: f64 = 0.99;
+const DEFAULT_NODE_ENTANGLEMENT: f64 = 0.99;
 
 /// Kraus rank for network quantum channels.
-const KRAUS_RANK: usize = 4;
+const DEFAULT_KRAUS_RANK: usize = 4;
 
 /// Minimum coherence for healthy network.
-const MIN_NETWORK_COHERENCE: f64 = 0.9;
+const DEFAULT_MIN_NETWORK_COHERENCE: f64 = 0.9;
 
 /// Default quantum purity for new nodes.
 const DEFAULT_NODE_PURITY: f64 = 1.0;
+
+/// Default enable metrics.
+const DEFAULT_ENABLE_METRICS: bool = false;
+
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
+
+/// Configuration for the quantum in-memory network.
+#[derive(Debug, Clone)]
+pub struct NetworkConfig {
+    /// Decoherence rate per broadcast message.
+    pub broadcast_decoherence_rate: f64,
+    /// Decoherence rate per unicast message.
+    pub unicast_decoherence_rate: f64,
+    /// Decoherence rate per node disconnection.
+    pub disconnect_decoherence_rate: f64,
+    /// Entanglement strength between connected nodes.
+    pub node_entanglement: f64,
+    /// Kraus rank for network quantum channels.
+    pub kraus_rank: usize,
+    /// Minimum coherence for healthy network.
+    pub min_network_coherence: f64,
+    /// Whether to enable Prometheus metrics.
+    pub enable_metrics: bool,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            broadcast_decoherence_rate: DEFAULT_BROADCAST_DECOHERENCE_RATE,
+            unicast_decoherence_rate: DEFAULT_UNICAST_DECOHERENCE_RATE,
+            disconnect_decoherence_rate: DEFAULT_DISCONNECT_DECOHERENCE_RATE,
+            node_entanglement: DEFAULT_NODE_ENTANGLEMENT,
+            kraus_rank: DEFAULT_KRAUS_RANK,
+            min_network_coherence: DEFAULT_MIN_NETWORK_COHERENCE,
+            enable_metrics: DEFAULT_ENABLE_METRICS,
+        }
+    }
+}
+
+impl NetworkConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.broadcast_decoherence_rate < 0.0 || self.broadcast_decoherence_rate > 1.0 {
+            return Err("broadcast_decoherence_rate must be between 0.0 and 1.0".into());
+        }
+        if self.unicast_decoherence_rate < 0.0 || self.unicast_decoherence_rate > 1.0 {
+            return Err("unicast_decoherence_rate must be between 0.0 and 1.0".into());
+        }
+        if self.disconnect_decoherence_rate < 0.0 || self.disconnect_decoherence_rate > 1.0 {
+            return Err("disconnect_decoherence_rate must be between 0.0 and 1.0".into());
+        }
+        if self.node_entanglement < 0.0 || self.node_entanglement > 1.0 {
+            return Err("node_entanglement must be between 0.0 and 1.0".into());
+        }
+        if self.kraus_rank == 0 {
+            return Err("kraus_rank must be > 0".into());
+        }
+        if self.min_network_coherence < 0.0 || self.min_network_coherence > 1.0 {
+            return Err("min_network_coherence must be between 0.0 and 1.0".into());
+        }
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Network Errors
+// -----------------------------------------------------------------------------
+
+/// Errors that can occur in the quantum in-memory network.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum NetworkError {
+    #[error("target node {0} not registered")]
+    TargetNotFound(NodeId),
+
+    #[error("failed to send message to node {0}")]
+    SendFailed(NodeId),
+
+    #[error("quantum decoherence: network purity {purity} below threshold {threshold}")]
+    Decoherence { purity: f64, threshold: f64 },
+
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    #[error("metrics error: {0}")]
+    Metrics(String),
+}
+
+pub type NetworkResult<T> = Result<T, NetworkError>;
+
+// -----------------------------------------------------------------------------
+// Network Metrics
+// -----------------------------------------------------------------------------
+
+/// Prometheus metrics for the quantum network.
+#[derive(Clone)]
+pub struct NetworkMetrics {
+    /// Number of nodes currently registered.
+    pub node_count: Gauge,
+    /// Network purity (average across nodes).
+    pub network_purity: Gauge,
+    /// Total broadcasts counter.
+    pub broadcasts_total: Counter,
+    /// Total unicast messages counter.
+    pub unicasts_total: Counter,
+    /// Total disconnections counter.
+    pub disconnections_total: Counter,
+    /// Network health (1 if healthy, 0 otherwise).
+    pub is_healthy: Gauge,
+}
+
+impl NetworkMetrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            node_count: register_gauge!(
+                "iona_net_node_count",
+                "Number of nodes in the quantum in-memory network"
+            )?,
+            network_purity: register_gauge!(
+                "iona_net_network_purity",
+                "Average quantum purity of the network"
+            )?,
+            broadcasts_total: register_counter!(
+                "iona_net_broadcasts_total",
+                "Total number of broadcast messages"
+            )?,
+            unicasts_total: register_counter!(
+                "iona_net_unicasts_total",
+                "Total number of unicast messages"
+            )?,
+            disconnections_total: register_counter!(
+                "iona_net_disconnections_total",
+                "Total number of node disconnections"
+            )?,
+            is_healthy: register_gauge!(
+                "iona_net_is_healthy",
+                "Whether the quantum network is healthy (1=healthy, 0=unhealthy)"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or when disabled).
+    pub fn new_unregistered() -> Self {
+        Self {
+            node_count: Gauge::new("iona_net_node_count", "Node count").unwrap(),
+            network_purity: Gauge::new("iona_net_network_purity", "Purity").unwrap(),
+            broadcasts_total: Counter::new("iona_net_broadcasts_total", "Broadcasts").unwrap(),
+            unicasts_total: Counter::new("iona_net_unicasts_total", "Unicasts").unwrap(),
+            disconnections_total: Counter::new("iona_net_disconnections_total", "Disconnections").unwrap(),
+            is_healthy: Gauge::new("iona_net_is_healthy", "Healthy").unwrap(),
+        }
+    }
+
+    /// Update metrics from network state.
+    pub fn update(&self, stats: &NetworkStats) {
+        self.node_count.set(stats.node_count as f64);
+        self.network_purity.set(stats.network_purity);
+        self.broadcasts_total.reset();
+        self.broadcasts_total.inc_by(stats.total_broadcasts as f64);
+        self.unicasts_total.reset();
+        self.unicasts_total.inc_by(stats.total_unicasts as f64);
+        self.disconnections_total.reset();
+        self.disconnections_total.inc_by(stats.total_disconnections as f64);
+        self.is_healthy.set(if stats.is_healthy { 1.0 } else { 0.0 });
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Quantum Node State
@@ -119,25 +290,25 @@ impl QuantumNodeState {
     }
 
     /// Apply decoherence from sending a message.
-    fn apply_send_decoherence(&mut self, broadcast: bool) {
-        self.messages_sent = self.messages_sent.wrapping_add(1);
+    fn apply_send_decoherence(&mut self, broadcast: bool, config: &NetworkConfig) {
+        self.messages_sent = self.messages_sent.saturating_add(1);
         let rate = if broadcast {
-            BROADCAST_DECOHERENCE_RATE
+            config.broadcast_decoherence_rate
         } else {
-            UNICAST_DECOHERENCE_RATE
+            config.unicast_decoherence_rate
         };
         let decay = (-rate).exp();
         self.purity = (self.purity * decay).clamp(0.0, 1.0);
         self.entanglement_fidelity = (self.entanglement_fidelity * decay.sqrt()).clamp(0.0, 1.0);
-        self.is_healthy = self.purity >= MIN_NETWORK_COHERENCE;
+        self.is_healthy = self.purity >= config.min_network_coherence;
     }
 
     /// Apply decoherence from receiving a message.
-    fn apply_receive_decoherence(&mut self) {
-        self.messages_received = self.messages_received.wrapping_add(1);
-        let decay = (-UNICAST_DECOHERENCE_RATE).exp();
+    fn apply_receive_decoherence(&mut self, config: &NetworkConfig) {
+        self.messages_received = self.messages_received.saturating_add(1);
+        let decay = (-config.unicast_decoherence_rate).exp();
         self.purity = (self.purity * decay).clamp(0.0, 1.0);
-        self.is_healthy = self.purity >= MIN_NETWORK_COHERENCE;
+        self.is_healthy = self.purity >= config.min_network_coherence;
     }
 }
 
@@ -160,10 +331,12 @@ struct QuantumNetworkState {
     total_disconnections: u64,
     /// Whether the network is healthy.
     is_healthy: bool,
+    /// Configuration reference (for thresholds and rates).
+    config: NetworkConfig,
 }
 
 impl QuantumNetworkState {
-    fn new() -> Self {
+    fn new(config: NetworkConfig) -> Self {
         Self {
             nodes: HashMap::new(),
             network_purity: DEFAULT_NODE_PURITY,
@@ -171,6 +344,7 @@ impl QuantumNetworkState {
             total_unicasts: 0,
             total_disconnections: 0,
             is_healthy: true,
+            config,
         }
     }
 
@@ -185,29 +359,34 @@ impl QuantumNetworkState {
     /// Remove a node from the network.
     fn unregister_node(&mut self, node_id: NodeId) {
         if self.nodes.remove(&node_id).is_some() {
-            self.total_disconnections = self.total_disconnections.wrapping_add(1);
+            self.total_disconnections = self.total_disconnections.saturating_add(1);
+            // Apply decoherence to remaining network
+            let decay = (-self.config.disconnect_decoherence_rate).exp();
+            for node in self.nodes.values_mut() {
+                node.purity = (node.purity * decay).clamp(0.0, 1.0);
+            }
             self.recompute();
         }
     }
 
     /// Record a broadcast event.
     fn record_broadcast(&mut self, from: NodeId, recipient_count: usize) {
-        self.total_broadcasts = self.total_broadcasts.wrapping_add(1);
+        self.total_broadcasts = self.total_broadcasts.saturating_add(1);
         if let Some(node) = self.nodes.get_mut(&from) {
-            node.apply_send_decoherence(true);
+            node.apply_send_decoherence(true, &self.config);
         }
         self.recompute();
     }
 
     /// Record a unicast event.
     fn record_unicast(&mut self, from: NodeId, to: NodeId, success: bool) {
-        self.total_unicasts = self.total_unicasts.wrapping_add(1);
+        self.total_unicasts = self.total_unicasts.saturating_add(1);
         if let Some(node) = self.nodes.get_mut(&from) {
-            node.apply_send_decoherence(false);
+            node.apply_send_decoherence(false, &self.config);
         }
         if success {
             if let Some(node) = self.nodes.get_mut(&to) {
-                node.apply_receive_decoherence();
+                node.apply_receive_decoherence(&self.config);
             }
         }
         self.recompute();
@@ -223,7 +402,7 @@ impl QuantumNetworkState {
         }
         let total_purity: f64 = self.nodes.values().map(|n| n.purity).sum();
         self.network_purity = (total_purity / count as f64).clamp(0.0, 1.0);
-        self.is_healthy = self.network_purity >= MIN_NETWORK_COHERENCE;
+        self.is_healthy = self.network_purity >= self.config.min_network_coherence;
     }
 
     /// Get quantum statistics.
@@ -236,6 +415,11 @@ impl QuantumNetworkState {
             total_disconnections: self.total_disconnections,
             is_healthy: self.is_healthy,
         }
+    }
+
+    /// Get per-node state (clone for external query).
+    fn node_stats(&self, node_id: NodeId) -> Option<&QuantumNodeState> {
+        self.nodes.get(&node_id)
     }
 }
 
@@ -268,6 +452,8 @@ pub struct InMemNet {
     inner: Arc<Mutex<Inner>>,
     /// Local node identifier.
     pub node_id: NodeId,
+    /// Metrics (if enabled).
+    metrics: Option<Arc<NetworkMetrics>>,
 }
 
 struct Inner {
@@ -284,7 +470,29 @@ impl InMemNet {
     ///
     /// Returns a handle for the node and a receiver to read incoming messages.
     pub fn new(node_id: NodeId) -> (Self, mpsc::UnboundedReceiver<ConsensusMsg>) {
-        let mut quantum = QuantumNetworkState::new();
+        Self::with_config(node_id, NetworkConfig::default())
+    }
+
+    /// Create a new quantum network with custom configuration.
+    pub fn with_config(
+        node_id: NodeId,
+        config: NetworkConfig,
+    ) -> (Self, mpsc::UnboundedReceiver<ConsensusMsg>) {
+        if let Err(e) = config.validate() {
+            panic!("Invalid network config: {}", e);
+        }
+        let metrics = if config.enable_metrics {
+            match NetworkMetrics::new() {
+                Ok(m) => Some(Arc::new(m)),
+                Err(e) => {
+                    warn!("Failed to register network metrics: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut quantum = QuantumNetworkState::new(config);
         quantum.register_node(node_id);
 
         let inner = Arc::new(Mutex::new(Inner {
@@ -292,7 +500,7 @@ impl InMemNet {
             quantum,
         }));
         let (tx, rx) = mpsc::unbounded_channel();
-        inner.lock().unwrap().peers.insert(node_id, tx);
+        inner.lock().peers.insert(node_id, tx);
 
         debug!(
             node_id,
@@ -300,7 +508,13 @@ impl InMemNet {
             "quantum in‑memory network created, node registered"
         );
 
-        (Self { inner, node_id }, rx)
+        let net = Self {
+            inner,
+            node_id,
+            metrics,
+        };
+        net.update_metrics();
+        (net, rx)
     }
 
     /// Register an additional node into the same quantum network.
@@ -313,7 +527,7 @@ impl InMemNet {
     /// Returns a receiver for that node.
     pub fn register(&self, node_id: NodeId) -> mpsc::UnboundedReceiver<ConsensusMsg> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.peers.insert(node_id, tx);
         inner.quantum.register_node(node_id);
 
@@ -323,6 +537,8 @@ impl InMemNet {
             "quantum node registered in existing network"
         );
 
+        drop(inner);
+        self.update_metrics();
         rx
     }
 
@@ -334,6 +550,7 @@ impl InMemNet {
         Self {
             inner: self.inner.clone(),
             node_id,
+            metrics: self.metrics.clone(),
         }
     }
 
@@ -345,9 +562,9 @@ impl InMemNet {
     /// ```
     /// where each Kraus operator K_i delivers the message to node i.
     pub fn broadcast(&self, msg: ConsensusMsg) {
-        let peers = self.inner.lock().unwrap().peers.clone();
+        let peers = self.inner.lock().peers.clone();
         let mut failed = Vec::new();
-        let mut recipient_count = 0u64;
+        let mut recipient_count = 0usize;
 
         for (id, tx) in peers.iter() {
             if *id == self.node_id {
@@ -362,8 +579,8 @@ impl InMemNet {
         }
 
         // Update quantum state
-        let mut inner = self.inner.lock().unwrap();
-        inner.quantum.record_broadcast(self.node_id, recipient_count as usize);
+        let mut inner = self.inner.lock();
+        inner.quantum.record_broadcast(self.node_id, recipient_count);
 
         if !failed.is_empty() {
             // Remove failed nodes — quantum disconnection
@@ -380,6 +597,9 @@ impl InMemNet {
             purity = inner.quantum.network_purity,
             "quantum broadcast completed"
         );
+
+        drop(inner);
+        self.update_metrics();
     }
 
     /// Send a message directly to a specific node (by ID).
@@ -388,46 +608,50 @@ impl InMemNet {
     /// ```text
     /// Φ_unicast(ρ) = K_deliver ρ K_deliver† + K_fail ρ K_fail†
     /// ```
-    pub fn send_to(&self, target: NodeId, msg: ConsensusMsg) -> Result<(), &'static str> {
-        let peers = self.inner.lock().unwrap().peers.clone();
+    pub fn send_to(&self, target: NodeId, msg: ConsensusMsg) -> NetworkResult<()> {
+        let peers = self.inner.lock().peers.clone();
         if let Some(tx) = peers.get(&target) {
             match tx.send(msg) {
                 Ok(()) => {
-                    let mut inner = self.inner.lock().unwrap();
+                    let mut inner = self.inner.lock();
                     inner.quantum.record_unicast(self.node_id, target, true);
                     debug!(
                         from = self.node_id,
                         to = target,
                         "quantum unicast message sent"
                     );
+                    drop(inner);
+                    self.update_metrics();
                     Ok(())
                 }
                 Err(_) => {
-                    let mut inner = self.inner.lock().unwrap();
+                    let mut inner = self.inner.lock();
                     inner.quantum.record_unicast(self.node_id, target, false);
                     warn!(to = target, "quantum channel decoherence: failed to send message");
-                    Err("failed to send message")
+                    drop(inner);
+                    self.update_metrics();
+                    Err(NetworkError::SendFailed(target))
                 }
             }
         } else {
             warn!(to = target, "target node not found in quantum network");
-            Err("target node not registered")
+            Err(NetworkError::TargetNotFound(target))
         }
     }
 
     /// Return the number of currently registered peers in the quantum network.
     pub fn peer_count(&self) -> usize {
-        self.inner.lock().unwrap().peers.len()
+        self.inner.lock().peers.len()
     }
 
     /// Check if a given node ID is connected (registered) in the quantum network.
     pub fn is_connected(&self, node_id: NodeId) -> bool {
-        self.inner.lock().unwrap().peers.contains_key(&node_id)
+        self.inner.lock().peers.contains_key(&node_id)
     }
 
     /// Get the quantum purity of the local node.
     pub fn node_purity(&self) -> f64 {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .quantum
             .nodes
@@ -436,24 +660,20 @@ impl InMemNet {
             .unwrap_or(0.0)
     }
 
-    /// Get the network-wide quantum purity.
-    pub fn network_purity(&self) -> f64 {
-        self.inner.lock().unwrap().quantum.network_purity
-    }
-
-    /// Check if the quantum network is healthy.
-    pub fn is_network_healthy(&self) -> bool {
-        self.inner.lock().unwrap().quantum.is_healthy
-    }
-
-    /// Get quantum network statistics.
-    pub fn network_stats(&self) -> NetworkStats {
-        self.inner.lock().unwrap().quantum.stats()
+    /// Get the entanglement fidelity of the local node.
+    pub fn node_entanglement_fidelity(&self) -> f64 {
+        let inner = self.inner.lock();
+        inner
+            .quantum
+            .nodes
+            .get(&self.node_id)
+            .map(|n| n.entanglement_fidelity)
+            .unwrap_or(0.0)
     }
 
     /// Get the number of messages sent by the local node.
     pub fn messages_sent(&self) -> u64 {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .quantum
             .nodes
@@ -464,13 +684,28 @@ impl InMemNet {
 
     /// Get the number of messages received by the local node.
     pub fn messages_received(&self) -> u64 {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner
             .quantum
             .nodes
             .get(&self.node_id)
             .map(|n| n.messages_received)
             .unwrap_or(0)
+    }
+
+    /// Get the network-wide quantum purity.
+    pub fn network_purity(&self) -> f64 {
+        self.inner.lock().quantum.network_purity
+    }
+
+    /// Check if the quantum network is healthy.
+    pub fn is_network_healthy(&self) -> bool {
+        self.inner.lock().quantum.is_healthy
+    }
+
+    /// Get quantum network statistics.
+    pub fn network_stats(&self) -> NetworkStats {
+        self.inner.lock().quantum.stats()
     }
 
     /// Unregister the local node from the network.
@@ -480,7 +715,7 @@ impl InMemNet {
     /// a |node_i⟩ → |∅⟩
     /// ```
     pub fn unregister(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.peers.remove(&self.node_id);
         inner.quantum.unregister_node(self.node_id);
         debug!(
@@ -488,7 +723,40 @@ impl InMemNet {
             purity = inner.quantum.network_purity,
             "quantum node unregistered"
         );
+        drop(inner);
+        self.update_metrics();
     }
+
+    /// Update Prometheus metrics from current network state.
+    fn update_metrics(&self) {
+        if let Some(metrics) = &self.metrics {
+            let stats = self.inner.lock().quantum.stats();
+            metrics.update(&stats);
+        }
+    }
+
+    /// Get a snapshot of metrics (for testing or external monitoring).
+    pub fn metrics_snapshot(&self) -> Option<NetworkMetricsSnapshot> {
+        self.metrics.as_ref().map(|m| NetworkMetricsSnapshot {
+            node_count: m.node_count.get() as usize,
+            network_purity: m.network_purity.get(),
+            total_broadcasts: m.broadcasts_total.get(),
+            total_unicasts: m.unicasts_total.get(),
+            total_disconnections: m.disconnections_total.get(),
+            is_healthy: m.is_healthy.get() > 0.5,
+        })
+    }
+}
+
+/// Snapshot of network metrics.
+#[derive(Debug, Clone)]
+pub struct NetworkMetricsSnapshot {
+    pub node_count: usize,
+    pub network_purity: f64,
+    pub total_broadcasts: u64,
+    pub total_unicasts: u64,
+    pub total_disconnections: u64,
+    pub is_healthy: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -538,7 +806,7 @@ mod tests {
     async fn test_send_to_nonexistent() {
         let (net1, _) = InMemNet::new(1);
         let res = net1.send_to(99, ConsensusMsg::Note("test".into()));
-        assert!(res.is_err());
+        assert!(matches!(res, Err(NetworkError::TargetNotFound(99))));
     }
 
     #[tokio::test]
@@ -670,5 +938,41 @@ mod tests {
         net1.unregister();
         assert_eq!(net1.peer_count(), 1);
         assert!(!net1.is_connected(1));
+    }
+
+    // ── Configuration and Metrics Tests ───────────────────────────────
+    #[test]
+    fn test_config_validation() {
+        let mut cfg = NetworkConfig::default();
+        assert!(cfg.validate().is_ok());
+
+        cfg.broadcast_decoherence_rate = 1.5;
+        assert!(cfg.validate().is_err());
+
+        cfg.broadcast_decoherence_rate = 0.5;
+        cfg.kraus_rank = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_metrics_enabled() {
+        let cfg = NetworkConfig {
+            enable_metrics: true,
+            ..Default::default()
+        };
+        let (net, _) = InMemNet::with_config(1, cfg);
+        net.register(2);
+
+        // Ensure metrics update without error; we can't check values without registry
+        let snapshot = net.metrics_snapshot();
+        assert!(snapshot.is_some());
+        let snap = snapshot.unwrap();
+        assert_eq!(snap.node_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_disabled_by_default() {
+        let (net, _) = InMemNet::new(1);
+        assert!(net.metrics_snapshot().is_none());
     }
 }
