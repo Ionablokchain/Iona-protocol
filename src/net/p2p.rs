@@ -9,6 +9,7 @@
 //! - Static peer dialing and reconnection
 //! - Kademlia DHT for peer discovery (optional)
 //! - mDNS for local network discovery (optional)
+//! - Prometheus metrics for observability
 //!
 //! # Example
 //!
@@ -49,6 +50,7 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, Swarm, Transport,
 };
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -536,6 +538,7 @@ pub struct P2pConfig {
     pub reseed_cooldown_s: u64,
     pub quarantine_path: PathBuf,
     pub persist_quarantine: bool,
+    pub enable_metrics: bool,
 }
 
 impl Default for P2pConfig {
@@ -580,6 +583,7 @@ impl Default for P2pConfig {
             reseed_cooldown_s: 60,
             quarantine_path: PathBuf::from("./data/quarantine.json"),
             persist_quarantine: true,
+            enable_metrics: false,
         }
     }
 }
@@ -636,9 +640,132 @@ pub enum P2pError {
 
     #[error("Peer not found: {0}")]
     PeerNotFound(PeerId),
+
+    #[error("Metrics error: {0}")]
+    Metrics(#[from] prometheus::Error),
 }
 
 pub type P2pResult<T> = Result<T, P2pError>;
+
+// -----------------------------------------------------------------------------
+// P2P Metrics
+// -----------------------------------------------------------------------------
+
+/// Prometheus metrics for the P2P networking layer.
+#[derive(Clone)]
+pub struct P2pMetrics {
+    /// Total number of connected peers.
+    pub connected_peers: Gauge,
+    /// Total number of banned peers.
+    pub banned_peers: Gauge,
+    /// Total number of quarantined peers.
+    pub quarantined_peers: Gauge,
+    /// Total number of connections established.
+    pub connections_total: Counter,
+    /// Total number of disconnections.
+    pub disconnections_total: Counter,
+    /// Total messages sent via Gossipsub.
+    pub gossip_messages_sent_total: Counter,
+    /// Total messages received via Gossipsub.
+    pub gossip_messages_received_total: Counter,
+    /// Total request-response requests received.
+    pub rr_requests_received_total: Counter,
+    /// Total request-response responses received.
+    pub rr_responses_received_total: Counter,
+    /// Total peer score sum (gauge).
+    pub peer_score_sum: Gauge,
+    /// Total number of eclipse reseed events.
+    pub eclipse_reseeds_total: Counter,
+}
+
+impl P2pMetrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            connected_peers: register_gauge!(
+                "iona_p2p_connected_peers",
+                "Number of currently connected peers"
+            )?,
+            banned_peers: register_gauge!(
+                "iona_p2p_banned_peers",
+                "Number of banned peers"
+            )?,
+            quarantined_peers: register_gauge!(
+                "iona_p2p_quarantined_peers",
+                "Number of quarantined peers"
+            )?,
+            connections_total: register_counter!(
+                "iona_p2p_connections_total",
+                "Total connection events"
+            )?,
+            disconnections_total: register_counter!(
+                "iona_p2p_disconnections_total",
+                "Total disconnection events"
+            )?,
+            gossip_messages_sent_total: register_counter!(
+                "iona_p2p_gossip_messages_sent_total",
+                "Total gossipsub messages sent"
+            )?,
+            gossip_messages_received_total: register_counter!(
+                "iona_p2p_gossip_messages_received_total",
+                "Total gossipsub messages received"
+            )?,
+            rr_requests_received_total: register_counter!(
+                "iona_p2p_rr_requests_received_total",
+                "Total request-response requests received"
+            )?,
+            rr_responses_received_total: register_counter!(
+                "iona_p2p_rr_responses_received_total",
+                "Total request-response responses received"
+            )?,
+            peer_score_sum: register_gauge!(
+                "iona_p2p_peer_score_sum",
+                "Sum of peer scores"
+            )?,
+            eclipse_reseeds_total: register_counter!(
+                "iona_p2p_eclipse_reseeds_total",
+                "Total eclipse reseed events"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or disabled metrics).
+    pub fn new_unregistered() -> Self {
+        Self {
+            connected_peers: Gauge::new("iona_p2p_connected_peers", "Connected").unwrap(),
+            banned_peers: Gauge::new("iona_p2p_banned_peers", "Banned").unwrap(),
+            quarantined_peers: Gauge::new("iona_p2p_quarantined_peers", "Quarantined").unwrap(),
+            connections_total: Counter::new("iona_p2p_connections_total", "Connections").unwrap(),
+            disconnections_total: Counter::new("iona_p2p_disconnections_total", "Disconnections").unwrap(),
+            gossip_messages_sent_total: Counter::new("iona_p2p_gossip_messages_sent_total", "Gossip sent").unwrap(),
+            gossip_messages_received_total: Counter::new("iona_p2p_gossip_messages_received_total", "Gossip received").unwrap(),
+            rr_requests_received_total: Counter::new("iona_p2p_rr_requests_received_total", "RR requests").unwrap(),
+            rr_responses_received_total: Counter::new("iona_p2p_rr_responses_received_total", "RR responses").unwrap(),
+            peer_score_sum: Gauge::new("iona_p2p_peer_score_sum", "Score sum").unwrap(),
+            eclipse_reseeds_total: Counter::new("iona_p2p_eclipse_reseeds_total", "Eclipse reseeds").unwrap(),
+        }
+    }
+
+    /// Update metrics from the P2P state.
+    pub fn update_metrics(
+        &self,
+        connected: usize,
+        banned: usize,
+        quarantined: usize,
+        total_connections: usize,
+        total_disconnections: usize,
+        peer_score_sum: i32,
+    ) {
+        self.connected_peers.set(connected as f64);
+        self.banned_peers.set(banned as f64);
+        self.quarantined_peers.set(quarantined as f64);
+        self.connections_total.reset();
+        self.connections_total.inc_by(total_connections as f64);
+        self.disconnections_total.reset();
+        self.disconnections_total.inc_by(total_disconnections as f64);
+        self.peer_score_sum.set(peer_score_sum as f64);
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Helper: extract IP bucket from multiaddress
@@ -732,6 +859,7 @@ pub struct P2p {
     gs_deny_unknown_topics: bool,
     gs_topic_limits: BTreeMap<String, (u32, u32)>,
     rr_global_window: (std::time::Instant, u32, u32),
+    metrics: Option<Arc<P2pMetrics>>,
 }
 
 // -----------------------------------------------------------------------------
@@ -804,6 +932,9 @@ impl P2p {
         warn!(%peer, reason, "peer quarantined");
         self.persist_quarantine_file();
         let _ = self.swarm.disconnect_peer_id(peer);
+        if let Some(metrics) = &self.metrics {
+            metrics.quarantined_peers.set(self.peer_quarantine.len() as f64);
+        }
     }
 
     /// Check if a peer is currently quarantined.
@@ -814,6 +945,9 @@ impl P2p {
             } else {
                 self.peer_quarantine.remove(&peer);
                 self.persist_quarantine_file();
+                if let Some(metrics) = &self.metrics {
+                    metrics.quarantined_peers.set(self.peer_quarantine.len() as f64);
+                }
             }
         }
         false
@@ -834,12 +968,33 @@ impl P2p {
         for _ in 0..steps {
             for v in self.peer_scores.values_mut() {
                 if *v > 0 {
-                    *v -= 1;
+                    *v = v.saturating_sub(1);
                 } else if *v < 0 {
-                    *v += 1;
+                    *v = v.saturating_add(1);
                 }
             }
             self.last_score_decay += every;
+        }
+        self.update_metrics();
+    }
+
+    /// Update all Prometheus metrics based on current state.
+    fn update_metrics(&self) {
+        if let Some(metrics) = &self.metrics {
+            let connected = self.peer_scores.len();
+            let banned = self.banned_peers.len();
+            let quarantined = self.peer_quarantine.len();
+            let total_conn = self.connections_total;
+            let total_disc = self.peer_scores.values().filter(|s| **s < 0).count(); // approximation
+            let score_sum: i32 = self.peer_scores.values().sum();
+            metrics.update_metrics(
+                connected,
+                banned,
+                quarantined,
+                total_conn,
+                total_disc,
+                score_sum,
+            );
         }
     }
 
@@ -891,6 +1046,12 @@ impl P2p {
     /// Create a new P2P instance.
     pub fn new(cfg: P2pConfig) -> P2pResult<Self> {
         cfg.validate()?;
+
+        let metrics = if cfg.enable_metrics {
+            Some(Arc::new(P2pMetrics::new()?))
+        } else {
+            None
+        };
 
         let peer_id = PeerId::from(cfg.local_key.public());
         info!(%peer_id, "local peer id");
@@ -999,7 +1160,7 @@ impl P2p {
             BTreeMap::new()
         };
 
-        Ok(Self {
+        let mut p2p = Self {
             swarm,
             topic: consensus_topic,
             peer_scores: BTreeMap::new(),
@@ -1054,7 +1215,10 @@ impl P2p {
                 .map(|(t, m, b)| (t, (m, b)))
                 .collect(),
             rr_global_window: (std::time::Instant::now(), 0, 0),
-        })
+            metrics,
+        };
+        p2p.update_metrics();
+        Ok(p2p)
     }
 
     /// Helper: seed Kademlia and dial a multiaddress.
@@ -1118,6 +1282,10 @@ impl P2p {
             .publish(self.topic.clone(), bytes)
         {
             warn!("gossipsub publish: {e:?}");
+        } else {
+            if let Some(metrics) = &self.metrics {
+                metrics.gossip_messages_sent_total.inc();
+            }
         }
     }
 
@@ -1398,12 +1566,16 @@ impl P2p {
         if *score < BAN_THRESHOLD {
             self.ban_peer(peer);
         }
+        self.update_metrics();
     }
 
     fn ban_peer(&mut self, peer: PeerId) {
         warn!(%peer, "banning peer (score too low)");
         self.banned_peers.insert(peer);
         let _ = self.swarm.disconnect_peer_id(peer);
+        if let Some(metrics) = &self.metrics {
+            metrics.banned_peers.set(self.banned_peers.len() as f64);
+        }
     }
 
     fn bucket_from_addrs(&self, addrs: &[Multiaddr]) -> Option<String> {
@@ -1432,6 +1604,9 @@ impl P2p {
         for addr in self.bootnodes.iter().cloned() {
             Self::seed_kad_and_dial(&mut self.swarm, addr);
         }
+        if let Some(metrics) = &self.metrics {
+            metrics.eclipse_reseeds_total.inc();
+        }
     }
 
     /// Process the next network event.
@@ -1452,6 +1627,7 @@ impl P2p {
                         self.peer_scores.entry(peer).or_insert(0);
                         info!(%peer, "mdns discovered");
                     }
+                    self.update_metrics();
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
                     for (peer, _addr) in list {
@@ -1461,6 +1637,7 @@ impl P2p {
                             .remove_explicit_peer(&peer);
                         info!(%peer, "mdns expired");
                     }
+                    self.update_metrics();
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
                     peer_id,
@@ -1494,6 +1671,7 @@ impl P2p {
                         .add_explicit_peer(&peer_id);
                     self.peer_scores.entry(peer_id).or_insert(0);
                     info!(%peer_id, "identify: peer connected");
+                    self.update_metrics();
                 }
 
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -1518,6 +1696,7 @@ impl P2p {
 
                     self.peer_scores.entry(peer_id).or_insert(0);
                     info!(%peer_id, "connection established");
+                    self.update_metrics();
                 }
 
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -1541,6 +1720,7 @@ impl P2p {
                     }
 
                     debug!(%peer_id, "connection closed");
+                    self.update_metrics();
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     propagation_source,
@@ -1586,6 +1766,10 @@ impl P2p {
                     match bincode::deserialize::<ConsensusMsg>(&message.data) {
                         Ok(msg) => {
                             *score = (*score).saturating_add(1);
+                            if let Some(metrics) = &self.metrics {
+                                metrics.gossip_messages_received_total.inc();
+                            }
+                            self.update_metrics();
                             return Ok(P2pEvent::Consensus {
                                 from: propagation_source,
                                 msg,
@@ -1597,6 +1781,8 @@ impl P2p {
                             *score = (*score).saturating_sub(5);
                             if *score < BAN_THRESHOLD {
                                 self.ban_peer(propagation_source);
+                            } else {
+                                self.update_metrics();
                             }
                         }
                     }
@@ -1624,6 +1810,9 @@ impl P2p {
                                 continue;
                             }
 
+                            if let Some(metrics) = &self.metrics {
+                                metrics.rr_requests_received_total.inc();
+                            }
                             return Ok(P2pEvent::Request {
                                 from: peer,
                                 req: request,
@@ -1631,6 +1820,9 @@ impl P2p {
                             });
                         }
                         RequestResponseMessage::Response { response, .. } => {
+                            if let Some(metrics) = &self.metrics {
+                                metrics.rr_responses_received_total.inc();
+                            }
                             return Ok(P2pEvent::Response {
                                 from: peer,
                                 resp: response,
@@ -1723,5 +1915,14 @@ mod tests {
         cfg.rr_strikes_before_ban = 0;
         cfg.rr_strikes_before_quarantine = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_metrics_unregistered() {
+        let metrics = P2pMetrics::new_unregistered();
+        metrics.update_metrics(10, 2, 3, 100, 50, 42);
+        assert!(metrics.connected_peers.get() == 10.0);
+        assert!(metrics.banned_peers.get() == 2.0);
+        assert!(metrics.quarantined_peers.get() == 3.0);
     }
 }
