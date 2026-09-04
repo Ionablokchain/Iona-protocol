@@ -11,12 +11,14 @@
 //! - LRU cache for computed roots (configurable size).
 //! - Parallel hashing using `rayon` for large trees.
 //! - Configurable parameters (batch size, thread pool).
-//! - Comprehensive metrics (hash count, cache hits, computation time).
+//! - Prometheus metrics for hash count, cache hits, computation time.
 //! - Batch processing for incremental updates.
 //! - Full validation and consistency checks.
 //! - Structured logging with `tracing`.
 
 use lru::LruCache;
+use parking_lot::Mutex;
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -79,7 +81,7 @@ pub struct MerkleConfig {
     pub parallel_enabled: bool,
     /// Minimum coherence threshold.
     pub min_coherence: f64,
-    /// Enable metrics collection.
+    /// Enable Prometheus metrics.
     pub enable_metrics: bool,
 }
 
@@ -135,6 +137,9 @@ pub enum MerkleError {
 
     #[error("validation failed: {0}")]
     Validation(String),
+
+    #[error("metrics error: {0}")]
+    Metrics(#[from] prometheus::Error),
 }
 
 pub type MerkleResult<T> = Result<T, MerkleError>;
@@ -161,29 +166,86 @@ pub struct QuantumMerkleTree {
 }
 
 // -----------------------------------------------------------------------------
-// Merkle Metrics
+// Merkle Metrics (Prometheus)
 // -----------------------------------------------------------------------------
 
-/// Metrics for the Merkle tree module.
-#[derive(Debug, Clone)]
+/// Prometheus metrics for the Merkle tree module.
+#[derive(Clone)]
 pub struct MerkleMetrics {
     /// Total number of leaf hashes computed.
-    pub leaf_hashes_computed: u64,
+    pub leaf_hashes: Counter,
     /// Total number of internal node hashes computed.
-    pub internal_hashes_computed: u64,
+    pub internal_hashes: Counter,
     /// Total number of root computations.
-    pub root_computations: u64,
+    pub root_computations: Counter,
     /// Number of cache hits.
-    pub cache_hits: u64,
+    pub cache_hits: Counter,
     /// Number of cache misses.
-    pub cache_misses: u64,
-    /// Average computation time (microseconds).
-    pub avg_compute_time_us: u64,
+    pub cache_misses: Counter,
     /// Total computation time (microseconds).
-    pub total_compute_time_us: u64,
+    pub total_compute_time_us: Counter,
+    /// Average computation time gauge (microseconds).
+    pub avg_compute_time_us: Gauge,
 }
 
-/// Global metrics (atomic for thread safety).
+impl MerkleMetrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            leaf_hashes: register_counter!(
+                "iona_merkle_leaf_hashes_total",
+                "Total leaf hashes computed"
+            )?,
+            internal_hashes: register_counter!(
+                "iona_merkle_internal_hashes_total",
+                "Total internal node hashes computed"
+            )?,
+            root_computations: register_counter!(
+                "iona_merkle_root_computations_total",
+                "Total root computations"
+            )?,
+            cache_hits: register_counter!(
+                "iona_merkle_cache_hits_total",
+                "Total cache hits"
+            )?,
+            cache_misses: register_counter!(
+                "iona_merkle_cache_misses_total",
+                "Total cache misses"
+            )?,
+            total_compute_time_us: register_counter!(
+                "iona_merkle_total_compute_time_us",
+                "Total computation time in microseconds"
+            )?,
+            avg_compute_time_us: register_gauge!(
+                "iona_merkle_avg_compute_time_us",
+                "Average computation time in microseconds"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or disabled metrics).
+    pub fn new_unregistered() -> Self {
+        Self {
+            leaf_hashes: Counter::new("iona_merkle_leaf_hashes_total", "Leaf hashes").unwrap(),
+            internal_hashes: Counter::new("iona_merkle_internal_hashes_total", "Internal hashes").unwrap(),
+            root_computations: Counter::new("iona_merkle_root_computations_total", "Root computations").unwrap(),
+            cache_hits: Counter::new("iona_merkle_cache_hits_total", "Cache hits").unwrap(),
+            cache_misses: Counter::new("iona_merkle_cache_misses_total", "Cache misses").unwrap(),
+            total_compute_time_us: Counter::new("iona_merkle_total_compute_time_us", "Total time").unwrap(),
+            avg_compute_time_us: Gauge::new("iona_merkle_avg_compute_time_us", "Avg time").unwrap(),
+        }
+    }
+}
+
+/// Global metrics instance (lazy initialized).
+static METRICS: once_cell::sync::Lazy<Arc<MerkleMetrics>> = once_cell::sync::Lazy::new(|| {
+    Arc::new(MerkleMetrics::new().unwrap_or_else(|_| {
+        warn!("Failed to register Merkle metrics; using unregistered");
+        MerkleMetrics::new_unregistered()
+    }))
+});
+
+/// Atomic fallback metrics for environments without Prometheus.
 #[derive(Debug, Default)]
 struct AtomicMerkleMetrics {
     leaf_hashes: AtomicU64,
@@ -195,25 +257,7 @@ struct AtomicMerkleMetrics {
     compute_count: AtomicU64,
 }
 
-impl AtomicMerkleMetrics {
-    fn snapshot(&self) -> MerkleMetrics {
-        MerkleMetrics {
-            leaf_hashes_computed: self.leaf_hashes.load(Ordering::Relaxed),
-            internal_hashes_computed: self.internal_hashes.load(Ordering::Relaxed),
-            root_computations: self.root_computations.load(Ordering::Relaxed),
-            cache_hits: self.cache_hits.load(Ordering::Relaxed),
-            cache_misses: self.cache_misses.load(Ordering::Relaxed),
-            avg_compute_time_us: self
-                .compute_count
-                .load(Ordering::Relaxed)
-                .checked_div(self.compute_count.load(Ordering::Relaxed))
-                .unwrap_or(0),
-            total_compute_time_us: self.total_compute_time_us.load(Ordering::Relaxed),
-        }
-    }
-}
-
-static METRICS: AtomicMerkleMetrics = AtomicMerkleMetrics {
+static ATOMIC_METRICS: AtomicMerkleMetrics = AtomicMerkleMetrics {
     leaf_hashes: AtomicU64::new(0),
     internal_hashes: AtomicU64::new(0),
     root_computations: AtomicU64::new(0),
@@ -229,14 +273,14 @@ static METRICS: AtomicMerkleMetrics = AtomicMerkleMetrics {
 
 /// A thread‑safe LRU cache for Merkle roots.
 struct MerkleCache {
-    inner: parking_lot::Mutex<LruCache<u64, [u8; HASH_LEN]>>,
+    inner: Mutex<LruCache<u64, [u8; HASH_LEN]>>,
     enabled: bool,
 }
 
 impl MerkleCache {
     fn new(capacity: usize, enabled: bool) -> Self {
         Self {
-            inner: parking_lot::Mutex::new(
+            inner: Mutex::new(
                 LruCache::new(NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1024).unwrap())),
             ),
             enabled,
@@ -249,10 +293,12 @@ impl MerkleCache {
         }
         let mut cache = self.inner.lock();
         if let Some(root) = cache.get(&key) {
-            METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+            METRICS.cache_hits.inc();
+            ATOMIC_METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
             Some(*root)
         } else {
-            METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
+            METRICS.cache_misses.inc();
+            ATOMIC_METRICS.cache_misses.fetch_add(1, Ordering::Relaxed);
             None
         }
     }
@@ -273,6 +319,14 @@ impl MerkleCache {
         cache.clear();
     }
 }
+
+// -----------------------------------------------------------------------------
+// Global Cache Instance
+// -----------------------------------------------------------------------------
+
+static CACHE: once_cell::sync::Lazy<MerkleCache> = once_cell::sync::Lazy::new(|| {
+    MerkleCache::new(DEFAULT_CACHE_SIZE, true)
+});
 
 // -----------------------------------------------------------------------------
 // Core Functions (with cache and metrics)
@@ -305,11 +359,7 @@ pub fn state_merkle_root_with_config(
     }
 
     // Compute cache key: simple hash of the state size and first/last keys.
-    // This is a heuristic; full cache would require hashing all keys.
     let cache_key = compute_cache_key(kv);
-    static CACHE: once_cell::sync::Lazy<MerkleCache> = once_cell::sync::Lazy::new(|| {
-        MerkleCache::new(DEFAULT_CACHE_SIZE, true)
-    });
 
     if let Some(root) = CACHE.get(cache_key) {
         record_metrics(start, true);
@@ -322,14 +372,16 @@ pub fn state_merkle_root_with_config(
         entries
             .par_iter()
             .map(|(k, v)| {
-                METRICS.leaf_hashes.fetch_add(1, Ordering::Relaxed);
+                METRICS.leaf_hashes.inc();
+                ATOMIC_METRICS.leaf_hashes.fetch_add(1, Ordering::Relaxed);
                 leaf_hash(k.as_bytes(), v.as_bytes())
             })
             .collect()
     } else {
         kv.iter()
             .map(|(k, v)| {
-                METRICS.leaf_hashes.fetch_add(1, Ordering::Relaxed);
+                METRICS.leaf_hashes.inc();
+                ATOMIC_METRICS.leaf_hashes.fetch_add(1, Ordering::Relaxed);
                 leaf_hash(k.as_bytes(), v.as_bytes())
             })
             .collect()
@@ -360,20 +412,21 @@ pub fn quantum_merkle_tree(
         });
     }
 
-    // Compute leaves
     let leaves: Vec<[u8; HASH_LEN]> = if config.parallel_enabled && leaf_count > config.batch_size {
         let entries: Vec<(&String, &String)> = kv.iter().collect();
         entries
             .par_iter()
             .map(|(k, v)| {
-                METRICS.leaf_hashes.fetch_add(1, Ordering::Relaxed);
+                METRICS.leaf_hashes.inc();
+                ATOMIC_METRICS.leaf_hashes.fetch_add(1, Ordering::Relaxed);
                 leaf_hash(k.as_bytes(), v.as_bytes())
             })
             .collect()
     } else {
         kv.iter()
             .map(|(k, v)| {
-                METRICS.leaf_hashes.fetch_add(1, Ordering::Relaxed);
+                METRICS.leaf_hashes.inc();
+                ATOMIC_METRICS.leaf_hashes.fetch_add(1, Ordering::Relaxed);
                 leaf_hash(k.as_bytes(), v.as_bytes())
             })
             .collect()
@@ -440,7 +493,8 @@ fn leaf_hash(key: &[u8], value: &[u8]) -> [u8; HASH_LEN] {
 
 /// Hash for an internal Merkle node.
 fn node_hash(left: &[u8; HASH_LEN], right: &[u8; HASH_LEN]) -> [u8; HASH_LEN] {
-    METRICS.internal_hashes.fetch_add(1, Ordering::Relaxed);
+    METRICS.internal_hashes.inc();
+    ATOMIC_METRICS.internal_hashes.fetch_add(1, Ordering::Relaxed);
     let mut hasher = Sha256::new();
     hasher.update(INTERNAL_DOMAIN);
     hasher.update(left);
@@ -534,11 +588,17 @@ fn compute_cache_key(kv: &BTreeMap<String, String>) -> u64 {
 
 fn record_metrics(start: Instant, cache_hit: bool) {
     let elapsed_us = start.elapsed().as_micros() as u64;
-    METRICS.root_computations.fetch_add(1, Ordering::Relaxed);
-    METRICS.total_compute_time_us.fetch_add(elapsed_us, Ordering::Relaxed);
-    METRICS.compute_count.fetch_add(1, Ordering::Relaxed);
+    METRICS.root_computations.inc();
+    ATOMIC_METRICS.root_computations.fetch_add(1, Ordering::Relaxed);
+    METRICS.total_compute_time_us.inc_by(elapsed_us as f64);
+    ATOMIC_METRICS.total_compute_time_us.fetch_add(elapsed_us, Ordering::Relaxed);
+    let count = ATOMIC_METRICS.compute_count.fetch_add(1, Ordering::Relaxed) + 1;
+    let total = ATOMIC_METRICS.total_compute_time_us.load(Ordering::Relaxed);
+    let avg = total / count;
+    METRICS.avg_compute_time_us.set(avg as f64);
     if cache_hit {
-        METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
+        METRICS.cache_hits.inc();
+        ATOMIC_METRICS.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -546,27 +606,48 @@ fn record_metrics(start: Instant, cache_hit: bool) {
 // Public Metrics Access
 // -----------------------------------------------------------------------------
 
-/// Get current Merkle metrics.
-pub fn merkle_metrics() -> MerkleMetrics {
-    METRICS.snapshot()
+/// Get current Merkle metrics (from atomic fallback if Prometheus not available).
+pub fn merkle_metrics() -> MerkleMetricsSnapshot {
+    MerkleMetricsSnapshot {
+        leaf_hashes_computed: ATOMIC_METRICS.leaf_hashes.load(Ordering::Relaxed),
+        internal_hashes_computed: ATOMIC_METRICS.internal_hashes.load(Ordering::Relaxed),
+        root_computations: ATOMIC_METRICS.root_computations.load(Ordering::Relaxed),
+        cache_hits: ATOMIC_METRICS.cache_hits.load(Ordering::Relaxed),
+        cache_misses: ATOMIC_METRICS.cache_misses.load(Ordering::Relaxed),
+        avg_compute_time_us: {
+            let count = ATOMIC_METRICS.compute_count.load(Ordering::Relaxed);
+            let total = ATOMIC_METRICS.total_compute_time_us.load(Ordering::Relaxed);
+            if count > 0 { total / count } else { 0 }
+        },
+        total_compute_time_us: ATOMIC_METRICS.total_compute_time_us.load(Ordering::Relaxed),
+    }
+}
+
+/// Snapshot of Merkle metrics.
+#[derive(Debug, Clone)]
+pub struct MerkleMetricsSnapshot {
+    pub leaf_hashes_computed: u64,
+    pub internal_hashes_computed: u64,
+    pub root_computations: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub avg_compute_time_us: u64,
+    pub total_compute_time_us: u64,
 }
 
 /// Reset Merkle metrics.
 pub fn reset_merkle_metrics() {
-    METRICS.leaf_hashes.store(0, Ordering::Relaxed);
-    METRICS.internal_hashes.store(0, Ordering::Relaxed);
-    METRICS.root_computations.store(0, Ordering::Relaxed);
-    METRICS.cache_hits.store(0, Ordering::Relaxed);
-    METRICS.cache_misses.store(0, Ordering::Relaxed);
-    METRICS.total_compute_time_us.store(0, Ordering::Relaxed);
-    METRICS.compute_count.store(0, Ordering::Relaxed);
+    ATOMIC_METRICS.leaf_hashes.store(0, Ordering::Relaxed);
+    ATOMIC_METRICS.internal_hashes.store(0, Ordering::Relaxed);
+    ATOMIC_METRICS.root_computations.store(0, Ordering::Relaxed);
+    ATOMIC_METRICS.cache_hits.store(0, Ordering::Relaxed);
+    ATOMIC_METRICS.cache_misses.store(0, Ordering::Relaxed);
+    ATOMIC_METRICS.total_compute_time_us.store(0, Ordering::Relaxed);
+    ATOMIC_METRICS.compute_count.store(0, Ordering::Relaxed);
 }
 
 /// Clear the Merkle cache.
 pub fn clear_merkle_cache() {
-    static CACHE: once_cell::sync::Lazy<MerkleCache> = once_cell::sync::Lazy::new(|| {
-        MerkleCache::new(DEFAULT_CACHE_SIZE, true)
-    });
     CACHE.clear();
 }
 
@@ -611,7 +692,6 @@ pub fn validate_merkle_tree(
     expected_root: &[u8; HASH_LEN],
     config: &MerkleConfig,
 ) -> MerkleResult<()> {
-    // Check root consistency
     let computed = state_merkle_root_with_config(kv, config);
     if computed != *expected_root {
         return Err(MerkleError::Validation(
@@ -619,7 +699,6 @@ pub fn validate_merkle_tree(
         ));
     }
 
-    // Check tree properties
     let tree = quantum_merkle_tree(kv, config)?;
     if tree.coherence < config.min_coherence {
         return Err(MerkleError::Decoherence {
