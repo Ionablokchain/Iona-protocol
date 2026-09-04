@@ -15,13 +15,15 @@
 //! - Structured logging with `tracing`.
 //! - Versioned serialization for forward compatibility.
 //! - Quantum coherence tracking with decoherence models.
-//! - Comprehensive metrics for monitoring.
+//! - Optional Prometheus metrics for observability.
+//! - Overflow‑safe counters using saturating arithmetic.
 
 use crate::crypto::PublicKeyBytes;
 use crate::evidence::Evidence;
 use crate::types::Height;
 use fs2::FileExt;
 use parking_lot::Mutex;
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -121,6 +123,8 @@ pub struct SlashingConfig {
     pub min_ledger_coherence: f64,
     /// Whether to persist state to disk.
     pub persist_state: bool,
+    /// Whether to enable Prometheus metrics.
+    pub enable_metrics: bool,
 }
 
 impl Default for SlashingConfig {
@@ -137,6 +141,7 @@ impl Default for SlashingConfig {
             downtime_decoherence_rate: DEFAULT_DOWNTIME_DECOHERENCE_RATE,
             min_ledger_coherence: DEFAULT_MIN_LEDGER_COHERENCE,
             persist_state: true,
+            enable_metrics: false,
         }
     }
 }
@@ -220,9 +225,108 @@ pub enum SlashingError {
 
     #[error("lock acquisition failed: {0}")]
     LockFailed(String),
+
+    #[error("metrics error: {0}")]
+    Metrics(#[from] prometheus::Error),
 }
 
 pub type SlashingResult<T> = Result<T, SlashingError>;
+
+// -----------------------------------------------------------------------------
+// Slashing Metrics (Prometheus)
+// -----------------------------------------------------------------------------
+
+/// Prometheus metrics for the slashing module.
+#[derive(Clone)]
+pub struct SlashingMetrics {
+    /// Current number of active validators.
+    pub active_validators: Gauge,
+    /// Current number of jailed validators.
+    pub jailed_validators: Gauge,
+    /// Current number of tombstoned validators.
+    pub tombstoned_validators: Gauge,
+    /// Current total staked power.
+    pub total_power: Gauge,
+    /// Ledger quantum purity.
+    pub ledger_purity: Gauge,
+    /// Ledger entropy.
+    pub ledger_entropy: Gauge,
+    /// Total slashes applied.
+    pub total_slashes: Counter,
+    /// Total unjail operations.
+    pub total_unjails: Counter,
+    /// Total downtime slashes.
+    pub total_downtime_slashes: Counter,
+}
+
+impl SlashingMetrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            active_validators: register_gauge!(
+                "iona_slashing_active_validators",
+                "Number of active validators"
+            )?,
+            jailed_validators: register_gauge!(
+                "iona_slashing_jailed_validators",
+                "Number of jailed validators"
+            )?,
+            tombstoned_validators: register_gauge!(
+                "iona_slashing_tombstoned_validators",
+                "Number of tombstoned validators"
+            )?,
+            total_power: register_gauge!(
+                "iona_slashing_total_power",
+                "Total staked power of active validators"
+            )?,
+            ledger_purity: register_gauge!(
+                "iona_slashing_ledger_purity",
+                "Ledger quantum purity"
+            )?,
+            ledger_entropy: register_gauge!(
+                "iona_slashing_ledger_entropy",
+                "Ledger quantum entropy"
+            )?,
+            total_slashes: register_counter!(
+                "iona_slashing_total_slashes",
+                "Total slashing operations"
+            )?,
+            total_unjails: register_counter!(
+                "iona_slashing_total_unjails",
+                "Total unjail operations"
+            )?,
+            total_downtime_slashes: register_counter!(
+                "iona_slashing_total_downtime_slashes",
+                "Total downtime slashes"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or disabled metrics).
+    pub fn new_unregistered() -> Self {
+        Self {
+            active_validators: Gauge::new("iona_slashing_active_validators", "Active").unwrap(),
+            jailed_validators: Gauge::new("iona_slashing_jailed_validators", "Jailed").unwrap(),
+            tombstoned_validators: Gauge::new("iona_slashing_tombstoned_validators", "Tombstoned").unwrap(),
+            total_power: Gauge::new("iona_slashing_total_power", "Power").unwrap(),
+            ledger_purity: Gauge::new("iona_slashing_ledger_purity", "Purity").unwrap(),
+            ledger_entropy: Gauge::new("iona_slashing_ledger_entropy", "Entropy").unwrap(),
+            total_slashes: Counter::new("iona_slashing_total_slashes", "Slashes").unwrap(),
+            total_unjails: Counter::new("iona_slashing_total_unjails", "Unjails").unwrap(),
+            total_downtime_slashes: Counter::new("iona_slashing_total_downtime_slashes", "Downtime slashes").unwrap(),
+        }
+    }
+
+    /// Update gauges from a stats snapshot.
+    pub fn update_gauges(&self, stats: &SlashingStats) {
+        self.active_validators.set(stats.active as f64);
+        self.jailed_validators.set(stats.jailed as f64);
+        self.tombstoned_validators.set(stats.tombstoned as f64);
+        self.total_power.set(stats.total_power as f64);
+        self.ledger_purity.set(stats.purity);
+        self.ledger_entropy.set(stats.entropy);
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Persistent State (versioned)
@@ -278,7 +382,6 @@ impl PersistentStateV1 {
                 coherence: record.coherence,
             });
         }
-        // Cap to avoid unbounded growth.
         if validators.len() > MAX_PERSISTED_VALIDATORS {
             validators.truncate(MAX_PERSISTED_VALIDATORS);
         }
@@ -359,6 +462,7 @@ impl PersistentStateV1 {
             processed_evidence,
             quantum,
             config: config.clone(),
+            metrics: None,
         }
     }
 }
@@ -397,10 +501,6 @@ fn acquire_lock(path: &Path) -> Result<File, SlashingError> {
     }
 }
 
-fn release_lock(file: File) -> Result<(), SlashingError> {
-    file.unlock().map_err(|e| SlashingError::LockFailed(e.to_string()))
-}
-
 fn load_state(path: &Path, config: &SlashingConfig) -> Result<Option<StakeLedger>, SlashingError> {
     if !path.exists() {
         return Ok(None);
@@ -421,7 +521,6 @@ fn load_state(path: &Path, config: &SlashingConfig) -> Result<Option<StakeLedger
             .map_err(|e| SlashingError::Serialization(e.to_string()))?;
         Ok(Some(st.into_ledger(config)))
     } else {
-        // Legacy: try to parse as ledger directly.
         match serde_json::from_value::<StakeLedger>(raw) {
             Ok(ledger) => Ok(Some(ledger)),
             Err(e) => Err(SlashingError::Serialization(e.to_string())),
@@ -480,37 +579,37 @@ impl QuantumSlashingState {
     }
 
     pub fn apply_slash_decoherence(&mut self, tombstoned: bool, rate: f64) {
-        self.total_slashes = self.total_slashes.wrapping_add(1);
+        self.total_slashes = self.total_slashes.saturating_add(1);
         if tombstoned {
             self.tombstoned_count = self.tombstoned_count.saturating_add(1);
         }
         let decay = (-rate).exp();
         self.slashing_coherence = (self.slashing_coherence * decay).clamp(0.0, 1.0);
-        self.recompute();
+        self.recompute(DEFAULT_MIN_LEDGER_COHERENCE);
     }
 
     pub fn apply_unjail_decoherence(&mut self, rate: f64) {
-        self.total_unjails = self.total_unjails.wrapping_add(1);
+        self.total_unjails = self.total_unjails.saturating_add(1);
         let decay = (-rate).exp();
         self.unjail_coherence = (self.unjail_coherence * decay).clamp(0.0, 1.0);
-        self.recompute();
+        self.recompute(DEFAULT_MIN_LEDGER_COHERENCE);
     }
 
     pub fn apply_downtime_decoherence(&mut self, rate: f64) {
-        self.total_downtime_slashes = self.total_downtime_slashes.wrapping_add(1);
+        self.total_downtime_slashes = self.total_downtime_slashes.saturating_add(1);
         let decay = (-rate).exp();
         self.slashing_coherence = (self.slashing_coherence * decay).clamp(0.0, 1.0);
-        self.recompute();
+        self.recompute(DEFAULT_MIN_LEDGER_COHERENCE);
     }
 
     pub fn apply_slashing_channel(&mut self) {
         let kraus_factor = (1.0 / SLASHING_KRAUS_RANK as f64).sqrt();
         self.slashing_coherence = (self.slashing_coherence * kraus_factor).clamp(0.0, 1.0);
         self.unjail_coherence = (self.unjail_coherence * kraus_factor).clamp(0.0, 1.0);
-        self.recompute();
+        self.recompute(DEFAULT_MIN_LEDGER_COHERENCE);
     }
 
-    fn recompute(&mut self, min_coherence: f64) {
+    pub fn recompute(&mut self, min_coherence: f64) {
         self.purity = (self.slashing_coherence * self.unjail_coherence).clamp(0.0, 1.0);
         self.entropy = if self.purity >= 1.0 {
             0.0
@@ -521,7 +620,7 @@ impl QuantumSlashingState {
     }
 
     // Backward compatibility.
-    fn recompute(&mut self) {
+    pub fn recompute_default(&mut self) {
         self.recompute(DEFAULT_MIN_LEDGER_COHERENCE);
     }
 }
@@ -603,6 +702,8 @@ pub struct StakeLedger {
     pub quantum: QuantumSlashingState,
     #[serde(skip)]
     pub config: SlashingConfig,
+    #[serde(skip)]
+    pub metrics: Option<Arc<SlashingMetrics>>,
 }
 
 impl Default for StakeLedger {
@@ -612,17 +713,24 @@ impl Default for StakeLedger {
             processed_evidence: HashSet::new(),
             quantum: QuantumSlashingState::default(),
             config: SlashingConfig::default(),
+            metrics: None,
         }
     }
 }
 
 impl StakeLedger {
     pub fn new(config: SlashingConfig) -> Self {
+        let metrics = if config.enable_metrics {
+            SlashingMetrics::new().ok().map(Arc::new)
+        } else {
+            None
+        };
         Self {
             validators: BTreeMap::new(),
             processed_evidence: HashSet::new(),
             quantum: QuantumSlashingState::default(),
             config,
+            metrics,
         }
     }
 
@@ -657,6 +765,45 @@ impl StakeLedger {
         self.quantum.is_healthy
     }
 
+    fn update_metrics(&self) {
+        if let Some(metrics) = &self.metrics {
+            let stats = self.stats();
+            metrics.update_gauges(&stats);
+        }
+    }
+
+    fn stats(&self) -> SlashingStats {
+        let active = self
+            .validators
+            .values()
+            .filter(|r| r.is_active())
+            .count();
+        let jailed = self
+            .validators
+            .values()
+            .filter(|r| r.is_jailed())
+            .count();
+        let tombstoned = self
+            .validators
+            .values()
+            .filter(|r| r.is_tombstoned())
+            .count();
+        SlashingStats {
+            total_validators: self.validators.len(),
+            active,
+            jailed,
+            tombstoned,
+            total_power: self.total_power(),
+            purity: self.quantum.purity,
+            entropy: self.quantum.entropy,
+            total_slashes: self.quantum.total_slashes,
+            total_unjails: self.quantum.total_unjails,
+            total_downtime_slashes: self.quantum.total_downtime_slashes,
+            is_healthy: self.quantum.is_healthy,
+            uptime_coherence: 1.0, // updated separately by manager
+        }
+    }
+
     pub fn apply_evidence(
         &mut self,
         evidence: &Evidence,
@@ -681,7 +828,7 @@ impl StakeLedger {
 
         let slash = (record.stake / self.config.slash_fraction_double_vote).max(1);
         record.stake = record.stake.saturating_sub(slash);
-        record.slashed_total += slash;
+        record.slashed_total = record.slashed_total.saturating_add(slash);
 
         let is_tombstone = matches!(
             &record.status,
@@ -720,6 +867,8 @@ impl StakeLedger {
         );
         self.quantum.apply_slashing_channel();
         self.quantum.recompute(self.config.min_ledger_coherence);
+
+        self.update_metrics();
 
         if !self.quantum.is_healthy {
             warn!(
@@ -763,6 +912,7 @@ impl StakeLedger {
                 self.quantum.apply_unjail_decoherence(self.config.unjail_decoherence_rate);
                 self.quantum.apply_slashing_channel();
                 self.quantum.recompute(self.config.min_ledger_coherence);
+                self.update_metrics();
                 info!(validator = %hex::encode(&pk.0), "validator unjailed");
                 Ok(())
             }
@@ -794,7 +944,7 @@ impl StakeLedger {
 
         let slash = (record.stake / self.config.slash_fraction_downtime).max(1);
         record.stake = record.stake.saturating_sub(slash);
-        record.slashed_total += slash;
+        record.slashed_total = record.slashed_total.saturating_add(slash);
         record.status = ValidatorStatus::Jailed {
             since_height: current_height,
             slash_count: 1,
@@ -809,6 +959,7 @@ impl StakeLedger {
         self.quantum.apply_downtime_decoherence(self.config.downtime_decoherence_rate);
         self.quantum.apply_slashing_channel();
         self.quantum.recompute(self.config.min_ledger_coherence);
+        self.update_metrics();
         Ok(())
     }
 
@@ -827,10 +978,12 @@ impl StakeLedger {
 
     pub fn add_validator(&mut self, pk: PublicKeyBytes, stake: u64) {
         self.validators.insert(pk, ValidatorRecord::new(stake));
+        self.update_metrics();
     }
 
     pub fn remove_validator(&mut self, pk: &PublicKeyBytes) {
         self.validators.remove(pk);
+        self.update_metrics();
     }
 
     /// Create a snapshot for rollback.
@@ -841,6 +994,7 @@ impl StakeLedger {
     /// Apply a snapshot (rollback).
     pub fn apply_snapshot(&mut self, snapshot: Self) {
         *self = snapshot;
+        self.update_metrics();
     }
 
     /// Save to disk.
@@ -912,7 +1066,8 @@ impl UptimeTracker {
         }
 
         for pk in signers {
-            *self.signed_in_window.entry(pk.clone()).or_insert(0) += 1;
+            *self.signed_in_window.entry(pk.clone()).or_insert(0) =
+                self.signed_in_window.get(pk).copied().unwrap_or(0).saturating_add(1);
             self.last_signed_height.insert(pk.clone(), height);
         }
 
@@ -953,7 +1108,6 @@ impl UptimeTracker {
         self.last_signed_height.remove(pk);
     }
 
-    /// Clear all data (for testing).
     #[cfg(test)]
     pub fn clear(&mut self) {
         self.signed_in_window.clear();
@@ -979,8 +1133,15 @@ impl SlashingManager {
     /// Create a new manager with the given configuration.
     pub fn new(config: SlashingConfig) -> Result<Self, SlashingError> {
         config.validate().map_err(|e| SlashingError::Config(e))?;
+        let metrics = if config.enable_metrics {
+            SlashingMetrics::new().ok().map(Arc::new)
+        } else {
+            None
+        };
+        let mut ledger = StakeLedger::new(config);
+        ledger.metrics = metrics;
         Ok(Self {
-            ledger: Arc::new(Mutex::new(StakeLedger::new(config))),
+            ledger: Arc::new(Mutex::new(ledger)),
             uptime: Arc::new(Mutex::new(UptimeTracker::new())),
             path: None,
         })
@@ -993,7 +1154,13 @@ impl SlashingManager {
     ) -> Result<Self, SlashingError> {
         config.validate().map_err(|e| SlashingError::Config(e))?;
         let path = PathBuf::from(data_dir).join(DEFAULT_PERSIST_FILE);
-        let ledger = StakeLedger::with_persistence(data_dir, config)?;
+        let mut ledger = StakeLedger::with_persistence(data_dir, config)?;
+        let metrics = if ledger.config.enable_metrics {
+            SlashingMetrics::new().ok().map(Arc::new)
+        } else {
+            None
+        };
+        ledger.metrics = metrics;
         Ok(Self {
             ledger: Arc::new(Mutex::new(ledger)),
             uptime: Arc::new(Mutex::new(UptimeTracker::new())),
@@ -1061,14 +1228,12 @@ impl SlashingManager {
             let _ = self.slash_downtime(pk, current_height);
         }
 
-        // Reset uptime counts for jailed validators.
         let mut uptime = self.uptime.lock();
         for pk in &offenders {
             uptime.reset_counts(pk);
         }
         drop(uptime);
 
-        // Persist if enabled.
         let mut ledger = self.ledger.lock();
         if ledger.config.persist_state {
             if let Some(path) = &self.path {
@@ -1188,9 +1353,9 @@ mod tests {
     use tempfile::tempdir;
 
     fn dummy_pk(id: u8) -> PublicKeyBytes {
-        let mut bytes = [0u8; 32];
+        let mut bytes = vec![0u8; 32];
         bytes[0] = id;
-        PublicKeyBytes(bytes.to_vec())
+        PublicKeyBytes(bytes)
     }
 
     fn test_config() -> SlashingConfig {
@@ -1201,6 +1366,7 @@ mod tests {
         cfg.downtime_window = 10;
         cfg.downtime_min_signed = 5;
         cfg.persist_state = false;
+        cfg.enable_metrics = false;
         cfg
     }
 
@@ -1300,9 +1466,8 @@ mod tests {
         let mut config = test_config();
         config.persist_state = true;
 
-        let ledger = StakeLedger::with_persistence(path, config.clone()).unwrap();
+        let mut ledger = StakeLedger::with_persistence(path, config.clone()).unwrap();
         let pk = dummy_pk(10);
-        let mut ledger = ledger;
         ledger.add_validator(pk.clone(), 1000);
         let evidence = Evidence::DoubleVote {
             voter: pk.clone(),
@@ -1317,7 +1482,6 @@ mod tests {
         ledger.apply_evidence(&evidence, 10).unwrap();
         ledger.flush().unwrap();
 
-        // Load a new ledger.
         let ledger2 = StakeLedger::with_persistence(path, config).unwrap();
         assert_eq!(ledger2.total_power(), 1000 - (1000 / 10));
     }
@@ -1395,6 +1559,41 @@ mod tests {
         ledger.apply_evidence(&evidence, 10).unwrap();
         let initial_purity = ledger.quantum.purity;
         ledger.unjail(&pk, 20).unwrap();
-        assert!(ledger.quantum.purity < initial_purity); // decoherence from unjail
+        assert!(ledger.quantum.purity < initial_purity);
+    }
+
+    #[test]
+    fn test_metrics_disabled_by_default() {
+        let config = test_config();
+        let ledger = StakeLedger::new(config);
+        assert!(ledger.metrics.is_none());
+    }
+
+    #[test]
+    fn test_metrics_enabled() {
+        let mut config = test_config();
+        config.enable_metrics = true;
+        // Use unregistered metrics to avoid global registry conflicts.
+        let metrics = SlashingMetrics::new_unregistered();
+        let stats = SlashingStats {
+            total_validators: 10,
+            active: 8,
+            jailed: 1,
+            tombstoned: 1,
+            total_power: 9000,
+            purity: 0.95,
+            entropy: 0.02,
+            total_slashes: 3,
+            total_unjails: 2,
+            total_downtime_slashes: 1,
+            is_healthy: true,
+            uptime_coherence: 0.98,
+        };
+        metrics.update_gauges(&stats);
+        assert_eq!(metrics.active_validators.get(), 8.0);
+        assert_eq!(metrics.jailed_validators.get(), 1.0);
+        assert_eq!(metrics.tombstoned_validators.get(), 1.0);
+        assert_eq!(metrics.total_power.get(), 9000.0);
+        assert!((metrics.ledger_purity.get() - 0.95).abs() < 1e-10);
     }
 }
