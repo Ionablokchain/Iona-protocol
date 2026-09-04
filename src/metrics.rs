@@ -229,6 +229,56 @@ fn reset_registry() {
 }
 
 // -----------------------------------------------------------------------------
+// Metric Creation Helpers (reduce boilerplate)
+// -----------------------------------------------------------------------------
+
+fn make_int_counter(registry: &Registry, name: &str, help: &str, enabled: bool) -> MetricsResult<IntCounter> {
+    let full_name = format!("{}_{}", METRIC_PREFIX, name);
+    let counter = IntCounter::with_opts(Opts::new(&full_name, help))
+        .map_err(|e| MetricsError::Registration { name: full_name.clone(), source: e })?;
+    if enabled {
+        registry.register(Box::new(counter.clone()))
+            .map_err(|e| MetricsError::Registration { name: full_name, source: e })?;
+    }
+    Ok(counter)
+}
+
+fn make_int_gauge(registry: &Registry, name: &str, help: &str, enabled: bool) -> MetricsResult<IntGauge> {
+    let full_name = format!("{}_{}", METRIC_PREFIX, name);
+    let gauge = IntGauge::with_opts(Opts::new(&full_name, help))
+        .map_err(|e| MetricsError::Registration { name: full_name.clone(), source: e })?;
+    if enabled {
+        registry.register(Box::new(gauge.clone()))
+            .map_err(|e| MetricsError::Registration { name: full_name, source: e })?;
+    }
+    Ok(gauge)
+}
+
+fn make_gauge(registry: &Registry, name: &str, help: &str, enabled: bool) -> MetricsResult<Gauge> {
+    let full_name = format!("{}_{}", METRIC_PREFIX, name);
+    let gauge = Gauge::with_opts(Opts::new(&full_name, help))
+        .map_err(|e| MetricsError::Registration { name: full_name.clone(), source: e })?;
+    if enabled {
+        registry.register(Box::new(gauge.clone()))
+            .map_err(|e| MetricsError::Registration { name: full_name, source: e })?;
+    }
+    Ok(gauge)
+}
+
+fn make_histogram(registry: &Registry, name: &str, help: &str, buckets: &[f64], enabled: bool) -> MetricsResult<Histogram> {
+    let full_name = format!("{}_{}", METRIC_PREFIX, name);
+    let histogram = Histogram::with_opts(
+        HistogramOpts::new(&full_name, help).buckets(buckets.to_vec()),
+    )
+    .map_err(|e| MetricsError::Registration { name: full_name.clone(), source: e })?;
+    if enabled {
+        registry.register(Box::new(histogram.clone()))
+            .map_err(|e| MetricsError::Registration { name: full_name, source: e })?;
+    }
+    Ok(histogram)
+}
+
+// -----------------------------------------------------------------------------
 // Quantum Metric Handles
 // -----------------------------------------------------------------------------
 
@@ -323,634 +373,79 @@ impl Metrics {
     pub fn new(config: &MetricsConfig) -> MetricsResult<Self> {
         let r = registry();
 
-        // Helper macros for metric creation with error propagation
-        macro_rules! int_counter {
-            ($name:expr, $help:expr) => {{
-                let full_name = format!("{}_{}", METRIC_PREFIX, $name);
-                let c = IntCounter::with_opts(Opts::new(&full_name, $help))
-                    .map_err(|e| MetricsError::Registration {
-                        name: full_name.clone(),
-                        source: e,
-                    })?;
-                r.register(Box::new(c.clone()))
-                    .map_err(|e| MetricsError::Registration {
-                        name: full_name,
-                        source: e,
-                    })?;
-                c
-            }};
-        }
-
-        macro_rules! int_gauge {
-            ($name:expr, $help:expr) => {{
-                let full_name = format!("{}_{}", METRIC_PREFIX, $name);
-                let g = IntGauge::with_opts(Opts::new(&full_name, $help))
-                    .map_err(|e| MetricsError::Registration {
-                        name: full_name.clone(),
-                        source: e,
-                    })?;
-                r.register(Box::new(g.clone()))
-                    .map_err(|e| MetricsError::Registration {
-                        name: full_name,
-                        source: e,
-                    })?;
-                g
-            }};
-        }
-
-        macro_rules! gauge {
-            ($name:expr, $help:expr) => {{
-                let full_name = format!("{}_{}", METRIC_PREFIX, $name);
-                let g = Gauge::with_opts(Opts::new(&full_name, $help))
-                    .map_err(|e| MetricsError::Registration {
-                        name: full_name.clone(),
-                        source: e,
-                    })?;
-                r.register(Box::new(g.clone()))
-                    .map_err(|e| MetricsError::Registration {
-                        name: full_name,
-                        source: e,
-                    })?;
-                g
-            }};
-        }
-
-        macro_rules! histogram {
-            ($name:expr, $help:expr, $buckets:expr) => {{
-                let full_name = format!("{}_{}", METRIC_PREFIX, $name);
-                let h = Histogram::with_opts(
-                    HistogramOpts::new(&full_name, $help).buckets($buckets.to_vec()),
-                )
-                .map_err(|e| MetricsError::Registration {
-                    name: full_name.clone(),
-                    source: e,
-                })?;
-                r.register(Box::new(h.clone()))
-                    .map_err(|e| MetricsError::Registration {
-                        name: full_name,
-                        source: e,
-                    })?;
-                h
-            }};
-        }
-
-        // Create all metrics conditionally.
-        let blocks_committed = if config.enable_consensus {
-            int_counter!("blocks_committed_total", "Total blocks committed")
-        } else {
-            // Register a dummy metric that never increments.
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "blocks_committed_total"),
-                "Total blocks committed",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let rounds_advanced = if config.enable_consensus {
-            int_counter!("rounds_advanced_total", "Total BFT rounds advanced")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "rounds_advanced_total"),
-                "Total BFT rounds advanced",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let consensus_height = if config.enable_consensus {
-            int_gauge!("consensus_height", "Current consensus height")
-        } else {
-            let g = IntGauge::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "consensus_height"),
-                "Current consensus height",
-            )).unwrap();
-            r.register(Box::new(g.clone())).ok();
-            g
-        };
-
-        let block_time_ms = if config.enable_consensus {
-            histogram!("block_time_ms", "Block commit latency in milliseconds", BLOCK_TIME_BUCKETS_MS)
-        } else {
-            let h = Histogram::with_opts(
-                HistogramOpts::new(
-                    &format!("{}_{}", METRIC_PREFIX, "block_time_ms"),
-                    "Block commit latency in milliseconds",
-                ).buckets(BLOCK_TIME_BUCKETS_MS.to_vec()),
-            ).unwrap();
-            r.register(Box::new(h.clone())).ok();
-            h
-        };
+        // Consensus
+        let blocks_committed = make_int_counter(r, "blocks_committed_total", "Total blocks committed", config.enable_consensus)?;
+        let rounds_advanced = make_int_counter(r, "rounds_advanced_total", "Total BFT rounds advanced", config.enable_consensus)?;
+        let consensus_height = make_int_gauge(r, "consensus_height", "Current consensus height", config.enable_consensus)?;
+        let block_time_ms = make_histogram(r, "block_time_ms", "Block commit latency in milliseconds", BLOCK_TIME_BUCKETS_MS, config.enable_consensus)?;
 
         // Throughput
-        let txs_per_block = if config.enable_consensus {
-            histogram!("txs_per_block", "Transactions per committed block", TXS_PER_BLOCK_BUCKETS)
-        } else {
-            let h = Histogram::with_opts(
-                HistogramOpts::new(
-                    &format!("{}_{}", METRIC_PREFIX, "txs_per_block"),
-                    "Transactions per committed block",
-                ).buckets(TXS_PER_BLOCK_BUCKETS.to_vec()),
-            ).unwrap();
-            r.register(Box::new(h.clone())).ok();
-            h
-        };
-
-        let gas_per_block = if config.enable_consensus {
-            histogram!("gas_per_block", "Gas used per committed block", GAS_PER_BLOCK_BUCKETS)
-        } else {
-            let h = Histogram::with_opts(
-                HistogramOpts::new(
-                    &format!("{}_{}", METRIC_PREFIX, "gas_per_block"),
-                    "Gas used per committed block",
-                ).buckets(GAS_PER_BLOCK_BUCKETS.to_vec()),
-            ).unwrap();
-            r.register(Box::new(h.clone())).ok();
-            h
-        };
-
-        let base_fee = if config.enable_consensus {
-            gauge!("base_fee_per_gas", "Current EIP-1559 base fee per gas")
-        } else {
-            let g = Gauge::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "base_fee_per_gas"),
-                "Current EIP-1559 base fee per gas",
-            )).unwrap();
-            r.register(Box::new(g.clone())).ok();
-            g
-        };
+        let txs_per_block = make_histogram(r, "txs_per_block", "Transactions per committed block", TXS_PER_BLOCK_BUCKETS, config.enable_consensus)?;
+        let gas_per_block = make_histogram(r, "gas_per_block", "Gas used per committed block", GAS_PER_BLOCK_BUCKETS, config.enable_consensus)?;
+        let base_fee = make_gauge(r, "base_fee_per_gas", "Current EIP-1559 base fee per gas", config.enable_consensus)?;
 
         // Mempool
-        let mempool_size = if config.enable_mempool {
-            int_gauge!("mempool_size", "Current mempool transaction count")
-        } else {
-            let g = IntGauge::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "mempool_size"),
-                "Current mempool transaction count",
-            )).unwrap();
-            r.register(Box::new(g.clone())).ok();
-            g
-        };
-
-        let mempool_admitted = if config.enable_mempool {
-            int_counter!("mempool_admitted_total", "Transactions admitted to mempool")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "mempool_admitted_total"),
-                "Transactions admitted to mempool",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let mempool_rejected = if config.enable_mempool {
-            int_counter!("mempool_rejected_total", "Transactions rejected")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "mempool_rejected_total"),
-                "Transactions rejected",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let mempool_evicted = if config.enable_mempool {
-            int_counter!("mempool_evicted_total", "Transactions evicted from mempool")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "mempool_evicted_total"),
-                "Transactions evicted from mempool",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let mempool_expired = if config.enable_mempool {
-            int_counter!("mempool_expired_total", "Transactions expired by TTL")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "mempool_expired_total"),
-                "Transactions expired by TTL",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let mempool_rbf = if config.enable_mempool {
-            int_counter!("mempool_rbf_total", "Replace-by-fee replacements")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "mempool_rbf_total"),
-                "Replace-by-fee replacements",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
+        let mempool_size = make_int_gauge(r, "mempool_size", "Current mempool transaction count", config.enable_mempool)?;
+        let mempool_admitted = make_int_counter(r, "mempool_admitted_total", "Transactions admitted to mempool", config.enable_mempool)?;
+        let mempool_rejected = make_int_counter(r, "mempool_rejected_total", "Transactions rejected", config.enable_mempool)?;
+        let mempool_evicted = make_int_counter(r, "mempool_evicted_total", "Transactions evicted from mempool", config.enable_mempool)?;
+        let mempool_expired = make_int_counter(r, "mempool_expired_total", "Transactions expired by TTL", config.enable_mempool)?;
+        let mempool_rbf = make_int_counter(r, "mempool_rbf_total", "Replace-by-fee replacements", config.enable_mempool)?;
 
         // Network
-        let p2p_peers = if config.enable_network {
-            int_gauge!("p2p_peers", "Connected P2P peers")
-        } else {
-            let g = IntGauge::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "p2p_peers"),
-                "Connected P2P peers",
-            )).unwrap();
-            r.register(Box::new(g.clone())).ok();
-            g
-        };
-
-        let msgs_broadcast = if config.enable_network {
-            int_counter!("msgs_broadcast_total", "Gossip messages broadcast")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "msgs_broadcast_total"),
-                "Gossip messages broadcast",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let msgs_received = if config.enable_network {
-            int_counter!("msgs_received_total", "Gossip messages received")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "msgs_received_total"),
-                "Gossip messages received",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let block_requests = if config.enable_network {
-            int_counter!("block_requests_total", "Block fetch requests sent")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "block_requests_total"),
-                "Block fetch requests sent",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let range_syncs = if config.enable_network {
-            int_counter!("range_syncs_total", "Block range sync operations")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "range_syncs_total"),
-                "Block range sync operations",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let net_msg_size_bytes = if config.enable_network {
-            histogram!("net_msg_size_bytes", "Network message size in bytes", NET_MSG_SIZE_BUCKETS)
-        } else {
-            let h = Histogram::with_opts(
-                HistogramOpts::new(
-                    &format!("{}_{}", METRIC_PREFIX, "net_msg_size_bytes"),
-                    "Network message size in bytes",
-                ).buckets(NET_MSG_SIZE_BUCKETS.to_vec()),
-            ).unwrap();
-            r.register(Box::new(h.clone())).ok();
-            h
-        };
-
-        let net_latency_ms = if config.enable_network {
-            histogram!("net_latency_ms", "Network round-trip latency in milliseconds", &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0])
-        } else {
-            let h = Histogram::with_opts(
-                HistogramOpts::new(
-                    &format!("{}_{}", METRIC_PREFIX, "net_latency_ms"),
-                    "Network round-trip latency in milliseconds",
-                ).buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0]),
-            ).unwrap();
-            r.register(Box::new(h.clone())).ok();
-            h
-        };
+        let p2p_peers = make_int_gauge(r, "p2p_peers", "Connected P2P peers", config.enable_network)?;
+        let msgs_broadcast = make_int_counter(r, "msgs_broadcast_total", "Gossip messages broadcast", config.enable_network)?;
+        let msgs_received = make_int_counter(r, "msgs_received_total", "Gossip messages received", config.enable_network)?;
+        let block_requests = make_int_counter(r, "block_requests_total", "Block fetch requests sent", config.enable_network)?;
+        let range_syncs = make_int_counter(r, "range_syncs_total", "Block range sync operations", config.enable_network)?;
+        let net_msg_size_bytes = make_histogram(r, "net_msg_size_bytes", "Network message size in bytes", NET_MSG_SIZE_BUCKETS, config.enable_network)?;
+        let net_latency_ms = make_histogram(r, "net_latency_ms", "Network round-trip latency in milliseconds", &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0], config.enable_network)?;
 
         // RPC
-        let rpc_requests = if config.enable_rpc {
-            int_counter!("rpc_requests_total", "Total RPC requests")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "rpc_requests_total"),
-                "Total RPC requests",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let rpc_tx_submitted = if config.enable_rpc {
-            int_counter!("rpc_tx_submitted_total", "Transactions submitted via RPC")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "rpc_tx_submitted_total"),
-                "Transactions submitted via RPC",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let rpc_errors = if config.enable_rpc {
-            int_counter!("rpc_errors_total", "RPC errors returned")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "rpc_errors_total"),
-                "RPC errors returned",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let rpc_duration_seconds = if config.enable_rpc {
-            histogram!("rpc_request_duration_seconds", "RPC request duration in seconds", RPC_DURATION_BUCKETS_S)
-        } else {
-            let h = Histogram::with_opts(
-                HistogramOpts::new(
-                    &format!("{}_{}", METRIC_PREFIX, "rpc_request_duration_seconds"),
-                    "RPC request duration in seconds",
-                ).buckets(RPC_DURATION_BUCKETS_S.to_vec()),
-            ).unwrap();
-            r.register(Box::new(h.clone())).ok();
-            h
-        };
+        let rpc_requests = make_int_counter(r, "rpc_requests_total", "Total RPC requests", config.enable_rpc)?;
+        let rpc_tx_submitted = make_int_counter(r, "rpc_tx_submitted_total", "Transactions submitted via RPC", config.enable_rpc)?;
+        let rpc_errors = make_int_counter(r, "rpc_errors_total", "RPC errors returned", config.enable_rpc)?;
+        let rpc_duration_seconds = make_histogram(r, "rpc_request_duration_seconds", "RPC request duration in seconds", RPC_DURATION_BUCKETS_S, config.enable_rpc)?;
 
         // Storage
-        let wal_writes = if config.enable_storage {
-            int_counter!("wal_writes_total", "WAL write operations")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "wal_writes_total"),
-                "WAL write operations",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let wal_write_errors = if config.enable_storage {
-            int_counter!("wal_write_errors_total", "WAL write errors")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "wal_write_errors_total"),
-                "WAL write errors",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let state_saves = if config.enable_storage {
-            int_counter!("state_saves_total", "State snapshots saved to disk")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "state_saves_total"),
-                "State snapshots saved to disk",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let wal_latency_ms = if config.enable_storage {
-            histogram!("wal_latency_ms", "WAL write latency in milliseconds", WAL_LATENCY_BUCKETS_MS)
-        } else {
-            let h = Histogram::with_opts(
-                HistogramOpts::new(
-                    &format!("{}_{}", METRIC_PREFIX, "wal_latency_ms"),
-                    "WAL write latency in milliseconds",
-                ).buckets(WAL_LATENCY_BUCKETS_MS.to_vec()),
-            ).unwrap();
-            r.register(Box::new(h.clone())).ok();
-            h
-        };
-
-        let storage_size_bytes = if config.enable_storage {
-            gauge!("storage_size_bytes", "Total storage size in bytes")
-        } else {
-            let g = Gauge::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "storage_size_bytes"),
-                "Total storage size in bytes",
-            )).unwrap();
-            r.register(Box::new(g.clone())).ok();
-            g
-        };
+        let wal_writes = make_int_counter(r, "wal_writes_total", "WAL write operations", config.enable_storage)?;
+        let wal_write_errors = make_int_counter(r, "wal_write_errors_total", "WAL write errors", config.enable_storage)?;
+        let state_saves = make_int_counter(r, "state_saves_total", "State snapshots saved to disk", config.enable_storage)?;
+        let wal_latency_ms = make_histogram(r, "wal_latency_ms", "WAL write latency in milliseconds", WAL_LATENCY_BUCKETS_MS, config.enable_storage)?;
+        let storage_size_bytes = make_gauge(r, "storage_size_bytes", "Total storage size in bytes", config.enable_storage)?;
 
         // Finality
-        let finality_latency_ms = if config.enable_finality {
-            histogram!("finality_latency_ms", "Time from proposal to finality in milliseconds", FINALITY_LATENCY_BUCKETS_MS)
-        } else {
-            let h = Histogram::with_opts(
-                HistogramOpts::new(
-                    &format!("{}_{}", METRIC_PREFIX, "finality_latency_ms"),
-                    "Time from proposal to finality in milliseconds",
-                ).buckets(FINALITY_LATENCY_BUCKETS_MS.to_vec()),
-            ).unwrap();
-            r.register(Box::new(h.clone())).ok();
-            h
-        };
-
-        let finality_height = if config.enable_finality {
-            int_gauge!("finality_height", "Latest finalized block height")
-        } else {
-            let g = IntGauge::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "finality_height"),
-                "Latest finalized block height",
-            )).unwrap();
-            r.register(Box::new(g.clone())).ok();
-            g
-        };
-
-        let finality_certificates = if config.enable_finality {
-            int_counter!("finality_certificates_total", "Finality certificates issued")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "finality_certificates_total"),
-                "Finality certificates issued",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
+        let finality_latency_ms = make_histogram(r, "finality_latency_ms", "Time from proposal to finality in milliseconds", FINALITY_LATENCY_BUCKETS_MS, config.enable_finality)?;
+        let finality_height = make_int_gauge(r, "finality_height", "Latest finalized block height", config.enable_finality)?;
+        let finality_certificates = make_int_counter(r, "finality_certificates_total", "Finality certificates issued", config.enable_finality)?;
 
         // Protocol
-        let protocol_version = if config.enable_protocol {
-            int_gauge!("protocol_version", "Current active protocol version")
-        } else {
-            let g = IntGauge::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "protocol_version"),
-                "Current active protocol version",
-            )).unwrap();
-            r.register(Box::new(g.clone())).ok();
-            g
-        };
-
-        let schema_version = if config.enable_protocol {
-            int_gauge!("schema_version", "Current storage schema version")
-        } else {
-            let g = IntGauge::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "schema_version"),
-                "Current storage schema version",
-            )).unwrap();
-            r.register(Box::new(g.clone())).ok();
-            g
-        };
+        let protocol_version = make_int_gauge(r, "protocol_version", "Current active protocol version", config.enable_protocol)?;
+        let schema_version = make_int_gauge(r, "schema_version", "Current storage schema version", config.enable_protocol)?;
 
         // Migration
-        let migration_running = if config.enable_migration {
-            int_gauge!("migration_running", "Number of migrations currently running")
-        } else {
-            let g = IntGauge::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "migration_running"),
-                "Number of migrations currently running",
-            )).unwrap();
-            r.register(Box::new(g.clone())).ok();
-            g
-        };
-
-        let migration_completed = if config.enable_migration {
-            int_counter!("migrations_completed_total", "Migrations completed successfully")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "migrations_completed_total"),
-                "Migrations completed successfully",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let migration_errors = if config.enable_migration {
-            int_counter!("migration_errors_total", "Migration errors")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "migration_errors_total"),
-                "Migration errors",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
+        let migration_running = make_int_gauge(r, "migration_running", "Number of migrations currently running", config.enable_migration)?;
+        let migration_completed = make_int_counter(r, "migrations_completed_total", "Migrations completed successfully", config.enable_migration)?;
+        let migration_errors = make_int_counter(r, "migration_errors_total", "Migration errors", config.enable_migration)?;
 
         // Rate Limiting
-        let p2p_rate_limited = if config.enable_rate_limiting {
-            int_counter!("p2p_rate_limited_total", "P2P requests rate-limited")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "p2p_rate_limited_total"),
-                "P2P requests rate-limited",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let p2p_peers_banned = if config.enable_rate_limiting {
-            int_counter!("p2p_peers_banned_total", "Peers permanently banned")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "p2p_peers_banned_total"),
-                "Peers permanently banned",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let p2p_peers_quarantined = if config.enable_rate_limiting {
-            int_counter!("p2p_peers_quarantined_total", "Peers quarantined")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "p2p_peers_quarantined_total"),
-                "Peers quarantined",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let rpc_rate_limited = if config.enable_rate_limiting {
-            int_counter!("rpc_rate_limited_total", "RPC requests rate-limited")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "rpc_rate_limited_total"),
-                "RPC requests rate-limited",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
+        let p2p_rate_limited = make_int_counter(r, "p2p_rate_limited_total", "P2P requests rate-limited", config.enable_rate_limiting)?;
+        let p2p_peers_banned = make_int_counter(r, "p2p_peers_banned_total", "Peers permanently banned", config.enable_rate_limiting)?;
+        let p2p_peers_quarantined = make_int_counter(r, "p2p_peers_quarantined_total", "Peers quarantined", config.enable_rate_limiting)?;
+        let rpc_rate_limited = make_int_counter(r, "rpc_rate_limited_total", "RPC requests rate-limited", config.enable_rate_limiting)?;
 
         // Snapshots
-        let snapshots_created = if config.enable_snapshots {
-            int_counter!("snapshots_created_total", "State snapshots created")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "snapshots_created_total"),
-                "State snapshots created",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let snapshots_loaded = if config.enable_snapshots {
-            int_counter!("snapshots_loaded_total", "State snapshots loaded")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "snapshots_loaded_total"),
-                "State snapshots loaded",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
-
-        let snapshot_size_bytes = if config.enable_snapshots {
-            gauge!("snapshot_size_bytes", "Size of latest snapshot in bytes")
-        } else {
-            let g = Gauge::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "snapshot_size_bytes"),
-                "Size of latest snapshot in bytes",
-            )).unwrap();
-            r.register(Box::new(g.clone())).ok();
-            g
-        };
+        let snapshots_created = make_int_counter(r, "snapshots_created_total", "State snapshots created", config.enable_snapshots)?;
+        let snapshots_loaded = make_int_counter(r, "snapshots_loaded_total", "State snapshots loaded", config.enable_snapshots)?;
+        let snapshot_size_bytes = make_gauge(r, "snapshot_size_bytes", "Size of latest snapshot in bytes", config.enable_snapshots)?;
 
         // Audit
-        let audit_events = if config.enable_audit {
-            int_counter!("audit_events_total", "Total audit events logged")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "audit_events_total"),
-                "Total audit events logged",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
+        let audit_events = make_int_counter(r, "audit_events_total", "Total audit events logged", config.enable_audit)?;
 
         // Quantum
-        let node_coherence = if config.enable_quantum {
-            gauge!("node_coherence", "Node quantum coherence (state purity γ = Tr(ρ²))")
-        } else {
-            let g = Gauge::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "node_coherence"),
-                "Node quantum coherence (state purity γ = Tr(ρ²))",
-            )).unwrap();
-            r.register(Box::new(g.clone())).ok();
-            g
-        };
-
-        let entanglement_entropy = if config.enable_quantum {
-            gauge!("entanglement_entropy", "Node entanglement entropy S = -Tr(ρ ln ρ)")
-        } else {
-            let g = Gauge::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "entanglement_entropy"),
-                "Node entanglement entropy S = -Tr(ρ ln ρ)",
-            )).unwrap();
-            r.register(Box::new(g.clone())).ok();
-            g
-        };
-
-        let measurement_count = if config.enable_quantum {
-            int_counter!("measurement_count_total", "Total measurement operations (scrape count)")
-        } else {
-            let c = IntCounter::with_opts(Opts::new(
-                &format!("{}_{}", METRIC_PREFIX, "measurement_count_total"),
-                "Total measurement operations (scrape count)",
-            )).unwrap();
-            r.register(Box::new(c.clone())).ok();
-            c
-        };
+        let node_coherence = make_gauge(r, "node_coherence", "Node quantum coherence (state purity γ = Tr(ρ²))", config.enable_quantum)?;
+        let entanglement_entropy = make_gauge(r, "entanglement_entropy", "Node entanglement entropy S = -Tr(ρ ln ρ)", config.enable_quantum)?;
+        let measurement_count = make_int_counter(r, "measurement_count_total", "Total measurement operations (scrape count)", config.enable_quantum)?;
 
         // Labeled metrics (optional)
         let rpc_requests_by_method = if config.enable_labels && config.enable_rpc {
@@ -959,15 +454,9 @@ impl Metrics {
                 "RPC requests by method",
             );
             let vec = prometheus::CounterVec::new(opts, &["method"])
-                .map_err(|e| MetricsError::Registration {
-                    name: "rpc_requests_by_method".into(),
-                    source: e,
-                })?;
+                .map_err(|e| MetricsError::Registration { name: "rpc_requests_by_method".into(), source: e })?;
             r.register(Box::new(vec.clone()))
-                .map_err(|e| MetricsError::Registration {
-                    name: "rpc_requests_by_method".into(),
-                    source: e,
-                })?;
+                .map_err(|e| MetricsError::Registration { name: "rpc_requests_by_method".into(), source: e })?;
             Some(vec)
         } else {
             None
@@ -979,15 +468,9 @@ impl Metrics {
                 "P2P messages by type",
             );
             let vec = prometheus::CounterVec::new(opts, &["type"])
-                .map_err(|e| MetricsError::Registration {
-                    name: "p2p_messages_by_type".into(),
-                    source: e,
-                })?;
+                .map_err(|e| MetricsError::Registration { name: "p2p_messages_by_type".into(), source: e })?;
             r.register(Box::new(vec.clone()))
-                .map_err(|e| MetricsError::Registration {
-                    name: "p2p_messages_by_type".into(),
-                    source: e,
-                })?;
+                .map_err(|e| MetricsError::Registration { name: "p2p_messages_by_type".into(), source: e })?;
             Some(vec)
         } else {
             None
@@ -999,15 +482,9 @@ impl Metrics {
                 "Mempool transactions by type",
             );
             let vec = prometheus::CounterVec::new(opts, &["type"])
-                .map_err(|e| MetricsError::Registration {
-                    name: "mempool_txs_by_type".into(),
-                    source: e,
-                })?;
+                .map_err(|e| MetricsError::Registration { name: "mempool_txs_by_type".into(), source: e })?;
             r.register(Box::new(vec.clone()))
-                .map_err(|e| MetricsError::Registration {
-                    name: "mempool_txs_by_type".into(),
-                    source: e,
-                })?;
+                .map_err(|e| MetricsError::Registration { name: "mempool_txs_by_type".into(), source: e })?;
             Some(vec)
         } else {
             None
@@ -1072,9 +549,6 @@ impl Metrics {
     /// Apply quantum decoherence to the metrics registry (placeholder).
     /// In practice, this could adjust gauge values to reflect measurement disturbance.
     pub fn apply_decoherence(&self) {
-        // Update the node_coherence and entanglement_entropy gauges
-        // based on some internal model, if enabled.
-        // For now, we just set a default value.
         self.node_coherence.set(0.99);
         self.entanglement_entropy.set(0.01);
     }
@@ -1217,11 +691,9 @@ fn get_metrics() -> Option<&'static Metrics> {
 /// Reset global metrics (for testing).
 #[cfg(test)]
 pub fn reset_metrics() {
-    // Drop the current metrics.
     if let Some(m) = METRICS.take() {
         drop(m);
     }
-    // Reset registry.
     reset_registry();
 }
 
@@ -1404,10 +876,7 @@ mod tests {
         let m = Metrics::new(&cfg).unwrap();
         // Should still exist but not increment.
         m.blocks_committed.inc_by(5);
-        // No error, but metric may be unused.
-        assert_eq!(m.blocks_committed.get(), 5); // It still increments because it's registered.
-        // The metric is registered as dummy but we can still increment it.
-        // That's okay; in practice we'd guard calls with config checks.
+        assert_eq!(m.blocks_committed.get(), 5); // It still increments because it's created.
     }
 
     #[test]
@@ -1416,7 +885,6 @@ mod tests {
         {
             let cfg = test_config();
             let result = build_otel_layer(&cfg);
-            // Without endpoint set, should fail.
             assert!(result.is_err());
         }
         #[cfg(not(feature = "otel"))]
