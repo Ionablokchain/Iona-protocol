@@ -12,7 +12,7 @@
 //! - Configurable segment size, retention, sync policy, and checksums.
 //! - Streaming replay with `replay_stream` to avoid memory blow‑up.
 //! - Batch append for high throughput.
-//! - Metrics with atomic counters.
+//! - Metrics with atomic counters and optional Prometheus integration.
 //! - Quantum coherence tracking for operational insights.
 //! - Automatic segment rotation with atomic rename.
 //! - Pruning of old segments with configurable retention.
@@ -20,6 +20,7 @@
 //! - Full test coverage.
 
 use parking_lot::Mutex;
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write, Seek, SeekFrom};
@@ -85,6 +86,8 @@ pub struct WalConfig {
     pub track_coherence: bool,
     /// Whether to perform strict validation on replay.
     pub strict_replay: bool,
+    /// Whether to enable Prometheus metrics.
+    pub enable_metrics: bool,
 }
 
 impl Default for WalConfig {
@@ -97,6 +100,7 @@ impl Default for WalConfig {
             sync_interval_ms: DEFAULT_SYNC_INTERVAL_MS,
             track_coherence: true,
             strict_replay: true,
+            enable_metrics: false,
         }
     }
 }
@@ -118,12 +122,122 @@ impl WalConfig {
 }
 
 // -----------------------------------------------------------------------------
-// Metrics
+// Prometheus Metrics (optional)
 // -----------------------------------------------------------------------------
 
-/// Metrics for the Write-Ahead Log.
-#[derive(Debug, Clone, Default)]
+/// Prometheus metrics for the Write-Ahead Log.
+#[derive(Clone)]
 pub struct WalMetrics {
+    /// Total WAL events written.
+    pub events_written_total: Counter,
+    /// Total segment rotations.
+    pub rotations_total: Counter,
+    /// Total corrupt lines encountered.
+    pub corrupt_lines_total: Counter,
+    /// Total bytes written.
+    pub bytes_written_total: Counter,
+    /// Total fsync operations.
+    pub fsyncs_total: Counter,
+    /// Total events replayed.
+    pub replay_events_total: Counter,
+    /// Current WAL coherence.
+    pub coherence: Gauge,
+    /// Current segment number.
+    pub current_segment: Gauge,
+}
+
+impl WalMetrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            events_written_total: register_counter!(
+                "iona_wal_events_written_total",
+                "Total WAL events written"
+            )?,
+            rotations_total: register_counter!(
+                "iona_wal_rotations_total",
+                "Total WAL segment rotations"
+            )?,
+            corrupt_lines_total: register_counter!(
+                "iona_wal_corrupt_lines_total",
+                "Total corrupt lines encountered"
+            )?,
+            bytes_written_total: register_counter!(
+                "iona_wal_bytes_written_total",
+                "Total bytes written"
+            )?,
+            fsyncs_total: register_counter!(
+                "iona_wal_fsyncs_total",
+                "Total fsync operations"
+            )?,
+            replay_events_total: register_counter!(
+                "iona_wal_replay_events_total",
+                "Total events replayed"
+            )?,
+            coherence: register_gauge!(
+                "iona_wal_coherence",
+                "Current WAL quantum coherence"
+            )?,
+            current_segment: register_gauge!(
+                "iona_wal_current_segment",
+                "Current WAL segment number"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or disabled metrics).
+    pub fn new_unregistered() -> Self {
+        Self {
+            events_written_total: Counter::new("iona_wal_events_written_total", "Events").unwrap(),
+            rotations_total: Counter::new("iona_wal_rotations_total", "Rotations").unwrap(),
+            corrupt_lines_total: Counter::new("iona_wal_corrupt_lines_total", "Corrupt").unwrap(),
+            bytes_written_total: Counter::new("iona_wal_bytes_written_total", "Bytes").unwrap(),
+            fsyncs_total: Counter::new("iona_wal_fsyncs_total", "Fsyncs").unwrap(),
+            replay_events_total: Counter::new("iona_wal_replay_events_total", "Replay events").unwrap(),
+            coherence: Gauge::new("iona_wal_coherence", "Coherence").unwrap(),
+            current_segment: Gauge::new("iona_wal_current_segment", "Segment").unwrap(),
+        }
+    }
+
+    /// Record a write.
+    pub fn record_write(&self, bytes: u64) {
+        self.events_written_total.inc();
+        self.bytes_written_total.inc_by(bytes as f64);
+    }
+
+    /// Record a rotation.
+    pub fn record_rotation(&self) {
+        self.rotations_total.inc();
+    }
+
+    /// Record a corrupt line.
+    pub fn record_corrupt(&self) {
+        self.corrupt_lines_total.inc();
+    }
+
+    /// Record an fsync.
+    pub fn record_fsync(&self) {
+        self.fsyncs_total.inc();
+    }
+
+    /// Record a replay event.
+    pub fn record_replay_event(&self) {
+        self.replay_events_total.inc();
+    }
+
+    /// Update gauges from current state.
+    pub fn update_gauges(&self, coherence: f64, current_segment: u32) {
+        self.coherence.set(coherence);
+        self.current_segment.set(current_segment as f64);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Atomic fallback metrics (for environments without Prometheus)
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct AtomicWalMetrics {
     pub events_written: AtomicU64,
     pub rotations: AtomicU64,
     pub corrupt_lines: AtomicU64,
@@ -132,7 +246,7 @@ pub struct WalMetrics {
     pub replay_events: AtomicU64,
 }
 
-impl WalMetrics {
+impl AtomicWalMetrics {
     pub fn record_write(&self, bytes: u64) {
         self.events_written.fetch_add(1, Ordering::Relaxed);
         self.bytes_written.fetch_add(bytes, Ordering::Relaxed);
@@ -200,6 +314,9 @@ pub enum WalError {
 
     #[error("WAL already closed")]
     AlreadyClosed,
+
+    #[error("metrics error: {0}")]
+    Metrics(#[from] prometheus::Error),
 }
 
 pub type WalResult<T> = Result<T, WalError>;
@@ -282,11 +399,11 @@ impl WalInner {
         crc32fast::hash(&bytes)
     }
 
-    fn rotate(&mut self, metrics: &WalMetrics) -> WalResult<()> {
+    fn rotate(&mut self, metrics: &AtomicWalMetrics, prometheus: Option<&WalMetrics>) -> WalResult<()> {
         if self.closed {
             return Err(WalError::AlreadyClosed);
         }
-        self.current_segment += 1;
+        self.current_segment = self.current_segment.saturating_add(1);
         let new_path = Self::segment_path(&self.dir, self.current_segment);
 
         self.file.sync_data()?;
@@ -298,6 +415,10 @@ impl WalInner {
         self.prune_old_segments()?;
 
         metrics.record_rotation();
+        if let Some(pm) = prometheus {
+            pm.record_rotation();
+            pm.update_gauges(self.coherence, self.current_segment);
+        }
         trace!("WAL rotated to segment {}", self.current_segment);
 
         if self.config.track_coherence {
@@ -326,14 +447,19 @@ impl WalInner {
         Ok(())
     }
 
-    fn append_event(&mut self, event: &WalEvent, metrics: &WalMetrics) -> WalResult<()> {
+    fn append_event(
+        &mut self,
+        event: &WalEvent,
+        metrics: &AtomicWalMetrics,
+        prometheus: Option<&WalMetrics>,
+    ) -> WalResult<()> {
         if self.closed {
             return Err(WalError::AlreadyClosed);
         }
 
         // Check segment size
         if self.written >= self.config.max_segment_bytes {
-            self.rotate(metrics)?;
+            self.rotate(metrics, prometheus)?;
         }
 
         // Serialise with optional checksum
@@ -358,8 +484,11 @@ impl WalInner {
 
         // Update metrics
         let bytes = (line.len() + 1) as u64;
-        self.written += bytes;
+        self.written = self.written.saturating_add(bytes);
         metrics.record_write(bytes);
+        if let Some(pm) = prometheus {
+            pm.record_write(bytes);
+        }
 
         // Apply decoherence
         if self.config.track_coherence {
@@ -374,6 +503,9 @@ impl WalInner {
         {
             self.file.sync_data()?;
             metrics.record_fsync();
+            if let Some(pm) = prometheus {
+                pm.record_fsync();
+            }
             self.last_sync = now;
             if self.config.track_coherence {
                 self.coherence *= 1.0 - FSYNC_DECOHERENCE_RATE;
@@ -381,27 +513,37 @@ impl WalInner {
             }
         }
 
+        if let Some(pm) = prometheus {
+            pm.update_gauges(self.coherence, self.current_segment);
+        }
+
         Ok(())
     }
 
-    fn sync(&mut self, metrics: &WalMetrics) -> WalResult<()> {
+    fn sync(&mut self, metrics: &AtomicWalMetrics, prometheus: Option<&WalMetrics>) -> WalResult<()> {
         if self.closed {
             return Err(WalError::AlreadyClosed);
         }
         self.file.sync_all()?;
         metrics.record_fsync();
+        if let Some(pm) = prometheus {
+            pm.record_fsync();
+        }
         if self.config.track_coherence {
             self.coherence *= 1.0 - FSYNC_DECOHERENCE_RATE;
             self.coherence = self.coherence.clamp(0.0, 1.0);
         }
+        if let Some(pm) = prometheus {
+            pm.update_gauges(self.coherence, self.current_segment);
+        }
         Ok(())
     }
 
-    fn close(&mut self, metrics: &WalMetrics) -> WalResult<()> {
+    fn close(&mut self, metrics: &AtomicWalMetrics, prometheus: Option<&WalMetrics>) -> WalResult<()> {
         if self.closed {
             return Ok(());
         }
-        self.sync(metrics)?;
+        self.sync(metrics, prometheus)?;
         self.closed = true;
         Ok(())
     }
@@ -410,7 +552,7 @@ impl WalInner {
         WalStats {
             current_segment: self.current_segment,
             written_bytes: self.written,
-            total_events: 0, // updated externally
+            total_events: 0,
             rotations: 0,
             coherence: self.coherence,
         }
@@ -425,7 +567,8 @@ impl WalInner {
 #[derive(Clone)]
 pub struct Wal {
     inner: Arc<Mutex<WalInner>>,
-    metrics: Arc<WalMetrics>,
+    metrics: Arc<AtomicWalMetrics>,
+    prometheus: Option<Arc<WalMetrics>>,
     config: Arc<WalConfig>,
 }
 
@@ -450,6 +593,12 @@ impl Wal {
             1.0
         };
 
+        let prometheus = if config.enable_metrics {
+            Some(Arc::new(WalMetrics::new()?))
+        } else {
+            None
+        };
+
         let inner = WalInner {
             config: config.clone(),
             dir,
@@ -461,6 +610,10 @@ impl Wal {
             closed: false,
         };
 
+        if let Some(pm) = &prometheus {
+            pm.update_gauges(inner.coherence, inner.current_segment);
+        }
+
         info!(
             dir = %inner.dir.display(),
             segment = inner.current_segment,
@@ -471,7 +624,8 @@ impl Wal {
 
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
-            metrics: Arc::new(WalMetrics::default()),
+            metrics: Arc::new(AtomicWalMetrics::default()),
+            prometheus,
             config: Arc::new(config),
         })
     }
@@ -484,14 +638,14 @@ impl Wal {
     /// Append a single event to the WAL.
     pub fn append(&self, event: &WalEvent) -> WalResult<()> {
         let mut inner = self.inner.lock();
-        inner.append_event(event, &self.metrics)
+        inner.append_event(event, &self.metrics, self.prometheus.as_deref())
     }
 
     /// Append multiple events in a batch (more efficient).
     pub fn append_batch(&self, events: &[WalEvent]) -> WalResult<()> {
         let mut inner = self.inner.lock();
         for event in events {
-            inner.append_event(event, &self.metrics)?;
+            inner.append_event(event, &self.metrics, self.prometheus.as_deref())?;
         }
         Ok(())
     }
@@ -499,13 +653,13 @@ impl Wal {
     /// Force a full sync of the current segment.
     pub fn sync(&self) -> WalResult<()> {
         let mut inner = self.inner.lock();
-        inner.sync(&self.metrics)
+        inner.sync(&self.metrics, self.prometheus.as_deref())
     }
 
     /// Close the WAL (flush and release resources).
     pub fn close(&self) -> WalResult<()> {
         let mut inner = self.inner.lock();
-        inner.close(&self.metrics)
+        inner.close(&self.metrics, self.prometheus.as_deref())
     }
 
     /// Get current WAL coherence.
@@ -513,9 +667,23 @@ impl Wal {
         self.inner.lock().coherence
     }
 
-    /// Get metrics.
-    pub fn metrics(&self) -> &WalMetrics {
+    /// Get atomic metrics.
+    pub fn atomic_metrics(&self) -> &AtomicWalMetrics {
         &self.metrics
+    }
+
+    /// Get Prometheus metrics snapshot (if enabled).
+    pub fn metrics_snapshot(&self) -> Option<WalMetricsSnapshot> {
+        self.prometheus.as_ref().map(|pm| WalMetricsSnapshot {
+            events_written_total: pm.events_written_total.get(),
+            rotations_total: pm.rotations_total.get(),
+            corrupt_lines_total: pm.corrupt_lines_total.get(),
+            bytes_written_total: pm.bytes_written_total.get(),
+            fsyncs_total: pm.fsyncs_total.get(),
+            replay_events_total: pm.replay_events_total.get(),
+            coherence: pm.coherence.get(),
+            current_segment: pm.current_segment.get(),
+        })
     }
 
     /// Get WAL statistics.
@@ -575,7 +743,12 @@ impl Wal {
 
         let mut corrupt = 0usize;
         let mut total_lines = 0usize;
-        let metrics = WalMetrics::default();
+        let atomic = AtomicWalMetrics::default();
+        let prometheus = if config.enable_metrics {
+            Some(WalMetrics::new()?)
+        } else {
+            None
+        };
 
         for seg in segments {
             let path = WalInner::segment_path(dir, seg);
@@ -590,7 +763,10 @@ impl Wal {
                     Err(e) => {
                         warn!("WAL read error segment={seg} line={line_no}: {e}");
                         corrupt += 1;
-                        metrics.record_corrupt();
+                        atomic.record_corrupt();
+                        if let Some(pm) = &prometheus {
+                            pm.record_corrupt();
+                        }
                         continue;
                     }
                 };
@@ -611,7 +787,10 @@ impl Wal {
                                     expected, checked.checksum
                                 );
                                 corrupt += 1;
-                                metrics.record_corrupt();
+                                atomic.record_corrupt();
+                                if let Some(pm) = &prometheus {
+                                    pm.record_corrupt();
+                                }
                                 continue;
                             }
                             checked.inner
@@ -619,7 +798,10 @@ impl Wal {
                         Err(e) => {
                             warn!("WAL corrupt line segment={seg} line={line_no}: {e}");
                             corrupt += 1;
-                            metrics.record_corrupt();
+                            atomic.record_corrupt();
+                            if let Some(pm) = &prometheus {
+                                pm.record_corrupt();
+                            }
                             continue;
                         }
                     }
@@ -629,7 +811,10 @@ impl Wal {
                         Err(e) => {
                             warn!("WAL corrupt line segment={seg} line={line_no}: {e}");
                             corrupt += 1;
-                            metrics.record_corrupt();
+                            atomic.record_corrupt();
+                            if let Some(pm) = &prometheus {
+                                pm.record_corrupt();
+                            }
                             continue;
                         }
                     }
@@ -643,7 +828,10 @@ impl Wal {
                 }
 
                 callback(ev)?;
-                metrics.record_replay_event();
+                atomic.record_replay_event();
+                if let Some(pm) = &prometheus {
+                    pm.record_replay_event();
+                }
             }
         }
 
@@ -677,6 +865,12 @@ impl Wal {
         let reader = BufReader::new(file);
         let mut events = Vec::new();
         let mut corrupt = 0;
+        let atomic = AtomicWalMetrics::default();
+        let prometheus = if config.enable_metrics {
+            Some(WalMetrics::new()?)
+        } else {
+            None
+        };
 
         for (line_no, line_result) in reader.lines().enumerate() {
             let line = match line_result {
@@ -685,6 +879,10 @@ impl Wal {
                 Err(e) => {
                     warn!("legacy WAL read error line={line_no}: {e}");
                     corrupt += 1;
+                    atomic.record_corrupt();
+                    if let Some(pm) = &prometheus {
+                        pm.record_corrupt();
+                    }
                     continue;
                 }
             };
@@ -702,6 +900,10 @@ impl Wal {
                         if checked.checksum != expected {
                             warn!("legacy WAL checksum mismatch line={line_no}");
                             corrupt += 1;
+                            atomic.record_corrupt();
+                            if let Some(pm) = &prometheus {
+                                pm.record_corrupt();
+                            }
                             continue;
                         }
                         checked.inner
@@ -709,6 +911,10 @@ impl Wal {
                     Err(e) => {
                         warn!("legacy WAL corrupt line={line_no}: {e}");
                         corrupt += 1;
+                        atomic.record_corrupt();
+                        if let Some(pm) = &prometheus {
+                            pm.record_corrupt();
+                        }
                         continue;
                     }
                 }
@@ -718,12 +924,20 @@ impl Wal {
                     Err(e) => {
                         warn!("legacy WAL corrupt line={line_no}: {e}");
                         corrupt += 1;
+                        atomic.record_corrupt();
+                        if let Some(pm) = &prometheus {
+                            pm.record_corrupt();
+                        }
                         continue;
                     }
                 }
             };
 
             events.push(ev);
+            atomic.record_replay_event();
+            if let Some(pm) = &prometheus {
+                pm.record_replay_event();
+            }
         }
 
         if corrupt > 0 && config.strict_replay {
@@ -768,8 +982,21 @@ pub struct WalStats {
     pub coherence: f64,
 }
 
+/// Snapshot of Prometheus metrics for external use.
+#[derive(Debug, Clone)]
+pub struct WalMetricsSnapshot {
+    pub events_written_total: u64,
+    pub rotations_total: u64,
+    pub corrupt_lines_total: u64,
+    pub bytes_written_total: u64,
+    pub fsyncs_total: u64,
+    pub replay_events_total: u64,
+    pub coherence: f64,
+    pub current_segment: f64,
+}
+
 // -----------------------------------------------------------------------------
-// Tests
+// Tests (unchanged, plus one for metrics)
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -792,7 +1019,7 @@ mod tests {
         wal.append(&sample_event())?;
 
         assert!(wal.coherence() < initial_coherence);
-        assert_eq!(wal.metrics().events_written.load(Ordering::Relaxed), 1);
+        assert_eq!(wal.atomic_metrics().events_written.load(Ordering::Relaxed), 1);
 
         let events = Wal::replay(dir.path())?;
         assert_eq!(events.len(), 1);
@@ -818,7 +1045,7 @@ mod tests {
         }
 
         assert!(wal.inner.lock().current_segment >= 1);
-        assert_eq!(wal.metrics().rotations.load(Ordering::Relaxed), 1);
+        assert_eq!(wal.atomic_metrics().rotations.load(Ordering::Relaxed), 1);
 
         Ok(())
     }
@@ -887,13 +1114,33 @@ mod tests {
     }
 
     #[test]
+    fn test_prometheus_metrics_disabled_by_default() {
+        let dir = TempDir::new().unwrap();
+        let wal = Wal::open_default(dir.path()).unwrap();
+        assert!(wal.metrics_snapshot().is_none());
+    }
+
+    #[test]
+    fn test_prometheus_metrics_enabled() {
+        let dir = TempDir::new().unwrap();
+        let config = WalConfig {
+            enable_metrics: true,
+            ..Default::default()
+        };
+        let wal = Wal::open(dir.path(), config).unwrap();
+        wal.append(&sample_event()).unwrap();
+        let snapshot = wal.metrics_snapshot().unwrap();
+        assert_eq!(snapshot.events_written_total, 1);
+        assert!(snapshot.coherence < 1.0);
+    }
+
+    #[test]
     fn test_close_and_drop() -> WalResult<()> {
         let dir = TempDir::new()?;
         let wal = Wal::open_default(dir.path())?;
         wal.append(&sample_event())?;
         wal.close()?;
         assert!(wal.inner.lock().closed);
-        // Drop will not error.
         drop(wal);
         Ok(())
     }
