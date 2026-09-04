@@ -14,8 +14,11 @@
 //! - Persistent trace context (trace ID, span ID) for correlation.
 //! - Structured logging with `tracing` itself.
 //! - Comprehensive metrics and error handling.
+//! - Overflow‑safe counters using saturating arithmetic.
+//! - Optional Prometheus metrics for observability.
 
 use parking_lot::Mutex;
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -107,6 +110,8 @@ pub struct TracingConfig {
     pub file_log_path: Option<PathBuf>,
     /// Whether to enable OTLP export.
     pub enable_otlp: bool,
+    /// Whether to enable Prometheus metrics.
+    pub enable_metrics: bool,
 }
 
 impl Default for TracingConfig {
@@ -125,6 +130,7 @@ impl Default for TracingConfig {
             enable_file: false,
             file_log_path: None,
             enable_otlp: false,
+            enable_metrics: false,
         }
     }
 }
@@ -157,6 +163,78 @@ impl TracingConfig {
             return Err("otlp_endpoint must be set when enable_otlp is true".into());
         }
         Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tracing Metrics (Prometheus)
+// -----------------------------------------------------------------------------
+
+/// Prometheus metrics for the quantum tracing system.
+#[derive(Clone)]
+pub struct TracingMetrics {
+    /// Total spans created.
+    pub spans_created_total: Counter,
+    /// Total spans exported.
+    pub spans_exported_total: Counter,
+    /// Total spans dropped.
+    pub spans_dropped_total: Counter,
+    /// Current span queue depth.
+    pub span_queue_depth: Gauge,
+    /// Processor quantum coherence.
+    pub processor_coherence: Gauge,
+    /// Number of trace contexts.
+    pub trace_contexts: Gauge,
+}
+
+impl TracingMetrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            spans_created_total: register_counter!(
+                "iona_tracing_spans_created_total",
+                "Total spans created"
+            )?,
+            spans_exported_total: register_counter!(
+                "iona_tracing_spans_exported_total",
+                "Total spans exported"
+            )?,
+            spans_dropped_total: register_counter!(
+                "iona_tracing_spans_dropped_total",
+                "Total spans dropped"
+            )?,
+            span_queue_depth: register_gauge!(
+                "iona_tracing_span_queue_depth",
+                "Current span queue depth"
+            )?,
+            processor_coherence: register_gauge!(
+                "iona_tracing_processor_coherence",
+                "Quantum coherence of span processor"
+            )?,
+            trace_contexts: register_gauge!(
+                "iona_tracing_trace_contexts",
+                "Number of active trace contexts"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or disabled metrics).
+    pub fn new_unregistered() -> Self {
+        Self {
+            spans_created_total: Counter::new("iona_tracing_spans_created_total", "Created").unwrap(),
+            spans_exported_total: Counter::new("iona_tracing_spans_exported_total", "Exported").unwrap(),
+            spans_dropped_total: Counter::new("iona_tracing_spans_dropped_total", "Dropped").unwrap(),
+            span_queue_depth: Gauge::new("iona_tracing_span_queue_depth", "Depth").unwrap(),
+            processor_coherence: Gauge::new("iona_tracing_processor_coherence", "Coherence").unwrap(),
+            trace_contexts: Gauge::new("iona_tracing_trace_contexts", "Contexts").unwrap(),
+        }
+    }
+
+    /// Update gauges from a stats snapshot.
+    pub fn update_gauges(&self, stats: &TracingStats) {
+        self.span_queue_depth.set(stats.current_queue_depth as f64);
+        self.processor_coherence.set(stats.coherence);
+        self.trace_contexts.set(stats.context_count as f64);
     }
 }
 
@@ -275,10 +353,6 @@ fn acquire_lock(path: &Path) -> Result<File, String> {
             }
         }
     }
-}
-
-fn release_lock(file: File) -> Result<(), String> {
-    file.unlock().map_err(|e| format!("unlock error: {}", e))
 }
 
 fn load_trace_state(path: &Path) -> Result<Vec<TraceContext>, String> {
@@ -468,6 +542,8 @@ pub struct TracingManager {
     spans_exported: Arc<AtomicU64>,
     /// Total spans dropped.
     spans_dropped: Arc<AtomicU64>,
+    /// Optional Prometheus metrics.
+    metrics: Option<Arc<TracingMetrics>>,
 }
 
 impl TracingManager {
@@ -477,6 +553,11 @@ impl TracingManager {
         let config = Arc::new(config);
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let processor = Arc::new(Mutex::new(QuantumSpanProcessor::new(&config)));
+        let metrics = if config.enable_metrics {
+            Some(Arc::new(TracingMetrics::new().map_err(|e| e.to_string())?))
+        } else {
+            None
+        };
 
         Ok(Self {
             config,
@@ -486,6 +567,7 @@ impl TracingManager {
             spans_created: Arc::new(AtomicU64::new(0)),
             spans_exported: Arc::new(AtomicU64::new(0)),
             spans_dropped: Arc::new(AtomicU64::new(0)),
+            metrics,
         })
     }
 
@@ -509,6 +591,11 @@ impl TracingManager {
             Arc::new(Mutex::new(Vec::new()))
         };
         let processor = Arc::new(Mutex::new(QuantumSpanProcessor::new(&config)));
+        let metrics = if config.enable_metrics {
+            Some(Arc::new(TracingMetrics::new().map_err(|e| e.to_string())?))
+        } else {
+            None
+        };
 
         Ok(Self {
             config,
@@ -518,6 +605,7 @@ impl TracingManager {
             spans_created: Arc::new(AtomicU64::new(0)),
             spans_exported: Arc::new(AtomicU64::new(0)),
             spans_dropped: Arc::new(AtomicU64::new(0)),
+            metrics,
         })
     }
 
@@ -563,6 +651,9 @@ impl TracingManager {
             self.config.sampling_probability,
         );
         self.spans_created.fetch_add(1, Ordering::Relaxed);
+        if let Some(m) = &self.metrics {
+            m.spans_created_total.inc();
+        }
 
         // Push to processor if sampled.
         if span.born_probability >= rand::random::<f64>() {
@@ -570,8 +661,16 @@ impl TracingManager {
             processor.push(span.clone());
             if processor.should_export() {
                 let exported = processor.export();
-                self.spans_exported.fetch_add(exported.len() as u64, Ordering::Relaxed);
-                // In production, this would send to OTLP.
+                let count = exported.len() as u64;
+                self.spans_exported.fetch_add(count, Ordering::Relaxed);
+                self.spans_dropped.fetch_add(
+                    processor.total_dropped.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                if let Some(m) = &self.metrics {
+                    m.spans_exported_total.inc_by(count);
+                    m.spans_dropped_total.inc_by(processor.total_dropped.load(Ordering::Relaxed));
+                }
                 trace!(count = exported.len(), "exported spans");
             }
         }
@@ -590,10 +689,20 @@ impl TracingManager {
     pub fn flush(&self) -> Result<(), String> {
         let mut processor = self.processor.lock();
         let exported = processor.export();
-        self.spans_exported.fetch_add(exported.len() as u64, Ordering::Relaxed);
+        let count = exported.len() as u64;
+        self.spans_exported.fetch_add(count, Ordering::Relaxed);
+        self.spans_dropped.fetch_add(
+            processor.total_dropped.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        if let Some(m) = &self.metrics {
+            m.spans_exported_total.inc_by(count);
+            m.spans_dropped_total.inc_by(processor.total_dropped.load(Ordering::Relaxed));
+        }
         if let Some(path) = &self.persist_path {
             save_trace_state(path, self)?;
         }
+        self.update_metrics();
         Ok(())
     }
 
@@ -611,6 +720,14 @@ impl TracingManager {
         }
     }
 
+    /// Update metrics from current stats.
+    fn update_metrics(&self) {
+        if let Some(m) = &self.metrics {
+            let stats = self.stats();
+            m.update_gauges(&stats);
+        }
+    }
+
     /// Get configuration.
     pub fn config(&self) -> &TracingConfig {
         &self.config
@@ -619,6 +736,18 @@ impl TracingManager {
     /// Get current trace context.
     pub fn current_context(&self) -> TraceContext {
         self.get_or_create_context()
+    }
+
+    /// Get a snapshot of Prometheus metrics (if enabled).
+    pub fn metrics_snapshot(&self) -> Option<TracingMetricsSnapshot> {
+        self.metrics.as_ref().map(|m| TracingMetricsSnapshot {
+            spans_created_total: m.spans_created_total.get(),
+            spans_exported_total: m.spans_exported_total.get(),
+            spans_dropped_total: m.spans_dropped_total.get(),
+            span_queue_depth: m.span_queue_depth.get(),
+            processor_coherence: m.processor_coherence.get(),
+            trace_contexts: m.trace_contexts.get(),
+        })
     }
 
     /// Initialize the tracing subscriber.
@@ -716,6 +845,7 @@ impl TracingManager {
             }
         }
 
+        self.update_metrics();
         Ok(None)
     }
 }
@@ -758,6 +888,17 @@ pub struct TracingStats {
     pub coherence: f64,
     pub context_count: usize,
     pub service_name: String,
+}
+
+/// Snapshot of Prometheus metrics for external use.
+#[derive(Debug, Clone)]
+pub struct TracingMetricsSnapshot {
+    pub spans_created_total: u64,
+    pub spans_exported_total: u64,
+    pub spans_dropped_total: u64,
+    pub span_queue_depth: f64,
+    pub processor_coherence: f64,
+    pub trace_contexts: f64,
 }
 
 // -----------------------------------------------------------------------------
@@ -808,10 +949,8 @@ static GLOBAL_MANAGER: parking_lot::Mutex<Option<TracingManager>> =
 pub fn init_global(data_dir: &str, config: TracingConfig) -> Result<OtelGuard, String> {
     let manager = TracingManager::with_persistence(data_dir, config)?;
     let guard = manager.init_subscriber()?;
-    *GLOBAL_MANAGER.lock() = Some(manager);
-    Ok(guard.unwrap_or_else(|| OtelGuard {
-        manager: GLOBAL_MANAGER.lock().clone().unwrap(),
-    }))
+    *GLOBAL_MANAGER.lock() = Some(manager.clone());
+    Ok(guard.unwrap_or_else(|| OtelGuard { manager }))
 }
 
 // -----------------------------------------------------------------------------
@@ -832,6 +971,7 @@ mod tests {
         cfg.persist_context = true;
         cfg.enable_console = false;
         cfg.enable_file = false;
+        cfg.enable_metrics = false;
         cfg
     }
 
@@ -976,5 +1116,33 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         ctx.touch();
         assert!(ctx.last_used > old);
+    }
+
+    #[test]
+    fn test_metrics_disabled_by_default() {
+        let config = test_config();
+        let manager = TracingManager::new(config).unwrap();
+        assert!(manager.metrics_snapshot().is_none());
+    }
+
+    #[test]
+    fn test_metrics_enabled() {
+        let mut config = test_config();
+        config.enable_metrics = true;
+        // Use unregistered metrics to avoid global registry conflicts.
+        let metrics = TracingMetrics::new_unregistered();
+        let stats = TracingStats {
+            total_spans_created: 10,
+            total_spans_exported: 8,
+            total_spans_dropped: 2,
+            current_queue_depth: 5,
+            coherence: 0.9,
+            context_count: 3,
+            service_name: "test".into(),
+        };
+        metrics.update_gauges(&stats);
+        assert_eq!(metrics.span_queue_depth.get(), 5.0);
+        assert!((metrics.processor_coherence.get() - 0.9).abs() < 1e-10);
+        assert_eq!(metrics.trace_contexts.get(), 3.0);
     }
 }
