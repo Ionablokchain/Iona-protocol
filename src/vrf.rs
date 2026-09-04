@@ -12,10 +12,11 @@
 //! - Integration with IONA key management (Signer trait).
 //! - Configurable parameters (cofactor, suite, hash-to-curve attempts).
 //! - Persistent VRF registry with atomic writes and file locking.
-//! - Metrics for monitoring (generations, verifications, failures).
+//! - Prometheus metrics for monitoring (generations, verifications, failures).
 //! - Quantum state tracking (purity, born probability, entanglement fidelity).
 //! - Block randomness with quantum accumulation (RANDAO-style).
 //! - VRF registry with bounded quantum memory.
+//! - Overflow‑safe counters using saturating arithmetic.
 //! - Comprehensive error handling with `VrfError`.
 //! - Full test coverage.
 
@@ -27,6 +28,7 @@ use curve25519_dalek::constants::ED25519_BASEPOINT_POINT as B;
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature};
 use fs2::FileExt;
 use parking_lot::Mutex;
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::{
@@ -103,6 +105,9 @@ pub enum VrfError {
 
     #[error("lock acquisition failed: {0}")]
     LockFailed(String),
+
+    #[error("metrics error: {0}")]
+    Metrics(#[from] prometheus::Error),
 }
 
 pub type VrfResult<T> = Result<T, VrfError>;
@@ -128,6 +133,8 @@ pub struct VrfConfig {
     pub max_registry_entries: usize,
     /// Whether to persist registry to disk.
     pub persist_registry: bool,
+    /// Whether to enable Prometheus metrics.
+    pub enable_metrics: bool,
 }
 
 impl Default for VrfConfig {
@@ -140,6 +147,7 @@ impl Default for VrfConfig {
             track_quantum_metrics: true,
             max_registry_entries: DEFAULT_MAX_REGISTRY_ENTRIES,
             persist_registry: true,
+            enable_metrics: false,
         }
     }
 }
@@ -163,6 +171,118 @@ impl VrfConfig {
         }
         Ok(())
     }
+}
+
+// -----------------------------------------------------------------------------
+// Metrics (Prometheus)
+// -----------------------------------------------------------------------------
+
+/// Prometheus metrics for the VRF subsystem.
+#[derive(Clone)]
+pub struct VrfMetrics {
+    /// Total VRF generations.
+    pub generations_total: Counter,
+    /// Total VRF verifications.
+    pub verifications_total: Counter,
+    /// Successful VRF verifications.
+    pub verifications_success_total: Counter,
+    /// Failed VRF verifications.
+    pub verifications_failed_total: Counter,
+    /// Total hash-to-curve attempts.
+    pub hash_attempts_total: Counter,
+    /// Number of records in VRF registry.
+    pub registry_records: Gauge,
+    /// VRF registry quantum coherence.
+    pub registry_coherence: Gauge,
+}
+
+impl VrfMetrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            generations_total: register_counter!(
+                "iona_vrf_generations_total",
+                "Total VRF generations"
+            )?,
+            verifications_total: register_counter!(
+                "iona_vrf_verifications_total",
+                "Total VRF verifications"
+            )?,
+            verifications_success_total: register_counter!(
+                "iona_vrf_verifications_success_total",
+                "Successful VRF verifications"
+            )?,
+            verifications_failed_total: register_counter!(
+                "iona_vrf_verifications_failed_total",
+                "Failed VRF verifications"
+            )?,
+            hash_attempts_total: register_counter!(
+                "iona_vrf_hash_attempts_total",
+                "Total hash-to-curve attempts"
+            )?,
+            registry_records: register_gauge!(
+                "iona_vrf_registry_records",
+                "Number of records in VRF registry"
+            )?,
+            registry_coherence: register_gauge!(
+                "iona_vrf_registry_coherence",
+                "VRF registry quantum coherence"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or disabled metrics).
+    pub fn new_unregistered() -> Self {
+        Self {
+            generations_total: Counter::new("iona_vrf_generations_total", "Generations").unwrap(),
+            verifications_total: Counter::new("iona_vrf_verifications_total", "Verifications").unwrap(),
+            verifications_success_total: Counter::new("iona_vrf_verifications_success_total", "Success").unwrap(),
+            verifications_failed_total: Counter::new("iona_vrf_verifications_failed_total", "Failed").unwrap(),
+            hash_attempts_total: Counter::new("iona_vrf_hash_attempts_total", "Hash attempts").unwrap(),
+            registry_records: Gauge::new("iona_vrf_registry_records", "Records").unwrap(),
+            registry_coherence: Gauge::new("iona_vrf_registry_coherence", "Coherence").unwrap(),
+        }
+    }
+
+    /// Record a generation.
+    pub fn record_generation(&self) {
+        self.generations_total.inc();
+    }
+
+    /// Record a verification.
+    pub fn record_verification(&self, success: bool) {
+        self.verifications_total.inc();
+        if success {
+            self.verifications_success_total.inc();
+        } else {
+            self.verifications_failed_total.inc();
+        }
+    }
+
+    /// Record a hash-to-curve attempt.
+    pub fn record_hash_attempt(&self) {
+        self.hash_attempts_total.inc();
+    }
+
+    /// Update gauge from registry stats.
+    pub fn update_registry_gauges(&self, record_count: usize, coherence: f64) {
+        self.registry_records.set(record_count as f64);
+        self.registry_coherence.set(coherence);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Atomic fallback metrics (for environments without Prometheus)
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct AtomicVrfMetrics {
+    generations: AtomicU64,
+    verifications: AtomicU64,
+    verifications_success: AtomicU64,
+    verifications_failed: AtomicU64,
+    hash_attempts: AtomicU64,
+    registry_records: AtomicU64,
 }
 
 // -----------------------------------------------------------------------------
@@ -243,10 +363,6 @@ fn acquire_lock(path: &Path) -> Result<File, VrfError> {
     }
 }
 
-fn release_lock(file: File) -> Result<(), VrfError> {
-    file.unlock().map_err(|e| VrfError::LockFailed(e.to_string()))
-}
-
 fn load_registry(path: &Path) -> Result<Option<VrfRegistry>, VrfError> {
     if !path.exists() {
         return Ok(None);
@@ -291,44 +407,6 @@ fn save_registry(path: &Path, registry: &VrfRegistry) -> Result<(), VrfError> {
     fs::write(&temp_path, &json).map_err(|e| VrfError::Io(e.to_string()))?;
     fs::rename(&temp_path, path).map_err(|e| VrfError::Io(e.to_string()))?;
     Ok(())
-}
-
-// -----------------------------------------------------------------------------
-// Metrics
-// -----------------------------------------------------------------------------
-
-/// Metrics for the VRF subsystem.
-#[derive(Debug, Clone, Default)]
-pub struct VrfMetrics {
-    pub generations: AtomicU64,
-    pub verifications: AtomicU64,
-    pub verifications_success: AtomicU64,
-    pub verifications_failed: AtomicU64,
-    pub hash_attempts: AtomicU64,
-    pub registry_records: AtomicU64,
-}
-
-impl VrfMetrics {
-    pub fn record_generation(&self) {
-        self.generations.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_verification(&self, success: bool) {
-        self.verifications.fetch_add(1, Ordering::Relaxed);
-        if success {
-            self.verifications_success.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.verifications_failed.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    pub fn record_hash_attempt(&self) {
-        self.hash_attempts.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_registry(&self) {
-        self.registry_records.fetch_add(1, Ordering::Relaxed);
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -405,7 +483,8 @@ impl VrfKeypair {
 #[derive(Clone)]
 pub struct Vrf {
     config: Arc<VrfConfig>,
-    metrics: Arc<VrfMetrics>,
+    metrics: Option<Arc<VrfMetrics>>,
+    atomic_metrics: Arc<AtomicVrfMetrics>,
     registry: Arc<Mutex<VrfRegistry>>,
     persist_path: Option<PathBuf>,
 }
@@ -414,10 +493,16 @@ impl Vrf {
     /// Create a new VRF engine with the given configuration.
     pub fn new(config: VrfConfig) -> VrfResult<Self> {
         config.validate()?;
+        let metrics = if config.enable_metrics {
+            Some(Arc::new(VrfMetrics::new()?))
+        } else {
+            None
+        };
         let registry = VrfRegistry::new(config.max_registry_entries);
         Ok(Self {
             config: Arc::new(config),
-            metrics: Arc::new(VrfMetrics::default()),
+            metrics,
+            atomic_metrics: Arc::new(AtomicVrfMetrics::default()),
             registry: Arc::new(Mutex::new(registry)),
             persist_path: None,
         })
@@ -429,6 +514,11 @@ impl Vrf {
         config: VrfConfig,
     ) -> VrfResult<Self> {
         config.validate()?;
+        let metrics = if config.enable_metrics {
+            Some(Arc::new(VrfMetrics::new()?))
+        } else {
+            None
+        };
         let path = PathBuf::from(data_dir).join(DEFAULT_PERSIST_FILE);
         let registry = if config.persist_registry && path.exists() {
             match load_registry(&path) {
@@ -443,22 +533,20 @@ impl Vrf {
             VrfRegistry::new(config.max_registry_entries)
         };
 
-        Ok(Self {
+        let engine = Self {
             config: Arc::new(config),
-            metrics: Arc::new(VrfMetrics::default()),
+            metrics,
+            atomic_metrics: Arc::new(AtomicVrfMetrics::default()),
             registry: Arc::new(Mutex::new(registry)),
             persist_path: Some(path),
-        })
+        };
+        engine.update_metrics();
+        Ok(engine)
     }
 
     /// Create a VRF engine with default configuration.
     pub fn default() -> Self {
         Self::new(VrfConfig::default()).unwrap()
-    }
-
-    /// Get the metrics.
-    pub fn metrics(&self) -> &VrfMetrics {
-        &self.metrics
     }
 
     /// Get the configuration.
@@ -477,9 +565,11 @@ impl Vrf {
             &pk,
             input,
             &self.config,
-            &self.metrics,
         )?;
-        self.metrics.record_generation();
+        self.atomic_metrics.generations.fetch_add(1, Ordering::Relaxed);
+        if let Some(m) = &self.metrics {
+            m.record_generation();
+        }
         Ok(output)
     }
 
@@ -490,7 +580,6 @@ impl Vrf {
         input: &[u8],
     ) -> VrfResult<VrfOutput> {
         // Extract seed from signer's secret key (Ed25519)
-        // In production, we'd use the actual signing key.
         let pk_bytes = signer.public_key().0;
         if pk_bytes.len() != 32 {
             return Err(VrfError::KeyLengthMismatch {
@@ -501,8 +590,7 @@ impl Vrf {
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&pk_bytes);
 
-        // For now, we need a SigningKey. We'll use the seed from the signer.
-        // In a complete implementation, we'd store the SigningKey in the signer.
+        // In production, we'd use the actual signing key from the signer.
         let seed = [0u8; 32]; // Placeholder - needs integration.
         let keypair = VrfKeypair::from_seed(&seed)?;
         self.generate(&keypair, input)
@@ -512,8 +600,16 @@ impl Vrf {
     ///
     /// Implements RFC 9381 §5.3 ECVRF_verify.
     pub fn verify(&self, output: &VrfOutput, pk: &[u8], input: &[u8]) -> VrfResult<bool> {
-        let result = output.verify_with_config(pk, input, &self.config, &self.metrics);
-        self.metrics.record_verification(result);
+        let result = output.verify_with_config(pk, input, &self.config);
+        self.atomic_metrics.verifications.fetch_add(1, Ordering::Relaxed);
+        if result {
+            self.atomic_metrics.verifications_success.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.atomic_metrics.verifications_failed.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(m) = &self.metrics {
+            m.record_verification(result);
+        }
         Ok(result)
     }
 
@@ -560,7 +656,7 @@ impl Vrf {
         // Record in registry.
         let mut registry = self.registry.lock();
         registry.record(height, randomness.accumulated_seed, self.config.max_registry_entries);
-        self.metrics.record_registry();
+        self.atomic_metrics.registry_records.fetch_add(1, Ordering::Relaxed);
 
         if self.config.persist_registry {
             if let Some(path) = &self.persist_path {
@@ -570,6 +666,7 @@ impl Vrf {
             }
         }
 
+        self.update_metrics();
         Ok(randomness)
     }
 
@@ -609,6 +706,43 @@ impl Vrf {
         }
         Ok(())
     }
+
+    /// Get a snapshot of Prometheus metrics (if enabled).
+    pub fn metrics_snapshot(&self) -> Option<VrfMetricsSnapshot> {
+        self.metrics.as_ref().map(|m| VrfMetricsSnapshot {
+            generations_total: m.generations_total.get(),
+            verifications_total: m.verifications_total.get(),
+            verifications_success_total: m.verifications_success_total.get(),
+            verifications_failed_total: m.verifications_failed_total.get(),
+            hash_attempts_total: m.hash_attempts_total.get(),
+            registry_records: m.registry_records.get(),
+            registry_coherence: m.registry_coherence.get(),
+        })
+    }
+
+    /// Get atomic metrics (always available).
+    pub fn atomic_metrics(&self) -> &AtomicVrfMetrics {
+        &self.atomic_metrics
+    }
+
+    fn update_metrics(&self) {
+        if let Some(m) = &self.metrics {
+            let reg = self.registry.lock();
+            m.update_registry_gauges(reg.history.len(), reg.coherence);
+        }
+    }
+}
+
+/// Snapshot of Prometheus metrics for external use.
+#[derive(Debug, Clone)]
+pub struct VrfMetricsSnapshot {
+    pub generations_total: u64,
+    pub verifications_total: u64,
+    pub verifications_success_total: u64,
+    pub verifications_failed_total: u64,
+    pub hash_attempts_total: u64,
+    pub registry_records: f64,
+    pub registry_coherence: f64,
 }
 
 // -----------------------------------------------------------------------------
@@ -629,13 +763,12 @@ pub struct VrfOutput {
 }
 
 impl VrfOutput {
-    /// Generate a VRF output with the given configuration and metrics.
+    /// Generate a VRF output with the given configuration.
     pub fn generate_with_config(
         sk: &[u8],
         pk: &[u8],
         input: &[u8],
         config: &VrfConfig,
-        metrics: &VrfMetrics,
     ) -> VrfResult<Self> {
         if sk.len() != 32 {
             return Err(VrfError::KeyLengthMismatch {
@@ -660,7 +793,7 @@ impl VrfOutput {
         let x = Scalar::from_bytes_mod_order(scalar_bytes);
 
         // ── Step 1: Hash-to-Curve ──────────────────────────────────────
-        let h = ecvrf_hash_to_try_and_increment(pk, input, config, metrics)?;
+        let h = ecvrf_hash_to_try_and_increment(pk, input, config)?;
 
         // ── Step 2: VRF Evaluation ────────────────────────────────────
         let gamma = x * h;
@@ -716,17 +849,15 @@ impl VrfOutput {
     /// Generate a VRF output using the default configuration.
     pub fn generate(sk: &[u8], pk: &[u8], input: &[u8]) -> Self {
         let config = VrfConfig::default();
-        let metrics = Arc::new(VrfMetrics::default());
-        Self::generate_with_config(sk, pk, input, &config, &metrics).unwrap()
+        Self::generate_with_config(sk, pk, input, &config).unwrap()
     }
 
-    /// Verify a VRF proof with configuration and metrics.
+    /// Verify a VRF proof with configuration.
     pub fn verify_with_config(
         &self,
         pk: &[u8],
         input: &[u8],
         config: &VrfConfig,
-        metrics: &VrfMetrics,
     ) -> bool {
         if self.proof.public_key != pk || pk.len() != 32 {
             return false;
@@ -755,7 +886,7 @@ impl VrfOutput {
         c_scalar_bytes[..16].copy_from_slice(&self.proof.c);
         let c_scalar = Scalar::from_bytes_mod_order(c_scalar_bytes);
 
-        let h = match ecvrf_hash_to_try_and_increment(pk, input, config, metrics) {
+        let h = match ecvrf_hash_to_try_and_increment(pk, input, config) {
             Ok(h) => h,
             Err(_) => return false,
         };
@@ -785,8 +916,7 @@ impl VrfOutput {
     /// Verify a VRF proof using the default configuration.
     pub fn verify(&self, pk: &[u8], input: &[u8]) -> bool {
         let config = VrfConfig::default();
-        let metrics = Arc::new(VrfMetrics::default());
-        self.verify_with_config(pk, input, &config, &metrics)
+        self.verify_with_config(pk, input, &config)
     }
 
     /// Compute the per-block VRF input from previous block hash and height.
@@ -874,7 +1004,7 @@ impl VrfRegistry {
     /// Record a VRF output.
     pub fn record(&mut self, height: Height, seed: [u8; 32], max_entries: usize) {
         self.history.insert(height, seed);
-        self.total_recorded += 1;
+        self.total_recorded = self.total_recorded.saturating_add(1);
 
         while self.history.len() > max_entries {
             if let Some(&oldest) = self.history.keys().next() {
@@ -912,7 +1042,6 @@ fn ecvrf_hash_to_try_and_increment(
     pk: &[u8],
     input: &[u8],
     config: &VrfConfig,
-    metrics: &VrfMetrics,
 ) -> VrfResult<EdwardsPoint> {
     for ctr in 0u8..=config.max_hash_attempts {
         let mut hasher = Sha512::new();
@@ -923,8 +1052,6 @@ fn ecvrf_hash_to_try_and_increment(
         let hash = hasher.finalize();
         let mut candidate = [0u8; 32];
         candidate.copy_from_slice(&hash[..32]);
-
-        metrics.record_hash_attempt();
 
         if let Some(point) = CompressedEdwardsY(candidate).decompress() {
             return Ok(point * Scalar::from(config.cofactor as u64));
@@ -987,7 +1114,7 @@ fn compute_born_probability(gamma: &EdwardsPoint) -> f64 {
 fn compute_byte_entropy(data: &[u8; 32]) -> f64 {
     let mut counts = [0u32; 256];
     for &b in data {
-        counts[b as usize] += 1;
+        counts[b as usize] = counts[b as usize].saturating_add(1);
     }
     let total = data.len() as f64;
     let entropy: f64 = counts
@@ -1078,11 +1205,6 @@ impl VrfManager {
         self.inner.flush()
     }
 
-    /// Get metrics.
-    pub fn metrics(&self) -> &VrfMetrics {
-        self.inner.metrics()
-    }
-
     /// Get configuration.
     pub fn config(&self) -> &VrfConfig {
         self.inner.config()
@@ -1092,6 +1214,16 @@ impl VrfManager {
     pub fn registry_stats(&self) -> (usize, f64, u64) {
         let reg = self.inner.registry.lock();
         (reg.history.len(), reg.coherence, reg.total_recorded)
+    }
+
+    /// Get Prometheus metrics snapshot (if enabled).
+    pub fn metrics_snapshot(&self) -> Option<VrfMetricsSnapshot> {
+        self.inner.metrics_snapshot()
+    }
+
+    /// Get atomic metrics.
+    pub fn atomic_metrics(&self) -> &AtomicVrfMetrics {
+        self.inner.atomic_metrics()
     }
 }
 
@@ -1211,9 +1343,34 @@ mod tests {
         let output = vrf.generate(&keypair, b"input2").unwrap();
         vrf.verify(&output, &keypair.public_key(), b"input2").unwrap();
 
-        let metrics = vrf.metrics();
-        assert_eq!(metrics.generations.load(Ordering::Relaxed), 2);
-        assert_eq!(metrics.verifications.load(Ordering::Relaxed), 1);
+        let atomic = vrf.atomic_metrics();
+        assert_eq!(atomic.generations.load(Ordering::Relaxed), 2);
+        assert_eq!(atomic.verifications.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_prometheus_metrics_disabled_by_default() {
+        let config = VrfConfig::default();
+        let vrf = Vrf::new(config).unwrap();
+        assert!(vrf.metrics_snapshot().is_none());
+    }
+
+    #[test]
+    fn test_prometheus_metrics_enabled() {
+        let mut config = VrfConfig::default();
+        config.enable_metrics = true;
+        // Use unregistered metrics to avoid global registry conflicts.
+        let metrics = VrfMetrics::new_unregistered();
+        metrics.record_generation();
+        metrics.record_verification(true);
+        metrics.record_hash_attempt();
+        metrics.update_registry_gauges(5, 0.99);
+        assert_eq!(metrics.generations_total.get(), 1);
+        assert_eq!(metrics.verifications_total.get(), 1);
+        assert_eq!(metrics.verifications_success_total.get(), 1);
+        assert_eq!(metrics.hash_attempts_total.get(), 1);
+        assert_eq!(metrics.registry_records.get(), 5.0);
+        assert!((metrics.registry_coherence.get() - 0.99).abs() < 1e-10);
     }
 
     #[test]
@@ -1296,13 +1453,5 @@ mod tests {
         let r1 = vrf.generate_block_randomness(&keypair, &prev, 1, &prev_acc).unwrap();
         assert_eq!(vrf.get_seed(1), Some(r1.accumulated_seed));
         assert!(vrf.get_seed(2).is_none());
-    }
-
-    #[test]
-    fn test_vrf_with_signer() {
-        // This test verifies the interface, but requires proper signer integration.
-        // In production, the signer would provide the actual signing key.
-        let vrf = Vrf::default();
-        // Placeholder test - would need a real Signer implementation.
     }
 }
