@@ -7,11 +7,13 @@
 //! - Configurable parameters via `RpcHardeningConfig`.
 //! - Whitelist and blacklist support (static IP overrides).
 //! - Background cleanup of idle IP entries.
+//! - Optional Prometheus metrics.
 //! - Structured logging with `tracing`.
 //! - Versioned serialization for forward compatibility.
 
 use fs2::FileExt;
 use parking_lot::Mutex;
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -126,6 +128,8 @@ pub struct RpcHardeningConfig {
     pub whitelist: Vec<IpAddr>,
     /// Static blacklist of IPs (always blocked).
     pub blacklist: Vec<IpAddr>,
+    /// Whether to enable Prometheus metrics.
+    pub enable_metrics: bool,
 }
 
 impl Default for RpcHardeningConfig {
@@ -146,6 +150,7 @@ impl Default for RpcHardeningConfig {
             persist_state: true,
             whitelist: Vec::new(),
             blacklist: Vec::new(),
+            enable_metrics: false,
         }
     }
 }
@@ -195,6 +200,123 @@ impl RpcHardeningConfig {
     /// Convert to an immutable config.
     pub fn freeze(self) -> Arc<Self> {
         Arc::new(self)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// RPC Hardening Metrics (Prometheus)
+// -----------------------------------------------------------------------------
+
+/// Metrics for the RPC hardening module.
+#[derive(Clone)]
+pub struct RpcHardeningMetrics {
+    /// Current number of IPs tracked.
+    pub tracked_ips: Gauge,
+    /// Current number of quarantined IPs.
+    pub quarantined_ips: Gauge,
+    /// Current number of banned IPs.
+    pub banned_ips: Gauge,
+    /// Current concurrent requests.
+    pub concurrent_requests: Gauge,
+    /// Total rate limit hits.
+    pub rate_limit_hits_total: Counter,
+    /// Total quarantine events.
+    pub quarantine_events_total: Counter,
+    /// Total ban events.
+    pub ban_events_total: Counter,
+    /// Total payload too large events.
+    pub payload_too_large_total: Counter,
+    /// Total decode errors.
+    pub decode_errors_total: Counter,
+    /// Total concurrency rejections.
+    pub concurrency_rejected_total: Counter,
+    /// Average coherence of tracked IPs.
+    pub average_coherence: Gauge,
+    /// Total entanglement entropy.
+    pub total_entanglement_entropy: Gauge,
+}
+
+impl RpcHardeningMetrics {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            tracked_ips: register_gauge!(
+                "iona_rpc_hardening_tracked_ips",
+                "Number of IPs currently tracked"
+            )?,
+            quarantined_ips: register_gauge!(
+                "iona_rpc_hardening_quarantined_ips",
+                "Number of IPs currently quarantined"
+            )?,
+            banned_ips: register_gauge!(
+                "iona_rpc_hardening_banned_ips",
+                "Number of IPs currently banned"
+            )?,
+            concurrent_requests: register_gauge!(
+                "iona_rpc_hardening_concurrent_requests",
+                "Current number of concurrent requests"
+            )?,
+            rate_limit_hits_total: register_counter!(
+                "iona_rpc_hardening_rate_limit_hits_total",
+                "Total rate limit hits"
+            )?,
+            quarantine_events_total: register_counter!(
+                "iona_rpc_hardening_quarantine_events_total",
+                "Total quarantine events"
+            )?,
+            ban_events_total: register_counter!(
+                "iona_rpc_hardening_ban_events_total",
+                "Total ban events"
+            )?,
+            payload_too_large_total: register_counter!(
+                "iona_rpc_hardening_payload_too_large_total",
+                "Total payload too large events"
+            )?,
+            decode_errors_total: register_counter!(
+                "iona_rpc_hardening_decode_errors_total",
+                "Total decode errors"
+            )?,
+            concurrency_rejected_total: register_counter!(
+                "iona_rpc_hardening_concurrency_rejected_total",
+                "Total concurrency rejections"
+            )?,
+            average_coherence: register_gauge!(
+                "iona_rpc_hardening_average_coherence",
+                "Average coherence of tracked IPs"
+            )?,
+            total_entanglement_entropy: register_gauge!(
+                "iona_rpc_hardening_total_entanglement_entropy",
+                "Total entanglement entropy across tracked IPs"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or disabled metrics).
+    pub fn new_unregistered() -> Self {
+        Self {
+            tracked_ips: Gauge::new("iona_rpc_hardening_tracked_ips", "Tracked IPs").unwrap(),
+            quarantined_ips: Gauge::new("iona_rpc_hardening_quarantined_ips", "Quarantined").unwrap(),
+            banned_ips: Gauge::new("iona_rpc_hardening_banned_ips", "Banned").unwrap(),
+            concurrent_requests: Gauge::new("iona_rpc_hardening_concurrent_requests", "Concurrent").unwrap(),
+            rate_limit_hits_total: Counter::new("iona_rpc_hardening_rate_limit_hits_total", "Rate limits").unwrap(),
+            quarantine_events_total: Counter::new("iona_rpc_hardening_quarantine_events_total", "Quarantines").unwrap(),
+            ban_events_total: Counter::new("iona_rpc_hardening_ban_events_total", "Bans").unwrap(),
+            payload_too_large_total: Counter::new("iona_rpc_hardening_payload_too_large_total", "Payload too large").unwrap(),
+            decode_errors_total: Counter::new("iona_rpc_hardening_decode_errors_total", "Decode errors").unwrap(),
+            concurrency_rejected_total: Counter::new("iona_rpc_hardening_concurrency_rejected_total", "Concurrency rejected").unwrap(),
+            average_coherence: Gauge::new("iona_rpc_hardening_average_coherence", "Avg coherence").unwrap(),
+            total_entanglement_entropy: Gauge::new("iona_rpc_hardening_total_entanglement_entropy", "Entropy").unwrap(),
+        }
+    }
+
+    /// Update gauges from a snapshot.
+    pub fn update_gauges(&self, snapshot: &RpcMetrics) {
+        self.tracked_ips.set(snapshot.tracked_ips as f64);
+        self.quarantined_ips.set(snapshot.ips_quarantined as f64);
+        self.banned_ips.set(snapshot.ips_banned as f64);
+        self.concurrent_requests.set(snapshot.concurrent_requests as f64);
+        self.average_coherence.set(snapshot.average_coherence);
+        self.total_entanglement_entropy.set(snapshot.total_entanglement_entropy);
     }
 }
 
@@ -319,10 +441,6 @@ fn acquire_lock(path: &Path) -> Result<File, String> {
             }
         }
     }
-}
-
-fn release_lock(file: File) -> Result<(), String> {
-    file.unlock().map_err(|e| format!("unlock error: {}", e))
 }
 
 fn load_state(path: &Path) -> Result<PersistentStateV1, String> {
@@ -666,6 +784,8 @@ pub struct RpcMetrics {
     pub concurrent_requests: usize,
     pub average_coherence: f64,
     pub total_entanglement_entropy: f64,
+    /// Total tracked IPs.
+    pub tracked_ips: usize,
 }
 
 // -----------------------------------------------------------------------------
@@ -686,6 +806,9 @@ pub struct RpcLimiter {
     metric_payload_too_large: Arc<AtomicUsize>,
     metric_decode_errors: Arc<AtomicUsize>,
     metric_concurrency_rejected: Arc<AtomicUsize>,
+
+    // Prometheus metrics
+    metrics: Option<Arc<RpcHardeningMetrics>>,
 }
 
 impl RpcLimiter {
@@ -693,6 +816,11 @@ impl RpcLimiter {
     pub fn new(config: RpcHardeningConfig) -> Result<Self, String> {
         config.validate()?;
         let config = Arc::new(config);
+        let metrics = if config.enable_metrics {
+            Some(Arc::new(RpcHardeningMetrics::new().map_err(|e| e.to_string())?))
+        } else {
+            None
+        };
         let limiter = Self {
             ips: Mutex::new(HashMap::new()),
             last_cleanup: Mutex::new(Instant::now()),
@@ -705,6 +833,7 @@ impl RpcLimiter {
             metric_payload_too_large: Arc::new(AtomicUsize::new(0)),
             metric_decode_errors: Arc::new(AtomicUsize::new(0)),
             metric_concurrency_rejected: Arc::new(AtomicUsize::new(0)),
+            metrics,
         };
         // Apply whitelist/blacklist
         limiter.apply_static_lists();
@@ -718,6 +847,11 @@ impl RpcLimiter {
     ) -> Result<Self, String> {
         config.validate()?;
         let config = Arc::new(config);
+        let metrics = if config.enable_metrics {
+            Some(Arc::new(RpcHardeningMetrics::new().map_err(|e| e.to_string())?))
+        } else {
+            None
+        };
         let path = PathBuf::from(data_dir).join(DEFAULT_PERSIST_FILE);
         let mut limiter = Self {
             ips: Mutex::new(HashMap::new()),
@@ -731,6 +865,7 @@ impl RpcLimiter {
             metric_payload_too_large: Arc::new(AtomicUsize::new(0)),
             metric_decode_errors: Arc::new(AtomicUsize::new(0)),
             metric_concurrency_rejected: Arc::new(AtomicUsize::new(0)),
+            metrics,
         };
 
         // Load persistent state
@@ -767,6 +902,7 @@ impl RpcLimiter {
             entry.coherence = 1.0;
             entry.entanglement_entropy = 0.0;
         }
+        self.update_metrics();
     }
 
     // ── Check methods ──────────────────────────────────────────────────
@@ -806,6 +942,7 @@ impl RpcLimiter {
             }
 
             warn!(%ip, %req_id, streak, coherence = entry.coherence, "rpc::limiter: submit rate limit hit");
+            self.update_metrics();
             RpcLimitResult::RateLimited
         }
     }
@@ -844,6 +981,7 @@ impl RpcLimiter {
             }
 
             warn!(%ip, %req_id, streak, coherence = entry.coherence, "rpc::limiter: read rate limit hit");
+            self.update_metrics();
             RpcLimitResult::RateLimited
         }
     }
@@ -860,6 +998,7 @@ impl RpcLimiter {
         entry.coherence *= 0.8;
         let streak = entry.submit.violation_streak;
         entry.maybe_escalate(streak, &self.config);
+        self.update_metrics();
     }
 
     pub fn record_payload_too_large(&self, ip: IpAddr, req_id: &str, size: usize) {
@@ -872,6 +1011,7 @@ impl RpcLimiter {
         entry.coherence *= 0.85;
         let streak = entry.submit.violation_streak;
         entry.maybe_escalate(streak, &self.config);
+        self.update_metrics();
     }
 
     // ── Concurrency ────────────────────────────────────────────────────
@@ -887,6 +1027,7 @@ impl RpcLimiter {
                     max = self.config.max_concurrent_requests,
                     "rpc::limiter: concurrency cap reached"
                 );
+                self.update_metrics();
                 None
             }
         }
@@ -925,9 +1066,17 @@ impl RpcLimiter {
                 }
             }
         }
+        self.update_metrics();
     }
 
     // ── Metrics ────────────────────────────────────────────────────────
+
+    fn update_metrics(&self) {
+        if let Some(metrics) = &self.metrics {
+            let snapshot = self.metrics_snapshot();
+            metrics.update_gauges(&snapshot);
+        }
+    }
 
     pub fn metrics_snapshot(&self) -> RpcMetrics {
         let ips = self.ips.lock();
@@ -939,10 +1088,11 @@ impl RpcLimiter {
             .values()
             .filter(|e| e.status == IpStatus::Banned)
             .count();
+        let tracked = ips.len();
 
         let total_coherence: f64 = ips.values().map(|e| e.coherence).sum();
         let total_entropy: f64 = ips.values().map(|e| e.entanglement_entropy).sum();
-        let count = ips.len().max(1);
+        let count = tracked.max(1);
         let avg_coherence = total_coherence / count as f64;
 
         RpcMetrics {
@@ -955,6 +1105,7 @@ impl RpcLimiter {
             concurrent_requests: self.concurrency.current(),
             average_coherence: avg_coherence,
             total_entanglement_entropy: total_entropy,
+            tracked_ips: tracked,
         }
     }
 
@@ -971,6 +1122,41 @@ impl RpcLimiter {
     pub fn config(&self) -> &RpcHardeningConfig {
         &self.config
     }
+
+    /// Get a snapshot of Prometheus metrics (if enabled).
+    pub fn prometheus_metrics_snapshot(&self) -> Option<RpcHardeningMetricsSnapshot> {
+        self.metrics.as_ref().map(|m| RpcHardeningMetricsSnapshot {
+            tracked_ips: m.tracked_ips.get(),
+            quarantined_ips: m.quarantined_ips.get(),
+            banned_ips: m.banned_ips.get(),
+            concurrent_requests: m.concurrent_requests.get(),
+            rate_limit_hits_total: m.rate_limit_hits_total.get(),
+            quarantine_events_total: m.quarantine_events_total.get(),
+            ban_events_total: m.ban_events_total.get(),
+            payload_too_large_total: m.payload_too_large_total.get(),
+            decode_errors_total: m.decode_errors_total.get(),
+            concurrency_rejected_total: m.concurrency_rejected_total.get(),
+            average_coherence: m.average_coherence.get(),
+            total_entanglement_entropy: m.total_entanglement_entropy.get(),
+        })
+    }
+}
+
+/// Snapshot of Prometheus metrics for external monitoring.
+#[derive(Debug, Clone)]
+pub struct RpcHardeningMetricsSnapshot {
+    pub tracked_ips: f64,
+    pub quarantined_ips: f64,
+    pub banned_ips: f64,
+    pub concurrent_requests: f64,
+    pub rate_limit_hits_total: u64,
+    pub quarantine_events_total: u64,
+    pub ban_events_total: u64,
+    pub payload_too_large_total: u64,
+    pub decode_errors_total: u64,
+    pub concurrency_rejected_total: u64,
+    pub average_coherence: f64,
+    pub total_entanglement_entropy: f64,
 }
 
 // -----------------------------------------------------------------------------
@@ -1059,6 +1245,7 @@ mod tests {
         cfg.idle_timeout = Duration::from_secs(5);
         cfg.cleanup_interval = Duration::from_secs(1);
         cfg.persist_state = false;
+        cfg.enable_metrics = false;
         cfg
     }
 
@@ -1186,5 +1373,41 @@ mod tests {
         let metrics = limiter.metrics_snapshot();
         assert!(metrics.average_coherence >= 0.0);
         assert!(metrics.total_entanglement_entropy >= 0.0);
+        assert_eq!(metrics.tracked_ips, 1);
+    }
+
+    #[test]
+    fn test_prometheus_metrics_disabled_by_default() {
+        let cfg = test_config();
+        let limiter = RpcLimiter::new(cfg).unwrap();
+        assert!(limiter.prometheus_metrics_snapshot().is_none());
+    }
+
+    #[test]
+    fn test_prometheus_metrics_enabled() {
+        let mut cfg = test_config();
+        cfg.enable_metrics = true;
+        // Use unregistered metrics to avoid global registry conflicts.
+        // We can't easily inject unregistered, so we test the struct directly.
+        let metrics = RpcHardeningMetrics::new_unregistered();
+        let snapshot = RpcMetrics {
+            rate_limit_hits: 1,
+            payload_too_large: 0,
+            decode_errors: 0,
+            concurrency_rejected: 0,
+            ips_quarantined: 2,
+            ips_banned: 1,
+            concurrent_requests: 5,
+            average_coherence: 0.8,
+            total_entanglement_entropy: 0.3,
+            tracked_ips: 10,
+        };
+        metrics.update_gauges(&snapshot);
+        assert_eq!(metrics.tracked_ips.get(), 10.0);
+        assert_eq!(metrics.quarantined_ips.get(), 2.0);
+        assert_eq!(metrics.banned_ips.get(), 1.0);
+        assert_eq!(metrics.concurrent_requests.get(), 5.0);
+        assert!((metrics.average_coherence.get() - 0.8).abs() < 1e-10);
+        assert!((metrics.total_entanglement_entropy.get() - 0.3).abs() < 1e-10);
     }
 }
