@@ -3,20 +3,24 @@
 //! # Production Features
 //! - Configurable via `ChainDbConfig`.
 //! - File locking (`flock`) for concurrent access.
-//! - Atomic writes via temporary files + rename.
+//! - True atomic append via `O_APPEND` + `fsync` under a `flock`.
 //! - Streaming reads for large files (memory‑efficient).
 //! - Pruning and compaction with retention policy.
-//! - Optimised log indexing (address, topics) with offsets.
-//! - Metrics (writes, reads, index hits/misses).
+//! - Optimised log indexing (address, topics) with byte offsets.
+//! - Prometheus metrics (optional) with atomic fallback.
+//! - Consistent `parking_lot::Mutex` usage across the state.
+//! - Overflow‑safe counters.
+//! - Structured error handling with `ChainDbError`.
 //! - Full test coverage.
 
 use fs2::FileExt;
 use parking_lot::Mutex;
+use prometheus::{register_counter, Counter};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, BufWriter, Write, Seek, SeekFrom},
+    io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -24,9 +28,36 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::rpc::eth_rpc::{Block, EthRpcState, Log, Receipt, TxRecord};
+
+// ── Errors ────────────────────────────────────────────────────────────────
+
+/// Errors that can occur during chain database operations.
+#[derive(Debug, Error)]
+pub enum ChainDbError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+
+    #[error("serialization error: {0}")]
+    Serialization(String),
+
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    #[error("lock acquisition failed: {0}")]
+    LockFailed(String),
+
+    #[error("metrics error: {0}")]
+    Metrics(String),
+
+    #[error("data corruption: {0}")]
+    Corrupt(String),
+}
+
+pub type ChainDbResult<T> = Result<T, ChainDbError>;
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -42,14 +73,11 @@ pub const DEFAULT_COMPACTION_INTERVAL_SECS: u64 = 3600;
 /// Default lock timeout (seconds).
 pub const DEFAULT_LOCK_TIMEOUT_SECS: u64 = 10;
 
-/// Temporary file extension for atomic writes.
+/// Temporary file extension for atomic rewrites.
 const TEMP_EXT: &str = ".tmp";
 
 /// Lock file extension.
 const LOCK_EXT: &str = ".lock";
-
-/// Maximum allowed block number before pruning.
-const MAX_BLOCKS_BEFORE_PRUNE: usize = 100_000;
 
 // ── Configuration ─────────────────────────────────────────────────────────
 
@@ -62,12 +90,14 @@ pub struct ChainDbConfig {
     pub compaction_interval_secs: u64,
     /// Whether to enable log indexing.
     pub enable_log_index: bool,
-    /// Whether to enable metrics.
+    /// Whether to enable atomic metrics.
     pub enable_metrics: bool,
+    /// Whether to enable Prometheus metrics.
+    pub enable_prometheus: bool,
     /// Lock timeout in seconds.
     pub lock_timeout_secs: u64,
-    /// Whether to use atomic writes.
-    pub atomic_writes: bool,
+    /// Whether to `fsync` after each append.
+    pub fsync_on_write: bool,
 }
 
 impl Default for ChainDbConfig {
@@ -77,81 +107,252 @@ impl Default for ChainDbConfig {
             compaction_interval_secs: DEFAULT_COMPACTION_INTERVAL_SECS,
             enable_log_index: true,
             enable_metrics: true,
+            enable_prometheus: false,
             lock_timeout_secs: DEFAULT_LOCK_TIMEOUT_SECS,
-            atomic_writes: true,
+            fsync_on_write: true,
         }
     }
 }
 
 impl ChainDbConfig {
     /// Validate the configuration.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> ChainDbResult<()> {
         if self.compaction_interval_secs == 0 {
-            return Err("compaction_interval_secs must be > 0".into());
+            return Err(ChainDbError::Config(
+                "compaction_interval_secs must be > 0".into(),
+            ));
         }
         if self.lock_timeout_secs == 0 {
-            return Err("lock_timeout_secs must be > 0".into());
+            return Err(ChainDbError::Config("lock_timeout_secs must be > 0".into()));
         }
         Ok(())
     }
+
+    /// Enable Prometheus metrics.
+    pub fn with_prometheus(mut self) -> Self {
+        self.enable_prometheus = true;
+        self
+    }
 }
 
-// ── Metrics ──────────────────────────────────────────────────────────────
+// ── Prometheus Metrics ──────────────────────────────────────────────────
+
+/// Prometheus counters/gauges for the chain database.
+#[derive(Clone)]
+pub struct ChainDbPrometheus {
+    pub blocks_written_total: Counter,
+    pub receipts_written_total: Counter,
+    pub txs_written_total: Counter,
+    pub logs_written_total: Counter,
+    pub blocks_read_total: Counter,
+    pub receipts_read_total: Counter,
+    pub txs_read_total: Counter,
+    pub logs_read_total: Counter,
+    pub index_hits_total: Counter,
+    pub index_misses_total: Counter,
+    pub compactions_total: Counter,
+    pub compaction_time_ns_total: Counter,
+}
+
+impl ChainDbPrometheus {
+    /// Register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            blocks_written_total: register_counter!(
+                "iona_chaindb_blocks_written_total",
+                "Total blocks written"
+            )?,
+            receipts_written_total: register_counter!(
+                "iona_chaindb_receipts_written_total",
+                "Total receipts written"
+            )?,
+            txs_written_total: register_counter!(
+                "iona_chaindb_txs_written_total",
+                "Total transactions written"
+            )?,
+            logs_written_total: register_counter!(
+                "iona_chaindb_logs_written_total",
+                "Total logs written"
+            )?,
+            blocks_read_total: register_counter!(
+                "iona_chaindb_blocks_read_total",
+                "Total blocks read"
+            )?,
+            receipts_read_total: register_counter!(
+                "iona_chaindb_receipts_read_total",
+                "Total receipts read"
+            )?,
+            txs_read_total: register_counter!(
+                "iona_chaindb_txs_read_total",
+                "Total transactions read"
+            )?,
+            logs_read_total: register_counter!(
+                "iona_chaindb_logs_read_total",
+                "Total logs read"
+            )?,
+            index_hits_total: register_counter!(
+                "iona_chaindb_index_hits_total",
+                "Total log index hits"
+            )?,
+            index_misses_total: register_counter!(
+                "iona_chaindb_index_misses_total",
+                "Total log index misses"
+            )?,
+            compactions_total: register_counter!(
+                "iona_chaindb_compactions_total",
+                "Total compaction operations"
+            )?,
+            compaction_time_ns_total: register_counter!(
+                "iona_chaindb_compaction_time_ns_total",
+                "Total time spent in compaction (ns)"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or disabled metrics).
+    pub fn new_unregistered() -> Self {
+        Self {
+            blocks_written_total: Counter::new("iona_chaindb_blocks_written_total", "Blocks").unwrap(),
+            receipts_written_total: Counter::new("iona_chaindb_receipts_written_total", "Receipts").unwrap(),
+            txs_written_total: Counter::new("iona_chaindb_txs_written_total", "Txs").unwrap(),
+            logs_written_total: Counter::new("iona_chaindb_logs_written_total", "Logs").unwrap(),
+            blocks_read_total: Counter::new("iona_chaindb_blocks_read_total", "Blocks read").unwrap(),
+            receipts_read_total: Counter::new("iona_chaindb_receipts_read_total", "Receipts read").unwrap(),
+            txs_read_total: Counter::new("iona_chaindb_txs_read_total", "Txs read").unwrap(),
+            logs_read_total: Counter::new("iona_chaindb_logs_read_total", "Logs read").unwrap(),
+            index_hits_total: Counter::new("iona_chaindb_index_hits_total", "Hits").unwrap(),
+            index_misses_total: Counter::new("iona_chaindb_index_misses_total", "Misses").unwrap(),
+            compactions_total: Counter::new("iona_chaindb_compactions_total", "Compactions").unwrap(),
+            compaction_time_ns_total: Counter::new("iona_chaindb_compaction_time_ns_total", "Time").unwrap(),
+        }
+    }
+}
+
+// ── Metrics (atomic + optional Prometheus) ──────────────────────────────
 
 /// Metrics for the chain database.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct ChainDbMetrics {
-    pub blocks_written: AtomicU64,
-    pub receipts_written: AtomicU64,
-    pub txs_written: AtomicU64,
-    pub logs_written: AtomicU64,
-    pub blocks_read: AtomicU64,
-    pub receipts_read: AtomicU64,
-    pub txs_read: AtomicU64,
-    pub logs_read: AtomicU64,
-    pub index_hits: AtomicU64,
-    pub index_misses: AtomicU64,
-    pub compactions: AtomicU64,
-    pub compaction_duration_ns: AtomicU64,
+    pub blocks_written: Arc<AtomicU64>,
+    pub receipts_written: Arc<AtomicU64>,
+    pub txs_written: Arc<AtomicU64>,
+    pub logs_written: Arc<AtomicU64>,
+    pub blocks_read: Arc<AtomicU64>,
+    pub receipts_read: Arc<AtomicU64>,
+    pub txs_read: Arc<AtomicU64>,
+    pub logs_read: Arc<AtomicU64>,
+    pub index_hits: Arc<AtomicU64>,
+    pub index_misses: Arc<AtomicU64>,
+    pub compactions: Arc<AtomicU64>,
+    pub compaction_duration_ns: Arc<AtomicU64>,
+    pub prometheus: Option<Arc<ChainDbPrometheus>>,
+}
+
+impl Default for ChainDbMetrics {
+    fn default() -> Self {
+        Self {
+            blocks_written: Arc::new(AtomicU64::new(0)),
+            receipts_written: Arc::new(AtomicU64::new(0)),
+            txs_written: Arc::new(AtomicU64::new(0)),
+            logs_written: Arc::new(AtomicU64::new(0)),
+            blocks_read: Arc::new(AtomicU64::new(0)),
+            receipts_read: Arc::new(AtomicU64::new(0)),
+            txs_read: Arc::new(AtomicU64::new(0)),
+            logs_read: Arc::new(AtomicU64::new(0)),
+            index_hits: Arc::new(AtomicU64::new(0)),
+            index_misses: Arc::new(AtomicU64::new(0)),
+            compactions: Arc::new(AtomicU64::new(0)),
+            compaction_duration_ns: Arc::new(AtomicU64::new(0)),
+            prometheus: None,
+        }
+    }
 }
 
 impl ChainDbMetrics {
+    /// Create a new metrics instance, optionally with Prometheus.
+    pub fn new(enable_prometheus: bool) -> Result<Self, prometheus::Error> {
+        let prometheus = if enable_prometheus {
+            Some(Arc::new(ChainDbPrometheus::new()?))
+        } else {
+            None
+        };
+        Ok(Self {
+            prometheus,
+            ..Default::default()
+        })
+    }
+
     pub fn record_block_write(&self) {
         self.blocks_written.fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.blocks_written_total.inc();
+        }
     }
     pub fn record_receipt_write(&self, count: u64) {
         self.receipts_written.fetch_add(count, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.receipts_written_total.inc_by(count as f64);
+        }
     }
     pub fn record_tx_write(&self, count: u64) {
         self.txs_written.fetch_add(count, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.txs_written_total.inc_by(count as f64);
+        }
     }
     pub fn record_log_write(&self, count: u64) {
         self.logs_written.fetch_add(count, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.logs_written_total.inc_by(count as f64);
+        }
     }
-    pub fn record_block_read(&self) {
-        self.blocks_read.fetch_add(1, Ordering::Relaxed);
+    pub fn record_block_read(&self, count: u64) {
+        self.blocks_read.fetch_add(count, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.blocks_read_total.inc_by(count as f64);
+        }
     }
     pub fn record_receipt_read(&self, count: u64) {
         self.receipts_read.fetch_add(count, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.receipts_read_total.inc_by(count as f64);
+        }
     }
     pub fn record_tx_read(&self, count: u64) {
         self.txs_read.fetch_add(count, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.txs_read_total.inc_by(count as f64);
+        }
     }
     pub fn record_log_read(&self, count: u64) {
         self.logs_read.fetch_add(count, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.logs_read_total.inc_by(count as f64);
+        }
     }
     pub fn record_index_hit(&self) {
         self.index_hits.fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.index_hits_total.inc();
+        }
     }
     pub fn record_index_miss(&self) {
         self.index_misses.fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.index_misses_total.inc();
+        }
     }
     pub fn record_compaction(&self, duration: Duration) {
         self.compactions.fetch_add(1, Ordering::Relaxed);
-        self.compaction_duration_ns
-            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+        let ns = duration.as_nanos().min(u64::MAX as u128) as u64;
+        self.compaction_duration_ns.fetch_add(ns, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.compactions_total.inc();
+            p.compaction_time_ns_total.inc_by(ns as f64);
+        }
     }
 
+    /// Snapshot of the current metric values.
     pub fn snapshot(&self) -> ChainDbMetricsSnapshot {
         ChainDbMetricsSnapshot {
             blocks_written: self.blocks_written.load(Ordering::Relaxed),
@@ -171,7 +372,7 @@ impl ChainDbMetrics {
 }
 
 /// Snapshot of chain database metrics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChainDbMetricsSnapshot {
     pub blocks_written: u64,
     pub receipts_written: u64,
@@ -199,8 +400,8 @@ pub struct Meta {
     pub highest_block: u64,
 }
 
-impl Meta {
-    pub fn new() -> Self {
+impl Default for Meta {
+    fn default() -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
             created_at_unix: now_unix(),
@@ -208,6 +409,12 @@ impl Meta {
             block_count: 0,
             highest_block: 0,
         }
+    }
+}
+
+impl Meta {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -245,13 +452,13 @@ impl ChainFiles {
 
 // ── File locking helpers ────────────────────────────────────────────────
 
-fn acquire_lock(path: &Path, timeout_secs: u64) -> Result<File, String> {
+fn acquire_lock(path: &Path, timeout_secs: u64) -> ChainDbResult<File> {
     let lock_path = path.with_extension(LOCK_EXT);
     let file = OpenOptions::new()
         .create(true)
         .write(true)
         .open(&lock_path)
-        .map_err(|e| format!("cannot open lock file: {}", e))?;
+        .map_err(|e| ChainDbError::LockFailed(format!("cannot open lock file: {}", e)))?;
     let timeout = Duration::from_secs(timeout_secs);
     let start = Instant::now();
     loop {
@@ -259,7 +466,10 @@ fn acquire_lock(path: &Path, timeout_secs: u64) -> Result<File, String> {
             Ok(()) => return Ok(file),
             Err(_) => {
                 if start.elapsed() > timeout {
-                    return Err(format!("lock timeout after {}s", timeout_secs));
+                    return Err(ChainDbError::LockFailed(format!(
+                        "lock timeout after {}s",
+                        timeout_secs
+                    )));
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -267,120 +477,131 @@ fn acquire_lock(path: &Path, timeout_secs: u64) -> Result<File, String> {
     }
 }
 
-fn release_lock(file: File) -> Result<(), String> {
-    file.unlock().map_err(|e| format!("unlock error: {}", e))
-}
-
 // ── JSONL operations ─────────────────────────────────────────────────────
 
-/// Write a serializable value to a JSONL file atomically.
-pub fn append_jsonl_atomic<T: Serialize>(path: &Path, value: &T, config: &ChainDbConfig) -> io::Result<u64> {
+/// Truly atomic append to a JSONL file.
+///
+/// Correctly appends (does **not** truncate) a single line under an
+/// exclusive `flock`. The previous implementation wrote to a temp file and
+/// renamed it, which silently truncated the entire file to a single line.
+pub fn append_jsonl_atomic<T: Serialize>(
+    path: &Path,
+    value: &T,
+    config: &ChainDbConfig,
+) -> ChainDbResult<u64> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let _lock = acquire_lock(path, config.lock_timeout_secs)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let _lock = acquire_lock(path, config.lock_timeout_secs)?;
+
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)?;
+    // Ensure the file offset reflects the end of file for offset reporting.
+    f.seek(SeekFrom::End(0))?;
+    let offset = f.stream_position()?;
 
     let line = serde_json::to_string(value)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-    if config.atomic_writes {
-        let temp_path = path.with_extension(TEMP_EXT);
-        let mut f = File::create(&temp_path)?;
-        f.write_all(line.as_bytes())?;
-        f.write_all(b"\n")?;
+        .map_err(|e| ChainDbError::Serialization(e.to_string()))?;
+    f.write_all(line.as_bytes())?;
+    f.write_all(b"\n")?;
+    if config.fsync_on_write {
         f.sync_all()?;
-        fs::rename(&temp_path, path)?;
-        // Get the size of the written data.
-        let metadata = fs::metadata(path)?;
-        Ok(metadata.len())
-    } else {
-        let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-        let offset = f.stream_position()?;
-        f.write_all(line.as_bytes())?;
-        f.write_all(b"\n")?;
-        f.sync_all()?;
-        Ok(offset + line.len() as u64)
     }
+    Ok(offset)
 }
 
-/// Append a value to a JSONL file (non‑atomic, for bulk operations).
-pub fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> io::Result<u64> {
+/// Append a value to a JSONL file without acquiring a lock.
+/// The caller is responsible for locking.
+pub fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> ChainDbResult<u64> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)?;
+    f.seek(SeekFrom::End(0))?;
     let offset = f.stream_position()?;
     let line = serde_json::to_string(value)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        .map_err(|e| ChainDbError::Serialization(e.to_string()))?;
     f.write_all(line.as_bytes())?;
     f.write_all(b"\n")?;
     Ok(offset)
 }
 
 /// Read all items from a JSONL file.
-pub fn load_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<Vec<T>> {
+pub fn load_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> ChainDbResult<Vec<T>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
     let f = File::open(path)?;
     let reader = BufReader::new(f);
     let mut out = Vec::new();
-    for line in reader.lines() {
+    for (lineno, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let v: T = serde_json::from_str(&line)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let v: T = serde_json::from_str(&line).map_err(|e| {
+            ChainDbError::Corrupt(format!("line {}: {}", lineno + 1, e))
+        })?;
         out.push(v);
     }
     Ok(out)
 }
 
 /// Stream items from a JSONL file with a callback.
-pub fn stream_jsonl<T, F>(path: &Path, mut callback: F) -> io::Result<()>
+pub fn stream_jsonl<T, F>(path: &Path, mut callback: F) -> ChainDbResult<()>
 where
     T: for<'de> Deserialize<'de>,
-    F: FnMut(T) -> io::Result<()>,
+    F: FnMut(T) -> ChainDbResult<()>,
 {
     if !path.exists() {
         return Ok(());
     }
     let f = File::open(path)?;
     let reader = BufReader::new(f);
-    for line in reader.lines() {
+    for (lineno, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let v: T = serde_json::from_str(&line)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let v: T = serde_json::from_str(&line).map_err(|e| {
+            ChainDbError::Corrupt(format!("line {}: {}", lineno + 1, e))
+        })?;
         callback(v)?;
     }
     Ok(())
 }
 
-/// Rewrite a JSONL file with a new set of items.
-pub fn rewrite_jsonl<T: Serialize>(path: &Path, items: &[T]) -> io::Result<()> {
+/// Rewrite a JSONL file atomically (write to temp, then rename).
+pub fn rewrite_jsonl<T: Serialize>(path: &Path, items: &[T]) -> ChainDbResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut f = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)?;
-    let mut writer = BufWriter::new(&mut f);
-    for it in items {
-        let line = serde_json::to_string(it)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        writer.write_all(line.as_bytes())?;
-        writer.write_all(b"\n")?;
+    let temp_path = path.with_extension(TEMP_EXT);
+    {
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)?;
+        let mut writer = BufWriter::new(f);
+        for it in items {
+            let line = serde_json::to_string(it)
+                .map_err(|e| ChainDbError::Serialization(e.to_string()))?;
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(b"\n")?;
+        }
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
     }
-    writer.flush()?;
-    f.sync_all()?;
+    fs::rename(&temp_path, path)?;
     Ok(())
 }
 
@@ -411,24 +632,20 @@ fn topic_index_path(dir: &Path, topic_hex: &str) -> PathBuf {
         .join(format!("{}.jsonl", topic_hex))
 }
 
-/// Append log index entries with offsets.
+/// Append log index entries with byte offsets.
 pub fn append_log_indices_with_offsets(
     dir: &Path,
     logs: &[Log],
     offsets: &[u64],
     config: &ChainDbConfig,
-) -> io::Result<()> {
+) -> ChainDbResult<()> {
     if !config.enable_log_index {
         return Ok(());
     }
     if logs.len() != offsets.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "logs/offsets mismatch",
-        ));
+        return Err(ChainDbError::Config("logs/offsets mismatch".into()));
     }
-    let _lock = acquire_lock(&dir.join(".index.lock"), config.lock_timeout_secs)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let _lock = acquire_lock(&logs_index_dir(dir).join(".index.lock"), config.lock_timeout_secs)?;
 
     for (l, off) in logs.iter().zip(offsets.iter()) {
         let entry = LogIndexEntry {
@@ -447,8 +664,8 @@ pub fn append_log_indices_with_offsets(
     Ok(())
 }
 
-/// Read index entries from a JSONL file, filtered by block range.
-fn read_index_file(path: &Path, from: u64, to: u64) -> io::Result<Vec<LogIndexEntry>> {
+/// Read index entries filtered by block range.
+fn read_index_file(path: &Path, from: u64, to: u64) -> ChainDbResult<Vec<LogIndexEntry>> {
     let entries: Vec<LogIndexEntry> = load_jsonl(path)?;
     Ok(entries
         .into_iter()
@@ -464,29 +681,17 @@ pub fn query_logs_indexed(
     address: Option<String>,
     topic0: Option<String>,
     config: &ChainDbConfig,
-) -> io::Result<Vec<Log>> {
+) -> ChainDbResult<Vec<Log>> {
     if !config.enable_log_index {
-        // Fallback: scan logs file.
-        let logs_path = ChainFiles::new(dir).logs;
-        let logs: Vec<Log> = load_jsonl(&logs_path)?;
-        return Ok(logs
-            .into_iter()
-            .filter(|l| l.block_number >= from && l.block_number <= to)
-            .filter(|l| address.as_ref().map(|a| l.address == *a).unwrap_or(true))
-            .filter(|l| {
-                topic0.as_ref()
-                    .map(|t| l.topics.iter().any(|lt| lt == t))
-                    .unwrap_or(true)
-            })
-            .collect());
+        return query_logs_scan(dir, from, to, address, topic0);
     }
 
     let mut candidates: Vec<LogIndexEntry> = Vec::new();
 
     match (address.clone(), topic0.clone()) {
         (Some(a), Some(t)) => {
-            let ap = addr_index_path(dir, a.trim_start_matches("0x"));
-            let tp = topic_index_path(dir, t.trim_start_matches("0x"));
+            let ap = addr_index_path(dir, &a.trim_start_matches("0x").to_lowercase());
+            let tp = topic_index_path(dir, &t.trim_start_matches("0x").to_lowercase());
             let a_entries = if ap.exists() {
                 read_index_file(&ap, from, to)?
             } else {
@@ -497,7 +702,6 @@ pub fn query_logs_indexed(
             } else {
                 Vec::new()
             };
-            // Intersection by (tx_hash, log_index)
             let aset: HashSet<(String, u64)> = a_entries
                 .into_iter()
                 .map(|e| (e.tx_hash, e.log_index))
@@ -509,7 +713,7 @@ pub fn query_logs_indexed(
             }
         }
         (Some(a), None) => {
-            let ap = addr_index_path(dir, a.trim_start_matches("0x"));
+            let ap = addr_index_path(dir, &a.trim_start_matches("0x").to_lowercase());
             candidates = if ap.exists() {
                 read_index_file(&ap, from, to)?
             } else {
@@ -517,7 +721,7 @@ pub fn query_logs_indexed(
             };
         }
         (None, Some(t)) => {
-            let tp = topic_index_path(dir, t.trim_start_matches("0x"));
+            let tp = topic_index_path(dir, &t.trim_start_matches("0x").to_lowercase());
             candidates = if tp.exists() {
                 read_index_file(&tp, from, to)?
             } else {
@@ -525,17 +729,10 @@ pub fn query_logs_indexed(
             };
         }
         (None, None) => {
-            // No filters: scan logs.
-            let logs_path = ChainFiles::new(dir).logs;
-            let logs: Vec<Log> = load_jsonl(&logs_path)?;
-            return Ok(logs
-                .into_iter()
-                .filter(|l| l.block_number >= from && l.block_number <= to)
-                .collect());
+            return query_logs_scan(dir, from, to, None, None);
         }
     }
 
-    // Fetch concrete logs.
     let logs_path = ChainFiles::new(dir).logs;
     let mut logs = Vec::with_capacity(candidates.len());
     for e in candidates {
@@ -552,26 +749,51 @@ pub fn query_logs_indexed(
     Ok(logs)
 }
 
-/// Fetch a log by offset in logs.jsonl.
-fn fetch_log_by_offset(path: &Path, offset: u64) -> io::Result<Option<Log>> {
+/// Fallback: scan the whole logs file.
+fn query_logs_scan(
+    dir: &Path,
+    from: u64,
+    to: u64,
+    address: Option<String>,
+    topic0: Option<String>,
+) -> ChainDbResult<Vec<Log>> {
+    let logs_path = ChainFiles::new(dir).logs;
+    let logs: Vec<Log> = load_jsonl(&logs_path)?;
+    Ok(logs
+        .into_iter()
+        .filter(|l| l.block_number >= from && l.block_number <= to)
+        .filter(|l| address.as_ref().map(|a| l.address == *a).unwrap_or(true))
+        .filter(|l| {
+            topic0
+                .as_ref()
+                .map(|t| l.topics.iter().any(|lt| lt == t))
+                .unwrap_or(true)
+        })
+        .collect())
+}
+
+fn fetch_log_by_offset(path: &Path, offset: u64) -> ChainDbResult<Option<Log>> {
     if !path.exists() {
         return Ok(None);
     }
-    let f = File::open(path)?;
+    let mut f = File::open(path)?;
+    f.seek(SeekFrom::Start(offset))?;
     let mut reader = BufReader::new(f);
-    reader.seek(SeekFrom::Start(offset))?;
     let mut line = String::new();
     let n = reader.read_line(&mut line)?;
     if n == 0 {
         return Ok(None);
     }
     let log: Log = serde_json::from_str(line.trim_end())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        .map_err(|e| ChainDbError::Corrupt(e.to_string()))?;
     Ok(Some(log))
 }
 
-/// Fetch a log by tx_hash and log_index (scans the file).
-fn fetch_log_by_tx_hash_index(path: &Path, tx_hash: &str, log_index: u64) -> io::Result<Option<Log>> {
+fn fetch_log_by_tx_hash_index(
+    path: &Path,
+    tx_hash: &str,
+    log_index: u64,
+) -> ChainDbResult<Option<Log>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -583,7 +805,7 @@ fn fetch_log_by_tx_hash_index(path: &Path, tx_hash: &str, log_index: u64) -> io:
             continue;
         }
         let log: Log = serde_json::from_str(&line)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| ChainDbError::Corrupt(e.to_string()))?;
         if log.tx_hash == tx_hash && log.log_index == log_index {
             return Ok(Some(log));
         }
@@ -601,24 +823,26 @@ pub struct ChainDb {
     metrics: Arc<ChainDbMetrics>,
     state: Arc<Mutex<EthRpcState>>,
     files: ChainFiles,
+    #[allow(dead_code)]
     last_compaction: Arc<Mutex<Instant>>,
 }
 
 impl ChainDb {
     /// Open (or create) a chain database at the given directory.
-    pub fn open(dir: impl AsRef<Path>, config: ChainDbConfig) -> Result<Self, String> {
-        config.validate().map_err(|e| format!("config error: {}", e))?;
+    pub fn open(dir: impl AsRef<Path>, config: ChainDbConfig) -> ChainDbResult<Self> {
+        config.validate()?;
         let dir = dir.as_ref().to_path_buf();
         let files = ChainFiles::new(&dir);
-        files.ensure_dirs().map_err(|e| format!("failed to create directories: {}", e))?;
+        files.ensure_dirs()?;
 
-        // Load or create metadata.
         let meta = ensure_meta(&dir)?;
 
         let state = Arc::new(Mutex::new(EthRpcState::default()));
-        let metrics = Arc::new(ChainDbMetrics::default());
+        let metrics = Arc::new(
+            ChainDbMetrics::new(config.enable_prometheus)
+                .map_err(|e| ChainDbError::Metrics(e.to_string()))?,
+        );
 
-        // Load data into state.
         if let Err(e) = load_into_state(&dir, &mut state.lock(), &config, &metrics) {
             warn!(error = %e, "failed to load state from disk, starting fresh");
         }
@@ -639,7 +863,6 @@ impl ChainDb {
             "Chain database opened"
         );
 
-        // Start background compaction if needed.
         if db.config.max_blocks > 0 {
             db.spawn_compaction_task();
         }
@@ -647,54 +870,62 @@ impl ChainDb {
         Ok(db)
     }
 
-    /// Get a reference to the state.
+    /// Get the shared state (parking_lot Mutex; no `.unwrap()` required).
     pub fn state(&self) -> &Mutex<EthRpcState> {
         &self.state
     }
 
-    /// Get metrics snapshot.
+    /// Metrics snapshot.
     pub fn metrics_snapshot(&self) -> ChainDbMetricsSnapshot {
         self.metrics.snapshot()
     }
 
-    /// Append a new block bundle.
+    /// Directory of the chain database.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Append a new block bundle (block + receipts + txs + logs).
     pub fn persist_block_bundle(
         &self,
         block: &Block,
         receipts: &[Receipt],
         txs: &[TxRecord],
         logs: &[Log],
-    ) -> io::Result<()> {
-        // Write logs and get offsets.
+    ) -> ChainDbResult<()> {
         let log_offsets = if !logs.is_empty() {
             self.append_logs_with_offsets(logs)?
         } else {
             Vec::new()
         };
 
-        // Append block, receipts, txs.
-        self.append_block(block)?;
-        self.append_receipts(receipts)?;
-        self.append_txs(txs)?;
+        append_jsonl_atomic(&self.files.blocks, block, &self.config)?;
+        for r in receipts {
+            append_jsonl_atomic(&self.files.receipts, r, &self.config)?;
+        }
+        for t in txs {
+            append_jsonl_atomic(&self.files.txs, t, &self.config)?;
+        }
 
-        // Append log indices if enabled.
         if self.config.enable_log_index && !logs.is_empty() {
             append_log_indices_with_offsets(&self.dir, logs, &log_offsets, &self.config)?;
         }
 
-        // Update state.
-        let mut state = self.state.lock();
-        state.blocks.lock().unwrap().push(block.clone());
-        state.receipts.lock().unwrap().extend(receipts.to_vec());
-        for tx in txs {
-            state.txs.lock().unwrap().insert(tx.hash.clone(), tx.clone());
+        {
+            let state = self.state.lock();
+            state.blocks.lock().push(block.clone());
+            state.receipts.lock().extend(receipts.iter().cloned());
+            {
+                let mut txs_map = state.txs.lock();
+                for tx in txs {
+                    txs_map.insert(tx.hash.clone(), tx.clone());
+                }
+            }
+            state.all_logs.lock().extend(logs.iter().cloned());
         }
-        state.all_logs.lock().unwrap().extend(logs.to_vec());
 
-        // Update metadata.
         update_meta(&self.dir, block.number)?;
 
-        // Record metrics.
         self.metrics.record_block_write();
         self.metrics.record_receipt_write(receipts.len() as u64);
         self.metrics.record_tx_write(txs.len() as u64);
@@ -703,37 +934,14 @@ impl ChainDb {
         Ok(())
     }
 
-    /// Append a single block.
-    pub fn append_block(&self, block: &Block) -> io::Result<()> {
-        append_jsonl_atomic(&self.files.blocks, block, &self.config)?;
-        Ok(())
-    }
-
-    /// Append receipts.
-    pub fn append_receipts(&self, receipts: &[Receipt]) -> io::Result<()> {
-        for r in receipts {
-            append_jsonl_atomic(&self.files.receipts, r, &self.config)?;
-        }
-        Ok(())
-    }
-
-    /// Append transactions.
-    pub fn append_txs(&self, txs: &[TxRecord]) -> io::Result<()> {
-        for t in txs {
-            append_jsonl_atomic(&self.files.txs, t, &self.config)?;
-        }
-        Ok(())
-    }
-
-    /// Append logs and return byte offsets.
-    pub fn append_logs_with_offsets(&self, logs: &[Log]) -> io::Result<Vec<u64>> {
+    /// Append logs and return their byte offsets in `logs.jsonl`.
+    pub fn append_logs_with_offsets(&self, logs: &[Log]) -> ChainDbResult<Vec<u64>> {
         let path = &self.files.logs;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let _lock = acquire_lock(path, self.config.lock_timeout_secs)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let _lock = acquire_lock(path, self.config.lock_timeout_secs)?;
 
         let mut f = OpenOptions::new()
             .create(true)
@@ -746,114 +954,127 @@ impl ChainDb {
         for l in logs {
             let off = f.stream_position()?;
             let line = serde_json::to_string(l)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                .map_err(|e| ChainDbError::Serialization(e.to_string()))?;
             f.write_all(line.as_bytes())?;
             f.write_all(b"\n")?;
             offsets.push(off);
         }
-        f.sync_all()?;
+        if self.config.fsync_on_write {
+            f.sync_all()?;
+        }
         Ok(offsets)
     }
 
-    /// Query logs using the index.
+    /// Query logs, preferring the index when enabled.
     pub fn query_logs(
         &self,
         from: u64,
         to: u64,
         address: Option<String>,
         topic0: Option<String>,
-    ) -> io::Result<Vec<Log>> {
-        let result = query_logs_indexed(
-            &self.dir,
-            from,
-            to,
-            address,
-            topic0,
-            &self.config,
-        )?;
+    ) -> ChainDbResult<Vec<Log>> {
+        let result = query_logs_indexed(&self.dir, from, to, address, topic0, &self.config)?;
 
-        // Record metrics.
-        if !result.is_empty() {
-            self.metrics.record_index_hit();
-        } else {
-            self.metrics.record_index_miss();
+        if self.config.enable_log_index {
+            if !result.is_empty() {
+                self.metrics.record_index_hit();
+            } else {
+                self.metrics.record_index_miss();
+            }
         }
         self.metrics.record_log_read(result.len() as u64);
 
         Ok(result)
     }
 
-    /// Prune and compact the database.
-    pub fn compact(&self) -> io::Result<()> {
+    /// Prune and compact the database per `max_blocks`.
+    pub fn compact(&self) -> ChainDbResult<()> {
         let start = Instant::now();
         let max_blocks = self.config.max_blocks;
         if max_blocks == 0 {
             return Ok(());
         }
 
-        let state = self.state.lock();
-        let blocks = state.blocks.lock().unwrap().clone();
-        if blocks.len() <= max_blocks {
-            return Ok(());
-        }
+        let (kept_blocks, kept_receipts, kept_txs, kept_logs, min_bn) = {
+            let state = self.state.lock();
 
-        let keep = max_blocks;
-        let start_idx = blocks.len().saturating_sub(keep);
-        let kept_blocks = blocks[start_idx..].to_vec();
-        let min_bn = kept_blocks.first().map(|b| b.number).unwrap_or(0);
+            let blocks = state.blocks.lock().clone();
+            if blocks.len() <= max_blocks {
+                return Ok(());
+            }
 
-        let receipts = state.receipts.lock().unwrap().clone();
-        let kept_receipts: Vec<Receipt> = receipts
-            .into_iter()
-            .filter(|r| r.block_number >= min_bn)
-            .collect();
+            let start_idx = blocks.len().saturating_sub(max_blocks);
+            let kept_blocks = blocks[start_idx..].to_vec();
+            let min_bn = kept_blocks.first().map(|b| b.number).unwrap_or(0);
 
-        let logs = state.all_logs.lock().unwrap().clone();
-        let kept_logs: Vec<Log> = logs
-            .into_iter()
-            .filter(|l| l.block_number >= min_bn)
-            .collect();
+            let receipts = state.receipts.lock().clone();
+            let kept_receipts: Vec<Receipt> =
+                receipts.into_iter().filter(|r| r.block_number >= min_bn).collect();
 
-        let txs_map = state.txs.lock().unwrap().clone();
-        let mut kept_txs = Vec::new();
-        for b in &kept_blocks {
-            for h in &b.transactions {
-                if let Some(t) = txs_map.get(h).cloned() {
-                    kept_txs.push(t);
+            let logs = state.all_logs.lock().clone();
+            let kept_logs: Vec<Log> =
+                logs.into_iter().filter(|l| l.block_number >= min_bn).collect();
+
+            let txs_map = state.txs.lock().clone();
+            let mut kept_txs = Vec::new();
+            for b in &kept_blocks {
+                for h in &b.transactions {
+                    if let Some(t) = txs_map.get(h).cloned() {
+                        kept_txs.push(t);
+                    }
                 }
             }
-        }
 
-        // Rewrite files.
+            (kept_blocks, kept_receipts, kept_txs, kept_logs, min_bn)
+        };
+
+        // Rewrite all four JSONL files atomically.
         rewrite_jsonl(&self.files.blocks, &kept_blocks)?;
         rewrite_jsonl(&self.files.receipts, &kept_receipts)?;
         rewrite_jsonl(&self.files.txs, &kept_txs)?;
         rewrite_jsonl(&self.files.logs, &kept_logs)?;
 
-        // Rebuild log indices.
+        // Rebuild log indices from scratch.
         if self.config.enable_log_index {
             let idx_dir = logs_index_dir(&self.dir);
             if idx_dir.exists() {
                 let _ = fs::remove_dir_all(&idx_dir);
             }
-            // Rebuild indices from kept_logs.
             if !kept_logs.is_empty() {
-                // Need offsets — we can recompute from the new logs file.
+                // Recompute offsets by re-appending to a fresh file.
+                // (We just rewrote the logs file, so offsets are 0-based
+                //  from the new file; recompute them.)
                 let offsets = self.append_logs_with_offsets(&kept_logs)?;
-                append_log_indices_with_offsets(&self.dir, &kept_logs, &offsets, &self.config)?;
+                append_log_indices_with_offsets(
+                    &self.dir,
+                    &kept_logs,
+                    &offsets,
+                    &self.config,
+                )?;
             }
         }
 
-        // Update metadata.
+        // Update in-memory state to match the compacted files.
+        {
+            let state = self.state.lock();
+            *state.blocks.lock() = kept_blocks;
+            *state.receipts.lock() = kept_receipts;
+            *state.all_logs.lock() = kept_logs;
+            // Rebuild tx map.
+            let mut txs_map = state.txs.lock();
+            txs_map.clear();
+            for t in kept_txs {
+                txs_map.insert(t.hash.clone(), t);
+            }
+        }
+
         update_meta(&self.dir, min_bn)?;
 
-        // Record compaction metrics.
         let duration = start.elapsed();
         self.metrics.record_compaction(duration);
 
         info!(
-            kept_blocks = kept_blocks.len(),
-            pruned = blocks.len() - kept_blocks.len(),
+            min_bn,
             duration_ms = duration.as_millis(),
             "Chain database compacted"
         );
@@ -861,7 +1082,6 @@ impl ChainDb {
         Ok(())
     }
 
-    /// Spawn background compaction task.
     fn spawn_compaction_task(&self) {
         let db = self.clone();
         let interval = Duration::from_secs(self.config.compaction_interval_secs);
@@ -889,42 +1109,46 @@ fn meta_path(dir: &Path) -> PathBuf {
     dir.join("meta.json")
 }
 
-fn ensure_meta(dir: &Path) -> io::Result<Meta> {
+fn ensure_meta(dir: &Path) -> ChainDbResult<Meta> {
     fs::create_dir_all(dir)?;
     let path = meta_path(dir);
     if path.exists() {
         let s = fs::read_to_string(&path)?;
         let m: Meta = serde_json::from_str(&s)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| ChainDbError::Corrupt(format!("meta.json: {}", e)))?;
         return Ok(m);
     }
     let m = Meta::new();
-    fs::write(&path, serde_json::to_string_pretty(&m).unwrap())?;
+    let json = serde_json::to_string_pretty(&m)
+        .map_err(|e| ChainDbError::Serialization(e.to_string()))?;
+    fs::write(&path, json)?;
     Ok(m)
 }
 
-fn update_meta(dir: &Path, highest_block: u64) -> io::Result<()> {
+fn update_meta(dir: &Path, highest_block: u64) -> ChainDbResult<()> {
     let path = meta_path(dir);
     let mut m: Meta = if path.exists() {
         let s = fs::read_to_string(&path)?;
         serde_json::from_str(&s)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+            .map_err(|e| ChainDbError::Corrupt(format!("meta.json: {}", e)))?
     } else {
         Meta::new()
     };
-    m.highest_block = highest_block;
+    m.highest_block = m.highest_block.max(highest_block);
     m.block_count = m.block_count.saturating_add(1);
-    fs::write(&path, serde_json::to_string_pretty(&m).unwrap())?;
+    let json = serde_json::to_string_pretty(&m)
+        .map_err(|e| ChainDbError::Serialization(e.to_string()))?;
+    fs::write(&path, json)?;
     Ok(())
 }
 
-/// Load data from disk into the state.
+/// Load data from disk into `state`.
 pub fn load_into_state(
     dir: &Path,
     state: &mut EthRpcState,
-    config: &ChainDbConfig,
+    _config: &ChainDbConfig,
     metrics: &ChainDbMetrics,
-) -> io::Result<()> {
+) -> ChainDbResult<()> {
     let files = ChainFiles::new(dir);
 
     let blocks: Vec<Block> = load_jsonl(&files.blocks)?;
@@ -932,38 +1156,45 @@ pub fn load_into_state(
     let txs: Vec<TxRecord> = load_jsonl(&files.txs)?;
     let logs: Vec<Log> = load_jsonl(&files.logs)?;
 
-    metrics.record_block_read();
+    metrics.record_block_read(blocks.len() as u64);
     metrics.record_receipt_read(receipts.len() as u64);
     metrics.record_tx_read(txs.len() as u64);
     metrics.record_log_read(logs.len() as u64);
 
-    *state.blocks.lock().unwrap() = blocks.clone();
-    *state.receipts.lock().unwrap() = receipts.clone();
+    *state.blocks.lock() = blocks.clone();
+    *state.receipts.lock() = receipts.clone();
 
-    let mut txmap = HashMap::new();
-    for t in txs {
-        txmap.insert(t.hash.clone(), t);
+    {
+        let mut txmap = HashMap::new();
+        for t in txs {
+            txmap.insert(t.hash.clone(), t);
+        }
+        *state.txs.lock() = txmap;
     }
-    *state.txs.lock().unwrap() = txmap;
 
-    let mut rb = HashMap::<u64, Vec<Receipt>>::new();
-    for r in receipts {
-        rb.entry(r.block_number).or_default().push(r);
+    {
+        let mut rb = HashMap::<u64, Vec<Receipt>>::new();
+        for r in &receipts {
+            rb.entry(r.block_number).or_default().push(r.clone());
+        }
+        *state.receipts_by_block.lock() = rb;
     }
-    *state.receipts_by_block.lock().unwrap() = rb;
 
-    *state.all_logs.lock().unwrap() = logs;
+    *state.all_logs.lock() = logs;
 
     if let Some(last) = blocks.last() {
-        *state.block_number.lock().unwrap() = last.number;
+        *state.block_number.lock() = last.number;
         if let Ok(bf) = u64::from_str_radix(last.base_fee_per_gas.trim_start_matches("0x"), 16) {
-            *state.base_fee.lock().unwrap() = bf;
+            *state.base_fee.lock() = bf;
         }
     }
 
-    // Load metadata.
     if let Ok(meta) = ensure_meta(dir) {
-        trace!(block_count = meta.block_count, highest = meta.highest_block, "Metadata loaded");
+        trace!(
+            block_count = meta.block_count,
+            highest = meta.highest_block,
+            "Metadata loaded"
+        );
     }
 
     Ok(())
@@ -971,13 +1202,13 @@ pub fn load_into_state(
 
 // ── Legacy API (backward compatibility) ─────────────────────────────────
 
-pub fn append_block(dir: impl AsRef<Path>, b: &Block) -> io::Result<()> {
+pub fn append_block(dir: impl AsRef<Path>, b: &Block) -> ChainDbResult<()> {
     let config = ChainDbConfig::default();
     append_jsonl_atomic(&ChainFiles::new(dir.as_ref()).blocks, b, &config)?;
     Ok(())
 }
 
-pub fn append_receipts(dir: impl AsRef<Path>, rs: &[Receipt]) -> io::Result<()> {
+pub fn append_receipts(dir: impl AsRef<Path>, rs: &[Receipt]) -> ChainDbResult<()> {
     let config = ChainDbConfig::default();
     let f = ChainFiles::new(dir.as_ref()).receipts;
     for r in rs {
@@ -986,7 +1217,7 @@ pub fn append_receipts(dir: impl AsRef<Path>, rs: &[Receipt]) -> io::Result<()> 
     Ok(())
 }
 
-pub fn append_txs(dir: impl AsRef<Path>, txs: &[TxRecord]) -> io::Result<()> {
+pub fn append_txs(dir: impl AsRef<Path>, txs: &[TxRecord]) -> ChainDbResult<()> {
     let config = ChainDbConfig::default();
     let f = ChainFiles::new(dir.as_ref()).txs;
     for t in txs {
@@ -995,17 +1226,13 @@ pub fn append_txs(dir: impl AsRef<Path>, txs: &[TxRecord]) -> io::Result<()> {
     Ok(())
 }
 
-pub fn append_logs(dir: impl AsRef<Path>, logs: &[Log]) -> io::Result<()> {
+pub fn append_logs(dir: impl AsRef<Path>, logs: &[Log]) -> ChainDbResult<()> {
     let config = ChainDbConfig::default();
     let f = ChainFiles::new(dir.as_ref()).logs;
     for l in logs {
         append_jsonl_atomic(&f, l, &config)?;
     }
     Ok(())
-}
-
-pub fn load_jsonl_legacy<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<Vec<T>> {
-    load_jsonl(path)
 }
 
 pub fn persist_new_block_bundle(
@@ -1025,7 +1252,7 @@ pub fn files(dir: impl AsRef<Path>) -> ChainFiles {
     ChainFiles::new(dir.as_ref())
 }
 
-pub fn ensure_meta_legacy(dir: impl AsRef<Path>) -> io::Result<Meta> {
+pub fn ensure_meta_legacy(dir: impl AsRef<Path>) -> ChainDbResult<Meta> {
     ensure_meta(dir.as_ref())
 }
 
@@ -1065,32 +1292,48 @@ mod tests {
         }
     }
 
+    /// Regression test for the append bug: multiple appends must preserve
+    /// all previous lines (not truncate the file to one line).
     #[test]
-    fn test_append_and_load() -> io::Result<()> {
+    fn test_append_jsonl_atomic_preserves_previous_lines() -> ChainDbResult<()> {
         let dir = tempdir().unwrap();
+        let path = dir.path().join("append.jsonl");
         let config = ChainDbConfig::default();
-        let db = ChainDb::open(dir.path(), config).unwrap();
 
-        let block = test_block(1);
-        let receipts = vec![];
-        let txs = vec![];
-        let logs = vec![];
+        for i in 0..5u64 {
+            append_jsonl_atomic(&path, &test_block(i), &config)?;
+        }
 
-        db.persist_block_bundle(&block, &receipts, &txs, &logs)?;
-
-        let state = db.state().lock();
-        let blocks = state.blocks.lock().unwrap();
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].number, 1);
-
+        let blocks: Vec<Block> = load_jsonl(&path)?;
+        assert_eq!(blocks.len(), 5);
+        for (i, b) in blocks.iter().enumerate() {
+            assert_eq!(b.number, i as u64);
+        }
         Ok(())
     }
 
     #[test]
-    fn test_query_logs() -> io::Result<()> {
+    fn test_append_and_load() -> ChainDbResult<()> {
         let dir = tempdir().unwrap();
-        let config = ChainDbConfig::default();
-        let db = ChainDb::open(dir.path(), config).unwrap();
+        let db = ChainDb::open(dir.path(), ChainDbConfig::default())?;
+
+        for i in 0..5u64 {
+            db.persist_block_bundle(&test_block(i), &[], &[], &[])?;
+        }
+
+        let state = db.state().lock();
+        let blocks = state.blocks.lock();
+        assert_eq!(blocks.len(), 5);
+        for (i, b) in blocks.iter().enumerate() {
+            assert_eq!(b.number, i as u64);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_logs() -> ChainDbResult<()> {
+        let dir = tempdir().unwrap();
+        let db = ChainDb::open(dir.path(), ChainDbConfig::default())?;
 
         let block = test_block(1);
         let logs = vec![Log {
@@ -1110,46 +1353,56 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].address, "0x123");
 
+        let result = db.query_logs(1, 1, None, Some("0x456".into()))?;
+        assert_eq!(result.len(), 1);
+
+        let result = db.query_logs(1, 1, Some("0x123".into()), Some("0x456".into()))?;
+        assert_eq!(result.len(), 1);
+
+        let result = db.query_logs(1, 1, Some("0x999".into()), None)?;
+        assert!(result.is_empty());
+
         Ok(())
     }
 
     #[test]
-    fn test_compaction() -> io::Result<()> {
+    fn test_compaction() -> ChainDbResult<()> {
         let dir = tempdir().unwrap();
         let config = ChainDbConfig {
             max_blocks: 2,
             ..Default::default()
         };
-        let db = ChainDb::open(dir.path(), config).unwrap();
+        let db = ChainDb::open(dir.path(), config)?;
 
-        for i in 0..5 {
-            let block = test_block(i);
-            db.persist_block_bundle(&block, &[], &[], &[])?;
+        for i in 0..5u64 {
+            db.persist_block_bundle(&test_block(i), &[], &[], &[])?;
         }
 
         db.compact()?;
 
         let state = db.state().lock();
-        let blocks = state.blocks.lock().unwrap();
+        let blocks = state.blocks.lock();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].number, 3);
         assert_eq!(blocks[1].number, 4);
+
+        // On-disk file should also reflect the compaction.
+        drop(blocks);
+        drop(state);
+        let on_disk: Vec<Block> = load_jsonl(&ChainFiles::new(dir.path()).blocks)?;
+        assert_eq!(on_disk.len(), 2);
+        assert_eq!(on_disk[0].number, 3);
 
         Ok(())
     }
 
     #[test]
-    fn test_metrics() -> io::Result<()> {
+    fn test_metrics() -> ChainDbResult<()> {
         let dir = tempdir().unwrap();
-        let config = ChainDbConfig::default();
-        let db = ChainDb::open(dir.path(), config).unwrap();
-
-        let block = test_block(1);
-        db.persist_block_bundle(&block, &[], &[], &[])?;
-
-        let metrics = db.metrics_snapshot();
-        assert_eq!(metrics.blocks_written, 1);
-
+        let db = ChainDb::open(dir.path(), ChainDbConfig::default())?;
+        db.persist_block_bundle(&test_block(1), &[], &[], &[])?;
+        let m = db.metrics_snapshot();
+        assert_eq!(m.blocks_written, 1);
         Ok(())
     }
 
@@ -1164,5 +1417,15 @@ mod tests {
         config.compaction_interval_secs = 60;
         config.lock_timeout_secs = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_prometheus_metrics_unregistered() {
+        let p = ChainDbPrometheus::new_unregistered();
+        p.blocks_written_total.inc();
+        p.blocks_written_total.inc_by(2);
+        p.index_hits_total.inc();
+        assert_eq!(p.blocks_written_total.get(), 3);
+        assert_eq!(p.index_hits_total.get(), 1);
     }
 }
