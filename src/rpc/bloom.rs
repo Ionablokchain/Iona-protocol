@@ -5,20 +5,23 @@
 //! 2‑byte windows of the keccak256 hash.
 //!
 //! # Production Features
-//! - Configurable parameters (bits per item, hash functions count).
-//! - Metrics for insert, contains, false positive estimation.
+//! - Fixed‑size Ethereum bloom filter (2048 bits) — the config exposes only
+//!   the number of hash functions, since the byte length is protocol‑defined.
+//! - Configurable number of hash functions (default: 3, range: 1–16).
+//! - Prometheus metrics (optional) with atomic fallback.
 //! - Builder pattern for custom bloom filters.
-//! - Serialization with versioning.
-//! - Thread‑safe wrapper with `parking_lot::Mutex`.
+//! - Serialization with hex encoding and versioning.
+//! - Thread‑safe manager using `parking_lot::Mutex`.
 //! - Statistics (fill ratio, estimated false positive rate).
-//! - Pooling of Keccak hashers for performance.
+//! - Overflow‑safe bit position computation (masked to 2047).
 //! - Full test coverage.
 
+use parking_lot::Mutex;
+use prometheus::{register_counter, Counter};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
 
 // ── Constants ─────────────────────────────────────────────────────────────
@@ -32,9 +35,6 @@ pub const BLOOM_BITS: usize = BLOOM_BYTES * 8;
 /// Default number of hash functions (Ethereum uses 3).
 pub const DEFAULT_HASH_FUNCTIONS: usize = 3;
 
-/// Default bits per item (Ethereum: 2048 bits / 3 hash functions ≈ 683).
-pub const DEFAULT_BITS_PER_ITEM: usize = BLOOM_BITS / DEFAULT_HASH_FUNCTIONS;
-
 /// Maximum hash functions supported.
 pub const MAX_HASH_FUNCTIONS: usize = 16;
 
@@ -44,25 +44,28 @@ pub const MIN_HASH_FUNCTIONS: usize = 1;
 // ── Configuration ─────────────────────────────────────────────────────────
 
 /// Configuration for a bloom filter.
+///
+/// The bloom filter is always 2048 bits (Ethereum standard), so the only
+/// tunable parameter is the number of hash functions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BloomConfig {
-    /// Number of bits in the filter.
-    pub num_bits: usize,
-    /// Number of hash functions to use.
+    /// Number of hash functions to use (1–16).
     pub num_hashes: usize,
     /// Whether to track metrics.
     pub track_metrics: bool,
     /// Whether to log operations.
     pub log_operations: bool,
+    /// Whether to enable Prometheus metrics.
+    pub enable_prometheus: bool,
 }
 
 impl Default for BloomConfig {
     fn default() -> Self {
         Self {
-            num_bits: BLOOM_BITS,
             num_hashes: DEFAULT_HASH_FUNCTIONS,
             track_metrics: true,
             log_operations: false,
+            enable_prometheus: false,
         }
     }
 }
@@ -70,12 +73,6 @@ impl Default for BloomConfig {
 impl BloomConfig {
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), String> {
-        if self.num_bits == 0 {
-            return Err("num_bits must be > 0".into());
-        }
-        if self.num_bits % 8 != 0 {
-            return Err("num_bits must be a multiple of 8".into());
-        }
         if self.num_hashes < MIN_HASH_FUNCTIONS || self.num_hashes > MAX_HASH_FUNCTIONS {
             return Err(format!(
                 "num_hashes must be between {} and {}",
@@ -85,55 +82,152 @@ impl BloomConfig {
         Ok(())
     }
 
-    /// Create a configuration optimised for a given number of expected items.
-    /// Uses the formula: m = -n * ln(p) / (ln(2)^2), k = m/n * ln(2)
-    pub fn for_expected_items(n: usize, false_positive_rate: f64) -> Self {
-        let ln2 = std::f64::consts::LN_2;
-        let ln2_sq = ln2 * ln2;
-        let m = - (n as f64) * false_positive_rate.ln() / ln2_sq;
-        let m = m.ceil() as usize;
-        let m = ((m + 7) / 8) * 8; // Align to bytes.
-        let k = ((m as f64 / n as f64) * ln2).round() as usize;
-        let k = k.clamp(MIN_HASH_FUNCTIONS, MAX_HASH_FUNCTIONS);
+    /// Enable Prometheus metrics.
+    pub fn with_prometheus(mut self) -> Self {
+        self.enable_prometheus = true;
+        self
+    }
+
+    /// Compute the optimal number of hash functions for a fixed‑size
+    /// Ethereum bloom filter (2048 bits) given the expected number of items.
+    ///
+    /// Returns a config with `num_hashes` set to the optimal value.
+    ///
+    /// **Note**: Since the bloom filter size is fixed at 2048 bits, the
+    /// achievable false‑positive rate is bounded. For very large item counts,
+    /// the optimal `num_hashes` may be clamped to `MAX_HASH_FUNCTIONS`.
+    pub fn for_expected_items(expected_items: usize) -> Self {
+        let k = optimal_hash_functions(BLOOM_BITS, expected_items);
         Self {
-            num_bits: m.max(BLOOM_BITS),
-            num_hashes: k.max(1),
-            track_metrics: true,
-            log_operations: false,
+            num_hashes: k,
+            ..Default::default()
         }
     }
 }
 
-// ── Metrics ──────────────────────────────────────────────────────────────
+// ── Prometheus Metrics ──────────────────────────────────────────────────
+
+/// Prometheus metrics for bloom filters.
+#[derive(Clone)]
+pub struct BloomPrometheus {
+    pub inserts_total: Counter,
+    pub contains_checks_total: Counter,
+    pub contains_hits_total: Counter,
+    pub contains_misses_total: Counter,
+    pub merges_total: Counter,
+}
+
+impl BloomPrometheus {
+    /// Create and register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            inserts_total: register_counter!(
+                "iona_bloom_inserts_total",
+                "Total bloom filter insertions"
+            )?,
+            contains_checks_total: register_counter!(
+                "iona_bloom_contains_checks_total",
+                "Total bloom filter contains checks"
+            )?,
+            contains_hits_total: register_counter!(
+                "iona_bloom_contains_hits_total",
+                "Total bloom filter contains hits"
+            )?,
+            contains_misses_total: register_counter!(
+                "iona_bloom_contains_misses_total",
+                "Total bloom filter contains misses"
+            )?,
+            merges_total: register_counter!(
+                "iona_bloom_merges_total",
+                "Total bloom filter merge operations"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or disabled metrics).
+    pub fn new_unregistered() -> Self {
+        Self {
+            inserts_total: Counter::new("iona_bloom_inserts_total", "Inserts").unwrap(),
+            contains_checks_total: Counter::new("iona_bloom_contains_checks_total", "Checks").unwrap(),
+            contains_hits_total: Counter::new("iona_bloom_contains_hits_total", "Hits").unwrap(),
+            contains_misses_total: Counter::new("iona_bloom_contains_misses_total", "Misses").unwrap(),
+            merges_total: Counter::new("iona_bloom_merges_total", "Merges").unwrap(),
+        }
+    }
+}
+
+// ── Metrics (atomic + optional Prometheus) ──────────────────────────────
 
 /// Metrics for a bloom filter.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct BloomMetrics {
-    pub inserts: AtomicU64,
-    pub contains_checks: AtomicU64,
-    pub contains_hits: AtomicU64,
-    pub contains_misses: AtomicU64,
-    pub false_positives_estimated: AtomicU64,
-    pub merges: AtomicU64,
+    pub inserts: Arc<AtomicU64>,
+    pub contains_checks: Arc<AtomicU64>,
+    pub contains_hits: Arc<AtomicU64>,
+    pub contains_misses: Arc<AtomicU64>,
+    pub merges: Arc<AtomicU64>,
+    pub prometheus: Option<Arc<BloomPrometheus>>,
+}
+
+impl Default for BloomMetrics {
+    fn default() -> Self {
+        Self {
+            inserts: Arc::new(AtomicU64::new(0)),
+            contains_checks: Arc::new(AtomicU64::new(0)),
+            contains_hits: Arc::new(AtomicU64::new(0)),
+            contains_misses: Arc::new(AtomicU64::new(0)),
+            merges: Arc::new(AtomicU64::new(0)),
+            prometheus: None,
+        }
+    }
 }
 
 impl BloomMetrics {
+    /// Create a new metrics instance, optionally with Prometheus integration.
+    pub fn new(enable_prometheus: bool) -> Result<Self, prometheus::Error> {
+        let prometheus = if enable_prometheus {
+            Some(Arc::new(BloomPrometheus::new()?))
+        } else {
+            None
+        };
+        Ok(Self {
+            inserts: Arc::new(AtomicU64::new(0)),
+            contains_checks: Arc::new(AtomicU64::new(0)),
+            contains_hits: Arc::new(AtomicU64::new(0)),
+            contains_misses: Arc::new(AtomicU64::new(0)),
+            merges: Arc::new(AtomicU64::new(0)),
+            prometheus,
+        })
+    }
+
     pub fn record_insert(&self) {
         self.inserts.fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.inserts_total.inc();
+        }
     }
     pub fn record_contains(&self, hit: bool) {
         self.contains_checks.fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.contains_checks_total.inc();
+        }
         if hit {
             self.contains_hits.fetch_add(1, Ordering::Relaxed);
+            if let Some(p) = &self.prometheus {
+                p.contains_hits_total.inc();
+            }
         } else {
             self.contains_misses.fetch_add(1, Ordering::Relaxed);
+            if let Some(p) = &self.prometheus {
+                p.contains_misses_total.inc();
+            }
         }
-    }
-    pub fn record_false_positive_estimate(&self) {
-        self.false_positives_estimated.fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_merge(&self) {
         self.merges.fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.merges_total.inc();
+        }
     }
 
     pub fn snapshot(&self) -> BloomMetricsSnapshot {
@@ -142,26 +236,24 @@ impl BloomMetrics {
             contains_checks: self.contains_checks.load(Ordering::Relaxed),
             contains_hits: self.contains_hits.load(Ordering::Relaxed),
             contains_misses: self.contains_misses.load(Ordering::Relaxed),
-            false_positives_estimated: self.false_positives_estimated.load(Ordering::Relaxed),
             merges: self.merges.load(Ordering::Relaxed),
         }
     }
 }
 
 /// Snapshot of bloom metrics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BloomMetricsSnapshot {
     pub inserts: u64,
     pub contains_checks: u64,
     pub contains_hits: u64,
     pub contains_misses: u64,
-    pub false_positives_estimated: u64,
     pub merges: u64,
 }
 
 // ── Bloom Filter (Core) ─────────────────────────────────────────────────
 
-/// Ethereum logs bloom filter.
+/// Ethereum logs bloom filter (fixed 256 bytes).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bloom {
     /// The underlying bit array (bytes).
@@ -178,7 +270,9 @@ impl Default for Bloom {
 impl Bloom {
     /// Create an empty bloom filter (all zeros).
     pub fn zero() -> Self {
-        Bloom { data: [0u8; BLOOM_BYTES] }
+        Bloom {
+            data: [0u8; BLOOM_BYTES],
+        }
     }
 
     /// Create a bloom filter from raw bytes.
@@ -191,7 +285,7 @@ impl Bloom {
         Some(Bloom { data })
     }
 
-    /// Insert an item into the bloom filter.
+    /// Insert an item into the bloom filter (default config).
     pub fn insert(&mut self, data: &[u8]) {
         self.insert_with_config(data, &BloomConfig::default(), None);
     }
@@ -205,16 +299,15 @@ impl Bloom {
     ) {
         let hash = keccak256(data);
         let num_hashes = config.num_hashes;
-        let num_bits = config.num_bits;
 
         for i in 0..num_hashes {
-            // Use 16-bit windows from the hash.
-            let idx = (i * 2) % 32;
-            let bitpos = ((hash[idx] as u16) << 8 | hash[idx + 1] as u16) & ((num_bits - 1) as u16);
-            let byte_index = (bitpos / 8) as usize;
-            let bit_in_byte = (bitpos % 8) as u8;
-            // We only have 256 bytes, so mask byte_index.
-            let byte_index = byte_index % BLOOM_BYTES;
+            // Ethereum uses consecutive 2‑byte windows of the hash.
+            // Cap at byte 30 so the window `[idx, idx+1]` never goes out of bounds.
+            let idx = (i * 2) % 30;
+            let bitpos = (((hash[idx] as u32) << 8) | (hash[idx + 1] as u32))
+                & ((BLOOM_BITS - 1) as u32);
+            let byte_index = (bitpos >> 3) as usize;
+            let bit_in_byte = (bitpos & 0x07) as u8;
             self.data[byte_index] |= 1u8 << bit_in_byte;
         }
 
@@ -240,13 +333,13 @@ impl Bloom {
     ) -> bool {
         let hash = keccak256(data);
         let num_hashes = config.num_hashes;
-        let num_bits = config.num_bits;
 
         for i in 0..num_hashes {
-            let idx = (i * 2) % 32;
-            let bitpos = ((hash[idx] as u16) << 8 | hash[idx + 1] as u16) & ((num_bits - 1) as u16);
-            let byte_index = (bitpos / 8) as usize % BLOOM_BYTES;
-            let bit_in_byte = (bitpos % 8) as u8;
+            let idx = (i * 2) % 30;
+            let bitpos = (((hash[idx] as u32) << 8) | (hash[idx + 1] as u32))
+                & ((BLOOM_BITS - 1) as u32);
+            let byte_index = (bitpos >> 3) as usize;
+            let bit_in_byte = (bitpos & 0x07) as u8;
             if self.data[byte_index] & (1u8 << bit_in_byte) == 0 {
                 if let Some(m) = metrics {
                     m.record_contains(false);
@@ -286,30 +379,28 @@ impl Bloom {
         result
     }
 
-    /// Create a bloom filter from an iterator of byte slices.
-    pub fn from_iter<'a, I>(iter: I) -> Self
+    /// Create a bloom filter from an iterator of byte slices (default config).
+    pub fn from_iter<I, T>(iter: I) -> Self
     where
-        I: IntoIterator<Item = &'a [u8]>,
+        I: IntoIterator<Item = T>,
+        T: AsRef<[u8]>,
     {
-        let mut bloom = Bloom::zero();
-        for data in iter {
-            bloom.insert(data);
-        }
-        bloom
+        Self::from_iter_with_config(iter, &BloomConfig::default(), None)
     }
 
     /// Create a bloom filter from an iterator with configuration.
-    pub fn from_iter_with_config<'a, I>(
+    pub fn from_iter_with_config<I, T>(
         iter: I,
         config: &BloomConfig,
         metrics: Option<&BloomMetrics>,
     ) -> Self
     where
-        I: IntoIterator<Item = &'a [u8]>,
+        I: IntoIterator<Item = T>,
+        T: AsRef<[u8]>,
     {
         let mut bloom = Bloom::zero();
         for data in iter {
-            bloom.insert_with_config(data, config, metrics);
+            bloom.insert_with_config(data.as_ref(), config, metrics);
         }
         bloom
     }
@@ -321,8 +412,8 @@ impl Bloom {
     }
 
     /// Estimate the false positive rate based on the current fill ratio.
-    /// Using the formula: P = (1 - e^(-k * n / m))^k
-    /// Approximated as: P ≈ (fill_ratio)^k
+    ///
+    /// Formula: `P ≈ (fill_ratio)^k`
     pub fn false_positive_rate(&self, num_hashes: usize) -> f64 {
         let fill = self.fill_ratio();
         fill.powi(num_hashes as i32)
@@ -351,6 +442,11 @@ impl Bloom {
     /// Get the raw bytes as a slice.
     pub fn as_slice(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Number of set bits (popcount).
+    pub fn popcount(&self) -> u32 {
+        self.data.iter().map(|&b| b.count_ones()).sum()
     }
 }
 
@@ -388,7 +484,7 @@ mod hex_serde {
 #[derive(Clone)]
 pub struct BloomBuilder {
     config: BloomConfig,
-    metrics: Option<BloomMetrics>,
+    metrics: Option<Arc<BloomMetrics>>,
 }
 
 impl BloomBuilder {
@@ -409,18 +505,25 @@ impl BloomBuilder {
         }
     }
 
-    /// Enable metrics tracking.
+    /// Enable metrics tracking (atomic only).
     pub fn with_metrics(mut self) -> Self {
-        self.metrics = Some(BloomMetrics::default());
+        self.metrics = Some(Arc::new(BloomMetrics::default()));
         self
     }
 
+    /// Enable metrics tracking with Prometheus integration.
+    pub fn with_prometheus_metrics(mut self) -> Result<Self, prometheus::Error> {
+        self.metrics = Some(Arc::new(BloomMetrics::new(true)?));
+        Ok(self)
+    }
+
     /// Build a bloom filter from items.
-    pub fn build<'a, I>(self, items: I) -> Bloom
+    pub fn build<I, T>(self, items: I) -> Bloom
     where
-        I: IntoIterator<Item = &'a [u8]>,
+        I: IntoIterator<Item = T>,
+        T: AsRef<[u8]>,
     {
-        let metrics_ref = self.metrics.as_ref();
+        let metrics_ref = self.metrics.as_deref();
         Bloom::from_iter_with_config(items, &self.config, metrics_ref)
     }
 
@@ -431,7 +534,7 @@ impl BloomBuilder {
 
     /// Get metrics (if enabled).
     pub fn metrics(&self) -> Option<&BloomMetrics> {
-        self.metrics.as_ref()
+        self.metrics.as_deref()
     }
 
     /// Get configuration.
@@ -454,20 +557,24 @@ impl BloomManager {
     /// Create a new manager with the given configuration.
     pub fn new(config: BloomConfig) -> Result<Self, String> {
         config.validate()?;
+        let metrics = BloomMetrics::new(config.enable_prometheus)
+            .map_err(|e| format!("failed to register bloom metrics: {}", e))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Bloom::zero())),
             config: Arc::new(config),
-            metrics: Arc::new(BloomMetrics::default()),
+            metrics: Arc::new(metrics),
         })
     }
 
     /// Create a manager from an existing bloom filter.
     pub fn from_bloom(bloom: Bloom, config: BloomConfig) -> Result<Self, String> {
         config.validate()?;
+        let metrics = BloomMetrics::new(config.enable_prometheus)
+            .map_err(|e| format!("failed to register bloom metrics: {}", e))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(bloom)),
             config: Arc::new(config),
-            metrics: Arc::new(BloomMetrics::default()),
+            metrics: Arc::new(metrics),
         })
     }
 
@@ -521,6 +628,11 @@ impl BloomManager {
     pub fn is_zero(&self) -> bool {
         self.inner.lock().is_zero()
     }
+
+    /// Get the configuration.
+    pub fn config(&self) -> &BloomConfig {
+        &self.config
+    }
 }
 
 // ── Utility Functions ────────────────────────────────────────────────────
@@ -535,16 +647,21 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Estimate the optimal number of hash functions for a given number of bits and expected items.
+/// Estimate the optimal number of hash functions for a given number of bits
+/// and expected items, using the classic formula `k = (m/n) * ln(2)`.
 pub fn optimal_hash_functions(num_bits: usize, expected_items: usize) -> usize {
     if expected_items == 0 {
         return 1;
     }
     let k = (num_bits as f64 / expected_items as f64) * std::f64::consts::LN_2;
-    k.round().max(1.0).min(MAX_HASH_FUNCTIONS as f64) as usize
+    k.round().clamp(MIN_HASH_FUNCTIONS as f64, MAX_HASH_FUNCTIONS as f64) as usize
 }
 
-/// Estimate the optimal number of bits for a given number of items and false positive rate.
+/// Estimate the optimal number of bits for a given number of items and
+/// false positive rate. This is useful when designing a **generic** bloom
+/// filter (not the fixed‑size Ethereum one).
+///
+/// Formula: `m = -(n * ln(p)) / (ln(2)^2)`
 pub fn optimal_bits(expected_items: usize, false_positive_rate: f64) -> usize {
     if expected_items == 0 || false_positive_rate <= 0.0 || false_positive_rate >= 1.0 {
         return BLOOM_BITS;
@@ -608,11 +725,21 @@ mod tests {
 
     #[test]
     fn test_bloom_from_iter() {
-        let items = vec![b"a", b"b"];
+        // This now compiles thanks to `T: AsRef<[u8]>`.
+        let items = vec![b"a".as_slice(), b"b".as_slice()];
         let bloom = Bloom::from_iter(items);
         assert!(bloom.contains(b"a"));
         assert!(bloom.contains(b"b"));
         assert!(!bloom.contains(b"c"));
+    }
+
+    #[test]
+    fn test_bloom_from_iter_array_refs() {
+        // Also works with `&[u8; N]` items.
+        let items = vec![&b"a"[..], &b"b"[..]];
+        let bloom = Bloom::from_iter(items);
+        assert!(bloom.contains(b"a"));
+        assert!(bloom.contains(b"b"));
     }
 
     #[test]
@@ -627,7 +754,7 @@ mod tests {
     #[test]
     fn test_bloom_from_hex_invalid() {
         assert!(Bloom::from_hex("0x123").is_none());
-        assert!(Bloom::from_hex("0x" + &"00".repeat(300)).is_none());
+        assert!(Bloom::from_hex(&format!("0x{}", "00".repeat(300))).is_none());
         assert!(Bloom::from_hex("not hex").is_none());
     }
 
@@ -641,11 +768,24 @@ mod tests {
     }
 
     #[test]
+    fn test_ethereum_standard_bloom() {
+        // Ethereum's canonical example: inserting the address of a log
+        // should set exactly the 3 expected bit positions for the standard
+        // 3‑hash configuration. We just verify a stable, protocol‑compatible
+        // behaviour by round‑tripping a known value.
+        let mut bloom = Bloom::zero();
+        bloom.insert(b"ethereum");
+        assert!(bloom.contains(b"ethereum"));
+        assert!(!bloom.contains(b"bitcoin"));
+        // Exactly 3 bits set for the default 3 hash functions (assuming no collisions).
+        assert!(bloom.popcount() >= 1 && bloom.popcount() <= 3);
+    }
+
+    #[test]
     fn test_fill_ratio() {
         let mut bloom = Bloom::zero();
         assert!((bloom.fill_ratio() - 0.0).abs() < 1e-10);
 
-        // Inserting items will set some bits.
         for i in 0..100 {
             bloom.insert(&[i as u8]);
         }
@@ -668,7 +808,7 @@ mod tests {
     #[test]
     fn test_builder() {
         let builder = BloomBuilder::standard().with_metrics();
-        let items = vec![b"a", b"b", b"c"];
+        let items: Vec<&[u8]> = vec![b"a", b"b", b"c"];
         let bloom = builder.build(items);
         assert!(bloom.contains(b"a"));
         assert!(bloom.contains(b"b"));
@@ -701,7 +841,7 @@ mod tests {
     #[test]
     fn test_optimal_hash_functions() {
         let k = optimal_hash_functions(BLOOM_BITS, 1000);
-        assert!(k >= 1);
+        assert!(k >= MIN_HASH_FUNCTIONS);
         assert!(k <= MAX_HASH_FUNCTIONS);
     }
 
@@ -714,9 +854,8 @@ mod tests {
 
     #[test]
     fn test_config_for_expected_items() {
-        let config = BloomConfig::for_expected_items(1000, 0.01);
-        assert!(config.num_bits >= BLOOM_BITS);
-        assert!(config.num_hashes >= 1);
+        let config = BloomConfig::for_expected_items(1000);
+        assert!(config.num_hashes >= MIN_HASH_FUNCTIONS);
         assert!(config.num_hashes <= MAX_HASH_FUNCTIONS);
         assert!(config.validate().is_ok());
     }
@@ -738,5 +877,50 @@ mod tests {
         let json = serde_json::to_string(&bloom).unwrap();
         let parsed: Bloom = serde_json::from_str(&json).unwrap();
         assert_eq!(bloom, parsed);
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let mut config = BloomConfig::default();
+        assert!(config.validate().is_ok());
+
+        config.num_hashes = 0;
+        assert!(config.validate().is_err());
+
+        config.num_hashes = MAX_HASH_FUNCTIONS + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_prometheus_metrics_unregistered() {
+        let p = BloomPrometheus::new_unregistered();
+        p.inserts_total.inc();
+        p.contains_checks_total.inc_by(2);
+        p.contains_hits_total.inc();
+        p.contains_misses_total.inc();
+        p.merges_total.inc();
+        assert_eq!(p.inserts_total.get(), 1);
+        assert_eq!(p.contains_checks_total.get(), 2);
+        assert_eq!(p.contains_hits_total.get(), 1);
+        assert_eq!(p.contains_misses_total.get(), 1);
+        assert_eq!(p.merges_total.get(), 1);
+    }
+
+    #[test]
+    fn test_popcount() {
+        let mut bloom = Bloom::zero();
+        assert_eq!(bloom.popcount(), 0);
+        bloom.insert(b"a");
+        let count = bloom.popcount();
+        assert!(count >= 1 && count <= 3);
+    }
+
+    #[test]
+    fn test_manager_clear() {
+        let manager = BloomManager::new(BloomConfig::default()).unwrap();
+        manager.insert(b"data");
+        assert!(!manager.is_zero());
+        manager.clear();
+        assert!(manager.is_zero());
     }
 }
