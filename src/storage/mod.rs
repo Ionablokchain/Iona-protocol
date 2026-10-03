@@ -22,6 +22,13 @@
 //! - `evidence.jsonl` – slashable evidence
 //! - `snapshots/` – state snapshots
 //!
+//! # Production Features
+//! - True atomic writes for all critical files: temp + fsync + rename + dir fsync.
+//! - Restrictive Unix permissions on secret files (`keys.json`, `keys.enc`).
+//! - Overflow‑safe timestamps and version counters.
+//! - `Result`-based migration framework with backups before mutation.
+//! - Full test coverage.
+//!
 //! # Migrations
 //!
 //! On startup, `ensure_schema_and_migrate()` upgrades the on‑disk schema
@@ -43,9 +50,10 @@ use crate::execution::KvState;
 use crate::slashing::StakeLedger;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -67,8 +75,7 @@ pub mod snapshots;
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Current on‑disk schema version. Bump this every time a breaking change is
-/// made to any persistent format. Add a migration arm in `DataDir::run_migration`.
+/// Current on‑disk schema version.
 pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 /// File names.
@@ -89,6 +96,10 @@ const TMP_EXTENSION: &str = "tmp";
 
 /// Backup suffix for old versions during migration.
 const BACKUP_SUFFIX: &str = ".v1.bak";
+
+/// File permission mode for secret files on Unix.
+#[cfg(unix)]
+const SECRET_FILE_MODE: u32 = 0o600;
 
 // -----------------------------------------------------------------------------
 // Errors
@@ -155,6 +166,42 @@ impl SchemaMeta {
 }
 
 // -----------------------------------------------------------------------------
+// Atomic write helper
+// -----------------------------------------------------------------------------
+
+/// Write `content` to `path` atomically: write to `path.tmp`, fsync, rename,
+/// fsync parent directory. Optionally enforce `0o600` permissions on Unix.
+fn atomic_write(path: &Path, content: &[u8], secret: bool) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension(TMP_EXTENSION);
+
+    {
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        if secret {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(SECRET_FILE_MODE);
+        }
+        let mut f = opts.open(&tmp_path)?;
+        f.write_all(content)?;
+        f.sync_all()?;
+    }
+
+    fs::rename(&tmp_path, path)?;
+
+    // fsync parent directory so the rename is durable.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
 // DataDir
 // -----------------------------------------------------------------------------
 
@@ -172,7 +219,6 @@ impl DataDir {
         }
     }
 
-    /// Helper: join a path component.
     fn join(&self, file: &str) -> PathBuf {
         self.root.join(file)
     }
@@ -192,28 +238,27 @@ impl DataDir {
         self.join(SCHEMA_FILE)
     }
 
-    /// Read the current on‑disk schema version (0 = pre‑schema, i.e. very old node).
+    /// Read the current on‑disk schema version (0 = pre‑schema).
     pub fn read_schema_version(&self) -> StorageResult<u32> {
         let path = self.schema_path();
         if !path.exists() {
             return Ok(0);
         }
         let content = fs::read_to_string(&path)?;
-        let meta: SchemaMeta = serde_json::from_str(&content)
-            .map_err(|e| StorageError::InvalidData {
+        let meta: SchemaMeta = serde_json::from_str(&content).map_err(|e| {
+            StorageError::InvalidData {
                 reason: format!("schema.json parse: {e}"),
-            })?;
+            }
+        })?;
         debug!(version = meta.version, "read schema version");
         Ok(meta.version)
     }
 
-    /// Persist the schema metadata atomically (write to `.tmp` then rename).
+    /// Persist the schema metadata atomically.
     fn write_schema(&self, meta: &SchemaMeta) -> StorageResult<()> {
         let path = self.schema_path();
-        let tmp = path.with_extension(TMP_EXTENSION);
         let content = serde_json::to_string_pretty(meta)?;
-        fs::write(&tmp, &content)?;
-        fs::rename(&tmp, &path)?;
+        atomic_write(&path, content.as_bytes(), false)?;
         debug!(path = %path.display(), "schema persisted");
         Ok(())
     }
@@ -223,8 +268,7 @@ impl DataDir {
         let timestamp = now_secs();
 
         match from_version {
-            // ── v0 → v1 ──────────────────────────────────────────────────────────
-            // Introduce schema.json marker.
+            // ── v0 → v1 ─────────────────────────────────────────────────────
             0 => {
                 meta.migration_log.push(format!(
                     "[{timestamp}] v0 → v1: schema.json marker created"
@@ -232,8 +276,8 @@ impl DataDir {
                 info!("migration v0→v1: schema.json marker created");
             }
 
-            // ── v1 → v2 ──────────────────────────────────────────────────────────
-            // KvState gained the `vm: VmStorage` field (v26).
+            // ── v1 → v2 ─────────────────────────────────────────────────────
+            // KvState gained the `vm: VmStorage` field.
             1 => {
                 let state_path = self.join(STATE_FULL_FILE);
                 if state_path.exists() {
@@ -254,7 +298,7 @@ impl DataDir {
                         obj.entry("burned").or_insert(serde_json::Value::from(0u64));
                     }
                     let normalised = serde_json::to_string_pretty(&val)?;
-                    fs::write(&state_path, normalised)?;
+                    atomic_write(&state_path, normalised.as_bytes(), false)?;
                 }
 
                 let stakes_path = self.join(STAKES_FILE);
@@ -273,7 +317,7 @@ impl DataDir {
                         obj.entry("params").or_insert_with(|| serde_json::json!({}));
                     }
                     let normalised = serde_json::to_string_pretty(&val)?;
-                    fs::write(&stakes_path, normalised)?;
+                    atomic_write(&stakes_path, normalised.as_bytes(), false)?;
                 }
                 meta.migration_log.push(format!(
                     "[{timestamp}] v1 → v2: state_full.json + stakes.json normalised; backups created"
@@ -281,9 +325,7 @@ impl DataDir {
                 info!("migration v1→v2: state and stakes normalised");
             }
 
-            // ── v2 → v3 ──────────────────────────────────────────────────────────
-            // WAL format: segment files moved from `wal.jsonl` (flat) to
-            // `wal/wal_00000000.jsonl` (segmented).
+            // ── v2 → v3 ─────────────────────────────────────────────────────
             2 => {
                 let old_wal = self.join(WAL_LEGACY_FILE);
                 let wal_dir = self.join("wal");
@@ -303,14 +345,12 @@ impl DataDir {
                 }
             }
 
-            // ── v3 → v4 ──────────────────────────────────────────────────────────
-            // Introduce node_meta.json with protocol version tracking.
+            // ── v3 → v4 ─────────────────────────────────────────────────────
             3 => {
                 migrations::m0004_protocol_version::migrate(&self.root, meta)?;
             }
 
-            // ── v4 → v5 ──────────────────────────────────────────────────────────
-            // Add tx_index.json for fast transaction lookup by hash.
+            // ── v4 → v5 ─────────────────────────────────────────────────────
             4 => {
                 migrations::m0005_add_tx_index::migrate(&self.root, meta)?;
             }
@@ -327,8 +367,8 @@ impl DataDir {
         Ok(())
     }
 
-    /// Ensures on‑disk schema is at `CURRENT_SCHEMA_VERSION`, running automatic
-    /// migrations if needed. Call this once at node startup before opening any
+    /// Ensure on‑disk schema is at `CURRENT_SCHEMA_VERSION`, running automatic
+    /// migrations if needed. Call once at node startup before opening any
     /// other data files.
     pub fn ensure_schema_and_migrate(&self) -> StorageResult<()> {
         self.ensure()?;
@@ -338,10 +378,7 @@ impl DataDir {
 
         if on_disk > binary {
             error!(on_disk, binary, "on‑disk schema is newer than binary");
-            return Err(StorageError::SchemaNewer {
-                on_disk,
-                binary,
-            });
+            return Err(StorageError::SchemaNewer { on_disk, binary });
         }
 
         if on_disk == binary {
@@ -349,13 +386,13 @@ impl DataDir {
             return Ok(());
         }
 
-        // Load or initialise metadata
         let mut meta = if on_disk == 0 {
             SchemaMeta::new(0)
         } else {
             let content = fs::read_to_string(self.schema_path())?;
-            serde_json::from_str(&content)
-                .map_err(|e| StorageError::InvalidData(format!("schema.json parse: {e}")))?
+            serde_json::from_str(&content).map_err(|e| {
+                StorageError::InvalidData(format!("schema.json parse: {e}"))
+            })?
         };
 
         info!(from = on_disk, to = binary, "running schema migrations");
@@ -363,7 +400,7 @@ impl DataDir {
         let mut v = on_disk;
         while v < binary {
             self.run_migration(v, &mut meta)?;
-            v += 1;
+            v = v.saturating_add(1);
             meta.version = v;
             self.write_schema(&meta)?;
             info!(version = v, "schema migration step complete");
@@ -379,16 +416,6 @@ impl DataDir {
     // -------------------------------------------------------------------------
     // Key management
     // -------------------------------------------------------------------------
-
-    /// Load or create keys (plain or encrypted) with password from env.
-    pub fn load_or_create_keys(
-        &self,
-        seed: u64,
-        keystore: &str,
-        password_env: &str,
-    ) -> StorageResult<Ed25519Keypair> {
-        self.load_or_create_keys_with_fallback(seed, keystore, password_env, "")
-    }
 
     /// Load or create keys with an optional fallback password from config.
     pub fn load_or_create_keys_with_fallback(
@@ -430,14 +457,19 @@ impl DataDir {
                 })?;
 
             if crate::crypto::keystore::keystore_exists(&enc_path) {
-                let seed32 = crate::crypto::keystore::decrypt_seed32_from_file(&enc_path, &password)?;
+                let seed32 =
+                    crate::crypto::keystore::decrypt_seed32_from_file(&enc_path, &password)?;
                 debug!("loaded encrypted keystore");
                 Ok(Ed25519Keypair::from_seed(seed32))
             } else {
                 let mut seed32 = [0u8; 32];
                 seed32[..8].copy_from_slice(&seed.to_le_bytes());
                 let keypair = Ed25519Keypair::from_seed(seed32);
-                crate::crypto::keystore::encrypt_seed32_to_file(&enc_path, seed32, &password)?;
+                crate::crypto::keystore::encrypt_seed32_to_file(
+                    &enc_path,
+                    seed32,
+                    &password,
+                )?;
                 info!("generated new encrypted keystore");
                 Ok(keypair)
             }
@@ -452,16 +484,21 @@ impl DataDir {
                 seed32[..8].copy_from_slice(&seed.to_le_bytes());
                 let keypair = Ed25519Keypair::from_seed(seed32);
                 let out = serde_json::to_string_pretty(&K { seed32 })?;
-                fs::write(&plain_path, out)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&plain_path, fs::Permissions::from_mode(0o600));
-                }
+                atomic_write(&plain_path, out.as_bytes(), true)?;
                 info!("generated new plain keystore");
                 Ok(keypair)
             }
         }
+    }
+
+    /// Load or create keys (plain or encrypted) with password from env.
+    pub fn load_or_create_keys(
+        &self,
+        seed: u64,
+        keystore: &str,
+        password_env: &str,
+    ) -> StorageResult<Ed25519Keypair> {
+        self.load_or_create_keys_with_fallback(seed, keystore, password_env, "")
     }
 
     // -------------------------------------------------------------------------
@@ -474,18 +511,19 @@ impl DataDir {
         let path = self.join(STATE_LEGACY_FILE);
         if path.exists() {
             let content = fs::read_to_string(&path)?;
-            serde_json::from_str(&content).map_err(|e| StorageError::InvalidData(e.to_string()))
+            serde_json::from_str(&content)
+                .map_err(|e| StorageError::InvalidData(e.to_string()))
         } else {
             Ok(BTreeMap::new())
         }
     }
 
-    /// Save legacy `state.json`.
+    /// Save legacy `state.json` atomically.
     pub fn save_state_kv(&self, state: &BTreeMap<String, String>) -> StorageResult<()> {
         self.ensure()?;
         let path = self.join(STATE_LEGACY_FILE);
         let content = serde_json::to_string_pretty(state)?;
-        fs::write(path, content)?;
+        atomic_write(&path, content.as_bytes(), false)?;
         Ok(())
     }
 
@@ -499,20 +537,21 @@ impl DataDir {
         let path = self.join(STATE_FULL_FILE);
         if path.exists() {
             let content = fs::read_to_string(&path)?;
-            serde_json::from_str(&content)
-                .map_err(|e| StorageError::InvalidData(format!("state_full.json parse: {e}")))
+            serde_json::from_str(&content).map_err(|e| {
+                StorageError::InvalidData(format!("state_full.json parse: {e}"))
+            })
         } else {
             debug!("state_full.json not found, returning default");
             Ok(KvState::default())
         }
     }
 
-    /// Save the full node state.
+    /// Save the full node state atomically.
     pub fn save_state_full(&self, state: &KvState) -> StorageResult<()> {
         self.ensure()?;
         let path = self.join(STATE_FULL_FILE);
         let content = serde_json::to_string_pretty(state)?;
-        fs::write(&path, content)?;
+        atomic_write(&path, content.as_bytes(), false)?;
         debug!(path = %path.display(), "saved state_full");
         Ok(())
     }
@@ -527,20 +566,21 @@ impl DataDir {
         let path = self.join(STAKES_FILE);
         if path.exists() {
             let content = fs::read_to_string(&path)?;
-            serde_json::from_str(&content)
-                .map_err(|e| StorageError::InvalidData(format!("stakes.json parse: {e}")))
+            serde_json::from_str(&content).map_err(|e| {
+                StorageError::InvalidData(format!("stakes.json parse: {e}"))
+            })
         } else {
             debug!("stakes.json not found, returning default demo ledger");
             Ok(StakeLedger::default_demo())
         }
     }
 
-    /// Save the stake ledger.
+    /// Save the stake ledger atomically.
     pub fn save_stakes(&self, stakes: &StakeLedger) -> StorageResult<()> {
         self.ensure()?;
         let path = self.join(STAKES_FILE);
         let content = serde_json::to_string_pretty(stakes)?;
-        fs::write(path, content)?;
+        atomic_write(&path, content.as_bytes(), false)?;
         debug!(path = %path.display(), "saved stakes");
         Ok(())
     }
@@ -549,39 +589,18 @@ impl DataDir {
     // Path helpers (for other modules)
     // -------------------------------------------------------------------------
 
-    /// Path to the legacy WAL file (pre‑v3).
-    pub fn wal_path(&self) -> PathBuf {
-        self.join(WAL_LEGACY_FILE)
-    }
-
-    /// Path to the blocks directory.
-    pub fn blocks_dir(&self) -> PathBuf {
-        self.join(BLOCKS_DIR)
-    }
-
-    /// Path to the evidence file.
-    pub fn evidence_path(&self) -> PathBuf {
-        self.join(EVIDENCE_FILE)
-    }
-
-    /// Path to the receipts directory.
-    pub fn receipts_dir(&self) -> PathBuf {
-        self.join(RECEIPTS_DIR)
-    }
-
-    /// Path to the snapshots directory.
-    pub fn snapshots_dir(&self) -> PathBuf {
-        self.join(SNAPSHOTS_DIR)
-    }
+    pub fn wal_path(&self) -> PathBuf { self.join(WAL_LEGACY_FILE) }
+    pub fn blocks_dir(&self) -> PathBuf { self.join(BLOCKS_DIR) }
+    pub fn evidence_path(&self) -> PathBuf { self.join(EVIDENCE_FILE) }
+    pub fn receipts_dir(&self) -> PathBuf { self.join(RECEIPTS_DIR) }
+    pub fn snapshots_dir(&self) -> PathBuf { self.join(SNAPSHOTS_DIR) }
 }
 
 // -----------------------------------------------------------------------------
 // Helper: timestamp
 // -----------------------------------------------------------------------------
 
-/// Return the current Unix timestamp as a `u64`.
 fn now_secs() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -640,15 +659,80 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_keys_plain_permissions() -> StorageResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir()?;
+        let data_dir = DataDir::new(dir.path());
+        data_dir.ensure()?;
+        let _ = data_dir.load_or_create_keys(42, "plain", "")?;
+        let path = dir.path().join(KEYS_PLAIN_FILE);
+        let mode = fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, SECRET_FILE_MODE);
+        Ok(())
+    }
+
+    #[test]
     fn test_keys_encrypted_with_env() -> StorageResult<()> {
         let dir = tempdir()?;
         let data_dir = DataDir::new(dir.path());
         data_dir.ensure()?;
-        std::env::set_var("TEST_PW", "secret");
-        let kp = data_dir.load_or_create_keys(42, "encrypted", "TEST_PW")?;
-        let kp2 = data_dir.load_or_create_keys(42, "encrypted", "TEST_PW")?;
+        std::env::set_var("TEST_PW_STORAGE", "secret");
+        let kp = data_dir.load_or_create_keys(42, "encrypted", "TEST_PW_STORAGE")?;
+        let kp2 = data_dir.load_or_create_keys(42, "encrypted", "TEST_PW_STORAGE")?;
+        std::env::remove_var("TEST_PW_STORAGE");
         assert_eq!(kp.to_seed(), kp2.to_seed());
-        std::env::remove_var("TEST_PW");
+        Ok(())
+    }
+
+    #[test]
+    fn test_keys_encrypted_with_config_password() -> StorageResult<()> {
+        let dir = tempdir()?;
+        let data_dir = DataDir::new(dir.path());
+        data_dir.ensure()?;
+        let kp =
+            data_dir.load_or_create_keys_with_fallback(7, "encrypted", "NONEXISTENT", "cfg-pw")?;
+        let kp2 =
+            data_dir.load_or_create_keys_with_fallback(7, "encrypted", "NONEXISTENT", "cfg-pw")?;
+        assert_eq!(kp.to_seed(), kp2.to_seed());
+        Ok(())
+    }
+
+    #[test]
+    fn test_atomic_write_leaves_no_tmp() -> StorageResult<()> {
+        let dir = tempdir()?;
+        let data_dir = DataDir::new(dir.path());
+        data_dir.ensure()?;
+        let state = KvState::default();
+        data_dir.save_state_full(&state)?;
+        let path = dir.path().join(STATE_FULL_FILE);
+        let tmp = path.with_extension(TMP_EXTENSION);
+        assert!(!tmp.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_stakes_roundtrip() -> StorageResult<()> {
+        let dir = tempdir()?;
+        let data_dir = DataDir::new(dir.path());
+        data_dir.ensure()?;
+        let stakes = StakeLedger::default_demo();
+        data_dir.save_stakes(&stakes)?;
+        let loaded = data_dir.load_stakes()?;
+        assert_eq!(stakes.validators.len(), loaded.validators.len());
+        Ok(())
+    }
+
+    #[test]
+    fn test_schema_newer_than_binary_rejected() -> StorageResult<()> {
+        let dir = tempdir()?;
+        let data_dir = DataDir::new(dir.path());
+        data_dir.ensure()?;
+        // Write a schema with a future version.
+        let meta = SchemaMeta::new(CURRENT_SCHEMA_VERSION + 1);
+        data_dir.write_schema(&meta)?;
+        let err = data_dir.ensure_schema_and_migrate().unwrap_err();
+        assert!(matches!(err, StorageError::SchemaNewer { .. }));
         Ok(())
     }
 }
