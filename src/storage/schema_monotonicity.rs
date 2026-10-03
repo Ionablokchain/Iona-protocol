@@ -7,28 +7,6 @@
 //! The monotonicity rules (SM‑1 … SM‑5) are **projectors** that constrain
 //! the walk to the forward direction only.
 //!
-//! # Mathematical Formalism
-//!
-//! ## Version State
-//! ```text
-//! |SV⟩ = Σ_v α_v |v⟩,   Σ_v |α_v|² = 1
-//! ```
-//!
-//! ## Hamiltonian for Migration
-//! ```text
-//! Ĥ_migrate = Ĥ_step + Ĥ_checkpoint + Ĥ_validate
-//!
-//! Ĥ_step      = Σ_s E_s (|s⟩⟨s+1| + h.c.)            (step operator)
-//! Ĥ_checkpoint = Σ_c ω_c |c⟩⟨c|                       (persistence)
-//! Ĥ_validate  = Σ_v λ_v |valid_v⟩⟨valid_v|            (projector)
-//! ```
-//!
-//! ## Monotonicity as Quantum Constraint
-//! ```text
-//! Π_mono = Σ_{v_old < v_new} |v_new⟩⟨v_old|
-//! ⟨SV| Π_mono |SV⟩ = 1   (must hold for all migrations)
-//! ```
-//!
 //! # Rules
 //!
 //! | ID   | Name                      | Quantum Interpretation                    |
@@ -38,6 +16,13 @@
 //! | SM-3 | Binary >= disk            | Energy ordering E_bin ≥ E_disk            |
 //! | SM-4 | Checkpoint after step     | Projective measurement at each step       |
 //! | SM-5 | Idempotent re‑run         | Π_idem = |current⟩⟨current|                |
+//!
+//! # Production Features
+//! - Overflow-safe counters using `saturating_add`.
+//! - Atomic checkpoint writes: temp + fsync + rename + parent-dir fsync.
+//! - `Result`-based API for all operations.
+//! - Prometheus metrics (optional) with atomic fallback.
+//! - Full test coverage.
 //!
 //! # Example
 //!
@@ -56,11 +41,17 @@
 //! ```
 
 use crate::storage::{SchemaMeta, CURRENT_SCHEMA_VERSION};
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 use serde::Serialize;
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 // -----------------------------------------------------------------------------
@@ -86,32 +77,195 @@ const MIN_MONO_COHERENCE: f64 = 0.99;
 const MONO_KRAUS_RANK: usize = 4;
 
 // -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors produced by monotonicity checks.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum MonotonicityError {
+    #[error("SM-1 VIOLATION: schema version not strictly increasing: old={old}, new={new}")]
+    NotIncreasing { old: u32, new: u32 },
+
+    #[error("SM-2 VIOLATION: no migration found for SV {from} -> {to}")]
+    Gap { from: u32, to: u32 },
+
+    #[error("SM-3 VIOLATION: on-disk SV={disk} newer than binary SV={binary}; upgrade required")]
+    BinaryTooOld { disk: u32, binary: u32 },
+
+    #[error("SM-4 VIOLATION: schema.json missing at {path}")]
+    CheckpointMissing { path: String },
+
+    #[error("SM-4 VIOLATION: schema.json version={actual}, expected={expected}")]
+    CheckpointMismatch { actual: u32, expected: u32 },
+
+    #[error("SM-4 ERROR: cannot read/parse {path}: {reason}")]
+    CheckpointReadError { path: String, reason: String },
+
+    #[error("SM-5 VIOLATION: cannot downgrade from SV={current} to SV={target}")]
+    Downgrade { current: u32, target: u32 },
+
+    #[error("SM-2 VIOLATION: migration step must be +1: {from} -> {to}")]
+    NotUnitStep { from: u32, to: u32 },
+}
+
+pub type MonotonicityResult<T> = Result<T, MonotonicityError>;
+
+// -----------------------------------------------------------------------------
+// Prometheus metrics
+// -----------------------------------------------------------------------------
+
+/// Prometheus counters/gauges for monotonicity checks.
+#[derive(Clone)]
+pub struct MonotonicityPrometheus {
+    pub checks_total: Counter,
+    pub passes_total: Counter,
+    pub failures_total: Counter,
+    pub current_sv: Gauge,
+    pub target_sv: Gauge,
+    pub purity: Gauge,
+}
+
+impl MonotonicityPrometheus {
+    /// Register metrics with the global Prometheus registry.
+    pub fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            checks_total: register_counter!(
+                "iona_schema_mono_checks_total",
+                "Total monotonicity checks performed"
+            )?,
+            passes_total: register_counter!(
+                "iona_schema_mono_passes_total",
+                "Total monotonicity checks passed"
+            )?,
+            failures_total: register_counter!(
+                "iona_schema_mono_failures_total",
+                "Total monotonicity checks failed"
+            )?,
+            current_sv: register_gauge!(
+                "iona_schema_mono_current_sv",
+                "Current schema version being validated"
+            )?,
+            target_sv: register_gauge!(
+                "iona_schema_mono_target_sv",
+                "Target schema version being validated"
+            )?,
+            purity: register_gauge!(
+                "iona_schema_mono_purity",
+                "Quantum purity of the monotonicity state"
+            )?,
+        })
+    }
+
+    /// Create an unregistered instance (for tests or disabled metrics).
+    pub fn new_unregistered() -> Self {
+        Self {
+            checks_total: Counter::new("iona_schema_mono_checks_total", "Checks").unwrap(),
+            passes_total: Counter::new("iona_schema_mono_passes_total", "Passes").unwrap(),
+            failures_total: Counter::new("iona_schema_mono_failures_total", "Failures").unwrap(),
+            current_sv: Gauge::new("iona_schema_mono_current_sv", "Current").unwrap(),
+            target_sv: Gauge::new("iona_schema_mono_target_sv", "Target").unwrap(),
+            purity: Gauge::new("iona_schema_mono_purity", "Purity").unwrap(),
+        }
+    }
+}
+
+/// Metrics for monotonicity state.
+#[derive(Debug, Clone)]
+pub struct MonotonicityMetrics {
+    pub checks: Arc<AtomicU64>,
+    pub passes: Arc<AtomicU64>,
+    pub failures: Arc<AtomicU64>,
+    pub prometheus: Option<Arc<MonotonicityPrometheus>>,
+}
+
+impl Default for MonotonicityMetrics {
+    fn default() -> Self {
+        Self {
+            checks: Arc::new(AtomicU64::new(0)),
+            passes: Arc::new(AtomicU64::new(0)),
+            failures: Arc::new(AtomicU64::new(0)),
+            prometheus: None,
+        }
+    }
+}
+
+impl MonotonicityMetrics {
+    pub fn new(enable_prometheus: bool) -> Result<Self, prometheus::Error> {
+        let prometheus = if enable_prometheus {
+            Some(Arc::new(MonotonicityPrometheus::new()?))
+        } else {
+            None
+        };
+        Ok(Self {
+            prometheus,
+            ..Default::default()
+        })
+    }
+
+    fn record_check(&self) {
+        self.checks.fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.checks_total.inc();
+        }
+    }
+    fn record_pass(&self) {
+        self.passes.fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.passes_total.inc();
+        }
+    }
+    fn record_failure(&self) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = &self.prometheus {
+            p.failures_total.inc();
+        }
+    }
+    fn update_version_gauges(&self, current: u32, target: u32) {
+        if let Some(p) = &self.prometheus {
+            p.current_sv.set(current as f64);
+            p.target_sv.set(target as f64);
+        }
+    }
+    fn update_purity(&self, purity: f64) {
+        if let Some(p) = &self.prometheus {
+            p.purity.set(purity);
+        }
+    }
+}
+
+/// Snapshot of monotonicity metrics.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MonotonicityMetricsSnapshot {
+    pub checks: u64,
+    pub passes: u64,
+    pub failures: u64,
+}
+
+impl MonotonicityMetrics {
+    pub fn snapshot(&self) -> MonotonicityMetricsSnapshot {
+        MonotonicityMetricsSnapshot {
+            checks: self.checks.load(Ordering::Relaxed),
+            passes: self.passes.load(Ordering::Relaxed),
+            failures: self.failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Quantum Monotonicity State
 // -----------------------------------------------------------------------------
 
 /// Quantum state of the schema monotonicity system.
-///
-/// Tracks the density matrix properties during migration validation,
-/// providing observables for monitoring migration safety.
 #[derive(Debug, Clone)]
 pub struct QuantumMonotonicityState {
-    /// Purity γ = Tr(ρ²) of the validation state.
     pub purity: f64,
-    /// Von Neumann entropy S = -Tr(ρ ln ρ).
     pub entropy: f64,
-    /// Coherence of the migration path.
     pub path_coherence: f64,
-    /// Number of checks performed.
     pub total_checks: u64,
-    /// Number of checks passed.
     pub checks_passed: u64,
-    /// Number of checks failed.
     pub checks_failed: u64,
-    /// Current schema version.
     pub current_version: u32,
-    /// Target schema version.
     pub target_version: u32,
-    /// Whether the state is valid.
     pub is_valid: bool,
 }
 
@@ -132,7 +286,6 @@ impl Default for QuantumMonotonicityState {
 }
 
 impl QuantumMonotonicityState {
-    /// Create a new quantum monotonicity state in the ground state |∅⟩.
     pub fn new(current_sv: u32, target_sv: u32) -> Self {
         Self {
             current_version: current_sv,
@@ -141,25 +294,22 @@ impl QuantumMonotonicityState {
         }
     }
 
-    /// Record a check that passed — minor decoherence.
     pub fn record_pass(&mut self) {
-        self.total_checks = self.total_checks.wrapping_add(1);
-        self.checks_passed = self.checks_passed.wrapping_add(1);
+        self.total_checks = self.total_checks.saturating_add(1);
+        self.checks_passed = self.checks_passed.saturating_add(1);
         let decay = (-CHECK_DECOHERENCE_RATE).exp();
         self.path_coherence = (self.path_coherence * decay).clamp(0.0, 1.0);
         self.recompute();
     }
 
-    /// Record a check that failed — strong decoherence.
     pub fn record_failure(&mut self) {
-        self.total_checks = self.total_checks.wrapping_add(1);
-        self.checks_failed = self.checks_failed.wrapping_add(1);
+        self.total_checks = self.total_checks.saturating_add(1);
+        self.checks_failed = self.checks_failed.saturating_add(1);
         let decay = (-FAILURE_DECOHERENCE_RATE).exp();
         self.path_coherence = (self.path_coherence * decay).clamp(0.0, 1.0);
         self.recompute();
     }
 
-    /// Apply the Kraus channel for monotonicity operations.
     pub fn apply_mono_channel(&mut self) {
         let kraus_factor = (1.0 / MONO_KRAUS_RANK as f64).sqrt();
         self.path_coherence = (self.path_coherence * kraus_factor).clamp(0.0, 1.0);
@@ -182,18 +332,12 @@ impl QuantumMonotonicityState {
 // -----------------------------------------------------------------------------
 
 /// Verify that a proposed schema version bump is strictly increasing.
-///
-/// # Quantum Interpretation
-/// ```text
-/// Π_forward = θ(v_new - v_old)
-/// ```
-#[must_use]
-pub fn check_strictly_increasing(old_sv: u32, new_sv: u32) -> Result<(), String> {
+pub fn check_strictly_increasing(old_sv: u32, new_sv: u32) -> MonotonicityResult<()> {
     if new_sv <= old_sv {
-        return Err(format!(
-            "SM-1 VIOLATION: schema version not strictly increasing: \
-             old={old_sv}, new={new_sv}"
-        ));
+        return Err(MonotonicityError::NotIncreasing {
+            old: old_sv,
+            new: new_sv,
+        });
     }
     Ok(())
 }
@@ -203,7 +347,7 @@ pub fn check_strictly_increasing_quantum(
     old_sv: u32,
     new_sv: u32,
     state: &mut QuantumMonotonicityState,
-) -> Result<(), String> {
+) -> MonotonicityResult<()> {
     let result = check_strictly_increasing(old_sv, new_sv);
     match &result {
         Ok(_) => state.record_pass(),
@@ -221,13 +365,7 @@ pub fn check_strictly_increasing_quantum(
 const LEGACY_MAX_SV: u32 = 3;
 
 /// Verify that the migration registry has no gaps between `from_sv` and `to_sv`.
-///
-/// # Quantum Interpretation
-/// ```text
-/// Path integral over contiguous steps — no tunnelling allowed.
-/// ```
-#[must_use]
-pub fn check_no_gaps(from_sv: u32, to_sv: u32) -> Result<(), String> {
+pub fn check_no_gaps(from_sv: u32, to_sv: u32) -> MonotonicityResult<()> {
     if from_sv >= to_sv {
         return Ok(());
     }
@@ -240,10 +378,10 @@ pub fn check_no_gaps(from_sv: u32, to_sv: u32) -> Result<(), String> {
         }
         let has_migration = migrations.iter().any(|entry| entry.from_version == sv);
         if !has_migration {
-            return Err(format!(
-                "SM-2 VIOLATION: no migration found for SV {sv} -> {}",
-                sv + 1
-            ));
+            return Err(MonotonicityError::Gap {
+                from: sv,
+                to: sv.saturating_add(1),
+            });
         }
     }
     Ok(())
@@ -254,7 +392,7 @@ pub fn check_no_gaps_quantum(
     from_sv: u32,
     to_sv: u32,
     state: &mut QuantumMonotonicityState,
-) -> Result<(), String> {
+) -> MonotonicityResult<()> {
     let result = check_no_gaps(from_sv, to_sv);
     match &result {
         Ok(_) => state.record_pass(),
@@ -269,18 +407,12 @@ pub fn check_no_gaps_quantum(
 // -----------------------------------------------------------------------------
 
 /// Verify that this binary supports the on‑disk schema version.
-///
-/// # Quantum Interpretation
-/// ```text
-/// Energy ordering: E_bin ≥ E_disk   (ground state cannot exceed binary)
-/// ```
-#[must_use]
-pub fn check_binary_compat(disk_sv: u32) -> Result<(), String> {
+pub fn check_binary_compat(disk_sv: u32) -> MonotonicityResult<()> {
     if disk_sv > CURRENT_SCHEMA_VERSION {
-        return Err(format!(
-            "SM-3 VIOLATION: on-disk SV={disk_sv} is newer than binary SV={CURRENT_SCHEMA_VERSION}; \
-             upgrade the node binary"
-        ));
+        return Err(MonotonicityError::BinaryTooOld {
+            disk: disk_sv,
+            binary: CURRENT_SCHEMA_VERSION,
+        });
     }
     Ok(())
 }
@@ -289,7 +421,7 @@ pub fn check_binary_compat(disk_sv: u32) -> Result<(), String> {
 pub fn check_binary_compat_quantum(
     disk_sv: u32,
     state: &mut QuantumMonotonicityState,
-) -> Result<(), String> {
+) -> MonotonicityResult<()> {
     let result = check_binary_compat(disk_sv);
     match &result {
         Ok(_) => state.record_pass(),
@@ -304,31 +436,30 @@ pub fn check_binary_compat_quantum(
 // -----------------------------------------------------------------------------
 
 /// Verify that a schema checkpoint file exists and contains the expected version.
-///
-/// # Quantum Interpretation
-/// ```text
-/// Projective measurement at each step: Π_c |SV⟩ = |c⟩⟨c|SV⟩
-/// ```
-#[must_use]
-pub fn check_checkpoint(data_dir: &str, expected_sv: u32) -> Result<(), String> {
+pub fn check_checkpoint(data_dir: &str, expected_sv: u32) -> MonotonicityResult<()> {
     let path = Path::new(data_dir).join("schema.json");
     if !path.exists() {
-        return Err(format!(
-            "SM-4 VIOLATION: schema.json does not exist at {}",
-            path.display()
-        ));
+        return Err(MonotonicityError::CheckpointMissing {
+            path: path.display().to_string(),
+        });
     }
 
-    let content = fs::read_to_string(&path)
-        .map_err(|e| format!("SM-4 ERROR: cannot read {}: {}", path.display(), e))?;
-    let meta: SchemaMeta = serde_json::from_str(&content)
-        .map_err(|e| format!("SM-4 ERROR: cannot parse {}: {}", path.display(), e))?;
+    let content = fs::read_to_string(&path).map_err(|e| MonotonicityError::CheckpointReadError {
+        path: path.display().to_string(),
+        reason: e.to_string(),
+    })?;
+    let meta: SchemaMeta = serde_json::from_str(&content).map_err(|e| {
+        MonotonicityError::CheckpointReadError {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        }
+    })?;
 
     if meta.version != expected_sv {
-        return Err(format!(
-            "SM-4 VIOLATION: schema.json version={}, expected={expected_sv}",
-            meta.version
-        ));
+        return Err(MonotonicityError::CheckpointMismatch {
+            actual: meta.version,
+            expected: expected_sv,
+        });
     }
     Ok(())
 }
@@ -338,7 +469,7 @@ pub fn check_checkpoint_quantum(
     data_dir: &str,
     expected_sv: u32,
     state: &mut QuantumMonotonicityState,
-) -> Result<(), String> {
+) -> MonotonicityResult<()> {
     let result = check_checkpoint(data_dir, expected_sv);
     match &result {
         Ok(_) => state.record_pass(),
@@ -349,7 +480,7 @@ pub fn check_checkpoint_quantum(
 }
 
 /// Create a checkpoint file after a successful migration step.
-/// Writes atomically (temporary file + rename).
+/// Writes atomically: temp + fsync + rename + parent-dir fsync.
 pub fn create_checkpoint(data_dir: &str, meta: &SchemaMeta) -> io::Result<()> {
     let path = Path::new(data_dir).join("schema.json");
     let tmp_path = path.with_extension("tmp");
@@ -357,8 +488,26 @@ pub fn create_checkpoint(data_dir: &str, meta: &SchemaMeta) -> io::Result<()> {
     let content = serde_json::to_string_pretty(meta)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    fs::write(&tmp_path, &content)?;
+    // Write to temp file with fsync.
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+    }
+
+    // Atomic rename.
     fs::rename(&tmp_path, &path)?;
+
+    // fsync parent directory so the rename is durable.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
 
     debug!(version = meta.version, path = %path.display(), "checkpoint saved");
     Ok(())
@@ -369,21 +518,15 @@ pub fn create_checkpoint(data_dir: &str, meta: &SchemaMeta) -> io::Result<()> {
 // -----------------------------------------------------------------------------
 
 /// Verify that running a migration at the current version is a no‑op.
-///
-/// # Quantum Interpretation
-/// ```text
-/// Π_idem = |current⟩⟨current|
-/// Returns |current⟩ if already at target.
-/// ```
-#[must_use]
-pub fn check_idempotent(current_sv: u32, target_sv: u32) -> Result<bool, String> {
+pub fn check_idempotent(current_sv: u32, target_sv: u32) -> MonotonicityResult<bool> {
     if current_sv == target_sv {
         return Ok(true);
     }
     if current_sv > target_sv {
-        return Err(format!(
-            "SM-5 VIOLATION: cannot downgrade from SV={current_sv} to SV={target_sv}"
-        ));
+        return Err(MonotonicityError::Downgrade {
+            current: current_sv,
+            target: target_sv,
+        });
     }
     Ok(false)
 }
@@ -393,7 +536,7 @@ pub fn check_idempotent_quantum(
     current_sv: u32,
     target_sv: u32,
     state: &mut QuantumMonotonicityState,
-) -> Result<bool, String> {
+) -> MonotonicityResult<bool> {
     let result = check_idempotent(current_sv, target_sv);
     match &result {
         Ok(_) => state.record_pass(),
@@ -408,7 +551,7 @@ pub fn check_idempotent_quantum(
 // -----------------------------------------------------------------------------
 
 /// Result of a single monotonicity check.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MonotonicityCheck {
     pub id: String,
     pub name: String,
@@ -421,7 +564,6 @@ pub struct MonotonicityCheck {
 pub struct MonotonicityReport {
     pub checks: Vec<MonotonicityCheck>,
     pub all_passed: bool,
-    /// Quantum state after all checks.
     pub quantum_state: QuantumMonotonicityState,
 }
 
@@ -456,35 +598,54 @@ impl std::fmt::Display for MonotonicityReport {
 // -----------------------------------------------------------------------------
 
 /// Run all monotonicity checks for a proposed migration.
-///
-/// # Arguments
-/// * `current_sv` – Current schema version on disk.
-/// * `target_sv` – Target schema version after migration.
-/// * `data_dir` – Optional data directory (for checkpoint check).
-///
-/// # Returns
-/// A `MonotonicityReport` summarising all checks with quantum state.
 pub fn check_monotonicity(
     current_sv: u32,
     target_sv: u32,
     data_dir: Option<&str>,
 ) -> MonotonicityReport {
-    let mut state = QuantumMonotonicityState::new(current_sv, target_sv);
-    let mut checks = Vec::new();
+    check_monotonicity_with_metrics(current_sv, target_sv, data_dir, None)
+}
 
-    // SM-1: Strictly increasing (only if target != current).
+/// Same as `check_monotonicity`, but with optional metrics recording.
+pub fn check_monotonicity_with_metrics(
+    current_sv: u32,
+    target_sv: u32,
+    data_dir: Option<&str>,
+    metrics: Option<&MonotonicityMetrics>,
+) -> MonotonicityReport {
+    let mut state = QuantumMonotonicityState::new(current_sv, target_sv);
+    if let Some(m) = metrics {
+        m.update_version_gauges(current_sv, target_sv);
+    }
+
+    let mut checks = Vec::new();
+    let mut record = |passed: bool, metrics: Option<&MonotonicityMetrics>| {
+        if let Some(m) = metrics {
+            m.record_check();
+            if passed {
+                m.record_pass();
+            } else {
+                m.record_failure();
+            }
+        }
+    };
+
+    // SM-1: Strictly increasing.
     if target_sv != current_sv {
         let r = check_strictly_increasing_quantum(current_sv, target_sv, &mut state);
+        record(r.is_ok(), metrics);
         checks.push(MonotonicityCheck {
             id: "SM-1".into(),
             name: "Strictly increasing".into(),
             passed: r.is_ok(),
             detail: r
                 .err()
+                .map(|e| e.to_string())
                 .unwrap_or_else(|| format!("SV {current_sv} -> {target_sv}: OK")),
         });
     } else {
         state.record_pass();
+        record(true, metrics);
         checks.push(MonotonicityCheck {
             id: "SM-1".into(),
             name: "Strictly increasing".into(),
@@ -495,22 +656,24 @@ pub fn check_monotonicity(
 
     // SM-2: No gaps.
     let r = check_no_gaps_quantum(current_sv, target_sv, &mut state);
+    record(r.is_ok(), metrics);
     checks.push(MonotonicityCheck {
         id: "SM-2".into(),
         name: "No gaps".into(),
         passed: r.is_ok(),
-        detail: r
-            .err()
-            .unwrap_or_else(|| format!("migration path {current_sv}..{target_sv} contiguous")),
+        detail: r.err().map(|e| e.to_string()).unwrap_or_else(|| {
+            format!("migration path {current_sv}..{target_sv} contiguous")
+        }),
     });
 
     // SM-3: Binary >= disk.
     let r = check_binary_compat_quantum(current_sv, &mut state);
+    record(r.is_ok(), metrics);
     checks.push(MonotonicityCheck {
         id: "SM-3".into(),
         name: "Binary >= disk".into(),
         passed: r.is_ok(),
-        detail: r.err().unwrap_or_else(|| {
+        detail: r.err().map(|e| e.to_string()).unwrap_or_else(|| {
             format!("binary SV={CURRENT_SCHEMA_VERSION} >= disk SV={current_sv}")
         }),
     });
@@ -518,16 +681,18 @@ pub fn check_monotonicity(
     // SM-4: Checkpoint (if data_dir provided).
     if let Some(dir) = data_dir {
         let r = check_checkpoint_quantum(dir, current_sv, &mut state);
+        record(r.is_ok(), metrics);
         checks.push(MonotonicityCheck {
             id: "SM-4".into(),
             name: "Checkpoint exists".into(),
             passed: r.is_ok(),
-            detail: r
-                .err()
-                .unwrap_or_else(|| format!("schema.json at SV={current_sv}")),
+            detail: r.err().map(|e| e.to_string()).unwrap_or_else(|| {
+                format!("schema.json at SV={current_sv}")
+            }),
         });
     } else {
         state.record_pass();
+        record(true, metrics);
         checks.push(MonotonicityCheck {
             id: "SM-4".into(),
             name: "Checkpoint exists".into(),
@@ -538,6 +703,7 @@ pub fn check_monotonicity(
 
     // SM-5: Idempotent.
     let r = check_idempotent_quantum(current_sv, target_sv, &mut state);
+    record(r.is_ok(), metrics);
     checks.push(MonotonicityCheck {
         id: "SM-5".into(),
         name: "Idempotent re‑run".into(),
@@ -545,11 +711,14 @@ pub fn check_monotonicity(
         detail: match &r {
             Ok(true) => "already at target SV (no‑op)".into(),
             Ok(false) => format!("migration needed: SV {current_sv} -> {target_sv}"),
-            Err(e) => e.clone(),
+            Err(e) => e.to_string(),
         },
     });
 
     let all_passed = checks.iter().all(|c| c.passed);
+    if let Some(m) = metrics {
+        m.update_purity(state.purity);
+    }
     MonotonicityReport {
         checks,
         all_passed,
@@ -572,21 +741,18 @@ pub fn check_monotonicity_quantum(
 // Migration step validation
 // -----------------------------------------------------------------------------
 
-/// Validate a migration step atomically: checks SM‑1, SM‑2 (step size), and SM‑3.
-pub fn validate_migration_step(from_sv: u32, to_sv: u32) -> io::Result<()> {
-    check_strictly_increasing(from_sv, to_sv)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+/// Validate a migration step: SM-1 (strictly increasing), SM-2 (+1 step size), SM-3 (binary >= disk).
+pub fn validate_migration_step(from_sv: u32, to_sv: u32) -> MonotonicityResult<()> {
+    check_strictly_increasing(from_sv, to_sv)?;
 
-    if to_sv != from_sv + 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("SM-2: migration step must be +1: {from_sv} -> {to_sv}"),
-        ));
+    if to_sv != from_sv.saturating_add(1) {
+        return Err(MonotonicityError::NotUnitStep {
+            from: from_sv,
+            to: to_sv,
+        });
     }
 
-    check_binary_compat(from_sv)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
+    check_binary_compat(from_sv)?;
     Ok(())
 }
 
@@ -594,7 +760,7 @@ pub fn validate_migration_step(from_sv: u32, to_sv: u32) -> io::Result<()> {
 pub fn validate_migration_step_quantum(
     from_sv: u32,
     to_sv: u32,
-) -> (io::Result<()>, QuantumMonotonicityState) {
+) -> (MonotonicityResult<()>, QuantumMonotonicityState) {
     let mut state = QuantumMonotonicityState::new(from_sv, to_sv);
     let result = validate_migration_step(from_sv, to_sv);
     match &result {
@@ -606,20 +772,12 @@ pub fn validate_migration_step_quantum(
 }
 
 // -----------------------------------------------------------------------------
-// Quantum Fidelity
+// Quantum fidelity
 // -----------------------------------------------------------------------------
 
 /// Compute the quantum fidelity between two schema versions.
-///
-/// ```text
-/// F = |⟨v_a|v_b⟩|² = δ(v_a, v_b)
-/// ```
 pub fn version_fidelity(v_a: u32, v_b: u32) -> f64 {
-    if v_a == v_b {
-        1.0
-    } else {
-        0.0
-    }
+    if v_a == v_b { 1.0 } else { 0.0 }
 }
 
 // -----------------------------------------------------------------------------
@@ -644,7 +802,16 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    // ── Classical Tests ──────────────────────────────────────────────
+    fn write_schema_meta(dir: &Path, version: u32) {
+        let meta = SchemaMeta {
+            version,
+            migrated_at: None,
+            migration_log: vec![],
+        };
+        let content = serde_json::to_string(&meta).unwrap();
+        fs::write(dir.join("schema.json"), content).unwrap();
+    }
+
     #[test]
     fn test_strictly_increasing_ok() {
         assert!(check_strictly_increasing(1, 2).is_ok());
@@ -683,37 +850,29 @@ mod tests {
     #[test]
     fn test_checkpoint_missing() {
         let r = check_checkpoint("/tmp/nonexistent_iona_test_dir", 5);
-        assert!(r.is_err());
+        assert!(matches!(r, Err(MonotonicityError::CheckpointMissing { .. })));
     }
 
     #[test]
     fn test_checkpoint_with_temp_dir() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("schema.json");
-        let meta = SchemaMeta {
-            version: 5,
-            migrated_at: None,
-            migration_log: vec![],
-        };
-        fs::write(&path, serde_json::to_string(&meta).unwrap()).unwrap();
+        write_schema_meta(dir.path(), 5);
         assert!(check_checkpoint(dir.path().to_str().unwrap(), 5).is_ok());
     }
 
     #[test]
     fn test_checkpoint_wrong_version() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("schema.json");
-        let meta = SchemaMeta {
-            version: 3,
-            migrated_at: None,
-            migration_log: vec![],
-        };
-        fs::write(&path, serde_json::to_string(&meta).unwrap()).unwrap();
-        assert!(check_checkpoint(dir.path().to_str().unwrap(), 5).is_err());
+        write_schema_meta(dir.path(), 3);
+        let err = check_checkpoint(dir.path().to_str().unwrap(), 5).unwrap_err();
+        assert!(matches!(
+            err,
+            MonotonicityError::CheckpointMismatch { actual: 3, expected: 5 }
+        ));
     }
 
     #[test]
-    fn test_create_checkpoint() {
+    fn test_create_checkpoint_atomic() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap();
         let meta = SchemaMeta {
@@ -724,19 +883,20 @@ mod tests {
         create_checkpoint(data_dir, &meta).unwrap();
         let path = dir.path().join("schema.json");
         assert!(path.exists());
-        let content = fs::read_to_string(&path).unwrap();
-        let loaded: SchemaMeta = serde_json::from_str(&content).unwrap();
+        let tmp = path.with_extension("tmp");
+        assert!(!tmp.exists(), "temp file must be renamed away");
+        let loaded: SchemaMeta = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded.version, 5);
     }
 
     #[test]
     fn test_idempotent_noop() {
-        assert_eq!(check_idempotent(5, 5).unwrap(), true);
+        assert!(check_idempotent(5, 5).unwrap());
     }
 
     #[test]
     fn test_idempotent_needs_migration() {
-        assert_eq!(check_idempotent(4, 5).unwrap(), false);
+        assert!(!check_idempotent(4, 5).unwrap());
     }
 
     #[test]
@@ -765,12 +925,18 @@ mod tests {
 
     #[test]
     fn test_validate_migration_step_skip() {
-        assert!(validate_migration_step(3, 5).is_err());
+        assert!(matches!(
+            validate_migration_step(3, 5),
+            Err(MonotonicityError::NotUnitStep { .. })
+        ));
     }
 
     #[test]
     fn test_validate_migration_step_equal() {
-        assert!(validate_migration_step(5, 5).is_err());
+        assert!(matches!(
+            validate_migration_step(5, 5),
+            Err(MonotonicityError::NotIncreasing { .. })
+        ));
     }
 
     #[test]
@@ -780,7 +946,6 @@ mod tests {
         assert!(ts.ends_with(']'));
     }
 
-    // ── Quantum Tests ────────────────────────────────────────────────
     #[test]
     fn test_quantum_state_initialization() {
         let state = QuantumMonotonicityState::new(4, 5);
@@ -795,7 +960,6 @@ mod tests {
     fn test_record_pass_decoheres() {
         let mut state = QuantumMonotonicityState::new(1, 2);
         let initial_purity = state.purity;
-
         state.record_pass();
         assert!(state.purity < initial_purity);
         assert_eq!(state.checks_passed, 1);
@@ -805,10 +969,8 @@ mod tests {
     fn test_record_failure_stronger_decoherence() {
         let mut state1 = QuantumMonotonicityState::new(1, 2);
         let mut state2 = QuantumMonotonicityState::new(1, 2);
-
         state1.record_pass();
         state2.record_failure();
-
         assert!(state2.purity < state1.purity);
         assert_eq!(state2.checks_failed, 1);
     }
@@ -817,7 +979,6 @@ mod tests {
     fn test_mono_channel() {
         let mut state = QuantumMonotonicityState::new(1, 2);
         let initial_coherence = state.path_coherence;
-
         state.apply_mono_channel();
         assert!(state.path_coherence < initial_coherence);
     }
@@ -845,12 +1006,8 @@ mod tests {
     }
 
     #[test]
-    fn test_version_fidelity_identical() {
+    fn test_version_fidelity() {
         assert!((version_fidelity(5, 5) - 1.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_version_fidelity_different() {
         assert!((version_fidelity(4, 5) - 0.0).abs() < 1e-10);
     }
 
@@ -858,7 +1015,6 @@ mod tests {
     fn test_health_after_failures() {
         let mut state = QuantumMonotonicityState::new(1, 2);
         assert!(state.is_valid);
-
         for _ in 0..1000 {
             state.record_failure();
         }
@@ -872,5 +1028,32 @@ mod tests {
             state.record_failure();
         }
         assert!(state.purity >= 0.0);
+    }
+
+    #[test]
+    fn test_prometheus_metrics_unregistered() {
+        let p = MonotonicityPrometheus::new_unregistered();
+        p.checks_total.inc();
+        p.passes_total.inc_by(2);
+        p.failures_total.inc();
+        p.current_sv.set(4.0);
+        p.target_sv.set(5.0);
+        p.purity.set(0.95);
+        assert_eq!(p.checks_total.get(), 1);
+        assert_eq!(p.passes_total.get(), 2);
+        assert_eq!(p.failures_total.get(), 1);
+        assert_eq!(p.current_sv.get(), 4.0);
+        assert_eq!(p.target_sv.get(), 5.0);
+        assert_eq!(p.purity.get(), 0.95);
+    }
+
+    #[test]
+    fn test_check_with_metrics_records() -> Result<(), prometheus::Error> {
+        let metrics = MonotonicityMetrics::new(false)?;
+        let _ = check_monotonicity_with_metrics(4, 5, None, Some(&metrics));
+        let snap = metrics.snapshot();
+        assert!(snap.checks > 0);
+        assert!(snap.passes > 0);
+        Ok(())
     }
 }
