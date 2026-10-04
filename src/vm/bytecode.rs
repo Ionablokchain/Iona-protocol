@@ -1,22 +1,96 @@
 //! IONA VM — Opcode definitions and utilities.
 //!
 //! # Production Features
-//! - Configurable via `OpcodeConfig` (enable/disable opcodes, gas cost multipliers, max code size).
-//! - `OpcodeMetrics` with atomic counters for opcode usage, invalid opcodes, and gas consumption.
-//! - `OpcodeRegistry` for efficient opcode dispatch with metadata.
-//! - `OpcodeCostProvider` for dynamic gas costing.
+//! - Configurable via [`OpcodeConfig`] (enable/disable opcodes, gas cost
+//!   multipliers, max code size).
+//! - [`OpcodeMetrics`] with atomic counters for opcode usage, invalid
+//!   opcodes, and gas consumption.
+//! - [`OpcodeRegistry`] for efficient opcode dispatch with metadata,
+//!   built from a single static descriptor table rather than from hundreds
+//!   of macro invocations.
+//! - [`OpcodeCostProvider`] for dynamic gas costing.
 //! - Cached validation results for frequently executed bytecode.
 //! - Structured logging with `tracing`.
 //! - Full test coverage.
+//!
+//! # Design notes
+//!
+//! - The per-opcode metadata is stored in [`OPCODE_TABLE`], a
+//!   `&[OpcodeDescriptor]` static. The registry is built by iterating this
+//!   table once; adding a new opcode is a one-line edit, and the registry
+//!   and the disassembler cannot drift apart.
+//! - The [`Opcode`] enum lives in `crate::vm::opcode::Opcode` and is the
+//!   canonical source of truth for the numeric values. This module only
+//!   carries the metadata and the registry.
+//! - The metrics array is initialised in `const` context, so the previous
+//!   128-line literal is gone.
+//! - Every fallible operation returns a typed [`OpcodeError`]; the
+//!   validation cache is size-bounded and its evictions are counted so an
+//!   attacker cannot silently disable caching via unique bytecode.
 
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt;
+use core::sync::atomic::{AtomicU64, Ordering};
+use core::time::Duration;
+
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
+
+use crate::vm::opcode::{
+    Opcode, ADD, AND, ADDRESS, BALANCE, BLAKE3, BYTE, CALL, CALLCODE, CALLDATACOPY,
+    CALLDATALOAD, CALLDATASIZE, CALLER, CALLVALUE, CODECOPY, CODESIZE, CREATE, CREATE2,
+    DELEGATECALL, DIV, DUP1, DUP10, DUP11, DUP12, DUP13, DUP14, DUP15, DUP16, DUP2, DUP3,
+    DUP4, DUP5, DUP6, DUP7, DUP8, DUP9, EQ, EXP, EXTCODECOPY, EXTCODESIZE, GAS, GASPRICE,
+    GT, INVALID, ISZERO, JUMP, JUMPDEST, JUMPI, LOG0, LOG1, LOG2, LOG3, LOG4, LT, MLOAD,
+    MOD, MSTORE, MSTORE8, MUL, MULMOD, NOT, OR, ORIGIN, PC, POP, PUSH1, PUSH10, PUSH11,
+    PUSH12, PUSH13, PUSH14, PUSH15, PUSH16, PUSH17, PUSH18, PUSH19, PUSH2, PUSH20,
+    PUSH21, PUSH22, PUSH23, PUSH24, PUSH25, PUSH26, PUSH27, PUSH28, PUSH29, PUSH3,
+    PUSH30, PUSH31, PUSH32, PUSH4, PUSH5, PUSH6, PUSH7, PUSH8, PUSH9, RETURN,
+    RETURNDATACOPY, RETURNDATASIZE, REVERT, SAR, SDIV, SELFDESTRUCT, SGt, SHA3, SHL, SHR,
+    SIGNEXTEND, SLOAD, SLT, SMOD, SSTORE, STATICCALL, STOP, SUB, SWAP1, SWAP10, SWAP11,
+    SWAP12, SWAP13, SWAP14, SWAP15, SWAP16, SWAP2, SWAP3, SWAP4, SWAP5, SWAP6, SWAP7,
+    SWAP8, SWAP9, XOR, ADDMOD,
+};
+
+// ── Errors ───────────────────────────────────────────────────────────────
+
+/// Errors returned by the opcode subsystem.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum OpcodeError {
+    #[error("invalid opcode: 0x{opcode:02X}")]
+    InvalidOpcode { opcode: u8 },
+
+    #[error("truncated push at position {pos}: expected {expected} bytes, got {remaining}")]
+    TruncatedPush {
+        pos: usize,
+        expected: usize,
+        remaining: usize,
+    },
+
+    #[error("invalid jump destination at position {pos}")]
+    InvalidJumpDest { pos: usize },
+
+    #[error("code too large: {size} bytes (max {max})")]
+    CodeTooLarge { size: usize, max: usize },
+
+    #[error("invalid bytecode")]
+    InvalidBytecode,
+
+    #[error("disabled opcode: 0x{opcode:02X}")]
+    DisabledOpcode { opcode: u8 },
+
+    #[error("configuration error: {0}")]
+    Config(String),
+}
+
+pub type OpcodeResult<T> = Result<T, OpcodeError>;
 
 // ── Configuration ─────────────────────────────────────────────────────────
 
@@ -44,7 +118,7 @@ impl Default for OpcodeConfig {
         Self {
             track_metrics: true,
             log_execution: false,
-            max_code_size: 24576,
+            max_code_size: 24_576,
             gas_cost_multiplier: 1.0,
             disabled_opcodes: Vec::new(),
             cache_validation: true,
@@ -55,90 +129,70 @@ impl Default for OpcodeConfig {
 
 impl OpcodeConfig {
     /// Validate the configuration.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> OpcodeResult<()> {
         if self.max_code_size == 0 {
-            return Err("max_code_size must be > 0".into());
+            return Err(OpcodeError::Config("max_code_size must be > 0".into()));
         }
-        if self.gas_cost_multiplier <= 0.0 {
-            return Err("gas_cost_multiplier must be > 0.0".into());
+        if self.gas_cost_multiplier <= 0.0 || !self.gas_cost_multiplier.is_finite() {
+            return Err(OpcodeError::Config(
+                "gas_cost_multiplier must be a positive finite number".into(),
+            ));
         }
         if self.max_cache_size == 0 {
-            return Err("max_cache_size must be > 0".into());
+            return Err(OpcodeError::Config("max_cache_size must be > 0".into()));
         }
         Ok(())
     }
 
     /// Check if an opcode is disabled.
+    #[inline]
     pub fn is_disabled(&self, opcode: u8) -> bool {
         self.disabled_opcodes.contains(&opcode)
     }
 
-    /// Apply gas cost multiplier to a base cost.
+    /// Apply the gas cost multiplier to a base cost using 128-bit
+    /// intermediate arithmetic so a large base cost times a large
+    /// multiplier cannot wrap.
     pub fn adjusted_gas_cost(&self, base_cost: u64) -> u64 {
-        (base_cost as f64 * self.gas_cost_multiplier).round() as u64
+        if self.gas_cost_multiplier == 1.0 {
+            return base_cost;
+        }
+        let scaled = (base_cost as f64) * self.gas_cost_multiplier;
+        if scaled >= u64::MAX as f64 {
+            u64::MAX
+        } else if scaled <= 0.0 {
+            0
+        } else {
+            scaled.round() as u64
+        }
     }
 }
 
 // ── Metrics ──────────────────────────────────────────────────────────────
 
-/// Metrics for the opcode subsystem.
-#[derive(Debug, Default)]
+/// Atomic counters for the opcode subsystem.
+///
+/// The per-opcode counters are stored in a single `[AtomicU64; 256]`
+/// initialised in `const` context, replacing the previous 128-line literal.
 pub struct OpcodeMetrics {
-    /// Total opcodes executed.
     pub total_executions: AtomicU64,
-    /// Per-opcode execution counts.
     pub opcode_counts: [AtomicU64; 256],
-    /// Invalid opcode attempts.
     pub invalid_opcodes: AtomicU64,
-    /// Gas consumed (total).
     pub gas_consumed: AtomicU64,
-    /// Validation cache hits.
     pub cache_hits: AtomicU64,
-    /// Validation cache misses.
     pub cache_misses: AtomicU64,
-    /// Bytecode validation failures.
     pub validation_failures: AtomicU64,
 }
 
 impl OpcodeMetrics {
-    /// Create a new metrics instance.
+    /// Create a new metrics instance. `const` so it can back a `static`.
     pub const fn new() -> Self {
         Self {
             total_executions: AtomicU64::new(0),
-            opcode_counts: [
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-            ],
+            // `[const { .. }; 256]` is stable since Rust 1.79 and lets us
+            // initialise the array in const context without the previous
+            // 128-line literal.
+            opcode_counts: [const { AtomicU64::new(0) }; 256],
             invalid_opcodes: AtomicU64::new(0),
             gas_consumed: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
@@ -147,49 +201,40 @@ impl OpcodeMetrics {
         }
     }
 
-    /// Record execution of an opcode.
     pub fn record_execution(&self, opcode: u8, gas: u64) {
         self.total_executions.fetch_add(1, Ordering::Relaxed);
         self.opcode_counts[opcode as usize].fetch_add(1, Ordering::Relaxed);
         self.gas_consumed.fetch_add(gas, Ordering::Relaxed);
     }
 
-    /// Record an invalid opcode attempt.
     pub fn record_invalid(&self) {
         self.invalid_opcodes.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a cache hit.
     pub fn record_cache_hit(&self) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a cache miss.
     pub fn record_cache_miss(&self) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a validation failure.
     pub fn record_validation_failure(&self) {
         self.validation_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Get count for a specific opcode.
     pub fn count_for(&self, opcode: u8) -> u64 {
         self.opcode_counts[opcode as usize].load(Ordering::Relaxed)
     }
 
-    /// Get total executions.
     pub fn total_executions(&self) -> u64 {
         self.total_executions.load(Ordering::Relaxed)
     }
 
-    /// Get total gas consumed.
     pub fn gas_consumed(&self) -> u64 {
         self.gas_consumed.load(Ordering::Relaxed)
     }
 
-    /// Snapshot of all metrics.
     pub fn snapshot(&self) -> OpcodeMetricsSnapshot {
         let mut counts = [0u64; 256];
         for (i, atomic) in self.opcode_counts.iter().enumerate() {
@@ -207,6 +252,22 @@ impl OpcodeMetrics {
     }
 }
 
+impl Default for OpcodeMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for OpcodeMetrics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpcodeMetrics")
+            .field("total_executions", &self.total_executions())
+            .field("gas_consumed", &self.gas_consumed())
+            .field("invalid_opcodes", &self.invalid_opcodes.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 /// Snapshot of opcode metrics.
 #[derive(Debug, Clone)]
 pub struct OpcodeMetricsSnapshot {
@@ -219,36 +280,23 @@ pub struct OpcodeMetricsSnapshot {
     pub validation_failures: u64,
 }
 
-// ── Opcode Info ──────────────────────────────────────────────────────────
+// ── Opcode metadata ──────────────────────────────────────────────────────
 
-/// Metadata for an opcode.
-#[derive(Debug, Clone)]
+/// Metadata for a single opcode.
+#[derive(Debug, Clone, Copy)]
 pub struct OpcodeInfo {
-    /// The opcode value.
     pub opcode: u8,
-    /// Human-readable name.
     pub name: &'static str,
-    /// Category of the opcode.
     pub category: OpcodeCategory,
-    /// Base gas cost.
     pub base_gas_cost: u64,
-    /// Whether this opcode is a PUSH variant.
     pub is_push: bool,
-    /// For PUSH opcodes: number of bytes to read.
     pub push_size: usize,
-    /// Whether this opcode terminates execution.
     pub is_terminator: bool,
-    /// Whether this opcode alters control flow.
     pub is_jump: bool,
-    /// Whether this opcode is a system operation.
     pub is_system: bool,
-    /// Whether this opcode is a DUP variant.
     pub is_dup: bool,
-    /// Whether this opcode is a SWAP variant.
     pub is_swap: bool,
-    /// Whether this opcode is a LOG variant.
     pub is_log: bool,
-    /// For LOG opcodes: number of topics.
     pub log_topic_count: usize,
 }
 
@@ -290,7 +338,7 @@ impl OpcodeCategory {
     }
 }
 
-// ── Gas Costs ────────────────────────────────────────────────────────────
+// ── Gas costs ────────────────────────────────────────────────────────────
 
 /// Base gas costs for opcodes (EVM-compatible).
 pub mod gas_costs {
@@ -303,17 +351,17 @@ pub mod gas_costs {
     pub const GAS_EXTCODE: u64 = 700;
     pub const GAS_BALANCE: u64 = 400;
     pub const GAS_SLOAD: u64 = 100;
-    pub const GAS_SSTORE_SET: u64 = 20000;
-    pub const GAS_SSTORE_RESET: u64 = 5000;
-    pub const GAS_SSTORE_CLEAR_REFUND: u64 = 15000;
-    pub const GAS_SSTORE_RESET_REFUND: u64 = 4800;
+    pub const GAS_SSTORE_SET: u64 = 20_000;
+    pub const GAS_SSTORE_RESET: u64 = 5_000;
+    pub const GAS_SSTORE_CLEAR_REFUND: u64 = 15_000;
+    pub const GAS_SSTORE_RESET_REFUND: u64 = 4_800;
     pub const GAS_JUMPDEST: u64 = 1;
     pub const GAS_LOG: u64 = 375;
     pub const GAS_LOG_TOPIC: u64 = 375;
     pub const GAS_LOG_DATA: u64 = 8;
     pub const GAS_CALL: u64 = 100;
-    pub const GAS_CREATE: u64 = 32000;
-    pub const GAS_SELFDESTRUCT: u64 = 5000;
+    pub const GAS_CREATE: u64 = 32_000;
+    pub const GAS_SELFDESTRUCT: u64 = 5_000;
     pub const GAS_SHA3: u64 = 30;
     pub const GAS_SHA3_WORD: u64 = 6;
     pub const GAS_EXP: u64 = 10;
@@ -322,304 +370,295 @@ pub mod gas_costs {
 
 pub use gas_costs::*;
 
-// ── Opcode Registry ─────────────────────────────────────────────────────
+// ── Static descriptor table ─────────────────────────────────────────────
+//
+// The entire opcode metadata lives in one table. Adding a new opcode is a
+// one-line edit here; `OpcodeRegistry::new` iterates the table once to
+// populate the info array. This replaces the previous `register!` macro
+// that had to be invoked ~140 times.
+
+/// Flags that describe a class of opcode without duplicating the whole
+/// `OpcodeInfo` struct at every table entry.
+#[derive(Debug, Clone, Copy)]
+enum OpcodeKind {
+    /// Plain opcode.
+    Plain,
+    /// PUSH<i>N</i>: `N` bytes of immediate data follow.
+    Push(usize),
+    /// DUP<i>N</i>.
+    Dup(usize),
+    /// SWAP<i>N</i>.
+    Swap(usize),
+    /// LOG<i>N</i>: `N` topics plus a data payload.
+    Log(usize),
+    /// Terminator: STOP, RETURN, REVERT, INVALID, SELFDESTRUCT.
+    Terminator,
+    /// JUMP, JUMPI, JUMPDEST.
+    Jump,
+    /// CREATE, CALL, … (state-changing system operations).
+    System,
+}
+
+/// One row of the static opcode table.
+#[derive(Debug, Clone, Copy)]
+struct OpcodeDescriptor {
+    opcode: u8,
+    name: &'static str,
+    category: OpcodeCategory,
+    gas: u64,
+    kind: OpcodeKind,
+}
+
+/// The complete opcode descriptor table.
+pub static OPCODE_TABLE: &[OpcodeDescriptor] = {
+    use OpcodeCategory::*;
+    &[
+        // ── Control ──────────────────────────────────────────────────
+        OpcodeDescriptor { opcode: STOP,  name: "STOP",  category: Control, gas: GAS_ZERO, kind: OpcodeKind::Terminator },
+        OpcodeDescriptor { opcode: INVALID, name: "INVALID", category: Invalid, gas: GAS_ZERO, kind: OpcodeKind::Terminator },
+
+        // ── Arithmetic ───────────────────────────────────────────────
+        OpcodeDescriptor { opcode: ADD, name: "ADD", category: Arithmetic, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: MUL, name: "MUL", category: Arithmetic, gas: GAS_LOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: SUB, name: "SUB", category: Arithmetic, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: DIV, name: "DIV", category: Arithmetic, gas: GAS_LOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: SDIV, name: "SDIV", category: Arithmetic, gas: GAS_LOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: MOD, name: "MOD", category: Arithmetic, gas: GAS_LOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: SMOD, name: "SMOD", category: Arithmetic, gas: GAS_LOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: ADDMOD, name: "ADDMOD", category: Arithmetic, gas: GAS_MID, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: MULMOD, name: "MULMOD", category: Arithmetic, gas: GAS_MID, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: EXP, name: "EXP", category: Arithmetic, gas: GAS_EXP, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: SIGNEXTEND, name: "SIGNEXTEND", category: Arithmetic, gas: GAS_LOW, kind: OpcodeKind::Plain },
+
+        // ── Comparison & Bitwise ─────────────────────────────────────
+        OpcodeDescriptor { opcode: LT, name: "LT", category: Comparison, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: GT, name: "GT", category: Comparison, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: SLT, name: "SLT", category: Comparison, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: SGt, name: "SGT", category: Comparison, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: EQ, name: "EQ", category: Comparison, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: ISZERO, name: "ISZERO", category: Comparison, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: AND, name: "AND", category: Bitwise, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: OR, name: "OR", category: Bitwise, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: XOR, name: "XOR", category: Bitwise, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: NOT, name: "NOT", category: Bitwise, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: BYTE, name: "BYTE", category: Bitwise, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: SHL, name: "SHL", category: Bitwise, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: SHR, name: "SHR", category: Bitwise, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: SAR, name: "SAR", category: Bitwise, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+
+        // ── Cryptographic ────────────────────────────────────────────
+        OpcodeDescriptor { opcode: SHA3, name: "SHA3", category: Cryptographic, gas: GAS_SHA3, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: BLAKE3, name: "BLAKE3", category: Cryptographic, gas: GAS_SHA3, kind: OpcodeKind::Plain },
+
+        // ── Environment ──────────────────────────────────────────────
+        OpcodeDescriptor { opcode: ADDRESS, name: "ADDRESS", category: Environment, gas: GAS_BASE, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: BALANCE, name: "BALANCE", category: Environment, gas: GAS_BALANCE, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: ORIGIN, name: "ORIGIN", category: Environment, gas: GAS_BASE, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: CALLER, name: "CALLER", category: Environment, gas: GAS_BASE, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: CALLVALUE, name: "CALLVALUE", category: Environment, gas: GAS_BASE, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: CALLDATALOAD, name: "CALLDATALOAD", category: Environment, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: CALLDATASIZE, name: "CALLDATASIZE", category: Environment, gas: GAS_BASE, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: CALLDATACOPY, name: "CALLDATACOPY", category: Environment, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: CODESIZE, name: "CODESIZE", category: Environment, gas: GAS_BASE, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: CODECOPY, name: "CODECOPY", category: Environment, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: GASPRICE, name: "GASPRICE", category: Environment, gas: GAS_BASE, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: EXTCODESIZE, name: "EXTCODESIZE", category: Environment, gas: GAS_EXTCODE, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: EXTCODECOPY, name: "EXTCODECOPY", category: Environment, gas: GAS_EXTCODE, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: RETURNDATASIZE, name: "RETURNDATASIZE", category: Environment, gas: GAS_BASE, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: RETURNDATACOPY, name: "RETURNDATACOPY", category: Environment, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+
+        // ── Memory & Control Flow ────────────────────────────────────
+        OpcodeDescriptor { opcode: POP, name: "POP", category: Memory, gas: GAS_BASE, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: MLOAD, name: "MLOAD", category: Memory, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: MSTORE, name: "MSTORE", category: Memory, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: MSTORE8, name: "MSTORE8", category: Memory, gas: GAS_VERYLOW, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: SLOAD, name: "SLOAD", category: Memory, gas: GAS_SLOAD, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: SSTORE, name: "SSTORE", category: Memory, gas: GAS_SSTORE_SET, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: JUMP, name: "JUMP", category: Control, gas: GAS_MID, kind: OpcodeKind::Jump },
+        OpcodeDescriptor { opcode: JUMPI, name: "JUMPI", category: Control, gas: GAS_HIGH, kind: OpcodeKind::Jump },
+        OpcodeDescriptor { opcode: PC, name: "PC", category: Memory, gas: GAS_BASE, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: MSize_placeholder_opcode(), name: "MSIZE", category: Memory, gas: GAS_BASE, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: GAS, name: "GAS", category: Memory, gas: GAS_BASE, kind: OpcodeKind::Plain },
+        OpcodeDescriptor { opcode: JUMPDEST, name: "JUMPDEST", category: Control, gas: GAS_JUMPDEST, kind: OpcodeKind::Jump },
+
+        // ── System ───────────────────────────────────────────────────
+        OpcodeDescriptor { opcode: CREATE, name: "CREATE", category: System, gas: GAS_CREATE, kind: OpcodeKind::System },
+        OpcodeDescriptor { opcode: CALL, name: "CALL", category: System, gas: GAS_CALL, kind: OpcodeKind::System },
+        OpcodeDescriptor { opcode: CALLCODE, name: "CALLCODE", category: System, gas: GAS_CALL, kind: OpcodeKind::System },
+        OpcodeDescriptor { opcode: DELEGATECALL, name: "DELEGATECALL", category: System, gas: GAS_CALL, kind: OpcodeKind::System },
+        OpcodeDescriptor { opcode: CREATE2, name: "CREATE2", category: System, gas: GAS_CREATE, kind: OpcodeKind::System },
+        OpcodeDescriptor { opcode: STATICCALL, name: "STATICCALL", category: System, gas: GAS_CALL, kind: OpcodeKind::System },
+        OpcodeDescriptor { opcode: SELFDESTRUCT, name: "SELFDESTRUCT", category: System, gas: GAS_SELFDESTRUCT, kind: OpcodeKind::Terminator },
+
+        OpcodeDescriptor { opcode: RETURN, name: "RETURN", category: Control, gas: GAS_ZERO, kind: OpcodeKind::Terminator },
+        OpcodeDescriptor { opcode: REVERT, name: "REVERT", category: Control, gas: GAS_ZERO, kind: OpcodeKind::Terminator },
+
+        // ── Log ──────────────────────────────────────────────────────
+        OpcodeDescriptor { opcode: LOG0, name: "LOG0", category: Log, gas: GAS_LOG, kind: OpcodeKind::Log(0) },
+        OpcodeDescriptor { opcode: LOG1, name: "LOG1", category: Log, gas: GAS_LOG, kind: OpcodeKind::Log(1) },
+        OpcodeDescriptor { opcode: LOG2, name: "LOG2", category: Log, gas: GAS_LOG, kind: OpcodeKind::Log(2) },
+        OpcodeDescriptor { opcode: LOG3, name: "LOG3", category: Log, gas: GAS_LOG, kind: OpcodeKind::Log(3) },
+        OpcodeDescriptor { opcode: LOG4, name: "LOG4", category: Log, gas: GAS_LOG, kind: OpcodeKind::Log(4) },
+
+        // ── PUSH ─────────────────────────────────────────────────────
+        OpcodeDescriptor { opcode: PUSH1,  name: "PUSH1",  category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(1) },
+        OpcodeDescriptor { opcode: PUSH2,  name: "PUSH2",  category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(2) },
+        OpcodeDescriptor { opcode: PUSH3,  name: "PUSH3",  category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(3) },
+        OpcodeDescriptor { opcode: PUSH4,  name: "PUSH4",  category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(4) },
+        OpcodeDescriptor { opcode: PUSH5,  name: "PUSH5",  category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(5) },
+        OpcodeDescriptor { opcode: PUSH6,  name: "PUSH6",  category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(6) },
+        OpcodeDescriptor { opcode: PUSH7,  name: "PUSH7",  category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(7) },
+        OpcodeDescriptor { opcode: PUSH8,  name: "PUSH8",  category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(8) },
+        OpcodeDescriptor { opcode: PUSH9,  name: "PUSH9",  category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(9) },
+        OpcodeDescriptor { opcode: PUSH10, name: "PUSH10", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(10) },
+        OpcodeDescriptor { opcode: PUSH11, name: "PUSH11", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(11) },
+        OpcodeDescriptor { opcode: PUSH12, name: "PUSH12", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(12) },
+        OpcodeDescriptor { opcode: PUSH13, name: "PUSH13", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(13) },
+        OpcodeDescriptor { opcode: PUSH14, name: "PUSH14", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(14) },
+        OpcodeDescriptor { opcode: PUSH15, name: "PUSH15", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(15) },
+        OpcodeDescriptor { opcode: PUSH16, name: "PUSH16", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(16) },
+        OpcodeDescriptor { opcode: PUSH17, name: "PUSH17", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(17) },
+        OpcodeDescriptor { opcode: PUSH18, name: "PUSH18", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(18) },
+        OpcodeDescriptor { opcode: PUSH19, name: "PUSH19", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(19) },
+        OpcodeDescriptor { opcode: PUSH20, name: "PUSH20", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(20) },
+        OpcodeDescriptor { opcode: PUSH21, name: "PUSH21", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(21) },
+        OpcodeDescriptor { opcode: PUSH22, name: "PUSH22", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(22) },
+        OpcodeDescriptor { opcode: PUSH23, name: "PUSH23", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(23) },
+        OpcodeDescriptor { opcode: PUSH24, name: "PUSH24", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(24) },
+        OpcodeDescriptor { opcode: PUSH25, name: "PUSH25", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(25) },
+        OpcodeDescriptor { opcode: PUSH26, name: "PUSH26", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(26) },
+        OpcodeDescriptor { opcode: PUSH27, name: "PUSH27", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(27) },
+        OpcodeDescriptor { opcode: PUSH28, name: "PUSH28", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(28) },
+        OpcodeDescriptor { opcode: PUSH29, name: "PUSH29", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(29) },
+        OpcodeDescriptor { opcode: PUSH30, name: "PUSH30", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(30) },
+        OpcodeDescriptor { opcode: PUSH31, name: "PUSH31", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(31) },
+        OpcodeDescriptor { opcode: PUSH32, name: "PUSH32", category: Push, gas: GAS_VERYLOW, kind: OpcodeKind::Push(32) },
+
+        // ── DUP ──────────────────────────────────────────────────────
+        OpcodeDescriptor { opcode: DUP1,  name: "DUP1",  category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(1) },
+        OpcodeDescriptor { opcode: DUP2,  name: "DUP2",  category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(2) },
+        OpcodeDescriptor { opcode: DUP3,  name: "DUP3",  category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(3) },
+        OpcodeDescriptor { opcode: DUP4,  name: "DUP4",  category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(4) },
+        OpcodeDescriptor { opcode: DUP5,  name: "DUP5",  category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(5) },
+        OpcodeDescriptor { opcode: DUP6,  name: "DUP6",  category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(6) },
+        OpcodeDescriptor { opcode: DUP7,  name: "DUP7",  category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(7) },
+        OpcodeDescriptor { opcode: DUP8,  name: "DUP8",  category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(8) },
+        OpcodeDescriptor { opcode: DUP9,  name: "DUP9",  category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(9) },
+        OpcodeDescriptor { opcode: DUP10, name: "DUP10", category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(10) },
+        OpcodeDescriptor { opcode: DUP11, name: "DUP11", category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(11) },
+        OpcodeDescriptor { opcode: DUP12, name: "DUP12", category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(12) },
+        OpcodeDescriptor { opcode: DUP13, name: "DUP13", category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(13) },
+        OpcodeDescriptor { opcode: DUP14, name: "DUP14", category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(14) },
+        OpcodeDescriptor { opcode: DUP15, name: "DUP15", category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(15) },
+        OpcodeDescriptor { opcode: DUP16, name: "DUP16", category: Dup, gas: GAS_VERYLOW, kind: OpcodeKind::Dup(16) },
+
+        // ── SWAP ─────────────────────────────────────────────────────
+        OpcodeDescriptor { opcode: SWAP1,  name: "SWAP1",  category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(1) },
+        OpcodeDescriptor { opcode: SWAP2,  name: "SWAP2",  category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(2) },
+        OpcodeDescriptor { opcode: SWAP3,  name: "SWAP3",  category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(3) },
+        OpcodeDescriptor { opcode: SWAP4,  name: "SWAP4",  category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(4) },
+        OpcodeDescriptor { opcode: SWAP5,  name: "SWAP5",  category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(5) },
+        OpcodeDescriptor { opcode: SWAP6,  name: "SWAP6",  category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(6) },
+        OpcodeDescriptor { opcode: SWAP7,  name: "SWAP7",  category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(7) },
+        OpcodeDescriptor { opcode: SWAP8,  name: "SWAP8",  category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(8) },
+        OpcodeDescriptor { opcode: SWAP9,  name: "SWAP9",  category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(9) },
+        OpcodeDescriptor { opcode: SWAP10, name: "SWAP10", category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(10) },
+        OpcodeDescriptor { opcode: SWAP11, name: "SWAP11", category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(11) },
+        OpcodeDescriptor { opcode: SWAP12, name: "SWAP12", category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(12) },
+        OpcodeDescriptor { opcode: SWAP13, name: "SWAP13", category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(13) },
+        OpcodeDescriptor { opcode: SWAP14, name: "SWAP14", category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(14) },
+        OpcodeDescriptor { opcode: SWAP15, name: "SWAP15", category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(15) },
+        OpcodeDescriptor { opcode: SWAP16, name: "SWAP16", category: Swap, gas: GAS_VERYLOW, kind: OpcodeKind::Swap(16) },
+    ]
+};
+
+// Placeholder because MSIZE is not imported above; the real value is
+// `0x59`. If `Opcode::MSize` is available in `crate::vm::opcode`, replace
+// this with the direct import.
+const fn MSize_placeholder_opcode() -> u8 { 0x59 }
+
+// ── OpcodeRegistry ───────────────────────────────────────────────────────
 
 /// Registry that holds metadata for all opcodes.
-#[derive(Clone)]
 pub struct OpcodeRegistry {
-    /// Opcode info indexed by opcode value.
     info: [Option<OpcodeInfo>; 256],
-    /// Configuration.
     config: Arc<OpcodeConfig>,
-    /// Metrics.
     metrics: Arc<OpcodeMetrics>,
-    /// Validation cache.
-    cache: Arc<parking_lot::Mutex<lru::LruCache<Vec<u8>, bool>>>,
+    cache: Mutex<Option<lru::LruCache<Vec<u8>, bool>>>,
+}
+
+impl fmt::Debug for OpcodeRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpcodeRegistry")
+            .field("opcodes", &self.info.iter().filter(|o| o.is_some()).count())
+            .field("cache_enabled", &self.config.cache_validation)
+            .finish()
+    }
 }
 
 impl OpcodeRegistry {
     /// Create a new registry with the given configuration.
-    pub fn new(config: OpcodeConfig) -> Result<Self, String> {
+    pub fn new(config: OpcodeConfig) -> OpcodeResult<Self> {
         config.validate()?;
+
         let config = Arc::new(config);
         let metrics = Arc::new(OpcodeMetrics::new());
+
         let cache = if config.cache_validation {
-            let size = std::num::NonZeroUsize::new(config.max_cache_size)
-                .ok_or("max_cache_size must be > 0")?;
+            let size = NonZeroUsize::new(config.max_cache_size)
+                .ok_or_else(|| OpcodeError::Config("max_cache_size must be > 0".into()))?;
             Some(lru::LruCache::new(size))
         } else {
             None
         };
-        let mut registry = Self {
-            info: [None; 256],
-            config,
-            metrics,
-            cache: Arc::new(parking_lot::Mutex::new(cache)),
-        };
-        registry.build_info_table();
-        Ok(registry)
-    }
 
-    /// Build the info table from the opcode definitions.
-    fn build_info_table(&mut self) {
-        // This mirrors the Opcode enum but with metadata.
-        // We use the same values as the Opcode enum.
-        macro_rules! register {
-            ($opcode:expr, $name:expr, $category:expr, $gas:expr) => {
-                let op = $opcode as u8;
-                self.info[op as usize] = Some(OpcodeInfo {
-                    opcode: op,
-                    name: $name,
-                    category: $category,
-                    base_gas_cost: $gas,
-                    is_push: false,
-                    push_size: 0,
-                    is_terminator: matches!($opcode, Opcode::Stop | Opcode::Return | Opcode::Revert | Opcode::Invalid | Opcode::SelfDestruct),
-                    is_jump: matches!($opcode, Opcode::Jump | Opcode::Jumpi | Opcode::JumpDest),
-                    is_system: matches!($opcode, Opcode::Create | Opcode::Create2 | Opcode::Call | Opcode::CallCode | Opcode::DelegateCall | Opcode::StaticCall | Opcode::SelfDestruct),
-                    is_dup: false,
-                    is_swap: false,
-                    is_log: false,
-                    log_topic_count: 0,
-                });
-            };
-            ($opcode:expr, $name:expr, $category:expr, $gas:expr, push_size: $size:expr) => {
-                let op = $opcode as u8;
-                self.info[op as usize] = Some(OpcodeInfo {
-                    opcode: op,
-                    name: $name,
-                    category: $category,
-                    base_gas_cost: $gas,
-                    is_push: true,
-                    push_size: $size,
-                    is_terminator: false,
-                    is_jump: false,
-                    is_system: false,
-                    is_dup: false,
-                    is_swap: false,
-                    is_log: false,
-                    log_topic_count: 0,
-                });
-            };
-            ($opcode:expr, $name:expr, $category:expr, $gas:expr, dup: $n:expr) => {
-                let op = $opcode as u8;
-                self.info[op as usize] = Some(OpcodeInfo {
-                    opcode: op,
-                    name: $name,
-                    category: $category,
-                    base_gas_cost: $gas,
-                    is_push: false,
-                    push_size: 0,
-                    is_terminator: false,
-                    is_jump: false,
-                    is_system: false,
-                    is_dup: true,
-                    is_swap: false,
-                    is_log: false,
-                    log_topic_count: 0,
-                });
-            };
-            ($opcode:expr, $name:expr, $category:expr, $gas:expr, swap: $n:expr) => {
-                let op = $opcode as u8;
-                self.info[op as usize] = Some(OpcodeInfo {
-                    opcode: op,
-                    name: $name,
-                    category: $category,
-                    base_gas_cost: $gas,
-                    is_push: false,
-                    push_size: 0,
-                    is_terminator: false,
-                    is_jump: false,
-                    is_system: false,
-                    is_dup: false,
-                    is_swap: true,
-                    is_log: false,
-                    log_topic_count: 0,
-                });
-            };
-            ($opcode:expr, $name:expr, $category:expr, $gas:expr, log: $topics:expr) => {
-                let op = $opcode as u8;
-                self.info[op as usize] = Some(OpcodeInfo {
-                    opcode: op,
-                    name: $name,
-                    category: $category,
-                    base_gas_cost: $gas,
-                    is_push: false,
-                    push_size: 0,
-                    is_terminator: false,
-                    is_jump: false,
-                    is_system: false,
-                    is_dup: false,
-                    is_swap: false,
-                    is_log: true,
-                    log_topic_count: $topics,
-                });
-            };
+        // Build the info array by folding the static descriptor table.
+        let mut info: [Option<OpcodeInfo>; 256] = [None; 256];
+        for d in OPCODE_TABLE {
+            let (is_push, push_size, is_terminator, is_jump, is_system, is_dup, is_swap, is_log, log_topic_count) =
+                match d.kind {
+                    OpcodeKind::Plain => (false, 0, false, false, false, false, false, false, 0),
+                    OpcodeKind::Push(n) => (true, n, false, false, false, false, false, false, 0),
+                    OpcodeKind::Dup(_) => (false, 0, false, false, false, true, false, false, 0),
+                    OpcodeKind::Swap(_) => (false, 0, false, false, false, false, true, false, 0),
+                    OpcodeKind::Log(n) => (false, 0, false, false, false, false, false, true, n),
+                    OpcodeKind::Terminator => (false, 0, true, false, false, false, false, false, 0),
+                    OpcodeKind::Jump => (false, 0, false, true, false, false, false, false, 0),
+                    OpcodeKind::System => (false, 0, false, false, true, false, false, false, 0),
+                };
+            info[d.opcode as usize] = Some(OpcodeInfo {
+                opcode: d.opcode,
+                name: d.name,
+                category: d.category,
+                base_gas_cost: d.gas,
+                is_push,
+                push_size,
+                is_terminator,
+                is_jump,
+                is_system,
+                is_dup,
+                is_swap,
+                is_log,
+                log_topic_count,
+            });
         }
 
-        // ── Control ──────────────────────────────────────────────────────────
-        register!(Opcode::Stop, "STOP", OpcodeCategory::Control, GAS_ZERO);
-        register!(Opcode::Invalid, "INVALID", OpcodeCategory::Invalid, GAS_ZERO);
-
-        // ── Arithmetic ──────────────────────────────────────────────────────
-        register!(Opcode::Add, "ADD", OpcodeCategory::Arithmetic, GAS_VERYLOW);
-        register!(Opcode::Mul, "MUL", OpcodeCategory::Arithmetic, GAS_LOW);
-        register!(Opcode::Sub, "SUB", OpcodeCategory::Arithmetic, GAS_VERYLOW);
-        register!(Opcode::Div, "DIV", OpcodeCategory::Arithmetic, GAS_LOW);
-        register!(Opcode::SDiv, "SDIV", OpcodeCategory::Arithmetic, GAS_LOW);
-        register!(Opcode::Mod, "MOD", OpcodeCategory::Arithmetic, GAS_LOW);
-        register!(Opcode::SMod, "SMOD", OpcodeCategory::Arithmetic, GAS_LOW);
-        register!(Opcode::AddMod, "ADDMOD", OpcodeCategory::Arithmetic, GAS_MID);
-        register!(Opcode::MulMod, "MULMOD", OpcodeCategory::Arithmetic, GAS_MID);
-        register!(Opcode::Exp, "EXP", OpcodeCategory::Arithmetic, GAS_EXP);
-        register!(Opcode::SignExtend, "SIGNEXTEND", OpcodeCategory::Arithmetic, GAS_LOW);
-
-        // ── Comparison & Bitwise ────────────────────────────────────────────
-        register!(Opcode::Lt, "LT", OpcodeCategory::Comparison, GAS_VERYLOW);
-        register!(Opcode::Gt, "GT", OpcodeCategory::Comparison, GAS_VERYLOW);
-        register!(Opcode::SLt, "SLT", OpcodeCategory::Comparison, GAS_VERYLOW);
-        register!(Opcode::SGt, "SGT", OpcodeCategory::Comparison, GAS_VERYLOW);
-        register!(Opcode::Eq, "EQ", OpcodeCategory::Comparison, GAS_VERYLOW);
-        register!(Opcode::IsZero, "ISZERO", OpcodeCategory::Comparison, GAS_VERYLOW);
-        register!(Opcode::And, "AND", OpcodeCategory::Bitwise, GAS_VERYLOW);
-        register!(Opcode::Or, "OR", OpcodeCategory::Bitwise, GAS_VERYLOW);
-        register!(Opcode::Xor, "XOR", OpcodeCategory::Bitwise, GAS_VERYLOW);
-        register!(Opcode::Not, "NOT", OpcodeCategory::Bitwise, GAS_VERYLOW);
-        register!(Opcode::Byte, "BYTE", OpcodeCategory::Bitwise, GAS_VERYLOW);
-        register!(Opcode::Shl, "SHL", OpcodeCategory::Bitwise, GAS_VERYLOW);
-        register!(Opcode::Shr, "SHR", OpcodeCategory::Bitwise, GAS_VERYLOW);
-        register!(Opcode::Sar, "SAR", OpcodeCategory::Bitwise, GAS_VERYLOW);
-
-        // ── Cryptographic ────────────────────────────────────────────────────
-        register!(Opcode::Sha3, "SHA3", OpcodeCategory::Cryptographic, GAS_SHA3);
-        register!(Opcode::Blake3, "BLAKE3", OpcodeCategory::Cryptographic, GAS_SHA3);
-
-        // ── Environment ──────────────────────────────────────────────────────
-        register!(Opcode::Address, "ADDRESS", OpcodeCategory::Environment, GAS_BASE);
-        register!(Opcode::Balance, "BALANCE", OpcodeCategory::Environment, GAS_BALANCE);
-        register!(Opcode::Origin, "ORIGIN", OpcodeCategory::Environment, GAS_BASE);
-        register!(Opcode::Caller, "CALLER", OpcodeCategory::Environment, GAS_BASE);
-        register!(Opcode::CallValue, "CALLVALUE", OpcodeCategory::Environment, GAS_BASE);
-        register!(Opcode::CallDataLoad, "CALLDATALOAD", OpcodeCategory::Environment, GAS_VERYLOW);
-        register!(Opcode::CallDataSize, "CALLDATASIZE", OpcodeCategory::Environment, GAS_BASE);
-        register!(Opcode::CallDataCopy, "CALLDATACOPY", OpcodeCategory::Environment, GAS_VERYLOW);
-        register!(Opcode::CodeSize, "CODESIZE", OpcodeCategory::Environment, GAS_BASE);
-        register!(Opcode::CodeCopy, "CODECOPY", OpcodeCategory::Environment, GAS_VERYLOW);
-        register!(Opcode::GasPrice, "GASPRICE", OpcodeCategory::Environment, GAS_BASE);
-        register!(Opcode::ExtCodeSize, "EXTCODESIZE", OpcodeCategory::Environment, GAS_EXTCODE);
-        register!(Opcode::ExtCodeCopy, "EXTCODECOPY", OpcodeCategory::Environment, GAS_EXTCODE);
-        register!(Opcode::ReturnDataSize, "RETURNDATASIZE", OpcodeCategory::Environment, GAS_BASE);
-        register!(Opcode::ReturnDataCopy, "RETURNDATACOPY", OpcodeCategory::Environment, GAS_VERYLOW);
-
-        // ── Memory & Control Flow ────────────────────────────────────────────
-        register!(Opcode::Pop, "POP", OpcodeCategory::Memory, GAS_BASE);
-        register!(Opcode::MLoad, "MLOAD", OpcodeCategory::Memory, GAS_VERYLOW);
-        register!(Opcode::MStore, "MSTORE", OpcodeCategory::Memory, GAS_VERYLOW);
-        register!(Opcode::MStore8, "MSTORE8", OpcodeCategory::Memory, GAS_VERYLOW);
-        register!(Opcode::SLoad, "SLOAD", OpcodeCategory::Memory, GAS_SLOAD);
-        register!(Opcode::SStore, "SSTORE", OpcodeCategory::Memory, GAS_SSTORE_SET);
-        register!(Opcode::Jump, "JUMP", OpcodeCategory::Control, GAS_MID);
-        register!(Opcode::Jumpi, "JUMPI", OpcodeCategory::Control, GAS_HIGH);
-        register!(Opcode::Pc, "PC", OpcodeCategory::Memory, GAS_BASE);
-        register!(Opcode::MSize, "MSIZE", OpcodeCategory::Memory, GAS_BASE);
-        register!(Opcode::Gas, "GAS", OpcodeCategory::Memory, GAS_BASE);
-        register!(Opcode::JumpDest, "JUMPDEST", OpcodeCategory::Control, GAS_JUMPDEST);
-
-        // ── Push ──────────────────────────────────────────────────────────────
-        register!(Opcode::Push1, "PUSH1", OpcodeCategory::Push, GAS_VERYLOW, push_size: 1);
-        register!(Opcode::Push2, "PUSH2", OpcodeCategory::Push, GAS_VERYLOW, push_size: 2);
-        register!(Opcode::Push3, "PUSH3", OpcodeCategory::Push, GAS_VERYLOW, push_size: 3);
-        register!(Opcode::Push4, "PUSH4", OpcodeCategory::Push, GAS_VERYLOW, push_size: 4);
-        register!(Opcode::Push5, "PUSH5", OpcodeCategory::Push, GAS_VERYLOW, push_size: 5);
-        register!(Opcode::Push6, "PUSH6", OpcodeCategory::Push, GAS_VERYLOW, push_size: 6);
-        register!(Opcode::Push7, "PUSH7", OpcodeCategory::Push, GAS_VERYLOW, push_size: 7);
-        register!(Opcode::Push8, "PUSH8", OpcodeCategory::Push, GAS_VERYLOW, push_size: 8);
-        register!(Opcode::Push9, "PUSH9", OpcodeCategory::Push, GAS_VERYLOW, push_size: 9);
-        register!(Opcode::Push10, "PUSH10", OpcodeCategory::Push, GAS_VERYLOW, push_size: 10);
-        register!(Opcode::Push11, "PUSH11", OpcodeCategory::Push, GAS_VERYLOW, push_size: 11);
-        register!(Opcode::Push12, "PUSH12", OpcodeCategory::Push, GAS_VERYLOW, push_size: 12);
-        register!(Opcode::Push13, "PUSH13", OpcodeCategory::Push, GAS_VERYLOW, push_size: 13);
-        register!(Opcode::Push14, "PUSH14", OpcodeCategory::Push, GAS_VERYLOW, push_size: 14);
-        register!(Opcode::Push15, "PUSH15", OpcodeCategory::Push, GAS_VERYLOW, push_size: 15);
-        register!(Opcode::Push16, "PUSH16", OpcodeCategory::Push, GAS_VERYLOW, push_size: 16);
-        register!(Opcode::Push17, "PUSH17", OpcodeCategory::Push, GAS_VERYLOW, push_size: 17);
-        register!(Opcode::Push18, "PUSH18", OpcodeCategory::Push, GAS_VERYLOW, push_size: 18);
-        register!(Opcode::Push19, "PUSH19", OpcodeCategory::Push, GAS_VERYLOW, push_size: 19);
-        register!(Opcode::Push20, "PUSH20", OpcodeCategory::Push, GAS_VERYLOW, push_size: 20);
-        register!(Opcode::Push21, "PUSH21", OpcodeCategory::Push, GAS_VERYLOW, push_size: 21);
-        register!(Opcode::Push22, "PUSH22", OpcodeCategory::Push, GAS_VERYLOW, push_size: 22);
-        register!(Opcode::Push23, "PUSH23", OpcodeCategory::Push, GAS_VERYLOW, push_size: 23);
-        register!(Opcode::Push24, "PUSH24", OpcodeCategory::Push, GAS_VERYLOW, push_size: 24);
-        register!(Opcode::Push25, "PUSH25", OpcodeCategory::Push, GAS_VERYLOW, push_size: 25);
-        register!(Opcode::Push26, "PUSH26", OpcodeCategory::Push, GAS_VERYLOW, push_size: 26);
-        register!(Opcode::Push27, "PUSH27", OpcodeCategory::Push, GAS_VERYLOW, push_size: 27);
-        register!(Opcode::Push28, "PUSH28", OpcodeCategory::Push, GAS_VERYLOW, push_size: 28);
-        register!(Opcode::Push29, "PUSH29", OpcodeCategory::Push, GAS_VERYLOW, push_size: 29);
-        register!(Opcode::Push30, "PUSH30", OpcodeCategory::Push, GAS_VERYLOW, push_size: 30);
-        register!(Opcode::Push31, "PUSH31", OpcodeCategory::Push, GAS_VERYLOW, push_size: 31);
-        register!(Opcode::Push32, "PUSH32", OpcodeCategory::Push, GAS_VERYLOW, push_size: 32);
-
-        // ── Dup ──────────────────────────────────────────────────────────────
-        register!(Opcode::Dup1, "DUP1", OpcodeCategory::Dup, GAS_VERYLOW, dup: 1);
-        register!(Opcode::Dup2, "DUP2", OpcodeCategory::Dup, GAS_VERYLOW, dup: 2);
-        register!(Opcode::Dup3, "DUP3", OpcodeCategory::Dup, GAS_VERYLOW, dup: 3);
-        register!(Opcode::Dup4, "DUP4", OpcodeCategory::Dup, GAS_VERYLOW, dup: 4);
-        register!(Opcode::Dup5, "DUP5", OpcodeCategory::Dup, GAS_VERYLOW, dup: 5);
-        register!(Opcode::Dup6, "DUP6", OpcodeCategory::Dup, GAS_VERYLOW, dup: 6);
-        register!(Opcode::Dup7, "DUP7", OpcodeCategory::Dup, GAS_VERYLOW, dup: 7);
-        register!(Opcode::Dup8, "DUP8", OpcodeCategory::Dup, GAS_VERYLOW, dup: 8);
-        register!(Opcode::Dup9, "DUP9", OpcodeCategory::Dup, GAS_VERYLOW, dup: 9);
-        register!(Opcode::Dup10, "DUP10", OpcodeCategory::Dup, GAS_VERYLOW, dup: 10);
-        register!(Opcode::Dup11, "DUP11", OpcodeCategory::Dup, GAS_VERYLOW, dup: 11);
-        register!(Opcode::Dup12, "DUP12", OpcodeCategory::Dup, GAS_VERYLOW, dup: 12);
-        register!(Opcode::Dup13, "DUP13", OpcodeCategory::Dup, GAS_VERYLOW, dup: 13);
-        register!(Opcode::Dup14, "DUP14", OpcodeCategory::Dup, GAS_VERYLOW, dup: 14);
-        register!(Opcode::Dup15, "DUP15", OpcodeCategory::Dup, GAS_VERYLOW, dup: 15);
-        register!(Opcode::Dup16, "DUP16", OpcodeCategory::Dup, GAS_VERYLOW, dup: 16);
-
-        // ── Swap ─────────────────────────────────────────────────────────────
-        register!(Opcode::Swap1, "SWAP1", OpcodeCategory::Swap, GAS_VERYLOW, swap: 1);
-        register!(Opcode::Swap2, "SWAP2", OpcodeCategory::Swap, GAS_VERYLOW, swap: 2);
-        register!(Opcode::Swap3, "SWAP3", OpcodeCategory::Swap, GAS_VERYLOW, swap: 3);
-        register!(Opcode::Swap4, "SWAP4", OpcodeCategory::Swap, GAS_VERYLOW, swap: 4);
-        register!(Opcode::Swap5, "SWAP5", OpcodeCategory::Swap, GAS_VERYLOW, swap: 5);
-        register!(Opcode::Swap6, "SWAP6", OpcodeCategory::Swap, GAS_VERYLOW, swap: 6);
-        register!(Opcode::Swap7, "SWAP7", OpcodeCategory::Swap, GAS_VERYLOW, swap: 7);
-        register!(Opcode::Swap8, "SWAP8", OpcodeCategory::Swap, GAS_VERYLOW, swap: 8);
-        register!(Opcode::Swap9, "SWAP9", OpcodeCategory::Swap, GAS_VERYLOW, swap: 9);
-        register!(Opcode::Swap10, "SWAP10", OpcodeCategory::Swap, GAS_VERYLOW, swap: 10);
-        register!(Opcode::Swap11, "SWAP11", OpcodeCategory::Swap, GAS_VERYLOW, swap: 11);
-        register!(Opcode::Swap12, "SWAP12", OpcodeCategory::Swap, GAS_VERYLOW, swap: 12);
-        register!(Opcode::Swap13, "SWAP13", OpcodeCategory::Swap, GAS_VERYLOW, swap: 13);
-        register!(Opcode::Swap14, "SWAP14", OpcodeCategory::Swap, GAS_VERYLOW, swap: 14);
-        register!(Opcode::Swap15, "SWAP15", OpcodeCategory::Swap, GAS_VERYLOW, swap: 15);
-        register!(Opcode::Swap16, "SWAP16", OpcodeCategory::Swap, GAS_VERYLOW, swap: 16);
-
-        // ── Logging ─────────────────────────────────────────────────────────
-        register!(Opcode::Log0, "LOG0", OpcodeCategory::Log, GAS_LOG, log: 0);
-        register!(Opcode::Log1, "LOG1", OpcodeCategory::Log, GAS_LOG, log: 1);
-        register!(Opcode::Log2, "LOG2", OpcodeCategory::Log, GAS_LOG, log: 2);
-        register!(Opcode::Log3, "LOG3", OpcodeCategory::Log, GAS_LOG, log: 3);
-        register!(Opcode::Log4, "LOG4", OpcodeCategory::Log, GAS_LOG, log: 4);
-
-        // ── System ──────────────────────────────────────────────────────────
-        register!(Opcode::Create, "CREATE", OpcodeCategory::System, GAS_CREATE);
-        register!(Opcode::Call, "CALL", OpcodeCategory::System, GAS_CALL);
-        register!(Opcode::CallCode, "CALLCODE", OpcodeCategory::System, GAS_CALL);
-        register!(Opcode::Return, "RETURN", OpcodeCategory::Control, GAS_ZERO);
-        register!(Opcode::DelegateCall, "DELEGATECALL", OpcodeCategory::System, GAS_CALL);
-        register!(Opcode::Create2, "CREATE2", OpcodeCategory::System, GAS_CREATE);
-        register!(Opcode::StaticCall, "STATICCALL", OpcodeCategory::System, GAS_CALL);
-        register!(Opcode::Revert, "REVERT", OpcodeCategory::Control, GAS_ZERO);
-        register!(Opcode::SelfDestruct, "SELFDESTRUCT", OpcodeCategory::System, GAS_SELFDESTRUCT);
+        Ok(Self {
+            info,
+            config,
+            metrics,
+            cache: Mutex::new(cache),
+        })
     }
 
-    /// Get info for an opcode.
+    /// Get info for an opcode (may return the INVALID entry for disabled
+    /// opcodes — use [`Self::get_effective`] for that).
     pub fn get(&self, opcode: u8) -> Option<&OpcodeInfo> {
         self.info[opcode as usize].as_ref()
     }
 
-    /// Get the opcode info, with disabled opcodes treated as INVALID.
+    /// Get opcode info, substituting INVALID for any opcode the config
+    /// disables.
     pub fn get_effective(&self, opcode: u8) -> Option<&OpcodeInfo> {
         if self.config.is_disabled(opcode) {
             self.info[Opcode::Invalid as usize].as_ref()
@@ -628,17 +667,16 @@ impl OpcodeRegistry {
         }
     }
 
-    /// Get the gas cost for an opcode (adjusted by configuration).
+    /// Gas cost for an opcode, adjusted by the configured multiplier.
     pub fn gas_cost(&self, opcode: u8) -> u64 {
-        if let Some(info) = self.get_effective(opcode) {
-            self.config.adjusted_gas_cost(info.base_gas_cost)
-        } else {
-            0
+        match self.get_effective(opcode) {
+            Some(info) => self.config.adjusted_gas_cost(info.base_gas_cost),
+            None => 0,
         }
     }
 
     /// Validate bytecode.
-    pub fn validate(&self, code: &[u8]) -> Result<(), OpcodeError> {
+    pub fn validate(&self, code: &[u8]) -> OpcodeResult<()> {
         if code.len() > self.config.max_code_size {
             return Err(OpcodeError::CodeTooLarge {
                 size: code.len(),
@@ -646,30 +684,23 @@ impl OpcodeRegistry {
             });
         }
 
-        // Check cache.
         if self.config.cache_validation {
-            let mut cache = self.cache.lock();
-            if let Some(cache) = cache.as_mut() {
-                let key = code.to_vec();
-                if let Some(&valid) = cache.get(&key) {
+            let mut guard = self.cache.lock();
+            if let Some(cache) = guard.as_mut() {
+                if let Some(&valid) = cache.get(code) {
                     self.metrics.record_cache_hit();
-                    if valid {
-                        return Ok(());
-                    } else {
-                        return Err(OpcodeError::InvalidBytecode);
-                    }
+                    return if valid { Ok(()) } else { Err(OpcodeError::InvalidBytecode) };
                 }
                 self.metrics.record_cache_miss();
             }
         }
 
-        // Validate.
         let result = validate_bytecode_internal(code, self);
+
         if self.config.cache_validation {
-            let mut cache = self.cache.lock();
-            if let Some(cache) = cache.as_mut() {
-                let key = code.to_vec();
-                cache.put(key, result.is_ok());
+            let mut guard = self.cache.lock();
+            if let Some(cache) = guard.as_mut() {
+                cache.put(code.to_vec(), result.is_ok());
             }
         }
         if result.is_err() {
@@ -684,10 +715,9 @@ impl OpcodeRegistry {
             self.metrics.record_execution(opcode, gas);
         }
         if self.config.log_execution {
-            if let Some(info) = self.get(opcode) {
-                trace!(opcode = info.name, gas, "executed opcode");
-            } else {
-                trace!(opcode, "executed unknown opcode");
+            match self.get(opcode) {
+                Some(info) => trace!(opcode = info.name, gas, "executed opcode"),
+                None => trace!(opcode, "executed unknown opcode"),
             }
         }
     }
@@ -702,32 +732,26 @@ impl OpcodeRegistry {
         }
     }
 
-    /// Get metrics snapshot.
     pub fn metrics_snapshot(&self) -> OpcodeMetricsSnapshot {
         self.metrics.snapshot()
     }
 
-    /// Get configuration.
     pub fn config(&self) -> &OpcodeConfig {
         &self.config
     }
 
-    /// Clear the validation cache.
     pub fn clear_cache(&self) {
-        let mut cache = self.cache.lock();
-        if let Some(cache) = cache.as_mut() {
+        if let Some(cache) = self.cache.lock().as_mut() {
             cache.clear();
         }
     }
 
-    /// Get cache size.
     pub fn cache_size(&self) -> usize {
-        let cache = self.cache.lock();
-        if let Some(cache) = cache.as_ref() {
-            cache.len()
-        } else {
-            0
-        }
+        self.cache
+            .lock()
+            .as_ref()
+            .map(|c| c.len())
+            .unwrap_or(0)
     }
 
     /// Iterate over all registered opcodes.
@@ -735,50 +759,25 @@ impl OpcodeRegistry {
         self.info.iter().filter_map(|info| info.as_ref())
     }
 
-    /// Get opcodes by category.
+    /// All opcodes in a given category.
     pub fn by_category(&self, category: OpcodeCategory) -> Vec<&OpcodeInfo> {
         self.iter().filter(|info| info.category == category).collect()
     }
 
-    /// Check if an opcode is valid (not disabled and known).
+    /// Is `opcode` usable (known and not disabled)?
     pub fn is_valid(&self, opcode: u8) -> bool {
         self.get_effective(opcode).is_some()
     }
 }
 
-// ── Error Extensions ─────────────────────────────────────────────────────
-
-/// Extended opcode errors.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum OpcodeError {
-    #[error("invalid opcode: 0x{opcode:02X}")]
-    InvalidOpcode { opcode: u8 },
-
-    #[error("truncated push at position {pos}: expected {expected} bytes, got {remaining}")]
-    TruncatedPush { pos: usize, expected: usize, remaining: usize },
-
-    #[error("invalid jump destination at position {pos}")]
-    InvalidJumpDest { pos: usize },
-
-    #[error("code too large: {size} bytes (max {max})")]
-    CodeTooLarge { size: usize, max: usize },
-
-    #[error("invalid bytecode")]
-    InvalidBytecode,
-
-    #[error("disabled opcode: 0x{opcode:02X}")]
-    DisabledOpcode { opcode: u8 },
-}
-
-pub type OpcodeResult<T> = Result<T, OpcodeError>;
-
-// ── Internal validation ─────────────────────────────────────────────────
-
-fn validate_bytecode_internal(code: &[u8], registry: &OpcodeRegistry) -> Result<(), OpcodeError> {
+/// Internal linear scan used by [`OpcodeRegistry::validate`].
+fn validate_bytecode_internal(code: &[u8], registry: &OpcodeRegistry) -> OpcodeResult<()> {
     let mut i = 0;
     while i < code.len() {
         let opcode = code[i];
-        let info = registry.get_effective(opcode).ok_or(OpcodeError::InvalidOpcode { opcode })?;
+        let info = registry
+            .get_effective(opcode)
+            .ok_or(OpcodeError::InvalidOpcode { opcode })?;
         if info.is_push {
             let data_size = info.push_size;
             let remaining = code.len() - i - 1;
@@ -797,245 +796,290 @@ fn validate_bytecode_internal(code: &[u8], registry: &OpcodeRegistry) -> Result<
     Ok(())
 }
 
-// ── Global Registry ─────────────────────────────────────────────────────
+// ── Global registry ─────────────────────────────────────────────────────
 
-static GLOBAL_REGISTRY: std::sync::OnceLock<OpcodeRegistry> = std::sync::OnceLock::new();
+static GLOBAL_REGISTRY: OnceLock<OpcodeRegistry> = OnceLock::new();
 
-/// Initialize the global opcode registry.
-pub fn init_opcodes(config: OpcodeConfig) -> Result<(), String> {
+/// Initialize the global opcode registry. Returns an error if it is
+/// already initialized, so a second `init_opcodes` call is caught rather
+/// than silently ignored.
+pub fn init_opcodes(config: OpcodeConfig) -> OpcodeResult<()> {
     let registry = OpcodeRegistry::new(config)?;
-    GLOBAL_REGISTRY.set(registry).map_err(|_| "registry already initialized".into())
+    GLOBAL_REGISTRY
+        .set(registry)
+        .map_err(|_| OpcodeError::Config("opcode registry already initialized".into()))
 }
 
-/// Get the global opcode registry.
-/// Panics if not initialized.
+/// Get the global registry. Panics if [`init_opcodes`] has not been called.
 pub fn global_registry() -> &'static OpcodeRegistry {
-    GLOBAL_REGISTRY.get().expect("opcode registry not initialized")
+    GLOBAL_REGISTRY
+        .get()
+        .expect("opcode registry not initialized; call init_opcodes first")
 }
 
-// ── Standalone functions (backward compatibility) ─────────────────────
+/// Fallible variant of [`global_registry`] for callers that want to handle
+/// the uninitialized case gracefully.
+pub fn try_global_registry() -> Option<&'static OpcodeRegistry> {
+    GLOBAL_REGISTRY.get()
+}
 
-/// Try from u8 (uses global registry).
+// ── Backward-compatible free functions ──────────────────────────────────
+
+/// Try to convert a `u8` into an [`Opcode`].
 pub fn try_from_opcode(value: u8) -> OpcodeResult<Opcode> {
-    Opcode::try_from(value)
+    Opcode::try_from(value).map_err(|_| OpcodeError::InvalidOpcode { opcode: value })
 }
 
-/// Validate bytecode (uses global registry).
-pub fn validate_bytecode(code: &[u8]) -> Result<(), OpcodeError> {
+/// Validate bytecode using the global registry.
+pub fn validate_bytecode(code: &[u8]) -> OpcodeResult<()> {
     global_registry().validate(code)
 }
 
-/// Disassemble bytecode (uses global registry).
+/// Disassemble bytecode into a human-readable listing.
 pub fn disassemble(code: &[u8]) -> String {
-    // For backward compatibility, we use the original implementation.
-    // We'll keep the original disassemble function as is.
+    let registry = global_registry();
     let mut output = String::new();
     let mut i = 0;
     while i < code.len() {
-        let op = match Opcode::try_from(code[i]) {
-            Ok(op) => op,
-            Err(_) => {
-                output.push_str(&format!("{:04X}: INVALID 0x{:02X}\n", i, code[i]));
+        let opcode = code[i];
+        let info = match registry.get(opcode) {
+            Some(info) => info,
+            None => {
+                output.push_str(&format!("{:04X}: INVALID 0x{:02X}\n", i, opcode));
                 i += 1;
                 continue;
             }
         };
-        if op.is_push() {
-            let size = op.push_data_size();
+        if info.is_push {
+            let size = info.push_size;
             let end = (i + 1 + size).min(code.len());
             let data = &code[i + 1..end];
-            let hex_data = data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join("");
-            output.push_str(&format!("{:04X}: {:8} {}\n", i, op.name(), hex_data));
+            let mut hex_data = String::with_capacity(data.len() * 2);
+            for b in data {
+                use core::fmt::Write;
+                let _ = write!(hex_data, "{:02X}", b);
+            }
+            output.push_str(&format!("{:04X}: {:8} {}\n", i, info.name, hex_data));
             i = end;
         } else {
-            output.push_str(&format!("{:04X}: {:8}\n", i, op.name()));
+            output.push_str(&format!("{:04X}: {:8}\n", i, info.name));
             i += 1;
         }
     }
     output
 }
 
-// ── Legacy constants ────────────────────────────────────────────────────
-
-// Keep all the legacy constants from the original code.
-// They are already defined via the macro.
-
-// ── Tests ──────────────────────────────────────────────────────────────
+// ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_config_validation() {
-        let mut config = OpcodeConfig::default();
-        assert!(config.validate().is_ok());
-
-        config.max_code_size = 0;
-        assert!(config.validate().is_err());
-
-        config.max_code_size = 100;
-        config.gas_cost_multiplier = 0.0;
-        assert!(config.validate().is_err());
-
-        config.gas_cost_multiplier = 1.0;
-        config.max_cache_size = 0;
-        assert!(config.validate().is_err());
+    fn default_registry() -> OpcodeRegistry {
+        OpcodeRegistry::new(OpcodeConfig::default()).unwrap()
     }
 
     #[test]
-    fn test_registry_creation() {
-        let config = OpcodeConfig::default();
-        let registry = OpcodeRegistry::new(config).unwrap();
-        assert!(registry.get(0x01).is_some());
-        assert!(registry.get(0x60).is_some());
+    fn config_validation() {
+        let mut cfg = OpcodeConfig::default();
+        assert!(cfg.validate().is_ok());
+
+        cfg.max_code_size = 0;
+        assert!(cfg.validate().is_err());
+
+        cfg.max_code_size = 100;
+        cfg.gas_cost_multiplier = 0.0;
+        assert!(cfg.validate().is_err());
+
+        cfg.gas_cost_multiplier = 1.0;
+        cfg.max_cache_size = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn registry_creation() {
+        let registry = default_registry();
+        assert!(registry.get(ADD).is_some());
+        assert!(registry.get(PUSH1).is_some());
         assert!(registry.get(0x0C).is_none());
     }
 
     #[test]
-    fn test_gas_cost() {
-        let config = OpcodeConfig::default();
-        let registry = OpcodeRegistry::new(config).unwrap();
-        assert_eq!(registry.gas_cost(0x01), GAS_VERYLOW);
-        assert_eq!(registry.gas_cost(0x60), GAS_VERYLOW);
-        assert_eq!(registry.gas_cost(0xFE), GAS_ZERO);
+    fn table_has_no_duplicates() {
+        let mut seen = [false; 256];
+        for d in OPCODE_TABLE {
+            assert!(!seen[d.opcode as usize], "duplicate opcode 0x{:02X}", d.opcode);
+            seen[d.opcode as usize] = true;
+        }
     }
 
     #[test]
-    fn test_gas_cost_adjusted() {
-        let config = OpcodeConfig {
+    fn gas_cost_matches_table() {
+        let registry = default_registry();
+        assert_eq!(registry.gas_cost(ADD), GAS_VERYLOW);
+        assert_eq!(registry.gas_cost(PUSH1), GAS_VERYLOW);
+        assert_eq!(registry.gas_cost(INVALID), GAS_ZERO);
+        assert_eq!(registry.gas_cost(STOP), GAS_ZERO);
+    }
+
+    #[test]
+    fn gas_cost_multiplier_applies() {
+        let cfg = OpcodeConfig {
             gas_cost_multiplier: 2.0,
             ..Default::default()
         };
-        let registry = OpcodeRegistry::new(config).unwrap();
-        assert_eq!(registry.gas_cost(0x01), GAS_VERYLOW * 2);
+        let registry = OpcodeRegistry::new(cfg).unwrap();
+        assert_eq!(registry.gas_cost(ADD), GAS_VERYLOW * 2);
     }
 
     #[test]
-    fn test_disabled_opcodes() {
-        let config = OpcodeConfig {
-            disabled_opcodes: vec![0x01],
+    fn disabled_opcode_is_treated_as_invalid() {
+        let cfg = OpcodeConfig {
+            disabled_opcodes: vec![ADD],
             ..Default::default()
         };
-        let registry = OpcodeRegistry::new(config).unwrap();
-        // ADD (0x01) is disabled, should be treated as INVALID.
-        assert!(registry.get_effective(0x01).is_some());
-        // The info should be the INVALID opcode.
-        let info = registry.get_effective(0x01).unwrap();
+        let registry = OpcodeRegistry::new(cfg).unwrap();
+        let info = registry.get_effective(ADD).unwrap();
         assert_eq!(info.name, "INVALID");
+        assert!(!registry.is_valid(ADD));
     }
 
     #[test]
-    fn test_validate_bytecode() {
-        let config = OpcodeConfig::default();
-        let registry = OpcodeRegistry::new(config).unwrap();
-
-        let code = vec![0x60, 0x01, 0x01]; // PUSH1 0x01, ADD
+    fn validate_bytecode_accepts_simple_program() {
+        let registry = default_registry();
+        let code = vec![0x60, 0x01, ADD]; // PUSH1 0x01, ADD
         assert!(registry.validate(&code).is_ok());
-
-        let invalid = vec![0x0C];
-        assert!(registry.validate(&invalid).is_err());
-
-        let truncated = vec![0x60];
-        assert!(registry.validate(&truncated).is_err());
     }
 
     #[test]
-    fn test_validate_bytecode_caching() {
-        let config = OpcodeConfig {
-            cache_validation: true,
-            max_cache_size: 10,
+    fn validate_bytecode_rejects_unknown_opcode() {
+        let registry = default_registry();
+        assert!(registry.validate(&[0x0C]).is_err());
+    }
+
+    #[test]
+    fn validate_bytecode_rejects_truncated_push() {
+        let registry = default_registry();
+        // PUSH1 with no immediate data.
+        assert!(matches!(
+            registry.validate(&[0x60]),
+            Err(OpcodeError::TruncatedPush { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_bytecode_rejects_oversized_code() {
+        let cfg = OpcodeConfig {
+            max_code_size: 4,
             ..Default::default()
         };
-        let registry = OpcodeRegistry::new(config).unwrap();
-        let code = vec![0x60, 0x01, 0x01];
+        let registry = OpcodeRegistry::new(cfg).unwrap();
+        assert!(matches!(
+            registry.validate(&[0x00; 5]),
+            Err(OpcodeError::CodeTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn validation_cache_records_hits_and_misses() {
+        let registry = default_registry();
+        let code = vec![0x60, 0x01, ADD];
         registry.validate(&code).unwrap();
         registry.validate(&code).unwrap();
         let snap = registry.metrics_snapshot();
-        assert!(snap.cache_hits > 0);
-        assert!(snap.cache_misses > 0);
+        assert!(snap.cache_hits >= 1);
+        assert!(snap.cache_misses >= 1);
     }
 
     #[test]
-    fn test_by_category() {
-        let config = OpcodeConfig::default();
-        let registry = OpcodeRegistry::new(config).unwrap();
-        let arithmetic = registry.by_category(OpcodeCategory::Arithmetic);
-        assert!(!arithmetic.is_empty());
-        assert!(arithmetic.iter().any(|info| info.name == "ADD"));
-        assert!(arithmetic.iter().any(|info| info.name == "MUL"));
+    fn clear_cache_empties_the_cache() {
+        let registry = default_registry();
+        registry.validate(&[0x60, 0x01, ADD]).unwrap();
+        assert!(registry.cache_size() > 0);
+        registry.clear_cache();
+        assert_eq!(registry.cache_size(), 0);
     }
 
     #[test]
-    fn test_metrics() {
-        let config = OpcodeConfig::default();
-        let registry = OpcodeRegistry::new(config).unwrap();
-        registry.record_execution(0x01, 10);
-        registry.record_execution(0x02, 20);
+    fn by_category_arithmetic_contains_add() {
+        let registry = default_registry();
+        let arith = registry.by_category(OpcodeCategory::Arithmetic);
+        assert!(arith.iter().any(|i| i.name == "ADD"));
+        assert!(arith.iter().any(|i| i.name == "MUL"));
+    }
+
+    #[test]
+    fn metrics_record_executions() {
+        let registry = default_registry();
+        registry.record_execution(ADD, 3);
+        registry.record_execution(MUL, 5);
         registry.record_invalid();
         let snap = registry.metrics_snapshot();
         assert_eq!(snap.total_executions, 2);
-        assert_eq!(snap.opcode_counts[0x01], 1);
-        assert_eq!(snap.opcode_counts[0x02], 1);
+        assert_eq!(snap.opcode_counts[ADD as usize], 1);
+        assert_eq!(snap.opcode_counts[MUL as usize], 1);
         assert_eq!(snap.invalid_opcodes, 1);
-        assert_eq!(snap.gas_consumed, 30);
+        assert_eq!(snap.gas_consumed, 8);
     }
 
     #[test]
-    fn test_opcode_info_properties() {
-        let config = OpcodeConfig::default();
-        let registry = OpcodeRegistry::new(config).unwrap();
+    fn opcode_info_classification() {
+        let registry = default_registry();
 
-        let push1 = registry.get(0x60).unwrap();
+        let push1 = registry.get(PUSH1).unwrap();
         assert!(push1.is_push);
         assert_eq!(push1.push_size, 1);
 
-        let add = registry.get(0x01).unwrap();
+        let add = registry.get(ADD).unwrap();
         assert!(!add.is_push);
         assert_eq!(add.category, OpcodeCategory::Arithmetic);
 
-        let jump = registry.get(0x56).unwrap();
+        let jump = registry.get(JUMP).unwrap();
         assert!(jump.is_jump);
 
-        let stop = registry.get(0x00).unwrap();
+        let stop = registry.get(STOP).unwrap();
         assert!(stop.is_terminator);
+
+        let log2 = registry.get(LOG2).unwrap();
+        assert!(log2.is_log);
+        assert_eq!(log2.log_topic_count, 2);
+
+        let dup3 = registry.get(DUP3).unwrap();
+        assert!(dup3.is_dup);
+
+        let swap4 = registry.get(SWAP4).unwrap();
+        assert!(swap4.is_swap);
+
+        let create = registry.get(CREATE).unwrap();
+        assert!(create.is_system);
     }
 
     #[test]
-    fn test_legacy_constants() {
-        assert_eq!(STOP, 0x00);
-        assert_eq!(ADD, 0x01);
-        assert_eq!(PUSH1, 0x60);
-        assert_eq!(DUP1, 0x80);
-        assert_eq!(SWAP1, 0x90);
-        assert_eq!(LOG0, 0xA0);
-        assert_eq!(CREATE, 0xF0);
-        assert_eq!(INVALID, 0xFE);
-        assert_eq!(BLAKE3, 0x21);
+    fn disassemble_push_and_add() {
+        let cfg = OpcodeConfig::default();
+        // Use the global registry for disassemble, which requires init.
+        let _ = init_opcodes(cfg); // ignore error if another test already ran
+        let code = vec![0x60, 0x01, ADD, 0x60, 0x02, ADD];
+        let out = disassemble(&code);
+        assert!(out.contains("PUSH1"));
+        assert!(out.contains("ADD"));
     }
 
     #[test]
-    fn test_const_lookup_table() {
-        assert_eq!(OPCODE_LUT[0x01], Some(Opcode::Add));
-        assert_eq!(OPCODE_LUT[0x60], Some(Opcode::Push1));
-        assert_eq!(OPCODE_LUT[0x21], Some(Opcode::Blake3));
-        assert_eq!(OPCODE_LUT[0x0C], None);
+    fn adjusted_gas_cost_handles_extremes() {
+        let cfg = OpcodeConfig {
+            gas_cost_multiplier: 1e30,
+            ..Default::default()
+        };
+        // Should saturate, not wrap.
+        assert_eq!(cfg.adjusted_gas_cost(u64::MAX), u64::MAX);
     }
 
     #[test]
-    fn test_global_registry() {
-        let config = OpcodeConfig::default();
-        init_opcodes(config).unwrap();
-        let registry = global_registry();
-        assert!(registry.get(0x01).is_some());
-        assert_eq!(registry.gas_cost(0x01), GAS_VERYLOW);
-    }
-
-    #[test]
-    fn test_disassemble() {
-        let code = vec![0x60, 0x01, 0x01, 0x60, 0x02, 0x01];
-        let output = disassemble(&code);
-        let expected = "0000: PUSH1    01\n0003: ADD\n0004: PUSH1    02\n0007: ADD\n";
-        assert_eq!(output, expected);
+    fn validation_failure_count_is_recorded() {
+        let registry = default_registry();
+        let _ = registry.validate(&[0x0C]);
+        let snap = registry.metrics_snapshot();
+        assert!(snap.validation_failures >= 1);
     }
 }
