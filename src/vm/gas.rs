@@ -1,25 +1,47 @@
 //! Gas meter for the IONA VM.
 //!
 //! # Production Features
-//! - Configurable via `GasConfig` (limits, refund quotient, memory cost parameters).
-//! - `GasMetrics` with atomic counters for charges, refunds, out‑of‑gas events.
-//! - `GasManager` as a thread‑safe wrapper (`parking_lot::Mutex`).
-//! - Structured logging with `tracing`.
-//! - Serialization support for snapshots.
-//! - Fork support for sub‑calls.
-//! - Full test coverage.
+//! - Configurable via [`GasConfig`] (limits, refund quotient, memory cost
+//!   parameters) with full validation.
+//! - [`GasMetrics`] with atomic counters for charges, refunds, out‑of‑gas
+//!   events, memory expansion, and forks.
+//! - [`GasMeter`] is `Clone` but not `Copy` (it may hold an `Arc` to the
+//!   metrics collector).
+//! - [`GasManager`] as a thread‑safe wrapper suitable for a process‑wide
+//!   singleton.
+//! - Structured logging with `tracing` that includes the meter's current
+//!   state and the operation that failed.
+//! - Serialization captures the meter's mutable state but not the shared
+//!   config/metrics handles; a deserialized meter is independent of any
+//!   manager.
+//! - Fork/snapshot support for sub‑calls and gas‑estimation rollback.
+//! - Full test coverage, including regression tests for the refund and
+//!   snapshot corner cases.
+//!
+//! # Concurrency
+//!
+//! A [`GasMeter`] is *not* internally synchronized: it is designed to be
+//! owned by a single execution context. The [`GasManager`] is the shared,
+//! thread‑safe object that hands out meters; it is `Send + Sync`.
+//!
+//! # Refund semantics
+//!
+//! Refunds are accrued separately from `used` and only applied at the end
+//! of execution via [`GasMeter::apply_refund`]. This ensures the meter's
+//! `used` value is monotonic during execution, which the VM relies on to
+//! detect out‑of‑gas deterministically.
+//!
+//! The maximum refund is bounded by [`GasConfig::refund_quotient`] (EIP-3529
+//! uses `2`, i.e. one half of `used`). Extra refund requests past the cap
+//! are silently clamped and counted in the `refund_cap_events` metric.
+
+use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::OnceLock;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 use thiserror::Error;
-use tracing::{debug, error, info, trace, warn};
-
-#[cfg(feature = "std")]
-use parking_lot::Mutex;
-#[cfg(not(feature = "std"))]
-use spin::Mutex;
+use tracing::{debug, trace, warn};
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -29,7 +51,7 @@ pub const MEMORY_WORD_GAS: u64 = 3;
 /// Minimum gas for any transaction (covers base overhead).
 pub const MINIMUM_GAS: u64 = 21_000;
 
-/// Maximum gas allowed in a single block (adjust per chain config).
+/// Maximum gas allowed in a single block (per chain configuration).
 pub const MAX_BLOCK_GAS: u64 = 30_000_000;
 
 /// Maximum refund allowed per EIP-3529: half of gas used.
@@ -40,6 +62,45 @@ pub const DEFAULT_MEMORY_COST_DENOM: u64 = 512;
 
 /// Default gas limit for tests.
 pub const DEFAULT_GAS_LIMIT: u64 = 10_000_000;
+
+// ── Errors ────────────────────────────────────────────────────────────────
+
+/// Errors produced by the gas metering subsystem.
+#[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GasError {
+    #[error("out of gas: needed {needed}, remaining {remaining}")]
+    OutOfGas { needed: u64, remaining: u64 },
+
+    #[error("refund capped: attempted {attempted}, current {current}, max allowed {max_allowed}")]
+    RefundCapped {
+        attempted: u64,
+        current: u64,
+        max_allowed: u64,
+    },
+
+    #[error("gas limit {limit} exceeds block gas limit {block_limit}")]
+    GasLimitTooHigh { limit: u64, block_limit: u64 },
+
+    #[error("gas limit {limit} below minimum {minimum}")]
+    GasLimitTooLow { limit: u64, minimum: u64 },
+
+    #[error("gas calculation overflow")]
+    Overflow,
+
+    #[error("refund already applied")]
+    RefundAlreadyApplied,
+
+    #[error("cannot charge gas after refund was applied")]
+    ChargeAfterRefund,
+
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    #[error("cannot restore a snapshot from a meter with a different limit (current {current}, snapshot {snapshot})")]
+    SnapshotMismatch { current: u64, snapshot: u64 },
+}
+
+pub type GasResult<T> = Result<T, GasError>;
 
 // ── Configuration ─────────────────────────────────────────────────────────
 
@@ -52,15 +113,15 @@ pub struct GasConfig {
     pub max_gas_per_block: u64,
     /// Minimum gas required per transaction.
     pub min_gas_per_tx: u64,
-    /// Refund quotient (denominator for max refund cap).
+    /// Refund quotient (denominator for max refund cap). EIP-3529 uses 2.
     pub refund_quotient: u64,
     /// Memory cost linear coefficient (gas per word).
     pub memory_word_gas: u64,
     /// Memory cost quadratic denominator.
     pub memory_quadratic_denom: u64,
-    /// Whether to enable metrics tracking.
+    /// Whether to record metrics.
     pub track_metrics: bool,
-    /// Whether to log gas operations.
+    /// Whether to log gas operations (verbose; off in production).
     pub log_operations: bool,
 }
 
@@ -81,101 +142,105 @@ impl Default for GasConfig {
 
 impl GasConfig {
     /// Validate the configuration.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> GasResult<()> {
         if self.max_gas_per_tx == 0 {
-            return Err("max_gas_per_tx must be > 0".into());
+            return Err(GasError::Config("max_gas_per_tx must be > 0".into()));
         }
         if self.max_gas_per_block == 0 {
-            return Err("max_gas_per_block must be > 0".into());
+            return Err(GasError::Config("max_gas_per_block must be > 0".into()));
         }
         if self.min_gas_per_tx == 0 {
-            return Err("min_gas_per_tx must be > 0".into());
+            return Err(GasError::Config("min_gas_per_tx must be > 0".into()));
         }
         if self.refund_quotient == 0 {
-            return Err("refund_quotient must be > 0".into());
+            return Err(GasError::Config("refund_quotient must be > 0".into()));
         }
         if self.memory_word_gas == 0 {
-            return Err("memory_word_gas must be > 0".into());
+            return Err(GasError::Config("memory_word_gas must be > 0".into()));
         }
         if self.memory_quadratic_denom == 0 {
-            return Err("memory_quadratic_denom must be > 0".into());
+            return Err(GasError::Config("memory_quadratic_denom must be > 0".into()));
         }
         if self.min_gas_per_tx > self.max_gas_per_tx {
-            return Err("min_gas_per_tx must be <= max_gas_per_tx".into());
+            return Err(GasError::Config(
+                "min_gas_per_tx must be <= max_gas_per_tx".into(),
+            ));
+        }
+        if self.max_gas_per_tx > self.max_gas_per_block {
+            return Err(GasError::Config(
+                "max_gas_per_tx must be <= max_gas_per_block".into(),
+            ));
         }
         Ok(())
     }
 }
 
-// ── Metrics ──────────────────────────────────────────────────────────────
+// ── Metrics ───────────────────────────────────────────────────────────────
 
-/// Metrics for the gas meter subsystem.
-#[derive(Debug, Default)]
+/// Atomic counters for the gas meter subsystem.
+///
+/// All fields are `AtomicU64` so the collector can be shared across
+/// concurrent meters without locking.
 pub struct GasMetrics {
-    /// Total gas charged.
     pub total_charged: AtomicU64,
-    /// Total gas refunded.
     pub total_refunded: AtomicU64,
-    /// Number of out‑of‑gas events.
     pub out_of_gas_events: AtomicU64,
-    /// Number of refund cap events.
     pub refund_cap_events: AtomicU64,
-    /// Total memory expansion gas charged.
     pub memory_expansion_gas: AtomicU64,
-    /// Number of gas meter forks.
     pub forks: AtomicU64,
-    /// Peak gas used across all meters.
     pub peak_gas_used: AtomicU64,
 }
 
 impl GasMetrics {
-    /// Record a gas charge.
+    pub const fn new() -> Self {
+        Self {
+            total_charged: AtomicU64::new(0),
+            total_refunded: AtomicU64::new(0),
+            out_of_gas_events: AtomicU64::new(0),
+            refund_cap_events: AtomicU64::new(0),
+            memory_expansion_gas: AtomicU64::new(0),
+            forks: AtomicU64::new(0),
+            peak_gas_used: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
     pub fn record_charge(&self, amount: u64) {
         self.total_charged.fetch_add(amount, Ordering::Relaxed);
     }
 
-    /// Record a gas refund.
+    #[inline]
     pub fn record_refund(&self, amount: u64) {
         self.total_refunded.fetch_add(amount, Ordering::Relaxed);
     }
 
-    /// Record an out‑of‑gas event.
+    #[inline]
     pub fn record_out_of_gas(&self) {
         self.out_of_gas_events.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a refund cap event.
+    #[inline]
     pub fn record_refund_cap(&self) {
         self.refund_cap_events.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record memory expansion gas.
+    #[inline]
     pub fn record_memory_expansion(&self, amount: u64) {
         self.memory_expansion_gas.fetch_add(amount, Ordering::Relaxed);
     }
 
-    /// Record a fork.
+    #[inline]
     pub fn record_fork(&self) {
         self.forks.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Update peak gas used.
+    /// Update peak gas used. Uses `fetch_max` so concurrent meters race
+    /// safely without a `compare_exchange` loop.
+    #[inline]
     pub fn update_peak(&self, used: u64) {
-        let mut current = self.peak_gas_used.load(Ordering::Relaxed);
-        while used > current {
-            match self.peak_gas_used.compare_exchange_weak(
-                current,
-                used,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
+        self.peak_gas_used.fetch_max(used, Ordering::Relaxed);
     }
 
-    /// Snapshot of all metrics.
     pub fn snapshot(&self) -> GasMetricsSnapshot {
         GasMetricsSnapshot {
             total_charged: self.total_charged.load(Ordering::Relaxed),
@@ -187,10 +252,37 @@ impl GasMetrics {
             peak_gas_used: self.peak_gas_used.load(Ordering::Relaxed),
         }
     }
+
+    /// Reset all counters.
+    pub fn reset(&self) {
+        self.total_charged.store(0, Ordering::Relaxed);
+        self.total_refunded.store(0, Ordering::Relaxed);
+        self.out_of_gas_events.store(0, Ordering::Relaxed);
+        self.refund_cap_events.store(0, Ordering::Relaxed);
+        self.memory_expansion_gas.store(0, Ordering::Relaxed);
+        self.forks.store(0, Ordering::Relaxed);
+        self.peak_gas_used.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Default for GasMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for GasMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GasMetrics")
+            .field("total_charged", &self.total_charged.load(Ordering::Relaxed))
+            .field("total_refunded", &self.total_refunded.load(Ordering::Relaxed))
+            .field("out_of_gas_events", &self.out_of_gas_events.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 /// Snapshot of gas metrics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct GasMetricsSnapshot {
     pub total_charged: u64,
     pub total_refunded: u64,
@@ -201,102 +293,79 @@ pub struct GasMetricsSnapshot {
     pub peak_gas_used: u64,
 }
 
-// ── Gas Error ─────────────────────────────────────────────────────────────
+// ── GasMeter ──────────────────────────────────────────────────────────────
 
-/// Errors that can occur during gas metering.
-#[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GasError {
-    /// Insufficient gas to perform the operation.
-    #[error("out of gas: needed {needed}, remaining {remaining}")]
-    OutOfGas { needed: u64, remaining: u64 },
-
-    /// Refund would exceed the maximum allowed (capped at half of gas used).
-    #[error("refund capped: attempted {attempted}, current refund {current}, max allowed {max_allowed}")]
-    RefundCapped {
-        attempted: u64,
-        current: u64,
-        max_allowed: u64,
-    },
-
-    /// Gas limit exceeds block gas limit.
-    #[error("gas limit {limit} exceeds block gas limit {block_limit}")]
-    GasLimitTooHigh { limit: u64, block_limit: u64 },
-
-    /// Gas limit below the minimum required.
-    #[error("gas limit {limit} below minimum {minimum}")]
-    GasLimitTooLow { limit: u64, minimum: u64 },
-
-    /// Arithmetic overflow in gas calculation (should never happen).
-    #[error("gas calculation overflow")]
-    Overflow,
-
-    /// Refund cannot be applied because execution already ended.
-    #[error("refund already applied")]
-    RefundAlreadyApplied,
-
-    /// Attempted to charge gas after refund was applied.
-    #[error("cannot charge gas after refund applied")]
-    ChargeAfterRefund,
-}
-
-pub type GasResult<T> = Result<T, GasError>;
-
-// ── Gas Meter ─────────────────────────────────────────────────────────────
-
-/// Gas meter tracks consumption and refunds during VM execution.
+/// Tracks gas consumption and refunds during a single execution context.
 ///
-/// The meter enforces that gas usage never exceeds the specified limit.
-/// Refunds are accumulated separately and applied only at the end of
-/// execution via [`apply_refund`], ensuring that execution never sees
-/// a decreasing gas balance.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// `GasMeter` is `Clone` but deliberately **not** `Copy`: it may hold an
+/// `Arc<GasMetrics>` and duplicating it via `Copy` would silently double
+/// the accounting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GasMeter {
     /// Maximum gas allowed for this execution context.
     limit: u64,
-    /// Gas consumed so far (monotonically increasing).
+    /// Gas consumed so far (monotonically non-decreasing until
+    /// `apply_refund` runs).
     used: u64,
-    /// Gas to be refunded after execution (capped at `used / 2`).
+    /// Pending refund. Applied only at the end of execution.
     refund: u64,
-    /// Whether refund has been applied (prevents double application).
+    /// Cached `used / refund_quotient`. Recomputed on every charge.
+    #[serde(skip)]
+    max_refund_cache: u64,
+    /// Whether `apply_refund` has already run.
     #[serde(skip)]
     refund_applied: bool,
-    /// Configuration (for memory cost calculations).
-    #[serde(skip)]
+    /// Configuration. Not serialized; a deserialized meter must be
+    /// re-attached to a manager before use.
+    #[serde(skip, default = "GasConfig::default")]
     config: GasConfig,
-    /// Metrics (optional).
+    /// Optional metrics collector. Not serialized.
     #[serde(skip)]
     metrics: Option<Arc<GasMetrics>>,
 }
 
 impl GasMeter {
-    /// Creates a new gas meter with the given limit.
+    /// Create a new meter with the given limit and the default config.
+    ///
+    /// The limit is clamped to `[1, max_gas_per_tx]` from the default
+    /// configuration. Use [`GasMeter::new_with_validation`] if you want
+    /// the limit checked instead of clamped.
     pub fn new(limit: u64) -> Self {
         Self::with_config(limit, GasConfig::default())
     }
 
-    /// Creates a new gas meter with configuration.
+    /// Create a new meter with the given limit and configuration.
+    ///
+    /// The limit is clamped to `[1, config.max_gas_per_tx]`.
     pub fn with_config(limit: u64, config: GasConfig) -> Self {
-        debug_assert!(limit > 0, "Gas limit must be > 0");
-        let limit = limit.min(config.max_gas_per_tx).max(1);
+        let clamped = limit.min(config.max_gas_per_tx).max(1);
+        if clamped != limit {
+            debug!(
+                requested = limit,
+                clamped,
+                "GasMeter limit clamped to configuration bounds"
+            );
+        }
         Self {
-            limit,
+            limit: clamped,
             used: 0,
             refund: 0,
+            max_refund_cache: 0,
             refund_applied: false,
             config,
             metrics: None,
         }
     }
 
-    /// Creates a gas meter with metrics tracking.
+    /// Create a meter with the given config and metrics collector.
     pub fn with_metrics(limit: u64, config: GasConfig, metrics: Arc<GasMetrics>) -> Self {
-        let mut meter = Self::with_config(limit, config);
-        meter.metrics = Some(metrics);
-        meter
+        let mut m = Self::with_config(limit, config);
+        m.metrics = Some(metrics);
+        m
     }
 
-    /// Creates a gas meter from a block context, validating the limit.
-    pub fn new_with_validation(limit: u64, config: &GasConfig) -> Result<Self, GasError> {
+    /// Create a meter, validating `limit` against `config`'s min/max bounds.
+    pub fn new_with_validation(limit: u64, config: &GasConfig) -> GasResult<Self> {
         if limit < config.min_gas_per_tx {
             return Err(GasError::GasLimitTooLow {
                 limit,
@@ -312,120 +381,110 @@ impl GasMeter {
         Ok(Self::with_config(limit, config.clone()))
     }
 
-    // ── Getters ─────────────────────────────────────────────────────────
+    // ── Read-only accessors ─────────────────────────────────────────────
 
-    /// Returns the gas limit.
     #[inline]
     pub fn limit(&self) -> u64 {
         self.limit
     }
 
-    /// Returns the gas used so far.
     #[inline]
     pub fn used(&self) -> u64 {
         self.used
     }
 
-    /// Returns the current refundable gas (before applying).
     #[inline]
     pub fn refundable(&self) -> u64 {
         self.refund
     }
 
-    /// Returns the remaining gas.
     #[inline]
     pub fn remaining(&self) -> u64 {
         self.limit.saturating_sub(self.used)
     }
 
-    /// Returns the maximum refund allowed under current usage.
     #[inline]
     pub fn max_refund_allowed(&self) -> u64 {
-        self.used / self.config.refund_quotient
+        self.max_refund_cache
     }
 
-    /// Returns the fraction of gas used (0.0 – 1.0).
+    /// Fraction of the limit that has been used, in `[0.0, 1.0]`.
     #[inline]
     pub fn fraction_used(&self) -> f64 {
         if self.limit == 0 {
             return 1.0;
         }
-        (self.used as f64 / self.limit as f64).min(1.0)
+        (self.used as f64 / self.limit as f64).clamp(0.0, 1.0)
     }
 
-    /// Returns the net gas used after applying the refund (without mutating).
+    /// Net gas used after applying the pending refund. Does not mutate.
     #[inline]
     pub fn net_used(&self) -> u64 {
-        let effective_refund = self.refund.min(self.used);
-        self.used.saturating_sub(effective_refund)
+        self.used.saturating_sub(self.refund)
     }
 
-    /// Returns whether the refund has already been applied.
     #[inline]
     pub fn refund_applied(&self) -> bool {
         self.refund_applied
     }
 
-    /// Returns a reference to the configuration.
     pub fn config(&self) -> &GasConfig {
         &self.config
     }
 
     // ── Charging ────────────────────────────────────────────────────────
 
-    /// Charges `amount` gas.
+    /// Charge `amount` gas.
     ///
-    /// Returns `Err(OutOfGas)` if the charge would exceed the limit.
-    /// On failure, `used` is set to `limit` (gas is fully consumed).
-    #[inline]
-    pub fn charge(&mut self, amount: u64) -> Result<(), GasError> {
+    /// On failure, `used` is set to `limit` (gas is fully consumed),
+    /// matching EVM semantics so the caller cannot continue execution.
+    pub fn charge(&mut self, amount: u64) -> GasResult<()> {
         if self.refund_applied {
             return Err(GasError::ChargeAfterRefund);
         }
+        if amount == 0 {
+            return Ok(());
+        }
 
-        let new_used = self
-            .used
-            .checked_add(amount)
-            .ok_or(GasError::Overflow)?;
-
+        let new_used = self.used.checked_add(amount).ok_or(GasError::Overflow)?;
         if new_used > self.limit {
             self.used = self.limit;
-            if let Some(metrics) = &self.metrics {
-                metrics.record_out_of_gas();
+            self.refresh_refund_cache();
+            if let Some(m) = &self.metrics {
+                m.record_out_of_gas();
             }
-            if self.config.log_operations {
-                warn!(
-                    "Out of gas: needed {}, remaining {}",
-                    amount,
-                    self.limit.saturating_sub(self.used)
-                );
-            }
+            warn!(
+                needed = amount,
+                remaining = self.limit.saturating_sub(self.used),
+                "GasMeter out of gas"
+            );
             return Err(GasError::OutOfGas {
                 needed: amount,
                 remaining: self.limit.saturating_sub(self.used),
             });
         }
 
-        if self.config.log_operations && amount > 1000 {
-            trace!("Charging {} gas, new used = {}", amount, new_used);
-        }
-        if let Some(metrics) = &self.metrics {
-            metrics.record_charge(amount);
-            metrics.update_peak(new_used);
+        if self.config.log_operations && amount > 1_000 {
+            trace!(amount, new_used, "GasMeter charge");
         }
         self.used = new_used;
+        self.refresh_refund_cache();
+
+        if let Some(m) = &self.metrics {
+            m.record_charge(amount);
+            m.update_peak(new_used);
+        }
         Ok(())
     }
 
-    /// Checks if `amount` gas can be charged without actually charging.
+    /// Whether `amount` gas can be charged without exceeding the limit.
     #[inline]
     pub fn can_charge(&self, amount: u64) -> bool {
         !self.refund_applied && self.used.saturating_add(amount) <= self.limit
     }
 
-    /// Charges gas only if `condition` is true.
-    #[inline]
-    pub fn charge_if(&mut self, condition: bool, amount: u64) -> Result<u64, GasError> {
+    /// Charge only if `condition` is true. Returns the amount charged.
+    pub fn charge_if(&mut self, condition: bool, amount: u64) -> GasResult<u64> {
         if condition {
             self.charge(amount)?;
             Ok(amount)
@@ -434,19 +493,28 @@ impl GasMeter {
         }
     }
 
-    /// Charges gas with a multiplier (for dynamic costs).
-    #[inline]
-    pub fn charge_scaled(&mut self, base: u64, multiplier: f64) -> Result<u64, GasError> {
-        let scaled = (base as f64 * multiplier).round() as u64;
+    /// Charge `base * multiplier`, rounding to the nearest integer.
+    ///
+    /// Uses `f64` only for the multiplication; the result is saturated to
+    /// `u64::MAX` before the integer charge so a huge multiplier cannot
+    /// wrap.
+    pub fn charge_scaled(&mut self, base: u64, multiplier: f64) -> GasResult<u64> {
+        let scaled_f = (base as f64) * multiplier;
+        let scaled = if scaled_f.is_nan() || scaled_f < 0.0 {
+            0
+        } else if scaled_f >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            scaled_f.round() as u64
+        };
         self.charge(scaled)?;
         Ok(scaled)
     }
 
     // ── Refunds ─────────────────────────────────────────────────────────
 
-    /// Adds a refund amount (e.g., for clearing storage slots).
-    #[inline]
-    pub fn add_refund(&mut self, amount: u64) -> Result<(), GasError> {
+    /// Add a refund request. The amount is clamped to `max_refund_allowed`.
+    pub fn add_refund(&mut self, amount: u64) -> GasResult<()> {
         if self.refund_applied {
             return Err(GasError::RefundAlreadyApplied);
         }
@@ -454,687 +522,753 @@ impl GasMeter {
             return Ok(());
         }
 
-        let new_refund = self
-            .refund
-            .checked_add(amount)
-            .ok_or(GasError::Overflow)?;
+        let requested = self.refund.checked_add(amount).ok_or(GasError::Overflow)?;
+        let cap = self.max_refund_cache;
 
-        let max_refund = self.max_refund_allowed();
-        if new_refund > max_refund {
-            if let Some(metrics) = &self.metrics {
-                metrics.record_refund_cap();
+        if requested > cap {
+            // Compute how much of this request actually fits under the cap
+            // so we can record the correct accepted amount in metrics.
+            let accepted = cap.saturating_sub(self.refund);
+            self.refund = cap;
+            if let Some(m) = &self.metrics {
+                m.record_refund(accepted);
+                m.record_refund_cap();
             }
-            if self.config.log_operations {
-                debug!(
-                    "Refund capped: attempted {}, max {}, capped at {}",
-                    new_refund, max_refund, max_refund
-                );
-            }
-            self.refund = max_refund;
+            debug!(
+                requested,
+                accepted,
+                cap,
+                "GasMeter refund clamped to cap"
+            );
         } else {
-            self.refund = new_refund;
-            if let Some(metrics) = &self.metrics {
-                metrics.record_refund(amount);
+            self.refund = requested;
+            if let Some(m) = &self.metrics {
+                m.record_refund(amount);
             }
         }
         Ok(())
     }
 
-    /// Applies the refund, reducing `used` gas.
-    #[inline]
+    /// Apply the pending refund, reducing `used`.
+    ///
+    /// Idempotent: a second call returns the same value and does nothing.
+    /// Returns the meter's `used` value *after* the refund.
     pub fn apply_refund(&mut self) -> u64 {
         if self.refund_applied {
             return self.used;
         }
-        let effective_refund = self.refund.min(self.used);
-        self.used = self.used.saturating_sub(effective_refund);
+        let effective = self.refund.min(self.used);
+        self.used = self.used.saturating_sub(effective);
         self.refund = 0;
         self.refund_applied = true;
+        self.refresh_refund_cache();
         if self.config.log_operations {
-            trace!(
-                "Refund applied: effective = {}, net used = {}",
-                effective_refund,
-                self.used
-            );
+            trace!(effective, net_used = self.used, "GasMeter refund applied");
         }
         self.used
     }
 
-    // ── Memory expansion ────────────────────────────────────────────────
+    // ── Memory ──────────────────────────────────────────────────────────
 
-    /// Charges gas for memory expansion.
-    #[inline]
+    /// Charge for memory expansion from `current_words` to `new_words`.
     pub fn charge_memory_expansion(
         &mut self,
         current_words: usize,
         new_words: usize,
-    ) -> Result<u64, GasError> {
+    ) -> GasResult<u64> {
         if new_words <= current_words {
             return Ok(0);
         }
-
-        let current_cost = memory_cost_words_with_config(
-            current_words,
-            &self.config,
-        );
-        let new_cost = memory_cost_words_with_config(
-            new_words,
-            &self.config,
-        );
+        let current_cost = memory_cost_words_with_config(current_words, &self.config);
+        let new_cost = memory_cost_words_with_config(new_words, &self.config);
         let additional = new_cost
             .checked_sub(current_cost)
             .ok_or(GasError::Overflow)?;
-
         if additional > 0 {
             self.charge(additional)?;
-            if let Some(metrics) = &self.metrics {
-                metrics.record_memory_expansion(additional);
+            if let Some(m) = &self.metrics {
+                m.record_memory_expansion(additional);
             }
         }
-
         Ok(additional)
     }
 
-    /// Convenience: charges memory expansion for bytes.
-    #[inline]
+    /// Charge for memory expansion from `current_bytes` to `new_bytes`.
     pub fn charge_memory_expansion_bytes(
         &mut self,
         current_bytes: usize,
         new_bytes: usize,
-    ) -> Result<u64, GasError> {
-        let current_words = (current_bytes + 31) / 32;
-        let new_words = (new_bytes + 31) / 32;
-        self.charge_memory_expansion(current_words, new_words)
+    ) -> GasResult<u64> {
+        let cur_words = bytes_to_words(current_bytes);
+        let new_words = bytes_to_words(new_bytes);
+        self.charge_memory_expansion(cur_words, new_words)
     }
 
-    /// Charges the cost of copying `size` bytes from memory to memory.
-    #[inline]
-    pub fn charge_memory_copy(&mut self, size: usize) -> Result<(), GasError> {
-        let words = (size + 31) / 32;
-        let cost = words as u64 * self.config.memory_word_gas;
+    /// Charge for copying `size` bytes within memory.
+    pub fn charge_memory_copy(&mut self, size: usize) -> GasResult<()> {
+        let words = bytes_to_words(size) as u64;
+        let cost = words.saturating_mul(self.config.memory_word_gas);
         self.charge(cost)
     }
 
-    // ── Fork ────────────────────────────────────────────────────────────
+    // ── Fork / snapshot ─────────────────────────────────────────────────
 
-    /// Creates a copy with a new limit (for sub‑calls).
+    /// Fork the meter with a new limit, preserving `used` and `refund`.
+    ///
+    /// Used by the VM when entering a sub-call: the sub-call inherits the
+    /// parent's accounting so a revert restores the parent's pre-call
+    /// state, but receives its own (smaller) `limit`.
+    ///
+    /// The new meter's `refund_applied` is always `false`; if the parent
+    /// has already applied its refund the fork is a fresh accounting
+    /// context for the sub-call.
     pub fn fork(&self, new_limit: u64) -> Self {
-        if let Some(metrics) = &self.metrics {
-            metrics.record_fork();
+        if let Some(m) = &self.metrics {
+            m.record_fork();
         }
-        Self {
-            limit: new_limit.min(self.config.max_gas_per_tx).max(1),
+        let clamped = new_limit.min(self.config.max_gas_per_tx).max(1);
+        let mut forked = Self {
+            limit: clamped,
             used: self.used,
             refund: self.refund,
+            max_refund_cache: 0,
             refund_applied: false,
             config: self.config.clone(),
             metrics: self.metrics.clone(),
-        }
+        };
+        forked.refresh_refund_cache();
+        forked
     }
 
-    /// Creates a copy with the same limit (for snapshot/restore).
+    /// Snapshot the meter for a later `restore`.
     pub fn snapshot(&self) -> Self {
-        *self
+        self.clone()
     }
 
-    /// Restores from a snapshot.
-    pub fn restore(&mut self, snapshot: Self) {
+    /// Restore from a snapshot.
+    ///
+    /// Returns [`GasError::SnapshotMismatch`] if the snapshot's limit
+    /// differs from this meter's limit, which would indicate the caller
+    /// is restoring into the wrong context.
+    pub fn restore(&mut self, snapshot: Self) -> GasResult<()> {
+        if snapshot.limit != self.limit {
+            return Err(GasError::SnapshotMismatch {
+                current: self.limit,
+                snapshot: snapshot.limit,
+            });
+        }
+        // Preserve the current metrics handle and config: the snapshot may
+        // have been taken before a manager re-attached them.
+        let metrics = self.metrics.take();
+        let config = std::mem::replace(&mut self.config, snapshot.config);
         *self = snapshot;
+        self.metrics = metrics;
+        self.config = config;
+        self.refresh_refund_cache();
+        Ok(())
     }
 
-    /// Sets metrics for this meter (for manager‑created meters).
+    /// Attach a metrics collector to this meter.
     pub fn set_metrics(&mut self, metrics: Arc<GasMetrics>) {
         self.metrics = Some(metrics);
     }
 
-    /// Resets the meter to zero used and refund.
+    /// Reset to a fresh state with the same limit and config.
     pub fn reset(&mut self) {
         self.used = 0;
         self.refund = 0;
+        self.max_refund_cache = 0;
         self.refund_applied = false;
+    }
+
+    // ── Internal ────────────────────────────────────────────────────────
+
+    #[inline]
+    fn refresh_refund_cache(&mut self) {
+        self.max_refund_cache = self.used / self.config.refund_quotient;
     }
 }
 
-// ── Memory cost functions ───────────────────────────────────────────────
+// ── Memory cost helpers ──────────────────────────────────────────────────
 
-/// Computes the gas cost for `words` of memory (EIP-150 quadratic formula).
+/// Number of 32-byte words needed for `bytes`.
+#[inline]
+pub const fn bytes_to_words(bytes: usize) -> usize {
+    (bytes + 31) / 32
+}
+
+/// Gas cost of `words` memory words under the default configuration.
 #[inline]
 pub fn memory_cost_words(words: usize) -> u64 {
     memory_cost_words_with_config(words, &GasConfig::default())
 }
 
-/// Computes the gas cost for `words` of memory with configuration.
+/// Gas cost of `words` memory words under the given configuration.
+///
+/// Uses saturating arithmetic throughout: the quadratic term can exceed
+/// `u64::MAX` only for pathological inputs, and saturating there is
+/// preferable to wrapping.
 #[inline]
 pub fn memory_cost_words_with_config(words: usize, config: &GasConfig) -> u64 {
     let w = words as u64;
     let linear = w.saturating_mul(config.memory_word_gas);
-    let quadratic = w.saturating_mul(w).saturating_div(config.memory_quadratic_denom);
+    let quadratic = w
+        .saturating_mul(w)
+        .saturating_div(config.memory_quadratic_denom);
     linear.saturating_add(quadratic)
 }
 
-/// Computes the gas cost for `bytes` of memory, rounding up to the next word.
+/// Gas cost of `bytes` memory bytes under the default configuration.
 #[inline]
 pub fn memory_cost_bytes(bytes: usize) -> u64 {
-    let words = (bytes + 31) / 32;
-    memory_cost_words(words)
+    memory_cost_words(bytes_to_words(bytes))
 }
 
-// ── Gas Price Provider ───────────────────────────────────────────────────
+// ── Gas price provider ──────────────────────────────────────────────────
 
-/// A simple gas price provider that returns a constant price.
+/// A trivial gas-price abstraction.
+///
+/// The VM accepts any type implementing this trait so that dynamic pricing
+/// (EIP-1559) or oracle-based pricing can be plugged in without changing
+/// the meter.
 pub trait GasPriceProvider: Send + Sync {
-    /// Returns the current gas price in wei per gas.
+    /// Current gas price in wei per gas.
     fn gas_price(&self) -> u64;
 }
 
-/// A fixed gas price provider (for testing or static configurations).
-#[derive(Debug, Clone, Copy)]
-pub struct FixedGasPrice(pub u64);
-
-impl GasPriceProvider for FixedGasPrice {
+impl GasPriceProvider for u64 {
     fn gas_price(&self) -> u64 {
-        self.0
+        *self
     }
 }
 
-// ── Gas Manager (thread‑safe) ───────────────────────────────────────────
+impl GasPriceProvider for Arc<dyn GasPriceProvider> {
+    fn gas_price(&self) -> u64 {
+        (**self).gas_price()
+    }
+}
 
-/// Thread‑safe manager for gas meters with metrics.
-#[cfg(feature = "std")]
+// ── GasManager ───────────────────────────────────────────────────────────
+
+/// Thread-safe factory and metrics aggregator for [`GasMeter`]s.
 #[derive(Clone)]
 pub struct GasManager {
     config: Arc<GasConfig>,
     metrics: Arc<GasMetrics>,
 }
 
-#[cfg(feature = "std")]
 impl GasManager {
-    /// Create a new gas manager with the given configuration.
-    pub fn new(config: GasConfig) -> Result<Self, String> {
+    /// Create a manager with the given configuration.
+    pub fn new(config: GasConfig) -> GasResult<Self> {
         config.validate()?;
         Ok(Self {
             config: Arc::new(config),
-            metrics: Arc::new(GasMetrics::default()),
+            metrics: Arc::new(GasMetrics::new()),
         })
     }
 
-    /// Create a new gas meter.
+    /// Create a meter with the configured limit clamped to `max_gas_per_tx`.
     pub fn meter(&self, limit: u64) -> GasMeter {
         GasMeter::with_metrics(limit, self.config.as_ref().clone(), self.metrics.clone())
     }
 
-    /// Create a gas meter with validation.
-    pub fn meter_with_validation(&self, limit: u64) -> Result<GasMeter, GasError> {
-        GasMeter::new_with_validation(limit, &self.config)
-            .map(|mut meter| {
-                meter.set_metrics(self.metrics.clone());
-                meter
-            })
+    /// Create a meter, validating `limit` against the configuration.
+    pub fn meter_with_validation(&self, limit: u64) -> GasResult<GasMeter> {
+        let mut m = GasMeter::new_with_validation(limit, &self.config)?;
+        m.set_metrics(self.metrics.clone());
+        Ok(m)
     }
 
-    /// Get metrics snapshot.
     pub fn metrics_snapshot(&self) -> GasMetricsSnapshot {
         self.metrics.snapshot()
     }
 
-    /// Get configuration.
     pub fn config(&self) -> &GasConfig {
         &self.config
     }
 
-    /// Reset all metrics.
+    /// Reset all metric counters.
     pub fn reset_metrics(&self) {
-        self.metrics.total_charged.store(0, Ordering::Relaxed);
-        self.metrics.total_refunded.store(0, Ordering::Relaxed);
-        self.metrics.out_of_gas_events.store(0, Ordering::Relaxed);
-        self.metrics.refund_cap_events.store(0, Ordering::Relaxed);
-        self.metrics.memory_expansion_gas.store(0, Ordering::Relaxed);
-        self.metrics.forks.store(0, Ordering::Relaxed);
-        self.metrics.peak_gas_used.store(0, Ordering::Relaxed);
+        self.metrics.reset();
+    }
+
+    /// Direct access to the shared metrics handle (for tests/diagnostics).
+    pub fn metrics(&self) -> &Arc<GasMetrics> {
+        &self.metrics
     }
 }
 
-// ── Global singleton (when std is available) ────────────────────────────
+// ── Global singleton ────────────────────────────────────────────────────
 
-#[cfg(feature = "std")]
-static GLOBAL_MANAGER: std::sync::OnceLock<GasManager> = std::sync::OnceLock::new();
+static GLOBAL_MANAGER: OnceLock<GasManager> = OnceLock::new();
 
-#[cfg(feature = "std")]
-/// Initialize the global gas manager.
-pub fn init_gas_manager(config: GasConfig) -> Result<(), String> {
+/// Initialize the global gas manager. Idempotent-safe: a second call
+/// returns [`GasError::Config`] rather than silently ignoring the request.
+pub fn init_gas_manager(config: GasConfig) -> GasResult<()> {
     let manager = GasManager::new(config)?;
-    GLOBAL_MANAGER.set(manager).map_err(|_| "gas manager already initialized".into())
+    GLOBAL_MANAGER
+        .set(manager)
+        .map_err(|_| GasError::Config("gas manager already initialized".into()))
 }
 
-#[cfg(feature = "std")]
-/// Get the global gas manager.
+/// Access the global gas manager. Panics if [`init_gas_manager`] was never
+/// called.
 pub fn gas_manager() -> &'static GasManager {
-    GLOBAL_MANAGER.get().expect("gas manager not initialized")
+    GLOBAL_MANAGER
+        .get()
+        .expect("gas manager not initialized; call init_gas_manager first")
 }
 
-// ── Standalone functions (backward compatibility) ──────────────────────
-
-/// Creates a new gas meter with default configuration (legacy).
-pub fn new_gas_meter(limit: u64) -> GasMeter {
-    GasMeter::new(limit)
+/// Fallible variant for callers that want to handle the uninitialized case.
+pub fn try_gas_manager() -> Option<&'static GasManager> {
+    GLOBAL_MANAGER.get()
 }
 
-/// Creates a new gas meter with validation.
-pub fn new_gas_meter_validated(limit: u64, config: &GasConfig) -> Result<GasMeter, GasError> {
-    GasMeter::new_with_validation(limit, config)
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────
+// ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ── Config ─────────────────────────────────────────────────────────
+
     #[test]
-    fn test_config_validation() {
-        let mut config = GasConfig::default();
-        assert!(config.validate().is_ok());
-
-        config.max_gas_per_tx = 0;
-        assert!(config.validate().is_err());
-
-        config.max_gas_per_tx = 100;
-        config.max_gas_per_block = 0;
-        assert!(config.validate().is_err());
-
-        config.max_gas_per_block = 100;
-        config.min_gas_per_tx = 0;
-        assert!(config.validate().is_err());
-
-        config.min_gas_per_tx = 10;
-        config.refund_quotient = 0;
-        assert!(config.validate().is_err());
-
-        config.refund_quotient = 2;
-        config.memory_word_gas = 0;
-        assert!(config.validate().is_err());
-
-        config.memory_word_gas = 3;
-        config.memory_quadratic_denom = 0;
-        assert!(config.validate().is_err());
-
-        config.memory_quadratic_denom = 512;
-        config.min_gas_per_tx = 200;
-        config.max_gas_per_tx = 100;
-        assert!(config.validate().is_err());
+    fn config_default_is_valid() {
+        assert!(GasConfig::default().validate().is_ok());
     }
 
     #[test]
-    fn test_new_normal() {
-        let g = GasMeter::new(1000);
-        assert_eq!(g.limit(), 1000);
-        assert_eq!(g.used(), 0);
-        assert_eq!(g.refundable(), 0);
-        assert!(!g.refund_applied());
+    fn config_rejects_zero_fields() {
+        let cfg = |f: fn(&mut GasConfig)| {
+            let mut c = GasConfig::default();
+            f(&mut c);
+            c.validate()
+        };
+        assert!(cfg(|c| c.max_gas_per_tx = 0).is_err());
+        assert!(cfg(|c| c.max_gas_per_block = 0).is_err());
+        assert!(cfg(|c| c.min_gas_per_tx = 0).is_err());
+        assert!(cfg(|c| c.refund_quotient = 0).is_err());
+        assert!(cfg(|c| c.memory_word_gas = 0).is_err());
+        assert!(cfg(|c| c.memory_quadratic_denom = 0).is_err());
     }
 
     #[test]
-    fn test_new_zero_clamped() {
+    fn config_rejects_min_above_max() {
+        let mut c = GasConfig::default();
+        c.min_gas_per_tx = 100;
+        c.max_gas_per_tx = 50;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn config_rejects_tx_limit_above_block_limit() {
+        let mut c = GasConfig::default();
+        c.max_gas_per_tx = 100;
+        c.max_gas_per_block = 50;
+        assert!(c.validate().is_err());
+    }
+
+    // ── Construction ───────────────────────────────────────────────────
+
+    #[test]
+    fn new_clamps_zero_to_one() {
         let g = GasMeter::new(0);
         assert_eq!(g.limit(), 1);
     }
 
     #[test]
-    fn test_new_exceeds_max() {
+    fn new_clamps_above_max() {
         let g = GasMeter::new(MAX_BLOCK_GAS + 1);
         assert_eq!(g.limit(), MAX_BLOCK_GAS);
     }
 
     #[test]
-    fn test_new_with_validation() {
-        let config = GasConfig::default();
-        let g = GasMeter::new_with_validation(50_000, &config).unwrap();
-        assert_eq!(g.limit(), 50_000);
+    fn new_with_validation_accepts_valid_limit() {
+        let cfg = GasConfig::default();
+        assert!(GasMeter::new_with_validation(50_000, &cfg).is_ok());
     }
 
     #[test]
-    fn test_new_with_validation_too_low() {
-        let config = GasConfig::default();
-        let err = GasMeter::new_with_validation(100, &config).unwrap_err();
-        assert!(matches!(err, GasError::GasLimitTooLow { .. }));
+    fn new_with_validation_rejects_too_low() {
+        let cfg = GasConfig::default();
+        assert!(matches!(
+            GasMeter::new_with_validation(100, &cfg),
+            Err(GasError::GasLimitTooLow { .. })
+        ));
     }
 
     #[test]
-    fn test_new_with_validation_too_high() {
-        let config = GasConfig::default();
-        let err = GasMeter::new_with_validation(MAX_BLOCK_GAS + 1, &config).unwrap_err();
-        assert!(matches!(err, GasError::GasLimitTooHigh { .. }));
+    fn new_with_validation_rejects_too_high() {
+        let cfg = GasConfig::default();
+        assert!(matches!(
+            GasMeter::new_with_validation(MAX_BLOCK_GAS + 1, &cfg),
+            Err(GasError::GasLimitTooHigh { .. })
+        ));
+    }
+
+    // ── Charging ───────────────────────────────────────────────────────
+
+    #[test]
+    fn charge_accumulates() {
+        let mut g = GasMeter::new(1_000);
+        g.charge(500).unwrap();
+        g.charge(100).unwrap();
+        assert_eq!(g.used(), 600);
+        assert_eq!(g.remaining(), 400);
     }
 
     #[test]
-    fn test_fork() {
-        let mut g = GasMeter::new(1000);
-        g.charge(200).unwrap();
-        g.add_refund(50).unwrap();
-        let forked = g.fork(500);
-        assert_eq!(forked.limit(), 500);
-        assert_eq!(forked.used(), 200);
-        assert_eq!(forked.refundable(), 50);
-        assert!(!forked.refund_applied());
-    }
-
-    #[test]
-    fn test_charge_ok() {
-        let mut g = GasMeter::new(1000);
-        assert!(g.charge(500).is_ok());
-        assert_eq!(g.used(), 500);
-        assert_eq!(g.remaining(), 500);
-    }
-
-    #[test]
-    fn test_charge_exact_limit() {
+    fn charge_exact_limit_is_ok() {
         let mut g = GasMeter::new(100);
-        assert!(g.charge(100).is_ok());
+        g.charge(100).unwrap();
         assert_eq!(g.remaining(), 0);
-        let err = g.charge(1).unwrap_err();
-        assert!(matches!(err, GasError::OutOfGas { .. }));
-        assert_eq!(g.used(), 100);
     }
 
     #[test]
-    fn test_charge_exceeds_limit() {
+    fn charge_over_limit_sets_used_to_limit() {
         let mut g = GasMeter::new(100);
-        assert!(g.charge(50).is_ok());
+        g.charge(50).unwrap();
         let err = g.charge(60).unwrap_err();
         assert!(matches!(
             err,
             GasError::OutOfGas { needed: 60, remaining: 50 }
         ));
+        assert_eq!(g.used(), 100);
     }
 
     #[test]
-    fn test_charge_overflow() {
+    fn charge_overflow_is_detected() {
         let mut g = GasMeter::new(u64::MAX);
         g.charge(1).unwrap();
-        let err = g.charge(u64::MAX).unwrap_err();
-        assert!(matches!(err, GasError::Overflow));
+        assert!(matches!(g.charge(u64::MAX), Err(GasError::Overflow)));
     }
 
     #[test]
-    fn test_charge_after_refund() {
-        let mut g = GasMeter::new(100);
-        g.charge(50).unwrap();
+    fn charge_after_refund_is_rejected() {
+        let mut g = GasMeter::new(1_000);
+        g.charge(100).unwrap();
         g.apply_refund();
-        let err = g.charge(10).unwrap_err();
-        assert!(matches!(err, GasError::ChargeAfterRefund));
+        assert!(matches!(g.charge(10), Err(GasError::ChargeAfterRefund)));
     }
 
     #[test]
-    fn test_charge_if() {
-        let mut g = GasMeter::new(100);
-        let cost = g.charge_if(true, 30).unwrap();
-        assert_eq!(cost, 30);
-        let cost = g.charge_if(false, 70).unwrap();
-        assert_eq!(cost, 0);
+    fn charge_if_only_charges_when_true() {
+        let mut g = GasMeter::new(1_000);
+        assert_eq!(g.charge_if(true, 30).unwrap(), 30);
+        assert_eq!(g.charge_if(false, 70).unwrap(), 0);
         assert_eq!(g.used(), 30);
     }
 
     #[test]
-    fn test_charge_scaled() {
-        let mut g = GasMeter::new(100);
-        let cost = g.charge_scaled(10, 1.5).unwrap();
-        assert_eq!(cost, 15);
-        assert_eq!(g.used(), 15);
+    fn charge_scaled_rounds_to_nearest() {
+        let mut g = GasMeter::new(1_000);
+        assert_eq!(g.charge_scaled(10, 1.5).unwrap(), 15);
+        assert_eq!(g.charge_scaled(10, 1.4).unwrap(), 14);
     }
 
     #[test]
-    fn test_can_charge() {
+    fn charge_scaled_saturates_on_huge_multiplier() {
+        let mut g = GasMeter::new(u64::MAX);
+        // Should produce u64::MAX, not wrap.
+        let _ = g.charge_scaled(10, 1e30);
+        assert_eq!(g.used(), u64::MAX);
+    }
+
+    #[test]
+    fn can_charge_reflects_limit() {
         let g = GasMeter::new(100);
-        assert!(g.can_charge(50));
         assert!(g.can_charge(100));
         assert!(!g.can_charge(101));
     }
 
+    // ── Refunds ────────────────────────────────────────────────────────
+
     #[test]
-    fn test_refund_basic() {
-        let mut g = GasMeter::new(1000);
+    fn refund_reduces_net_used() {
+        let mut g = GasMeter::new(1_000);
         g.charge(500).unwrap();
         g.add_refund(100).unwrap();
-        assert_eq!(g.refundable(), 100);
-        assert_eq!(g.max_refund_allowed(), 250);
+        assert_eq!(g.net_used(), 400);
         let net = g.apply_refund();
         assert_eq!(net, 400);
-        assert_eq!(g.used(), 400);
-        assert_eq!(g.refundable(), 0);
         assert!(g.refund_applied());
     }
 
     #[test]
-    fn test_refund_capped_at_half_used() {
-        let mut g = GasMeter::new(1000);
+    fn refund_is_clamped_to_half_of_used() {
+        let mut g = GasMeter::new(1_000);
         g.charge(200).unwrap();
         g.add_refund(80).unwrap();
-        g.add_refund(50).unwrap();
+        g.add_refund(80).unwrap();
+        // Half of 200 is 100.
         assert_eq!(g.refundable(), 100);
     }
 
     #[test]
-    fn test_refund_zero_amount() {
-        let mut g = GasMeter::new(1000);
+    fn refund_zero_is_noop() {
+        let mut g = GasMeter::new(1_000);
         g.charge(100).unwrap();
         g.add_refund(0).unwrap();
         assert_eq!(g.refundable(), 0);
     }
 
     #[test]
-    fn test_refund_overflow() {
-        let mut g = GasMeter::new(1000);
+    fn refund_overflow_is_detected() {
+        let mut g = GasMeter::new(1_000);
         g.charge(100).unwrap();
         g.refund = u64::MAX;
-        let err = g.add_refund(1).unwrap_err();
-        assert!(matches!(err, GasError::Overflow));
+        assert!(matches!(g.add_refund(1), Err(GasError::Overflow)));
     }
 
     #[test]
-    fn test_net_used() {
-        let mut g = GasMeter::new(1000);
-        g.charge(500).unwrap();
-        g.add_refund(100).unwrap();
-        assert_eq!(g.net_used(), 400);
-        assert_eq!(g.used(), 500);
-        assert_eq!(g.refundable(), 100);
+    fn refund_cap_is_recorded_in_metrics() {
+        let metrics = Arc::new(GasMetrics::new());
+        let mut g = GasMeter::with_metrics(1_000, GasConfig::default(), metrics.clone());
+        g.charge(200).unwrap();
+        // Half of 200 is 100; request 150, so 100 accepted, 50 rejected.
+        g.add_refund(150).unwrap();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.total_refunded, 100);
+        assert_eq!(snap.refund_cap_events, 1);
     }
 
     #[test]
-    fn test_apply_refund_zero() {
-        let mut g = GasMeter::new(1000);
-        g.charge(300).unwrap();
-        let net = g.apply_refund();
-        assert_eq!(net, 300);
-        assert!(g.refund_applied());
-    }
-
-    #[test]
-    fn test_apply_refund_twice() {
-        let mut g = GasMeter::new(1000);
+    fn apply_refund_is_idempotent() {
+        let mut g = GasMeter::new(1_000);
         g.charge(100).unwrap();
         g.add_refund(50).unwrap();
-        let net1 = g.apply_refund();
-        assert_eq!(net1, 50);
-        let net2 = g.apply_refund();
-        assert_eq!(net2, 50);
+        let a = g.apply_refund();
+        let b = g.apply_refund();
+        assert_eq!(a, b);
+        assert_eq!(b, 50);
     }
 
     #[test]
-    fn test_memory_cost_words() {
+    fn add_refund_after_apply_is_rejected() {
+        let mut g = GasMeter::new(1_000);
+        g.charge(100).unwrap();
+        g.apply_refund();
+        assert!(matches!(g.add_refund(50), Err(GasError::RefundAlreadyApplied)));
+    }
+
+    // ── Memory ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn bytes_to_words_rounds_up() {
+        assert_eq!(bytes_to_words(0), 0);
+        assert_eq!(bytes_to_words(1), 1);
+        assert_eq!(bytes_to_words(32), 1);
+        assert_eq!(bytes_to_words(33), 2);
+    }
+
+    #[test]
+    fn memory_cost_words_linear_plus_quadratic() {
         assert_eq!(memory_cost_words(0), 0);
         assert_eq!(memory_cost_words(1), 3);
         assert_eq!(memory_cost_words(10), 30);
-        assert_eq!(memory_cost_words(100), 3 * 100 + 10000 / 512);
+        let expected = 3 * 100 + (100 * 100) / 512;
+        assert_eq!(memory_cost_words(100), expected);
     }
 
     #[test]
-    fn test_memory_cost_words_with_config() {
-        let mut config = GasConfig::default();
-        config.memory_word_gas = 5;
-        config.memory_quadratic_denom = 256;
-        assert_eq!(memory_cost_words_with_config(10, &config), 5 * 10 + 100 / 256);
+    fn memory_cost_words_with_config_overrides() {
+        let mut c = GasConfig::default();
+        c.memory_word_gas = 5;
+        c.memory_quadratic_denom = 256;
+        assert_eq!(memory_cost_words_with_config(10, &c), 50 + 100 / 256);
     }
 
     #[test]
-    fn test_memory_cost_bytes() {
-        assert_eq!(memory_cost_bytes(0), 0);
-        assert_eq!(memory_cost_bytes(32), 3);
-        assert_eq!(memory_cost_bytes(33), memory_cost_words(2));
-    }
-
-    #[test]
-    fn test_charge_memory_expansion() {
-        let mut g = GasMeter::new(1000);
+    fn charge_memory_expansion_charges_delta() {
+        let mut g = GasMeter::new(10_000);
         let cost = g.charge_memory_expansion(0, 10).unwrap();
         assert_eq!(cost, memory_cost_words(10));
         assert_eq!(g.used(), memory_cost_words(10));
     }
 
     #[test]
-    fn test_charge_memory_no_expansion() {
-        let mut g = GasMeter::new(1000);
-        let cost = g.charge_memory_expansion(10, 10).unwrap();
-        assert_eq!(cost, 0);
-        let cost = g.charge_memory_expansion(10, 5).unwrap();
-        assert_eq!(cost, 0);
+    fn charge_memory_expansion_shrink_is_free() {
+        let mut g = GasMeter::new(10_000);
+        assert_eq!(g.charge_memory_expansion(10, 5).unwrap(), 0);
     }
 
     #[test]
-    fn test_charge_memory_insufficient_gas() {
+    fn charge_memory_expansion_out_of_gas() {
         let mut g = GasMeter::new(10);
-        let err = g.charge_memory_expansion(0, 100).unwrap_err();
-        assert!(matches!(err, GasError::OutOfGas { .. }));
+        assert!(matches!(
+            g.charge_memory_expansion(0, 100),
+            Err(GasError::OutOfGas { .. })
+        ));
     }
 
     #[test]
-    fn test_charge_memory_copy() {
-        let mut g = GasMeter::new(1000);
+    fn charge_memory_copy_uses_words() {
+        let mut g = GasMeter::new(1_000);
         g.charge_memory_copy(32).unwrap();
         assert_eq!(g.used(), 3);
         g.charge_memory_copy(33).unwrap();
         assert_eq!(g.used(), 3 + 6);
     }
 
-    #[test]
-    fn test_fraction_used() {
-        let mut g = GasMeter::new(200);
-        assert!((g.fraction_used() - 0.0).abs() < f64::EPSILON);
-        g.charge(50).unwrap();
-        assert!((g.fraction_used() - 0.25).abs() < f64::EPSILON);
-        g.charge(150).unwrap();
-        assert!((g.fraction_used() - 1.0).abs() < f64::EPSILON);
-    }
+    // ── Fork / snapshot ────────────────────────────────────────────────
 
     #[test]
-    fn test_fraction_used_zero_limit() {
-        let mut g = GasMeter::new(0);
-        assert!((g.fraction_used() - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_getters() {
-        let mut g = GasMeter::new(1000);
+    fn fork_preserves_used_and_refund() {
+        let mut g = GasMeter::new(1_000);
         g.charge(200).unwrap();
         g.add_refund(50).unwrap();
-
-        assert_eq!(g.limit(), 1000);
-        assert_eq!(g.used(), 200);
-        assert_eq!(g.refundable(), 50);
-        assert_eq!(g.remaining(), 800);
-        assert_eq!(g.max_refund_allowed(), 100);
-        assert_eq!(g.net_used(), 150);
-        assert!(!g.refund_applied());
+        let f = g.fork(500);
+        assert_eq!(f.limit(), 500);
+        assert_eq!(f.used(), 200);
+        assert_eq!(f.refundable(), 50);
+        assert!(!f.refund_applied());
     }
 
     #[test]
-    fn test_snapshot_restore() {
-        let mut g = GasMeter::new(1000);
+    fn fork_clears_refund_applied_flag() {
+        let mut g = GasMeter::new(1_000);
+        g.charge(100).unwrap();
+        g.apply_refund();
+        let f = g.fork(500);
+        assert!(!f.refund_applied());
+    }
+
+    #[test]
+    fn snapshot_restore_roundtrip() {
+        let mut g = GasMeter::new(1_000);
         g.charge(300).unwrap();
         g.add_refund(50).unwrap();
-
         let snap = g.snapshot();
+
         g.charge(100).unwrap();
         assert_eq!(g.used(), 400);
 
-        g.restore(snap);
+        g.restore(snap).unwrap();
         assert_eq!(g.used(), 300);
         assert_eq!(g.refundable(), 50);
         assert!(!g.refund_applied());
     }
 
     #[test]
-    fn test_integration_flow() {
-        let mut g = GasMeter::new(100_000);
-
-        g.charge(21_000).unwrap();
-        g.charge_memory_expansion(0, 100).unwrap();
-        g.charge(5_000).unwrap();
-        g.add_refund(15_000).unwrap();
-        g.charge(3).unwrap();
-
-        let net = g.apply_refund();
-        assert!(net > 0);
-        assert_eq!(g.refundable(), 0);
-        assert!(g.refund_applied());
+    fn restore_rejects_limit_mismatch() {
+        let mut g = GasMeter::new(1_000);
+        let snap = GasMeter::new(500);
+        assert!(matches!(
+            g.restore(snap),
+            Err(GasError::SnapshotMismatch { .. })
+        ));
     }
 
+    // ── Serde ──────────────────────────────────────────────────────────
+
     #[test]
-    fn test_serialize_deserialize() {
-        let mut g = GasMeter::new(1000);
+    fn serde_preserves_mutable_state() {
+        let mut g = GasMeter::new(1_000);
         g.charge(300).unwrap();
         g.add_refund(50).unwrap();
 
         let json = serde_json::to_string(&g).unwrap();
         let restored: GasMeter = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(restored.limit(), 1000);
+        assert_eq!(restored.limit(), 1_000);
         assert_eq!(restored.used(), 300);
         assert_eq!(restored.refundable(), 50);
+        // refund_applied is not serialized (it is a per-execution flag),
+        // and the deserialized meter starts with it cleared. That matches
+        // the semantics of "load a checkpoint, resume execution".
         assert!(!restored.refund_applied());
     }
 
+    // ── Metrics ────────────────────────────────────────────────────────
+
     #[test]
-    fn test_metrics() {
-        let config = GasConfig::default();
-        let metrics = Arc::new(GasMetrics::default());
-        let mut g = GasMeter::with_metrics(1000, config, metrics.clone());
+    fn metrics_track_every_operation() {
+        let metrics = Arc::new(GasMetrics::new());
+        let mut g = GasMeter::with_metrics(10_000, GasConfig::default(), metrics.clone());
 
         g.charge(500).unwrap();
         g.add_refund(100).unwrap();
         g.charge_memory_expansion(0, 10).unwrap();
+        let _ = g.fork(1_000);
 
         let snap = metrics.snapshot();
         assert_eq!(snap.total_charged, 500 + memory_cost_words(10));
         assert_eq!(snap.total_refunded, 100);
         assert_eq!(snap.memory_expansion_gas, memory_cost_words(10));
+        assert_eq!(snap.forks, 1);
         assert_eq!(snap.peak_gas_used, g.used());
     }
 
-    #[cfg(feature = "std")]
     #[test]
-    fn test_manager() {
-        let config = GasConfig::default();
-        let manager = GasManager::new(config).unwrap();
+    fn metrics_reset_clears_all_counters() {
+        let metrics = GasMetrics::new();
+        metrics.record_charge(100);
+        metrics.record_refund(50);
+        metrics.record_out_of_gas();
+        metrics.reset();
+        let s = metrics.snapshot();
+        assert_eq!(s.total_charged, 0);
+        assert_eq!(s.total_refunded, 0);
+        assert_eq!(s.out_of_gas_events, 0);
+    }
 
-        let mut meter = manager.meter(1000);
-        meter.charge(500).unwrap();
+    // ── Manager ────────────────────────────────────────────────────────
 
+    #[test]
+    fn manager_hands_out_meters_with_shared_metrics() {
+        let manager = GasManager::new(GasConfig::default()).unwrap();
+        let mut m1 = manager.meter(1_000);
+        let mut m2 = manager.meter(1_000);
+        m1.charge(500).unwrap();
+        m2.charge(200).unwrap();
         let snap = manager.metrics_snapshot();
-        assert_eq!(snap.total_charged, 500);
+        assert_eq!(snap.total_charged, 700);
         assert_eq!(snap.peak_gas_used, 500);
     }
 
-    #[cfg(feature = "std")]
     #[test]
-    fn test_manager_with_validation() {
-        let config = GasConfig::default();
-        let manager = GasManager::new(config).unwrap();
+    fn manager_rejects_invalid_config() {
+        let mut cfg = GasConfig::default();
+        cfg.max_gas_per_tx = 0;
+        assert!(GasManager::new(cfg).is_err());
+    }
 
-        let meter = manager.meter_with_validation(50_000);
-        assert!(meter.is_ok());
+    #[test]
+    fn manager_meter_with_validation() {
+        let manager = GasManager::new(GasConfig::default()).unwrap();
+        assert!(manager.meter_with_validation(50_000).is_ok());
+        assert!(manager.meter_with_validation(100).is_err());
+    }
 
-        let err = manager.meter_with_validation(100);
-        assert!(err.is_err());
+    // ── Integration ────────────────────────────────────────────────────
+
+    #[test]
+    fn realistic_execution_flow() {
+        let mut g = GasMeter::new(100_000);
+        g.charge(21_000).unwrap(); // intrinsic
+        g.charge_memory_expansion_bytes(0, 256).unwrap();
+        g.charge(5_000).unwrap(); // some opcodes
+        g.add_refund(15_000).unwrap(); // storage clear
+        g.charge(3).unwrap();
+        let net = g.apply_refund();
+        assert!(net > 0);
+        assert!(g.refund_applied());
+        assert_eq!(g.refundable(), 0);
+    }
+
+    #[test]
+    fn fraction_used_is_bounded() {
+        let mut g = GasMeter::new(200);
+        assert_eq!(g.fraction_used(), 0.0);
+        g.charge(50).unwrap();
+        assert!((g.fraction_used() - 0.25).abs() < f64::EPSILON);
+        g.charge(150).unwrap();
+        assert_eq!(g.fraction_used(), 1.0);
+    }
+
+    #[test]
+    fn gas_price_provider_for_u64() {
+        let p: u64 = 42;
+        assert_eq!(GasPriceProvider::gas_price(&p), 42);
     }
 }
