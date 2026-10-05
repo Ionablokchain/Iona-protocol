@@ -36,25 +36,66 @@
 //! - **Precommit**: Locking measurement collapsing to |commit⟩ or |nil⟩
 //! - **Commit**: Final projective measurement — consensus reached
 //! - **Timeout**: Decoherence event from Lindblad operator L_timeout
+//!
+//! # Concurrency
+//!
+//! [`ConsensusTracer`] and [`StateRootLog`] are **not** thread-safe on their own.
+//! Wrap them in a `Mutex`/`RwLock` when shared across tasks. They are `Send`
+//! but not `Sync`.
+//!
+//! # Bounded memory
+//!
+//! Both structures are ring buffers with hard caps so a long-running node
+//! cannot exhaust memory through consensus-event accumulation:
+//! - [`ConsensusTracer`]: [`HARD_MAX_EVENTS`] events.
+//! - [`StateRootLog`]: [`HARD_MAX_STATE_ROOTS`] entries.
 
 use crate::types::{Hash32, Height};
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
 
 // -----------------------------------------------------------------------------
 // Quantum Constants
 // -----------------------------------------------------------------------------
 
-/// Reduced Planck constant (natural units).
-const HBAR: f64 = 1.0;
+/// Default maximum events before ring buffer truncation (quantum memory bound).
+pub const DEFAULT_MAX_EVENTS: usize = 10_000;
+
+/// Hard cap on retained events (DoS guard). Requests above this are clamped.
+pub const HARD_MAX_EVENTS: usize = 1_000_000;
+
+/// Minimum meaningful ring buffer size.
+pub const MIN_MAX_EVENTS: usize = 1;
+
+/// Default maximum state-root entries retained.
+pub const DEFAULT_MAX_STATE_ROOTS: usize = 100_000;
+
+/// Hard cap on retained state-root entries (DoS guard).
+pub const HARD_MAX_STATE_ROOTS: usize = 10_000_000;
 
 /// Coherence decay per event recording.
 const EVENT_DECOHERENCE_RATE: f64 = 0.00001;
 
-/// Maximum events before ring buffer truncation (quantum memory bound).
-const DEFAULT_MAX_EVENTS: usize = 10_000;
+/// Coherence decay per state-root logging operation.
+const STATE_ROOT_DECOHERENCE_RATE: f64 = 0.00001;
 
-/// Default bucket size for quantum state tomography.
-const TOMOGRAPHY_BUCKET_SIZE: u64 = 100;
+/// Clamp a floating-point value into the [0, 1] probability range.
+/// NaN is mapped to 0.0 (fail-closed for a probability).
+#[inline]
+fn clamp01(x: f64) -> f64 {
+    if x.is_nan() {
+        0.0
+    } else {
+        x.clamp(0.0, 1.0)
+    }
+}
+
+/// Clamp a ring-buffer capacity into the allowed range.
+#[inline]
+fn clamp_capacity(requested: usize, hard_max: usize) -> usize {
+    requested.clamp(MIN_MAX_EVENTS, hard_max)
+}
 
 // -----------------------------------------------------------------------------
 // Quantum Consensus Event
@@ -64,20 +105,21 @@ const TOMOGRAPHY_BUCKET_SIZE: u64 = 100;
 ///
 /// Each event is an element of a POVM {E_i} acting on ℋ_consensus,
 /// with Born probability P(i) = Tr(ρ E_i).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # Note on `PartialEq`
+///
+/// `ConsensusEvent` contains `f64` fields, so it derives `PartialEq` but **not**
+/// `Eq`. Comparing two events with `==` uses floating-point semantics (NaN != NaN).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConsensusEvent {
     /// New height started — ground state preparation |height⟩.
     NewHeight {
         height: Height,
-        /// Quantum purity of the state at this height.
-        #[cfg_attr(not(test), allow(dead_code))]
+        /// Quantum purity of the state at this height, in [0, 1].
         purity: f64,
     },
     /// New round started — excitation to |round⟩.
-    NewRound {
-        height: Height,
-        round: u32,
-    },
+    NewRound { height: Height, round: u32 },
     /// Proposal received/created — projective measurement in proposal basis.
     Proposal {
         height: Height,
@@ -85,7 +127,7 @@ pub enum ConsensusEvent {
         proposer: String,
         block_hash: Hash32,
         tx_count: usize,
-        /// Born probability of this proposal.
+        /// Born probability of this proposal, in [0, 1].
         born_probability: f64,
     },
     /// Prevote cast — measurement outcome |vote⟩ or |nil⟩.
@@ -94,7 +136,7 @@ pub enum ConsensusEvent {
         round: u32,
         validator: String,
         block_hash: Option<Hash32>,
-        /// Entanglement fidelity with proposal.
+        /// Entanglement fidelity with proposal, in [0, 1].
         entanglement_fidelity: f64,
     },
     /// Precommit cast — locking measurement.
@@ -103,7 +145,7 @@ pub enum ConsensusEvent {
         round: u32,
         validator: String,
         block_hash: Option<Hash32>,
-        /// Lock strength (fidelity with commit target).
+        /// Lock strength (fidelity with commit target), in [0, 1].
         lock_fidelity: f64,
     },
     /// Block committed — final projective measurement.
@@ -114,7 +156,7 @@ pub enum ConsensusEvent {
         state_root: Hash32,
         tx_count: usize,
         gas_used: u64,
-        /// Consensus fidelity (1.0 = perfect agreement).
+        /// Consensus fidelity (1.0 = perfect agreement), in [0, 1].
         consensus_fidelity: f64,
     },
     /// Timeout occurred — Lindblad decoherence event.
@@ -122,7 +164,7 @@ pub enum ConsensusEvent {
         height: Height,
         round: u32,
         phase: String,
-        /// Decoherence strength.
+        /// Decoherence strength, in [0, 1].
         decoherence_strength: f64,
     },
     /// Round skip — quantum jump to higher round.
@@ -131,37 +173,52 @@ pub enum ConsensusEvent {
         from_round: u32,
         to_round: u32,
         reason: String,
-        /// Jump probability (tunneling amplitude).
+        /// Jump probability (tunneling amplitude), in (0, 1].
         jump_probability: f64,
     },
 }
 
 impl ConsensusEvent {
-    /// Compute the quantum purity of this event.
+    /// The consensus height this event belongs to.
+    #[inline]
+    pub fn height(&self) -> Height {
+        match self {
+            Self::NewHeight { height, .. }
+            | Self::NewRound { height, .. }
+            | Self::Proposal { height, .. }
+            | Self::Prevote { height, .. }
+            | Self::Precommit { height, .. }
+            | Self::Commit { height, .. }
+            | Self::Timeout { height, .. }
+            | Self::RoundSkip { height, .. } => *height,
+        }
+    }
+
+    /// Compute a scalar "purity / fidelity" summary for this event.
     ///
-    /// γ = Tr(ρ²) for the event's subspace.
+    /// The value returned is always in `[0, 1]`. For variants without an
+    /// explicit fidelity metric, `1.0` is returned (a pure event).
     pub fn purity(&self) -> f64 {
         match self {
-            Self::NewHeight { purity, .. } => *purity,
-            Self::Proposal { born_probability, .. } => *born_probability,
-            Self::Prevote { entanglement_fidelity, .. } => *entanglement_fidelity,
-            Self::Precommit { lock_fidelity, .. } => *lock_fidelity,
-            Self::Commit { consensus_fidelity, .. } => *consensus_fidelity,
-            Self::Timeout { decoherence_strength, .. } => 1.0 - *decoherence_strength,
-            Self::RoundSkip { jump_probability, .. } => *jump_probability,
+            Self::NewHeight { purity, .. } => clamp01(*purity),
+            Self::Proposal { born_probability, .. } => clamp01(*born_probability),
+            Self::Prevote { entanglement_fidelity, .. } => clamp01(*entanglement_fidelity),
+            Self::Precommit { lock_fidelity, .. } => clamp01(*lock_fidelity),
+            Self::Commit { consensus_fidelity, .. } => clamp01(*consensus_fidelity),
+            Self::Timeout { decoherence_strength, .. } => {
+                clamp01(1.0 - *decoherence_strength)
+            }
+            Self::RoundSkip { jump_probability, .. } => clamp01(*jump_probability),
             Self::NewRound { .. } => 1.0,
         }
     }
 }
 
-impl std::fmt::Display for ConsensusEvent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ConsensusEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NewHeight { height, purity } => {
-                write!(
-                    f,
-                    "[CONSENSUS] NEW_HEIGHT height={height} γ={purity:.4}"
-                )
+                write!(f, "[CONSENSUS] NEW_HEIGHT height={height} γ={purity:.4}")
             }
             Self::NewRound { height, round } => {
                 write!(f, "[CONSENSUS] NEW_ROUND height={height} round={round}")
@@ -275,13 +332,13 @@ impl std::fmt::Display for ConsensusEvent {
 /// ```
 #[derive(Debug)]
 pub struct ConsensusTracer {
-    /// Recorded events (quantum state history).
-    events: Vec<ConsensusEvent>,
+    /// Recorded events (quantum state history) — bounded ring buffer.
+    events: VecDeque<ConsensusEvent>,
     /// Maximum number of events (quantum memory bound).
     max_events: usize,
     /// Whether tracing is enabled.
     enabled: bool,
-    /// Quantum coherence of the trace.
+    /// Quantum coherence of the trace, in [0, 1].
     coherence: f64,
     /// Total events ever recorded (including evicted).
     total_events_recorded: u64,
@@ -292,11 +349,15 @@ pub struct ConsensusTracer {
 impl ConsensusTracer {
     /// Create a new quantum tracer.
     ///
+    /// `max_events` is clamped to `[MIN_MAX_EVENTS, HARD_MAX_EVENTS]` to
+    /// guarantee progress (never zero) and bound memory.
+    ///
     /// Initializes the trace in the vacuum state |∅⟩.
     pub fn new(enabled: bool, max_events: usize) -> Self {
+        let max_events = clamp_capacity(max_events, HARD_MAX_EVENTS);
         Self {
-            events: Vec::with_capacity(max_events.min(DEFAULT_MAX_EVENTS)),
-            max_events: max_events.min(DEFAULT_MAX_EVENTS),
+            events: VecDeque::with_capacity(max_events.min(DEFAULT_MAX_EVENTS)),
+            max_events,
             enabled,
             coherence: 1.0,
             total_events_recorded: 0,
@@ -309,23 +370,25 @@ impl ConsensusTracer {
     /// ```text
     /// a† |trace⟩ → |trace ⊗ event⟩
     /// ```
+    ///
+    /// If the ring buffer is full, the oldest event is evicted (annihilation
+    /// operator a) — O(1) with the internal [`VecDeque`].
     pub fn record(&mut self, event: ConsensusEvent) {
         if !self.enabled {
             return;
         }
 
-        // Ring buffer: if full, evict oldest (annihilation operator a)
-        if self.events.len() >= self.max_events {
-            self.events.remove(0);
-            self.total_events_evicted += 1;
+        // O(1) ring-buffer eviction. Guaranteed non-empty because `max_events >= 1`.
+        while self.events.len() >= self.max_events {
+            self.events.pop_front();
+            self.total_events_evicted = self.total_events_evicted.saturating_add(1);
         }
 
-        self.events.push(event);
-        self.total_events_recorded += 1;
+        self.events.push_back(event);
+        self.total_events_recorded = self.total_events_recorded.saturating_add(1);
 
-        // Apply decoherence from measurement
-        self.coherence = (self.coherence * (1.0 - EVENT_DECOHERENCE_RATE))
-            .max(0.0);
+        // Apply decoherence from the measurement.
+        self.coherence = (self.coherence * (1.0 - EVENT_DECOHERENCE_RATE)).max(0.0);
     }
 
     /// Record a new height event — ground state preparation.
@@ -429,8 +492,12 @@ impl ConsensusTracer {
     }
 
     /// Record a round skip — quantum jump.
+    ///
+    /// If `to <= from`, the span is clamped to 1 so `jump_probability = 1.0`
+    /// and no arithmetic underflow can occur.
     pub fn trace_round_skip(&mut self, height: Height, from: u32, to: u32, reason: &str) {
-        let jump_probability = 1.0 / (to - from).max(1) as f64;
+        let span = to.saturating_sub(from).max(1);
+        let jump_probability = 1.0 / span as f64;
         self.record(ConsensusEvent::RoundSkip {
             height,
             from_round: from,
@@ -440,17 +507,22 @@ impl ConsensusTracer {
         });
     }
 
-    /// Get all recorded events.
-    pub fn events(&self) -> &[ConsensusEvent] {
+    /// Get all recorded events in insertion order (oldest first).
+    pub fn events(&self) -> &VecDeque<ConsensusEvent> {
         &self.events
     }
 
-    /// Get events for a specific height.
-    pub fn events_at_height(&self, height: Height) -> Vec<&ConsensusEvent> {
-        self.events
-            .iter()
-            .filter(|e| event_height(e) == Some(height))
-            .collect()
+    /// Snapshot the current events as an owned `Vec` (cheap for small buffers).
+    pub fn events_snapshot(&self) -> Vec<ConsensusEvent> {
+        self.events.iter().cloned().collect()
+    }
+
+    /// Iterator over events for a specific height.
+    pub fn events_at_height(
+        &self,
+        height: Height,
+    ) -> impl Iterator<Item = &ConsensusEvent> + '_ {
+        self.events.iter().filter(move |e| e.height() == height)
     }
 
     /// Get the latest commit event.
@@ -461,51 +533,42 @@ impl ConsensusTracer {
             .find(|e| matches!(e, ConsensusEvent::Commit { .. }))
     }
 
-    /// Get quantum state tomography for a height range.
+    /// Get quantum state tomography for a height range `[from, to]` (inclusive).
     ///
-    /// Returns statistics with average coherence and fidelity metrics.
+    /// If `from > to`, the range is empty and all counts are zero with
+    /// `avg_coherence = 1.0`.
     pub fn stats(&self, from: Height, to: Height) -> QuantumConsensusStats {
-        let relevant: Vec<&ConsensusEvent> = self
-            .events
-            .iter()
-            .filter(|e| {
-                event_height(e)
-                    .map(|h| h >= from && h <= to)
-                    .unwrap_or(false)
-            })
-            .collect();
+        let mut proposals = 0usize;
+        let mut prevotes = 0usize;
+        let mut precommits = 0usize;
+        let mut commits = 0usize;
+        let mut timeouts = 0usize;
+        let mut round_skips = 0usize;
+        let mut total_purity = 0.0f64;
+        let mut total_events = 0usize;
 
-        let proposals = relevant
-            .iter()
-            .filter(|e| matches!(e, ConsensusEvent::Proposal { .. }))
-            .count();
-        let prevotes = relevant
-            .iter()
-            .filter(|e| matches!(e, ConsensusEvent::Prevote { .. }))
-            .count();
-        let precommits = relevant
-            .iter()
-            .filter(|e| matches!(e, ConsensusEvent::Precommit { .. }))
-            .count();
-        let commits = relevant
-            .iter()
-            .filter(|e| matches!(e, ConsensusEvent::Commit { .. }))
-            .count();
-        let timeouts = relevant
-            .iter()
-            .filter(|e| matches!(e, ConsensusEvent::Timeout { .. }))
-            .count();
-        let round_skips = relevant
-            .iter()
-            .filter(|e| matches!(e, ConsensusEvent::RoundSkip { .. }))
-            .count();
+        for e in &self.events {
+            let h = e.height();
+            if h < from || h > to {
+                continue;
+            }
+            total_events += 1;
+            total_purity += e.purity();
+            match e {
+                ConsensusEvent::Proposal { .. } => proposals += 1,
+                ConsensusEvent::Prevote { .. } => prevotes += 1,
+                ConsensusEvent::Precommit { .. } => precommits += 1,
+                ConsensusEvent::Commit { .. } => commits += 1,
+                ConsensusEvent::Timeout { .. } => timeouts += 1,
+                ConsensusEvent::RoundSkip { .. } => round_skips += 1,
+                _ => {}
+            }
+        }
 
-        // Compute average coherence from events
-        let total_purity: f64 = relevant.iter().map(|e| e.purity()).sum();
-        let avg_coherence = if relevant.is_empty() {
+        let avg_coherence = if total_events == 0 {
             1.0
         } else {
-            total_purity / relevant.len() as f64
+            clamp01(total_purity / total_events as f64)
         };
 
         QuantumConsensusStats {
@@ -518,52 +581,55 @@ impl ConsensusTracer {
             timeouts,
             round_skips,
             avg_coherence,
-            total_events: relevant.len(),
+            total_events,
         }
     }
 
     /// Clear all events — reset to vacuum state |∅⟩.
+    ///
+    /// Runtime counters (`total_events_recorded`, `total_events_evicted`) are
+    /// **not** reset, so operational telemetry survives a `clear()`.
     pub fn clear(&mut self) {
         self.events.clear();
         self.coherence = 1.0;
     }
 
-    /// Check if tracing is enabled.
+    /// Reset the eviction/recording counters (in addition to the buffer).
+    ///
+    /// Use this only if you truly want a fresh tracer.
+    pub fn reset_counters(&mut self) {
+        self.total_events_recorded = 0;
+        self.total_events_evicted = 0;
+    }
+
+    /// Whether tracing is enabled.
+    #[inline]
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
 
-    /// Get current tracer coherence.
+    /// Current tracer coherence.
+    #[inline]
     pub fn coherence(&self) -> f64 {
         self.coherence
     }
 
-    /// Get total events recorded (including evicted).
+    /// Current ring-buffer capacity.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.max_events
+    }
+
+    /// Total events recorded (including evicted).
+    #[inline]
     pub fn total_recorded(&self) -> u64 {
         self.total_events_recorded
     }
 
-    /// Get total events evicted.
+    /// Total events evicted.
+    #[inline]
     pub fn total_evicted(&self) -> u64 {
         self.total_events_evicted
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Helper Functions
-// -----------------------------------------------------------------------------
-
-/// Extract height from a consensus event.
-fn event_height(event: &ConsensusEvent) -> Option<Height> {
-    match event {
-        ConsensusEvent::NewHeight { height, .. } => Some(*height),
-        ConsensusEvent::NewRound { height, .. } => Some(*height),
-        ConsensusEvent::Proposal { height, .. } => Some(*height),
-        ConsensusEvent::Prevote { height, .. } => Some(*height),
-        ConsensusEvent::Precommit { height, .. } => Some(*height),
-        ConsensusEvent::Commit { height, .. } => Some(*height),
-        ConsensusEvent::Timeout { height, .. } => Some(*height),
-        ConsensusEvent::RoundSkip { height, .. } => Some(*height),
     }
 }
 
@@ -575,7 +641,7 @@ fn event_height(event: &ConsensusEvent) -> Option<Height> {
 ///
 /// Includes both classical counts and quantum metrics
 /// (average coherence, fidelity).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuantumConsensusStats {
     pub from: Height,
     pub to: Height,
@@ -585,17 +651,17 @@ pub struct QuantumConsensusStats {
     pub commits: usize,
     pub timeouts: usize,
     pub round_skips: usize,
-    /// Average quantum coherence across all events.
+    /// Average quantum coherence across all events, in [0, 1].
     pub avg_coherence: f64,
     /// Total events analyzed.
     pub total_events: usize,
 }
 
-impl std::fmt::Display for QuantumConsensusStats {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for QuantumConsensusStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Consensus Stats [{:.?}..{:.?}]: proposals={} prevotes={} precommits={} commits={} timeouts={} round_skips={} γ_avg={:.4} events={}",
+            "Consensus Stats [{}..{}]: proposals={} prevotes={} precommits={} commits={} timeouts={} round_skips={} γ_avg={:.4} events={}",
             self.from,
             self.to,
             self.proposals,
@@ -615,17 +681,17 @@ impl std::fmt::Display for QuantumConsensusStats {
 // -----------------------------------------------------------------------------
 
 /// Per-block state root log entry with quantum fingerprint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateRootLogEntry {
     pub height: Height,
     pub state_root: Hash32,
     pub timestamp: u64,
-    /// Quantum fidelity of the state root.
+    /// Quantum fidelity of the state root, in [0, 1].
     pub fidelity: f64,
 }
 
-impl std::fmt::Display for StateRootLogEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for StateRootLogEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "height={} root=0x{} F={:.4}",
@@ -638,31 +704,58 @@ impl std::fmt::Display for StateRootLogEntry {
 
 /// Quantum state root logger — maintains a log of (height, state_root)
 /// for every committed block with quantum fidelity tracking.
+///
+/// # Bounded memory
+///
+/// The log retains at most `max_entries` most-recent heights. Re-logging an
+/// existing height overwrites in place (idempotent reorg handling) and does
+/// **not** consume capacity.
 #[derive(Debug)]
 pub struct StateRootLog {
     entries: BTreeMap<Height, StateRootLogEntry>,
     enabled: bool,
-    /// Quantum coherence of the log.
     coherence: f64,
+    max_entries: usize,
 }
 
 impl StateRootLog {
-    /// Create a new state root log.
+    /// Create a new state root log with the default capacity
+    /// ([`DEFAULT_MAX_STATE_ROOTS`]).
     pub fn new(enabled: bool) -> Self {
+        Self::with_capacity(enabled, DEFAULT_MAX_STATE_ROOTS)
+    }
+
+    /// Create a new state root log with an explicit capacity.
+    ///
+    /// `max_entries` is clamped to `[1, HARD_MAX_STATE_ROOTS]`.
+    pub fn with_capacity(enabled: bool, max_entries: usize) -> Self {
+        let max_entries = max_entries.clamp(1, HARD_MAX_STATE_ROOTS);
         Self {
             entries: BTreeMap::new(),
             enabled,
             coherence: 1.0,
+            max_entries,
         }
     }
 
     /// Log a state root for a committed block.
     ///
     /// Applies minor decoherence from the logging operation.
+    ///
+    /// If the log is at capacity and `height` is new, the oldest retained
+    /// height (smallest key) is evicted first.
     pub fn log(&mut self, height: Height, state_root: Hash32, timestamp: u64) {
         if !self.enabled {
             return;
         }
+
+        // Evict oldest if at capacity AND we're inserting a new height.
+        while self.entries.len() >= self.max_entries && !self.entries.contains_key(&height) {
+            if self.entries.pop_first().is_none() {
+                break;
+            }
+        }
+
         let fidelity = self.coherence;
         self.entries.insert(
             height,
@@ -673,16 +766,17 @@ impl StateRootLog {
                 fidelity,
             },
         );
-        // Minor decoherence from storage operation
-        self.coherence = (self.coherence * 0.99999).max(0.0);
+
+        // Minor decoherence from storage operation.
+        self.coherence = (self.coherence * (1.0 - STATE_ROOT_DECOHERENCE_RATE)).max(0.0);
     }
 
-    /// Get the state root at a specific height.
+    /// Get the state root entry at a specific height.
     pub fn get(&self, height: Height) -> Option<&StateRootLogEntry> {
         self.entries.get(&height)
     }
 
-    /// Get all entries as a BTreeMap of height -> Hash32 (for cross-node comparison).
+    /// Get all entries as a `BTreeMap<Height, Hash32>` (for cross-node comparison).
     pub fn roots(&self) -> BTreeMap<Height, Hash32> {
         self.entries
             .iter()
@@ -690,31 +784,51 @@ impl StateRootLog {
             .collect()
     }
 
+    /// Iterate over all retained entries in ascending height order.
+    pub fn iter(&self) -> impl Iterator<Item = &StateRootLogEntry> {
+        self.entries.values()
+    }
+
     /// Get the latest logged height.
     pub fn latest_height(&self) -> Option<Height> {
         self.entries.keys().next_back().copied()
     }
 
-    /// Get total entries.
+    /// Get the oldest retained height.
+    pub fn oldest_height(&self) -> Option<Height> {
+        self.entries.keys().next().copied()
+    }
+
+    /// Total entries.
+    #[inline]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Check if empty.
+    /// Whether the log is empty.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// Get current log coherence.
+    /// Current log coherence.
+    #[inline]
     pub fn coherence(&self) -> f64 {
         self.coherence
+    }
+
+    /// Configured capacity.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.max_entries
     }
 
     /// Export log as text (for `iona compare` tool).
     pub fn export_text(&self) -> String {
         let mut out = String::new();
         for entry in self.entries.values() {
-            out.push_str(&format!("{entry}\n"));
+            out.push_str(&entry.to_string());
+            out.push('\n');
         }
         out
     }
@@ -727,6 +841,7 @@ mod tests {
     use super::*;
 
     // ── Quantum Tracer Tests ────────────────────────────────────────────
+
     #[test]
     fn test_tracer_basic_flow() {
         let mut tracer = ConsensusTracer::new(true, 1000);
@@ -738,17 +853,11 @@ mod tests {
         tracer.trace_prevote(100, 0, "val3", Some(Hash32([0xAB; 32])));
         tracer.trace_precommit(100, 0, "val2", Some(Hash32([0xAB; 32])));
         tracer.trace_precommit(100, 0, "val3", Some(Hash32([0xAB; 32])));
-        tracer.trace_commit(
-            100,
-            0,
-            Hash32([0xAB; 32]),
-            Hash32([0xCD; 32]),
-            5,
-            21000,
-        );
+        tracer.trace_commit(100, 0, Hash32([0xAB; 32]), Hash32([0xCD; 32]), 5, 21000);
 
         assert_eq!(tracer.events().len(), 8);
-        assert!(tracer.coherence() < 1.0); // decoherence from recordings
+        assert!(tracer.coherence() < 1.0);
+        assert!(tracer.coherence() > 0.0);
     }
 
     #[test]
@@ -765,17 +874,41 @@ mod tests {
         tracer.trace_new_height(1);
         tracer.trace_new_height(2);
         tracer.trace_new_height(3);
-        tracer.trace_new_height(4); // Should evict height=1.
+        tracer.trace_new_height(4); // Evicts height=1.
 
         assert_eq!(tracer.events().len(), 3);
         assert_eq!(tracer.total_evicted(), 1);
-        assert_eq!(
+        // Oldest retained is height=2.
+        assert!(matches!(
             tracer.events()[0],
-            ConsensusEvent::NewHeight {
-                height: 2,
-                purity: tracer.events()[0].purity()
-            }
-        );
+            ConsensusEvent::NewHeight { height: 2, .. }
+        ));
+        // Newest is height=4.
+        assert!(matches!(
+            tracer.events()[2],
+            ConsensusEvent::NewHeight { height: 4, .. }
+        ));
+    }
+
+    #[test]
+    fn test_tracer_zero_capacity_does_not_panic() {
+        // Regression: max_events = 0 previously caused `remove(0)` on an empty
+        // Vec inside `record()`, panicking. Now clamped to MIN_MAX_EVENTS.
+        let mut tracer = ConsensusTracer::new(true, 0);
+        assert_eq!(tracer.capacity(), MIN_MAX_EVENTS);
+        tracer.trace_new_height(1);
+        tracer.trace_new_height(2);
+        assert_eq!(tracer.events().len(), 1);
+        assert!(matches!(
+            tracer.events()[0],
+            ConsensusEvent::NewHeight { height: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn test_tracer_capacity_hard_cap() {
+        let tracer = ConsensusTracer::new(true, HARD_MAX_EVENTS + 1);
+        assert_eq!(tracer.capacity(), HARD_MAX_EVENTS);
     }
 
     #[test]
@@ -785,10 +918,10 @@ mod tests {
         tracer.trace_proposal(100, 0, "val2", Hash32([0; 32]), 0);
         tracer.trace_new_height(101);
 
-        let at_100 = tracer.events_at_height(100);
+        let at_100: Vec<_> = tracer.events_at_height(100).collect();
         assert_eq!(at_100.len(), 2);
 
-        let at_101 = tracer.events_at_height(101);
+        let at_101: Vec<_> = tracer.events_at_height(101).collect();
         assert_eq!(at_101.len(), 1);
     }
 
@@ -828,6 +961,23 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_empty_range() {
+        let tracer = ConsensusTracer::new(true, 10);
+        let stats = tracer.stats(100, 200);
+        assert_eq!(stats.total_events, 0);
+        assert_eq!(stats.avg_coherence, 1.0);
+    }
+
+    #[test]
+    fn test_stats_inverted_range() {
+        // from > to must not panic and must yield an empty result.
+        let mut tracer = ConsensusTracer::new(true, 10);
+        tracer.trace_new_height(5);
+        let stats = tracer.stats(10, 1);
+        assert_eq!(stats.total_events, 0);
+    }
+
+    #[test]
     fn test_consensus_stats_display() {
         let stats = QuantumConsensusStats {
             from: 1,
@@ -850,10 +1000,7 @@ mod tests {
     #[test]
     fn test_event_display_quantum() {
         let events = vec![
-            ConsensusEvent::NewHeight {
-                height: 42,
-                purity: 0.99,
-            },
+            ConsensusEvent::NewHeight { height: 42, purity: 0.99 },
             ConsensusEvent::Proposal {
                 height: 42,
                 round: 0,
@@ -898,7 +1045,6 @@ mod tests {
             assert!(s.starts_with("[CONSENSUS]"), "event display: {s}");
         }
 
-        // Check specific quantum fields in display
         let new_height_str = format!("{}", events[0]);
         assert!(new_height_str.contains("γ=0.99"));
 
@@ -914,6 +1060,17 @@ mod tests {
         tracer.clear();
         assert!(tracer.events().is_empty());
         assert!((tracer.coherence() - 1.0).abs() < 1e-10);
+        // Runtime counters survive clear().
+        assert_eq!(tracer.total_recorded(), 1);
+    }
+
+    #[test]
+    fn test_tracer_reset_counters() {
+        let mut tracer = ConsensusTracer::new(true, 100);
+        tracer.trace_new_height(1);
+        tracer.reset_counters();
+        assert_eq!(tracer.total_recorded(), 0);
+        assert_eq!(tracer.total_evicted(), 0);
     }
 
     #[test]
@@ -924,15 +1081,29 @@ mod tests {
 
         assert_eq!(tracer.events().len(), 2);
         match &tracer.events()[0] {
-            ConsensusEvent::Timeout {
-                decoherence_strength,
-                ..
-            } => assert!(*decoherence_strength >= 0.0),
+            ConsensusEvent::Timeout { decoherence_strength, .. } => {
+                assert!(*decoherence_strength >= 0.0);
+            }
             _ => panic!("expected Timeout"),
         }
     }
 
+    #[test]
+    fn test_round_skip_inverted_does_not_panic() {
+        // Regression: `to - from` underflowed when to < from, panicking in debug.
+        let mut tracer = ConsensusTracer::new(true, 10);
+        tracer.trace_round_skip(1, 5, 2, "reorg");
+        match &tracer.events()[0] {
+            ConsensusEvent::RoundSkip { jump_probability, .. } => {
+                assert!(*jump_probability > 0.0);
+                assert!(*jump_probability <= 1.0);
+            }
+            _ => panic!("expected RoundSkip"),
+        }
+    }
+
     // ── State Root Log Tests ────────────────────────────────────────────
+
     #[test]
     fn test_state_root_log() {
         let mut log = StateRootLog::new(true);
@@ -943,6 +1114,7 @@ mod tests {
 
         assert_eq!(log.len(), 3);
         assert_eq!(log.latest_height(), Some(3));
+        assert_eq!(log.oldest_height(), Some(1));
 
         let entry = log.get(2).unwrap();
         assert_eq!(entry.height, 2);
@@ -955,6 +1127,27 @@ mod tests {
         let mut log = StateRootLog::new(false);
         log.log(1, Hash32([0x01; 32]), 1000);
         assert!(log.is_empty());
+    }
+
+    #[test]
+    fn test_state_root_log_bounded() {
+        let mut log = StateRootLog::with_capacity(true, 3);
+        for h in 1..=10u64 {
+            log.log(h, Hash32([h as u8; 32]), h * 1000);
+        }
+        assert_eq!(log.len(), 3);
+        assert_eq!(log.oldest_height(), Some(8));
+        assert_eq!(log.latest_height(), Some(10));
+    }
+
+    #[test]
+    fn test_state_root_log_overwrite_does_not_grow() {
+        let mut log = StateRootLog::with_capacity(true, 2);
+        log.log(1, Hash32([0x01; 32]), 1000);
+        log.log(1, Hash32([0xAA; 32]), 2000); // Overwrite.
+        log.log(2, Hash32([0x02; 32]), 3000);
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.get(1).unwrap().state_root, Hash32([0xAA; 32]));
     }
 
     #[test]
@@ -977,14 +1170,12 @@ mod tests {
         log.log(1, Hash32([0x01; 32]), 1000);
         log.log(2, Hash32([0x02; 32]), 2000);
         assert!(log.coherence() < initial);
+        assert!(log.coherence() > 0.0);
     }
 
     #[test]
     fn test_event_purity_method() {
-        let event = ConsensusEvent::NewHeight {
-            height: 1,
-            purity: 0.95,
-        };
+        let event = ConsensusEvent::NewHeight { height: 1, purity: 0.95 };
         assert!((event.purity() - 0.95).abs() < 1e-10);
 
         let event = ConsensusEvent::Timeout {
@@ -994,6 +1185,19 @@ mod tests {
             decoherence_strength: 0.03,
         };
         assert!((event.purity() - 0.97).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_purity_clamped() {
+        // Out-of-range f64 values are clamped to [0, 1].
+        let event = ConsensusEvent::NewHeight { height: 1, purity: 1.5 };
+        assert_eq!(event.purity(), 1.0);
+
+        let event = ConsensusEvent::NewHeight { height: 1, purity: -0.3 };
+        assert_eq!(event.purity(), 0.0);
+
+        let event = ConsensusEvent::NewHeight { height: 1, purity: f64::NAN };
+        assert_eq!(event.purity(), 0.0);
     }
 
     #[test]
