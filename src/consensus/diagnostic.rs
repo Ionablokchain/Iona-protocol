@@ -7,28 +7,41 @@
 //! - Multi‑reason stall detection (proposal, votes, connectivity, rounds).
 //! - Quorum‑aware diagnostics using `QuorumCalculator` with stake‑weighted power.
 //! - Human‑readable summaries for logging and monitoring.
-//! - Configurable diagnostic parameters.
+//! - Configurable diagnostic parameters with validated ranges.
 //! - Statistics tracking for operational insights.
-//! - Rate‑limited diagnostics to avoid log spam.
-//! - Optional Prometheus metrics integration.
+//! - Rate‑limited diagnostics with a **bounded** rate‑limiter map (no leak).
+//! - Structured `tracing` at debug level for the diagnostic path.
 //!
 //! # Example output
 //! ```text
 //! NO_COMMIT height=42 round=0: waiting_proposal(from=val1, 150/300ms),
 //!   low_connectivity(connected=2/4 need=3)
 //! ```
+//!
+//! # Concurrency
+//!
+//! [`DiagnosticCollector`] is `Clone` and safe to share across threads: all
+//! internal state is behind [`parking_lot::Mutex`], which does not poison on
+//! panic. The standalone [`diagnose_with_stake`] function is pure and
+//! allocation‑bounded.
+//!
+//! # Rate limiting and memory
+//!
+//! The collector keeps a bounded rate‑limiter map (capacity
+//! [`MAX_RATE_LIMIT_ENTRIES`]) so a long‑running node with monotonic heights
+//! cannot leak memory. Oldest `(height, round)` entries are evicted on insert.
 
 use crate::consensus::engine::{ConsensusState, Step};
-use crate::consensus::quorum_diag::{QuorumCalculator, QuorumDiagnostic};
+use crate::consensus::quorum_diag::QuorumCalculator;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::crypto::PublicKeyBytes;
 use crate::slashing::StakeLedger;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::debug;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -43,18 +56,28 @@ const DEFAULT_MAX_REASONS: usize = 5;
 /// Default maximum rounds before flagging round advancement.
 const DEFAULT_MAX_ROUNDS: u32 = 10;
 
-/// Default minimum interval between diagnostics for the same height/round (milliseconds).
+/// Default minimum interval between diagnostics for the same height/round (ms).
 const DEFAULT_MIN_DIAG_INTERVAL_MS: u64 = 5000;
 
 /// Default maximum number of historical diagnostics to keep.
 const DEFAULT_MAX_HISTORY: usize = 100;
+
+/// Hard cap for `max_history` (memory guard).
+const MAX_ALLOWED_HISTORY: usize = 100_000;
+
+/// Hard cap for `max_reasons` (sanity guard).
+const MAX_ALLOWED_REASONS: usize = 64;
+
+/// Bound on the rate‑limiter map size. Prevents unbounded growth on a node
+/// that advances many heights/rounds.
+const MAX_RATE_LIMIT_ENTRIES: usize = 4096;
 
 // -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------
 
 /// Configuration for the diagnostic module.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiagnosticConfig {
     /// Maximum number of stall reasons to include in the summary.
     pub max_reasons: usize,
@@ -68,7 +91,10 @@ pub struct DiagnosticConfig {
     pub min_diag_interval_ms: u64,
     /// Maximum number of historical diagnostics to keep in memory.
     pub max_history: usize,
-    /// Whether to emit Prometheus metrics (if feature enabled).
+    /// Whether the caller should emit Prometheus metrics.
+    ///
+    /// This module does **not** emit metrics itself; it is a signal flag for
+    /// the outer metrics layer. Kept in the config for forward compatibility.
     pub enable_metrics: bool,
 }
 
@@ -88,15 +114,34 @@ impl Default for DiagnosticConfig {
 
 impl DiagnosticConfig {
     /// Validate the configuration.
+    ///
+    /// Returns `Err(String)` with a human‑readable reason. Callers should
+    /// surface this to operators (e.g. via `anyhow`/`thiserror`) rather than
+    /// panicking.
     pub fn validate(&self) -> Result<(), String> {
         if self.max_reasons == 0 {
             return Err("max_reasons must be > 0".into());
+        }
+        if self.max_reasons > MAX_ALLOWED_REASONS {
+            return Err(format!(
+                "max_reasons must be <= {} (got {})",
+                MAX_ALLOWED_REASONS, self.max_reasons
+            ));
         }
         if self.max_rounds == 0 {
             return Err("max_rounds must be > 0".into());
         }
         if self.min_diag_interval_ms == 0 {
             return Err("min_diag_interval_ms must be > 0".into());
+        }
+        if self.max_history == 0 {
+            return Err("max_history must be > 0".into());
+        }
+        if self.max_history > MAX_ALLOWED_HISTORY {
+            return Err(format!(
+                "max_history must be <= {} (got {})",
+                MAX_ALLOWED_HISTORY, self.max_history
+            ));
         }
         Ok(())
     }
@@ -107,7 +152,7 @@ impl DiagnosticConfig {
 // -----------------------------------------------------------------------------
 
 /// Statistics collected during diagnostic operations.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DiagnosticStats {
     /// Total number of diagnostic runs.
     pub total_diagnostics: u64,
@@ -123,20 +168,27 @@ pub struct DiagnosticStats {
 
 impl DiagnosticStats {
     /// Record a diagnostic result.
-    pub fn record(&mut self, reasons: &[StallReason]) {
-        self.total_diagnostics += 1;
-        if reasons.is_empty() {
-            self.healthy_count += 1;
+    ///
+    /// The healthy/stalled classification uses
+    /// [`ConsensusDiagnostic::is_healthy`], **not** whether
+    /// [`ConsensusDiagnostic::stall_reasons`] is empty. This matters for
+    /// `AlreadyCommitted` (a non‑stalled event that still carries one reason
+    /// for observability).
+    pub fn record(&mut self, diag: &ConsensusDiagnostic) {
+        self.total_diagnostics = self.total_diagnostics.saturating_add(1);
+        if diag.is_healthy {
+            self.healthy_count = self.healthy_count.saturating_add(1);
         } else {
-            self.stalled_count += 1;
+            self.stalled_count = self.stalled_count.saturating_add(1);
             let n = self.stalled_count as f64;
-            self.avg_reasons_per_stall = (self.avg_reasons_per_stall * (n - 1.0)
-                + reasons.len() as f64)
-                / n;
-            for reason in reasons {
-                let key = reason_type_name(reason);
-                *self.reason_counts.entry(key).or_insert(0) += 1;
-            }
+            let reasons = diag.stall_reasons.len() as f64;
+            // Running mean, guarded against the (n == 0) branch.
+            self.avg_reasons_per_stall =
+                (self.avg_reasons_per_stall * (n - 1.0) + reasons) / n;
+        }
+        for reason in &diag.stall_reasons {
+            let key = reason_type_name(reason);
+            *self.reason_counts.entry(key).or_insert(0) += 1;
         }
     }
 
@@ -147,30 +199,36 @@ impl DiagnosticStats {
 }
 
 /// Return a stable string name for a stall reason variant.
-fn reason_type_name(reason: &StallReason) -> String {
+///
+/// The name is a stable identifier suitable for Prometheus labels and logs —
+/// do not reorder or rename without a migration.
+pub fn reason_type_name(reason: &StallReason) -> String {
     match reason {
-        StallReason::WaitingForProposal { .. } => "waiting_for_proposal".into(),
-        StallReason::MissingBlock { .. } => "missing_block".into(),
-        StallReason::InsufficientPrevotes { .. } => "insufficient_prevotes".into(),
-        StallReason::InsufficientPrecommits { .. } => "insufficient_precommits".into(),
-        StallReason::NoConnectedValidators { .. } => "no_connected_validators".into(),
+        StallReason::WaitingForProposal { .. } => "waiting_for_proposal",
+        StallReason::MissingBlock { .. } => "missing_block",
+        StallReason::InsufficientPrevotes { .. } => "insufficient_prevotes",
+        StallReason::InsufficientPrecommits { .. } => "insufficient_precommits",
+        StallReason::NoConnectedValidators { .. } => "no_connected_validators",
         StallReason::InsufficientConnectedValidators { .. } => {
-            "insufficient_connected_validators".into()
+            "insufficient_connected_validators"
         }
-        StallReason::AlreadyCommitted { .. } => "already_committed".into(),
-        StallReason::RoundAdvancing { .. } => "round_advancing".into(),
-        StallReason::NoProposalInRound { .. } => "no_proposal_in_round".into(),
-        StallReason::ProposerNotConnected { .. } => "proposer_not_connected".into(),
-        StallReason::ProposerMismatch { .. } => "proposer_mismatch".into(),
-        StallReason::ProposalBlockHashMismatch { .. } => "proposal_block_hash_mismatch".into(),
-        StallReason::InvalidProposalSignature { .. } => "invalid_proposal_signature".into(),
-        StallReason::QuorumNotReached { .. } => "quorum_not_reached".into(),
-        StallReason::NotProposer { .. } => "not_proposer".into(),
-        StallReason::AlreadyVoted { .. } => "already_voted".into(),
-        StallReason::TimedOut { .. } => "timed_out".into(),
-        StallReason::StaleMessage { .. } => "stale_message".into(),
-        StallReason::DuplicateVote { .. } => "duplicate_vote".into(),
+        StallReason::AlreadyCommitted { .. } => "already_committed",
+        StallReason::RoundAdvancing { .. } => "round_advancing",
+        StallReason::NoProposalInRound { .. } => "no_proposal_in_round",
+        StallReason::ProposerNotConnected { .. } => "proposer_not_connected",
+        StallReason::ProposerMismatch { .. } => "proposer_mismatch",
+        StallReason::ProposalBlockHashMismatch { .. } => {
+            "proposal_block_hash_mismatch"
+        }
+        StallReason::InvalidProposalSignature { .. } => "invalid_proposal_signature",
+        StallReason::QuorumNotReached { .. } => "quorum_not_reached",
+        StallReason::NotProposer { .. } => "not_proposer",
+        StallReason::AlreadyVoted { .. } => "already_voted",
+        StallReason::TimedOut { .. } => "timed_out",
+        StallReason::StaleMessage { .. } => "stale_message",
+        StallReason::DuplicateVote { .. } => "duplicate_vote",
     }
+    .into()
 }
 
 // -----------------------------------------------------------------------------
@@ -188,82 +246,54 @@ pub enum StallReason {
         timeout_ms: u64,
     },
     /// Proposal received but block not yet available.
-    MissingBlock {
-        block_id: String,
-    },
+    MissingBlock { block_id: String },
     /// Not enough prevotes to proceed.
     InsufficientPrevotes {
         have: u64,
         need: u64,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
         voted: Vec<String>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
         missing: Vec<String>,
     },
     /// Not enough precommits to commit.
     InsufficientPrecommits {
         have: u64,
         need: u64,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
         voted: Vec<String>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
         missing: Vec<String>,
     },
     /// No connected validators (P2P issue).
-    NoConnectedValidators {
-        total_validators: usize,
-    },
+    NoConnectedValidators { total_validators: usize },
     /// Too few connected validators for quorum.
     InsufficientConnectedValidators {
         connected: usize,
         total: usize,
         needed: usize,
     },
-    /// Already committed at this height.
-    AlreadyCommitted {
-        height: u64,
-    },
+    /// Already committed at this height. Not a stall — carried for
+    /// observability. `ConsensusDiagnostic::is_healthy` will be `true`.
+    AlreadyCommitted { height: u64 },
     /// Round is advancing (timeout‑driven).
-    RoundAdvancing {
-        current_round: u32,
-        max_rounds: u32,
-    },
+    RoundAdvancing { current_round: u32, max_rounds: u32 },
     /// No proposal for this round (missing block or message).
-    NoProposalInRound {
-        round: u32,
-    },
+    NoProposalInRound { round: u32 },
     /// Designated proposer is not connected.
-    ProposerNotConnected {
-        proposer: String,
-    },
+    ProposerNotConnected { proposer: String },
     /// The received proposal has a different proposer than expected.
-    ProposerMismatch {
-        expected: String,
-        actual: String,
-    },
+    ProposerMismatch { expected: String, actual: String },
     /// The block hash in the proposal does not match the block.
-    ProposalBlockHashMismatch {
-        expected: String,
-        actual: String,
-    },
+    ProposalBlockHashMismatch { expected: String, actual: String },
     /// Invalid signature on the proposal.
-    InvalidProposalSignature {
-        proposer: String,
-        reason: String,
-    },
+    InvalidProposalSignature { proposer: String, reason: String },
     /// General quorum not reached (aggregate power).
-    QuorumNotReached {
-        have: u64,
-        need: u64,
-    },
+    QuorumNotReached { have: u64, need: u64 },
     /// This node is not the proposer for the round.
-    NotProposer {
-        proposer: String,
-    },
+    NotProposer { proposer: String },
     /// Already voted in this round (duplicate attempt).
-    AlreadyVoted {
-        vote_type: String,
-    },
+    AlreadyVoted { vote_type: String },
     /// Step timeout reached.
     TimedOut {
         step: String,
@@ -271,14 +301,9 @@ pub enum StallReason {
         timeout_ms: u64,
     },
     /// Stale message (height/round mismatch).
-    StaleMessage {
-        reason: String,
-    },
+    StaleMessage { reason: String },
     /// Duplicate vote from the same validator.
-    DuplicateVote {
-        validator: String,
-        vote_type: String,
-    },
+    DuplicateVote { validator: String, vote_type: String },
 }
 
 // -----------------------------------------------------------------------------
@@ -286,7 +311,7 @@ pub enum StallReason {
 // -----------------------------------------------------------------------------
 
 /// Full diagnostic snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConsensusDiagnostic {
     pub height: u64,
     pub round: u32,
@@ -294,9 +319,12 @@ pub struct ConsensusDiagnostic {
     pub stall_reasons: Vec<StallReason>,
     /// One‑line summary for quick logging.
     pub summary: String,
-    /// Whether consensus is healthy (no stall reasons).
+    /// Whether consensus is healthy (no stall reasons *that indicate a stall*).
+    ///
+    /// Note: [`StallReason::AlreadyCommitted`] does not make `is_healthy`
+    /// `false` — a committed height is a successful outcome.
     pub is_healthy: bool,
-    /// Timestamp of the diagnostic.
+    /// Wall‑clock timestamp (ms since UNIX epoch).
     pub timestamp: u64,
     /// Elapsed time since entering the current step (ms).
     pub step_elapsed_ms: u64,
@@ -315,18 +343,36 @@ fn short_pk(pk: &PublicKeyBytes) -> String {
     hex::encode(&pk.0[..len])
 }
 
+/// Format a short string, char‑boundary safe.
+///
+/// Uses `chars()` so a non‑ASCII string (defensive — public keys are hex)
+/// cannot trigger a byte‑slice panic.
+fn short_pk_str(s: &str) -> String {
+    let max = HEX_SHORT_LEN * 2;
+    let mut out = String::with_capacity(max);
+    for (i, c) in s.chars().enumerate() {
+        if i >= max {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Current wall‑clock time in milliseconds since the UNIX epoch.
+#[inline]
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Generate a short summary string for a stall reason.
 fn stall_reason_summary(reason: &StallReason) -> String {
     match reason {
-        StallReason::WaitingForProposal {
-            proposer,
-            elapsed_ms,
-            timeout_ms,
-        } => {
-            format!(
-                "waiting_proposal(from={}, {}/{}ms)",
-                proposer, elapsed_ms, timeout_ms
-            )
+        StallReason::WaitingForProposal { proposer, elapsed_ms, timeout_ms } => {
+            format!("waiting_proposal(from={}, {}/{}ms)", proposer, elapsed_ms, timeout_ms)
         }
         StallReason::MissingBlock { block_id } => {
             format!("missing_block(id={})", block_id)
@@ -340,23 +386,13 @@ fn stall_reason_summary(reason: &StallReason) -> String {
         StallReason::NoConnectedValidators { total_validators } => {
             format!("no_connected_validators(total={})", total_validators)
         }
-        StallReason::InsufficientConnectedValidators {
-            connected,
-            total,
-            needed,
-        } => {
-            format!(
-                "low_connectivity(connected={}/{} need={})",
-                connected, total, needed
-            )
+        StallReason::InsufficientConnectedValidators { connected, total, needed } => {
+            format!("low_connectivity(connected={}/{} need={})", connected, total, needed)
         }
         StallReason::AlreadyCommitted { height } => {
             format!("committed(height={})", height)
         }
-        StallReason::RoundAdvancing {
-            current_round,
-            max_rounds,
-        } => {
+        StallReason::RoundAdvancing { current_round, max_rounds } => {
             format!("round_advancing({}/{})", current_round, max_rounds)
         }
         StallReason::NoProposalInRound { round } => {
@@ -400,24 +436,34 @@ fn stall_reason_summary(reason: &StallReason) -> String {
 // -----------------------------------------------------------------------------
 
 /// A collector that provides rate‑limited diagnostics and history.
+///
+/// # Cloning
+///
+/// Cloning shares the underlying state via `Arc<Mutex<...>>` — clones observe
+/// each other's writes. This is intentional: a collector can be passed to a
+/// background task while the main loop keeps its handle.
 #[derive(Clone)]
 pub struct DiagnosticCollector {
     config: DiagnosticConfig,
-    stats: Arc<std::sync::Mutex<DiagnosticStats>>,
-    history: Arc<std::sync::Mutex<VecDeque<ConsensusDiagnostic>>>,
-    last_diag_time: Arc<std::sync::Mutex<HashMap<(u64, u32), Instant>>>,
+    stats: Arc<Mutex<DiagnosticStats>>,
+    history: Arc<Mutex<VecDeque<ConsensusDiagnostic>>>,
+    /// Bounded rate‑limiter map. `BTreeMap` gives O(log n) `pop_first` for
+    /// oldest‑key eviction. Keys are `(height, round)`.
+    last_diag_time: Arc<Mutex<BTreeMap<(u64, u32), Instant>>>,
 }
 
 impl DiagnosticCollector {
     /// Create a new diagnostic collector with the given configuration.
-    pub fn new(config: DiagnosticConfig) -> Self {
-        config.validate().expect("invalid diagnostic config");
-        Self {
+    ///
+    /// Returns `Err(String)` if `config` is invalid — no panic.
+    pub fn new(config: DiagnosticConfig) -> Result<Self, String> {
+        config.validate()?;
+        Ok(Self {
             config,
-            stats: Arc::new(std::sync::Mutex::new(DiagnosticStats::default())),
-            history: Arc::new(std::sync::Mutex::new(VecDeque::new())),
-            last_diag_time: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        }
+            stats: Arc::new(Mutex::new(DiagnosticStats::default())),
+            history: Arc::new(Mutex::new(VecDeque::new())),
+            last_diag_time: Arc::new(Mutex::new(BTreeMap::new())),
+        })
     }
 
     /// Run a diagnostic, respecting the rate limit.
@@ -435,16 +481,26 @@ impl DiagnosticCollector {
         let key = (state.height, state.round);
         let now = Instant::now();
 
-        // Check rate limit
+        // ── Rate limit ────────────────────────────────────────────────────
         {
-            let mut last_times = self.last_diag_time.lock().unwrap();
+            let mut last_times = self.last_diag_time.lock();
             if let Some(last) = last_times.get(&key) {
                 let interval = Duration::from_millis(self.config.min_diag_interval_ms);
                 if now.duration_since(*last) < interval {
+                    debug!(
+                        height = state.height,
+                        round = state.round,
+                        "diagnostic rate-limited"
+                    );
                     return None;
                 }
             }
             last_times.insert(key, now);
+
+            // Bound the map: evict oldest keys once we exceed the cap.
+            while last_times.len() > MAX_RATE_LIMIT_ENTRIES {
+                last_times.pop_first();
+            }
         }
 
         let diag = diagnose_with_stake(
@@ -457,16 +513,15 @@ impl DiagnosticCollector {
             &self.config,
         );
 
-        // Update statistics
+        // ── Statistics ────────────────────────────────────────────────────
         if self.config.enable_statistics {
-            if let Ok(mut stats) = self.stats.lock() {
-                stats.record(&diag.stall_reasons);
-            }
+            self.stats.lock().record(&diag);
         }
 
-        // Update history
-        if let Ok(mut history) = self.history.lock() {
-            if history.len() >= self.config.max_history {
+        // ── History ───────────────────────────────────────────────────────
+        {
+            let mut history = self.history.lock();
+            while history.len() >= self.config.max_history {
                 history.pop_front();
             }
             history.push_back(diag.clone());
@@ -477,22 +532,33 @@ impl DiagnosticCollector {
 
     /// Get the current statistics.
     pub fn stats(&self) -> DiagnosticStats {
-        self.stats.lock().unwrap().clone()
+        self.stats.lock().clone()
     }
 
     /// Get the diagnostic history.
     pub fn history(&self) -> Vec<ConsensusDiagnostic> {
-        self.history.lock().unwrap().iter().cloned().collect()
+        self.history.lock().iter().cloned().collect()
     }
 
     /// Reset statistics.
     pub fn reset_stats(&self) {
-        self.stats.lock().unwrap().reset();
+        self.stats.lock().reset();
     }
 
     /// Clear history.
     pub fn clear_history(&self) {
-        self.history.lock().unwrap().clear();
+        self.history.lock().clear();
+    }
+
+    /// Clear the rate‑limiter map. After this, the next `diagnose` for any
+    /// `(height, round)` will succeed regardless of the interval.
+    pub fn clear_rate_limits(&self) {
+        self.last_diag_time.lock().clear();
+    }
+
+    /// Access the validated configuration.
+    pub fn config(&self) -> &DiagnosticConfig {
+        &self.config
     }
 }
 
@@ -502,6 +568,10 @@ impl DiagnosticCollector {
 
 /// Analyze the current consensus state and return diagnostics.
 /// Uses `StakeLedger` for stake‑weighted quorum calculations.
+///
+/// This function is pure and allocation‑bounded: it allocates the returned
+/// diagnostic (with `max_reasons` reasons), the quorum calculator, and a
+/// `HashSet<&PublicKeyBytes>` for connectivity lookups.
 #[must_use]
 pub fn diagnose_with_stake(
     state: &ConsensusState,
@@ -512,30 +582,31 @@ pub fn diagnose_with_stake(
     propose_timeout_ms: u64,
     config: &DiagnosticConfig,
 ) -> ConsensusDiagnostic {
-    let mut reasons = Vec::new();
-    let quorum_calc = QuorumCalculator::new_with_stake(vset, stake_ledger);
+    let timestamp = now_ms();
+    let step_str = format!("{:?}", state.step);
 
-    // ── Check if already committed ──────────────────────────────────────
+    // ── Already committed ───────────────────────────────────────────────
+    //
+    // Not a stall — return early with `is_healthy = true`. The
+    // `AlreadyCommitted` reason is carried for observability but does not
+    // flip `is_healthy`, which drives the healthy/stalled classification
+    // in `DiagnosticStats::record`.
     if state.decided.is_some() {
-        let diag = ConsensusDiagnostic {
+        return ConsensusDiagnostic {
             height: state.height,
             round: state.round,
-            step: format!("{:?}", state.step),
-            stall_reasons: vec![StallReason::AlreadyCommitted {
-                height: state.height,
-            }],
+            step: step_str,
+            stall_reasons: vec![StallReason::AlreadyCommitted { height: state.height }],
             summary: format!("COMMITTED height={}", state.height),
             is_healthy: true,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            timestamp,
             step_elapsed_ms,
         };
-        return diag;
     }
 
-    // ── Check round advancement ─────────────────────────────────────────
+    let mut reasons: Vec<StallReason> = Vec::with_capacity(config.max_reasons);
+
+    // ── Round advancement ───────────────────────────────────────────────
     if state.round >= config.max_rounds {
         reasons.push(StallReason::RoundAdvancing {
             current_round: state.round,
@@ -543,7 +614,8 @@ pub fn diagnose_with_stake(
         });
     }
 
-    // ── Check P2P connectivity to validators ────────────────────────────
+    // ── P2P connectivity ────────────────────────────────────────────────
+    let quorum_calc = QuorumCalculator::new_with_stake(vset, stake_ledger);
     let connected_set: HashSet<&PublicKeyBytes> = connected_validators.iter().collect();
     let (connected_power, total_power) = quorum_calc.power_stats(&connected_set);
 
@@ -567,7 +639,6 @@ pub fn diagnose_with_stake(
         Step::Propose => {
             if state.proposal.is_none() {
                 let proposer = vset.proposer_for(state.height, state.round);
-                // Check if proposer is connected
                 if !connected_set.contains(&proposer.pk) {
                     reasons.push(StallReason::ProposerNotConnected {
                         proposer: short_pk(&proposer.pk),
@@ -586,7 +657,6 @@ pub fn diagnose_with_stake(
                     .unwrap_or_else(|| "??".into());
                 reasons.push(StallReason::MissingBlock { block_id });
             }
-            // If proposal exists but block is available, no stall reason here.
         }
         Step::Prevote => {
             let voters: Vec<PublicKeyBytes> = state
@@ -597,15 +667,13 @@ pub fn diagnose_with_stake(
                 .unwrap_or_default();
             let diag = quorum_calc.check(&voters);
             if !diag.has_quorum {
-                let voted = if config.include_validator_details {
-                    diag.voted.iter().map(|s| short_pk_str(s)).collect()
+                let (voted, missing) = if config.include_validator_details {
+                    (
+                        diag.voted.iter().map(|s| short_pk_str(s)).collect(),
+                        diag.missing.iter().map(|s| short_pk_str(s)).collect(),
+                    )
                 } else {
-                    vec![]
-                };
-                let missing = if config.include_validator_details {
-                    diag.missing.iter().map(|s| short_pk_str(s)).collect()
-                } else {
-                    vec![]
+                    (Vec::new(), Vec::new())
                 };
                 reasons.push(StallReason::InsufficientPrevotes {
                     have: diag.current_power,
@@ -614,8 +682,6 @@ pub fn diagnose_with_stake(
                     missing,
                 });
             }
-            // Also check if we already voted
-            // This would need access to local voting status; for now skip.
         }
         Step::Precommit => {
             let voters: Vec<PublicKeyBytes> = state
@@ -626,15 +692,13 @@ pub fn diagnose_with_stake(
                 .unwrap_or_default();
             let diag = quorum_calc.check(&voters);
             if !diag.has_quorum {
-                let voted = if config.include_validator_details {
-                    diag.voted.iter().map(|s| short_pk_str(s)).collect()
+                let (voted, missing) = if config.include_validator_details {
+                    (
+                        diag.voted.iter().map(|s| short_pk_str(s)).collect(),
+                        diag.missing.iter().map(|s| short_pk_str(s)).collect(),
+                    )
                 } else {
-                    vec![]
-                };
-                let missing = if config.include_validator_details {
-                    diag.missing.iter().map(|s| short_pk_str(s)).collect()
-                } else {
-                    vec![]
+                    (Vec::new(), Vec::new())
                 };
                 reasons.push(StallReason::InsufficientPrecommits {
                     have: diag.current_power,
@@ -645,11 +709,11 @@ pub fn diagnose_with_stake(
             }
         }
         Step::Commit => {
-            // Already handled by decided check above.
+            // Not reached: `state.decided` short‑circuits above.
         }
     }
 
-    // ── Truncate reasons if too many ────────────────────────────────────
+    // ── Truncate reasons ────────────────────────────────────────────────
     if reasons.len() > config.max_reasons {
         reasons.truncate(config.max_reasons);
     }
@@ -657,30 +721,22 @@ pub fn diagnose_with_stake(
     // ── Build summary ───────────────────────────────────────────────────
     let is_healthy = reasons.is_empty();
     let summary = if is_healthy {
-        format!(
-            "OK height={} round={} step={:?}",
-            state.height, state.round, state.step
-        )
+        format!("OK height={} round={} step={}", state.height, state.round, step_str)
     } else {
         let reason_strs: Vec<String> = reasons.iter().map(stall_reason_summary).collect();
         format!(
-            "NO_COMMIT height={} round={} step={:?}: {}",
+            "NO_COMMIT height={} round={} step={}: {}",
             state.height,
             state.round,
-            state.step,
+            step_str,
             reason_strs.join(", ")
         )
     };
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
     ConsensusDiagnostic {
         height: state.height,
         round: state.round,
-        step: format!("{:?}", state.step),
+        step: step_str,
         stall_reasons: reasons,
         summary,
         is_healthy,
@@ -689,21 +745,16 @@ pub fn diagnose_with_stake(
     }
 }
 
-/// Shorter version of `short_pk` that returns a String directly.
-fn short_pk_str(pk: &str) -> String {
-    if pk.len() <= HEX_SHORT_LEN * 2 {
-        pk.to_string()
-    } else {
-        pk[..HEX_SHORT_LEN * 2].to_string()
-    }
-}
-
 // -----------------------------------------------------------------------------
 // Legacy diagnose function (for backward compatibility)
 // -----------------------------------------------------------------------------
 
 /// Analyze the current consensus state and return diagnostics.
-/// (Legacy version; prefer `diagnose_with_stake` or `DiagnosticCollector`.)
+///
+/// (Legacy; prefer [`diagnose_with_stake`] or [`DiagnosticCollector`].)
+///
+/// Uses a synthetic equal‑weight stake ledger derived from `vset.vals`.
+/// If `stats` is provided, the diagnostic is recorded against it.
 #[must_use]
 pub fn diagnose(
     state: &ConsensusState,
@@ -714,7 +765,6 @@ pub fn diagnose(
     config: &DiagnosticConfig,
     stats: Option<&mut DiagnosticStats>,
 ) -> ConsensusDiagnostic {
-    // Use a dummy stake ledger where all validators have equal power.
     let mut ledger = StakeLedger::default();
     for v in &vset.vals {
         ledger.set_power(&v.pk, 1);
@@ -729,7 +779,7 @@ pub fn diagnose(
         config,
     );
     if let Some(s) = stats {
-        s.record(&diag.stall_reasons);
+        s.record(&diag);
     }
     diag
 }
@@ -744,21 +794,19 @@ mod tests {
     use crate::consensus::validator_set::{Validator, ValidatorSet};
     use crate::crypto::ed25519::Ed25519Keypair;
     use crate::crypto::Signer;
+    use std::thread;
 
     const TEST_PROPOSE_TIMEOUT_MS: u64 = 300;
 
     fn make_vset_and_pks(n: usize) -> (ValidatorSet, Vec<PublicKeyBytes>) {
-        let mut vals = Vec::new();
-        let mut pks = Vec::new();
+        let mut vals = Vec::with_capacity(n);
+        let mut pks = Vec::with_capacity(n);
         for i in 0..n {
             let mut seed = [0u8; 32];
             seed[0] = (i + 1) as u8;
             let kp = Ed25519Keypair::from_seed(seed);
             let pk = kp.public_key();
-            vals.push(Validator {
-                pk: pk.clone(),
-                power: 1,
-            });
+            vals.push(Validator { pk: pk.clone(), power: 1 });
             pks.push(pk);
         }
         (ValidatorSet { vals }, pks)
@@ -776,7 +824,31 @@ mod tests {
         ledger
     }
 
+    fn make_prevote_state(pks: &[PublicKeyBytes]) -> ConsensusState {
+        let mut state = ConsensusState::new(1);
+        state.step = Step::Prevote;
+        let mut votes = HashMap::new();
+        for pk in pks {
+            votes.insert(
+                pk.clone(),
+                crate::consensus::messages::Vote {
+                    validator: pk.clone(),
+                    height: 1,
+                    round: 0,
+                    vote_type: crate::consensus::messages::VoteType::Prevote,
+                    block_hash: Some(crate::types::Hash32::zero()),
+                    signature: crate::crypto::SignatureBytes(vec![]),
+                },
+            );
+        }
+        let mut round_map = HashMap::new();
+        round_map.insert(crate::consensus::messages::VoteType::Prevote, votes);
+        state.votes.insert(0, round_map);
+        state
+    }
+
     // ── Basic scenario tests ────────────────────────────────────────────
+
     #[test]
     fn test_diagnose_committed() {
         let (vset, pks) = make_vset_and_pks(3);
@@ -788,7 +860,9 @@ mod tests {
             precommits: vec![],
         });
 
-        let diag = diagnose_with_stake(&state, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS, &default_config());
+        let diag = diagnose_with_stake(
+            &state, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS, &default_config(),
+        );
         assert!(diag.is_healthy);
         assert!(diag.summary.contains("COMMITTED"));
         assert_eq!(diag.stall_reasons.len(), 1);
@@ -804,7 +878,9 @@ mod tests {
         let ledger = make_stake_ledger(&vset);
         let state = ConsensusState::new(1);
 
-        let diag = diagnose_with_stake(&state, &vset, &ledger, &pks, 100, TEST_PROPOSE_TIMEOUT_MS, &default_config());
+        let diag = diagnose_with_stake(
+            &state, &vset, &ledger, &pks, 100, TEST_PROPOSE_TIMEOUT_MS, &default_config(),
+        );
         assert!(!diag.is_healthy);
         assert!(diag.summary.contains("waiting_proposal"));
     }
@@ -815,7 +891,9 @@ mod tests {
         let ledger = make_stake_ledger(&vset);
         let state = ConsensusState::new(1);
 
-        let diag = diagnose_with_stake(&state, &vset, &ledger, &[], 100, TEST_PROPOSE_TIMEOUT_MS, &default_config());
+        let diag = diagnose_with_stake(
+            &state, &vset, &ledger, &[], 100, TEST_PROPOSE_TIMEOUT_MS, &default_config(),
+        );
         assert!(!diag.is_healthy);
         assert!(
             diag.summary.contains("no_connected_validators")
@@ -829,147 +907,135 @@ mod tests {
         let ledger = make_stake_ledger(&vset);
         let state = ConsensusState::new(1);
 
-        // Only 1 of 4 connected — not enough for quorum of 3.
-        let diag = diagnose_with_stake(&state, &vset, &ledger, &pks[..1], 100, TEST_PROPOSE_TIMEOUT_MS, &default_config());
+        let diag = diagnose_with_stake(
+            &state, &vset, &ledger, &pks[..1], 100, TEST_PROPOSE_TIMEOUT_MS, &default_config(),
+        );
         assert!(!diag.is_healthy);
         assert!(diag.summary.contains("low_connectivity"));
-    }
-
-    #[test]
-    fn test_diagnose_ok_when_all_connected() {
-        let (vset, pks) = make_vset_and_pks(3);
-        let ledger = make_stake_ledger(&vset);
-        let state = ConsensusState::new(1);
-
-        let diag = diagnose_with_stake(&state, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS, &default_config());
-        // All connected, but no proposal yet → waiting_proposal (not "OK").
-        assert!(!diag.is_healthy);
-        assert!(diag.summary.contains("waiting_proposal"));
     }
 
     #[test]
     fn test_diagnose_healthy_when_quorum_met() {
         let (vset, pks) = make_vset_and_pks(3);
         let ledger = make_stake_ledger(&vset);
-        let mut state = ConsensusState::new(1);
-        state.step = Step::Prevote;
-        // Simulate all 3 validators having prevoted
-        let mut votes = std::collections::HashMap::new();
-        for pk in &pks {
-            votes.insert(pk.clone(), crate::consensus::messages::Vote {
-                validator: pk.clone(),
-                height: 1,
-                round: 0,
-                vote_type: crate::consensus::messages::VoteType::Prevote,
-                block_hash: Some(crate::types::Hash32::zero()),
-                signature: crate::crypto::SignatureBytes(vec![]),
-            });
-        }
-        let mut round_map = std::collections::HashMap::new();
-        round_map.insert(crate::consensus::messages::VoteType::Prevote, votes);
-        state.votes.insert(0, round_map);
+        let state = make_prevote_state(&pks);
 
-        let diag = diagnose_with_stake(&state, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS, &default_config());
+        let diag = diagnose_with_stake(
+            &state, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS, &default_config(),
+        );
         assert!(diag.is_healthy);
         assert!(diag.summary.contains("OK"));
     }
 
     // ── Configuration tests ─────────────────────────────────────────────
+
     #[test]
     fn test_config_validation() {
         assert!(DiagnosticConfig::default().validate().is_ok());
+        assert!(DiagnosticConfig { max_reasons: 0, ..Default::default() }.validate().is_err());
+        assert!(DiagnosticConfig { max_rounds: 0, ..Default::default() }.validate().is_err());
+        assert!(DiagnosticConfig { min_diag_interval_ms: 0, ..Default::default() }.validate().is_err());
+        assert!(DiagnosticConfig { max_history: 0, ..Default::default() }.validate().is_err());
         assert!(DiagnosticConfig {
-            max_reasons: 0,
+            max_reasons: MAX_ALLOWED_REASONS + 1,
             ..Default::default()
-        }
-        .validate()
-        .is_err());
+        }.validate().is_err());
         assert!(DiagnosticConfig {
-            max_rounds: 0,
+            max_history: MAX_ALLOWED_HISTORY + 1,
             ..Default::default()
-        }
-        .validate()
-        .is_err());
-        assert!(DiagnosticConfig {
-            min_diag_interval_ms: 0,
-            ..Default::default()
-        }
-        .validate()
-        .is_err());
+        }.validate().is_err());
+    }
+
+    #[test]
+    fn test_collector_new_rejects_invalid_config() {
+        let cfg = DiagnosticConfig { max_reasons: 0, ..Default::default() };
+        assert!(DiagnosticCollector::new(cfg).is_err());
     }
 
     // ── Statistics tests ────────────────────────────────────────────────
+
     #[test]
     fn test_statistics_tracking() {
         let (vset, pks) = make_vset_and_pks(3);
         let ledger = make_stake_ledger(&vset);
-        let state = ConsensusState::new(1);
         let mut stats = DiagnosticStats::default();
 
-        // Run healthy diagnostic
-        let mut healthy_state = state.clone();
-        healthy_state.step = Step::Prevote;
-        let mut votes = std::collections::HashMap::new();
-        for pk in &pks {
-            votes.insert(pk.clone(), crate::consensus::messages::Vote {
-                validator: pk.clone(),
-                height: 1,
-                round: 0,
-                vote_type: crate::consensus::messages::VoteType::Prevote,
-                block_hash: Some(crate::types::Hash32::zero()),
-                signature: crate::crypto::SignatureBytes(vec![]),
-            });
-        }
-        let mut round_map = std::collections::HashMap::new();
-        round_map.insert(crate::consensus::messages::VoteType::Prevote, votes);
-        healthy_state.votes.insert(0, round_map);
-
-        let diag = diagnose_with_stake(&healthy_state, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS, &default_config());
-        stats.record(&diag.stall_reasons);
+        // Healthy
+        let healthy_state = make_prevote_state(&pks);
+        let diag = diagnose_with_stake(
+            &healthy_state, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS, &default_config(),
+        );
+        stats.record(&diag);
         assert_eq!(stats.total_diagnostics, 1);
         assert_eq!(stats.healthy_count, 1);
         assert_eq!(stats.stalled_count, 0);
 
-        // Run stalled diagnostic
-        let diag = diagnose_with_stake(&state, &vset, &ledger, &[], 100, TEST_PROPOSE_TIMEOUT_MS, &default_config());
-        stats.record(&diag.stall_reasons);
+        // Stalled
+        let state = ConsensusState::new(1);
+        let diag = diagnose_with_stake(
+            &state, &vset, &ledger, &[], 100, TEST_PROPOSE_TIMEOUT_MS, &default_config(),
+        );
+        stats.record(&diag);
         assert_eq!(stats.total_diagnostics, 2);
         assert_eq!(stats.healthy_count, 1);
         assert_eq!(stats.stalled_count, 1);
         assert!(stats.reason_counts.values().sum::<u64>() > 0);
     }
 
-    // ── Round advancement test ──────────────────────────────────────────
+    #[test]
+    fn test_statistics_already_committed_not_counted_as_stall() {
+        // Regression: previously `record` classified by `reasons.is_empty()`,
+        // so a committed height (with one AlreadyCommitted reason) was
+        // wrongly counted as stalled.
+        let (vset, pks) = make_vset_and_pks(3);
+        let ledger = make_stake_ledger(&vset);
+        let mut state = ConsensusState::new(1);
+        state.decided = Some(crate::consensus::engine::CommitCertificate {
+            height: 1,
+            block_id: crate::types::Hash32::zero(),
+            precommits: vec![],
+        });
+        let diag = diagnose_with_stake(
+            &state, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS, &default_config(),
+        );
+        let mut stats = DiagnosticStats::default();
+        stats.record(&diag);
+        assert_eq!(stats.healthy_count, 1);
+        assert_eq!(stats.stalled_count, 0);
+    }
+
+    // ── Round advancement ───────────────────────────────────────────────
+
     #[test]
     fn test_diagnose_round_advancing() {
         let (vset, pks) = make_vset_and_pks(3);
         let ledger = make_stake_ledger(&vset);
         let mut state = ConsensusState::new(1);
-        state.round = 15; // exceeds default max_rounds of 10
+        state.round = 15;
 
-        let diag = diagnose_with_stake(&state, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS, &default_config());
+        let diag = diagnose_with_stake(
+            &state, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS, &default_config(),
+        );
         assert!(!diag.is_healthy);
         assert!(diag.summary.contains("round_advancing"));
     }
 
-    // ── Reason truncation test ──────────────────────────────────────────
     #[test]
     fn test_max_reasons_truncation() {
         let (vset, _pks) = make_vset_and_pks(1);
         let ledger = make_stake_ledger(&vset);
         let mut state = ConsensusState::new(1);
-        state.round = 20; // triggers round_advancing
-        // No connected validators → triggers connectivity issues
-        let config = DiagnosticConfig {
-            max_reasons: 1,
-            ..Default::default()
-        };
+        state.round = 20;
+        let config = DiagnosticConfig { max_reasons: 1, ..Default::default() };
 
-        let diag = diagnose_with_stake(&state, &vset, &ledger, &[], 100, TEST_PROPOSE_TIMEOUT_MS, &config);
+        let diag = diagnose_with_stake(
+            &state, &vset, &ledger, &[], 100, TEST_PROPOSE_TIMEOUT_MS, &config,
+        );
         assert_eq!(diag.stall_reasons.len(), 1);
     }
 
-    // ── DiagnosticCollector tests ────────────────────────────────────────
+    // ── DiagnosticCollector tests ───────────────────────────────────────
+
     #[test]
     fn test_diagnostic_collector_rate_limit() {
         let (vset, pks) = make_vset_and_pks(3);
@@ -979,15 +1045,20 @@ mod tests {
             min_diag_interval_ms: 1000,
             ..Default::default()
         };
-        let collector = DiagnosticCollector::new(config);
+        let collector = DiagnosticCollector::new(config).unwrap();
 
-        // First call should return Some
-        let diag = collector.diagnose(&state, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS);
-        assert!(diag.is_some());
+        assert!(collector
+            .diagnose(&state, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS)
+            .is_some());
+        assert!(collector
+            .diagnose(&state, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS)
+            .is_none());
 
-        // Second call immediately should return None (rate limited)
-        let diag2 = collector.diagnose(&state, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS);
-        assert!(diag2.is_none());
+        // Clearing rate limits allows the next call.
+        collector.clear_rate_limits();
+        assert!(collector
+            .diagnose(&state, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS)
+            .is_some());
     }
 
     #[test]
@@ -996,34 +1067,58 @@ mod tests {
         let ledger = make_stake_ledger(&vset);
         let state = ConsensusState::new(1);
         let config = DiagnosticConfig {
-            min_diag_interval_ms: 1, // Allow quick calls
+            min_diag_interval_ms: 1,
             max_history: 3,
             ..Default::default()
         };
-        let collector = DiagnosticCollector::new(config);
+        let collector = DiagnosticCollector::new(config).unwrap();
 
-        // Run multiple diagnostics with different heights
-        for h in 1..=5 {
+        for h in 1..=5u64 {
             let mut s = state.clone();
             s.height = h;
-            let diag = collector.diagnose(&s, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS);
-            assert!(diag.is_some());
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert!(collector
+                .diagnose(&s, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS)
+                .is_some());
+            // 20ms is enough to clear the 1ms rate limit even on loaded CI.
+            thread::sleep(Duration::from_millis(20));
         }
 
         let history = collector.history();
-        assert_eq!(history.len(), 3); // max_history = 3
+        assert_eq!(history.len(), 3);
         assert_eq!(history[0].height, 3);
         assert_eq!(history[2].height, 5);
     }
 
-    // ── Serialization test ──────────────────────────────────────────────
+    #[test]
+    fn test_diagnostic_collector_rate_limit_map_bounded() {
+        // The rate limiter should not grow beyond MAX_RATE_LIMIT_ENTRIES.
+        let (vset, pks) = make_vset_and_pks(1);
+        let ledger = make_stake_ledger(&vset);
+        let config = DiagnosticConfig {
+            min_diag_interval_ms: 1,
+            ..Default::default()
+        };
+        let collector = DiagnosticCollector::new(config).unwrap();
+
+        for h in 0..(MAX_RATE_LIMIT_ENTRIES as u64 + 100) {
+            let mut s = ConsensusState::new(h);
+            s.height = h;
+            let _ = collector.diagnose(&s, &vset, &ledger, &pks, 0, TEST_PROPOSE_TIMEOUT_MS);
+        }
+        let map_len = collector.last_diag_time.lock().len();
+        assert!(map_len <= MAX_RATE_LIMIT_ENTRIES);
+    }
+
+    // ── Serialization ───────────────────────────────────────────────────
+
     #[test]
     fn test_diagnostic_serialization() {
         let (vset, pks) = make_vset_and_pks(3);
         let ledger = make_stake_ledger(&vset);
         let state = ConsensusState::new(1);
-        let diag = diagnose_with_stake(&state, &vset, &ledger, &pks, 100, TEST_PROPOSE_TIMEOUT_MS, &default_config());
+        let diag = diagnose_with_stake(
+            &state, &vset, &ledger, &pks, 100, TEST_PROPOSE_TIMEOUT_MS, &default_config(),
+        );
 
         let json = serde_json::to_string(&diag).unwrap();
         assert!(json.contains("height"));
@@ -1059,7 +1154,17 @@ mod tests {
     fn test_short_pk() {
         let pk = PublicKeyBytes([0xAA; 32]);
         let short = short_pk(&pk);
-        assert_eq!(short.len(), 16); // 8 bytes * 2 hex chars
+        assert_eq!(short.len(), 16);
         assert_eq!(short, "aaaaaaaaaaaaaaaa");
+    }
+
+    #[test]
+    fn test_short_pk_str_handles_non_ascii() {
+        // Regression: previously used `&s[..16]` which panics on a
+        // non‑UTF‑8 boundary.
+        let s = "éééééééééééééééééééé";
+        let out = short_pk_str(s);
+        // Should not panic, should not split a char.
+        assert!(out.chars().count() <= HEX_SHORT_LEN * 2);
     }
 }
