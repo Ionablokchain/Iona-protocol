@@ -1,44 +1,51 @@
-//! Quorum calculator with diagnostic output for IONA v28.
+//! Quorum calculator with diagnostic output for IONA.
 //!
 //! When consensus stalls, this module tells you exactly WHY:
-//!   - missing_quorum: have=2 need=3
-//!   - validators_online: [A,B] missing=[C]
-//!   - p2p_connected_validators=2/3
+//! ```text
+//! NO_QUORUM: have=2/3 power, voted=[a1b2c3d4,...], missing=[e5f6...,...]
+//! validators: 2/3 connected, quorum_ok=false
+//! ```
 //!
-//! # Production Features
-//! - Configurable via `QuorumDiagConfig` (cache size, TTL, logging).
-//! - `QuorumDiagMetrics` with Prometheus counters for checks, hits, misses.
-//! - `QuorumDiagManager` with thread‑safe LRU cache (`parking_lot::Mutex`).
-//! - Cached results for repeated queries.
-//! - Structured logging with `tracing`.
-//! - Full test coverage.
+//! # Concurrency
+//!
+//! [`QuorumDiagManager`] is `Clone + Send + Sync`. All internal state is
+//! behind [`parking_lot::Mutex`], which does not poison on panic. Clones
+//! share state via `Arc`.
+//!
+//! # Cache correctness
+//!
+//! The diagnostic cache is keyed on a blake3 fingerprint of the validator
+//! set **including per-validator powers** and the sorted voter set. Two
+//! validator sets with identical total power but different distributions
+//! produce different fingerprints (this was a correctness bug in earlier
+//! versions).
+//!
+//! Entries expire after `QuorumDiagConfig::cache_ttl_secs`.
 
 use crate::consensus::validator_set::{Validator, ValidatorSet, VotingPower};
 use crate::crypto::PublicKeyBytes;
 use crate::types::Hash32;
 use lru::LruCache;
 use parking_lot::Mutex;
-use prometheus::{
-    register_counter, register_counter_vec, register_gauge, Counter, CounterVec, Gauge,
-};
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, trace};
 
 // ── Configuration ─────────────────────────────────────────────────────────
 
 /// Configuration for the quorum diagnostics subsystem.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuorumDiagConfig {
     /// Whether to enable caching of diagnostic results.
     pub enable_cache: bool,
     /// Maximum number of entries in the cache.
     pub cache_size: usize,
-    /// Cache TTL in seconds.
+    /// Cache TTL in seconds. Entries older than this are treated as misses.
     pub cache_ttl_secs: u64,
     /// Whether to enable metrics.
     pub enable_metrics: bool,
@@ -73,7 +80,14 @@ impl QuorumDiagConfig {
 
 // ── Metrics ──────────────────────────────────────────────────────────────
 
-/// Metrics for the quorum diagnostics subsystem.
+/// Prometheus metrics for the quorum diagnostics subsystem.
+///
+/// # Registration
+///
+/// [`QuorumDiagMetrics::new`] registers with the **default** Prometheus
+/// registry and can only be called once per process. Use
+/// [`QuorumDiagMetrics::unregistered`] for a fail-free instance
+/// (that's what `Default` does).
 #[derive(Clone)]
 pub struct QuorumDiagMetrics {
     pub quorum_checks: Counter,
@@ -86,44 +100,69 @@ pub struct QuorumDiagMetrics {
 }
 
 impl QuorumDiagMetrics {
+    /// Register all metrics with the default Prometheus registry.
     pub fn new() -> Result<Self, prometheus::Error> {
-        let quorum_checks = register_counter!(
-            "iona_quorum_checks_total",
-            "Total quorum checks performed"
-        )?;
-        let quorum_ok = register_counter!(
-            "iona_quorum_ok_total",
-            "Quorum checks that succeeded"
-        )?;
-        let quorum_fail = register_counter!(
-            "iona_quorum_fail_total",
-            "Quorum checks that failed"
-        )?;
-        let cache_hits = register_counter!(
-            "iona_quorum_cache_hits_total",
-            "Cache hits for quorum diagnostics"
-        )?;
-        let cache_misses = register_counter!(
-            "iona_quorum_cache_misses_total",
-            "Cache misses for quorum diagnostics"
-        )?;
-        let connectivity_checks = register_counter!(
-            "iona_connectivity_checks_total",
-            "Total connectivity checks"
-        )?;
-        let cache_size = register_gauge!(
-            "iona_quorum_cache_size",
-            "Current size of the quorum diagnostics cache"
-        )?;
         Ok(Self {
-            quorum_checks,
-            quorum_ok,
-            quorum_fail,
-            cache_hits,
-            cache_misses,
-            connectivity_checks,
-            cache_size,
+            quorum_checks: prometheus::register_counter!(
+                "iona_quorum_checks_total",
+                "Total quorum checks performed"
+            )?,
+            quorum_ok: prometheus::register_counter!(
+                "iona_quorum_ok_total",
+                "Quorum checks that succeeded"
+            )?,
+            quorum_fail: prometheus::register_counter!(
+                "iona_quorum_fail_total",
+                "Quorum checks that failed"
+            )?,
+            cache_hits: prometheus::register_counter!(
+                "iona_quorum_cache_hits_total",
+                "Cache hits for quorum diagnostics"
+            )?,
+            cache_misses: prometheus::register_counter!(
+                "iona_quorum_cache_misses_total",
+                "Cache misses for quorum diagnostics"
+            )?,
+            connectivity_checks: prometheus::register_counter!(
+                "iona_connectivity_checks_total",
+                "Total connectivity checks"
+            )?,
+            cache_size: prometheus::register_gauge!(
+                "iona_quorum_cache_size",
+                "Current size of the quorum diagnostics cache"
+            )?,
         })
+    }
+
+    /// Create an **unregistered** metrics bundle.
+    ///
+    /// Never fails, never registers. Suitable for tests or a custom registry.
+    pub fn unregistered() -> Self {
+        let mk = |name: &str, help: &str| {
+            Counter::new(name, help).expect("counter construction is infallible")
+        };
+        Self {
+            quorum_checks: mk("iona_quorum_checks_total", "Total quorum checks performed"),
+            quorum_ok: mk("iona_quorum_ok_total", "Quorum checks that succeeded"),
+            quorum_fail: mk("iona_quorum_fail_total", "Quorum checks that failed"),
+            cache_hits: mk(
+                "iona_quorum_cache_hits_total",
+                "Cache hits for quorum diagnostics",
+            ),
+            cache_misses: mk(
+                "iona_quorum_cache_misses_total",
+                "Cache misses for quorum diagnostics",
+            ),
+            connectivity_checks: mk(
+                "iona_connectivity_checks_total",
+                "Total connectivity checks",
+            ),
+            cache_size: Gauge::new(
+                "iona_quorum_cache_size",
+                "Current size of the quorum diagnostics cache",
+            )
+            .expect("gauge construction is infallible"),
+        }
     }
 
     pub fn record_check(&self, has_quorum: bool) {
@@ -154,22 +193,14 @@ impl QuorumDiagMetrics {
 
 impl Default for QuorumDiagMetrics {
     fn default() -> Self {
-        Self::new().unwrap_or_else(|_| Self {
-            quorum_checks: Counter::new("iona_quorum_checks_total", "Checks").unwrap(),
-            quorum_ok: Counter::new("iona_quorum_ok_total", "OK").unwrap(),
-            quorum_fail: Counter::new("iona_quorum_fail_total", "Fail").unwrap(),
-            cache_hits: Counter::new("iona_quorum_cache_hits_total", "Hits").unwrap(),
-            cache_misses: Counter::new("iona_quorum_cache_misses_total", "Misses").unwrap(),
-            connectivity_checks: Counter::new("iona_connectivity_checks_total", "Connectivity").unwrap(),
-            cache_size: Gauge::new("iona_quorum_cache_size", "Cache size").unwrap(),
-        })
+        Self::unregistered()
     }
 }
 
 // ── QuorumDiagnostic ─────────────────────────────────────────────────────
 
 /// Diagnostic information about quorum status.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QuorumDiagnostic {
     pub total_validators: usize,
     pub total_power: VotingPower,
@@ -211,6 +242,7 @@ impl fmt::Display for QuorumDiagnostic {
 #[derive(Debug, Clone)]
 pub struct QuorumCalculator {
     vset: ValidatorSet,
+    total_power: VotingPower,
     threshold: VotingPower,
 }
 
@@ -222,11 +254,12 @@ impl QuorumCalculator {
         let threshold = (total * 2 / 3) + 1;
         Self {
             vset: vset.clone(),
+            total_power: total,
             threshold,
         }
     }
 
-    /// Get the quorum threshold.
+    /// Quorum threshold (`floor(total × 2 / 3) + 1`).
     #[must_use]
     pub fn threshold(&self) -> VotingPower {
         self.threshold
@@ -235,7 +268,7 @@ impl QuorumCalculator {
     /// Total voting power in the validator set.
     #[must_use]
     pub fn total_power(&self) -> VotingPower {
-        self.vset.total_power()
+        self.total_power
     }
 
     /// Number of validators.
@@ -244,7 +277,7 @@ impl QuorumCalculator {
         self.vset.vals.len()
     }
 
-    /// Check if a set of voters reaches quorum.
+    /// Check whether a set of voters reaches quorum.
     #[must_use]
     pub fn check(&self, voters: &[PublicKeyBytes]) -> QuorumDiagnostic {
         let voter_set: HashSet<&PublicKeyBytes> = voters.iter().collect();
@@ -277,7 +310,7 @@ impl QuorumCalculator {
 
         QuorumDiagnostic {
             total_validators: self.vset.vals.len(),
-            total_power: self.vset.total_power(),
+            total_power: self.total_power,
             quorum_threshold: self.threshold,
             current_power,
             has_quorum,
@@ -302,20 +335,31 @@ impl QuorumCalculator {
         self.check(&voters)
     }
 
-    /// Get a human‑readable summary of quorum status (for logging).
+    /// Human-readable summary of quorum status.
     #[must_use]
     pub fn summary(&self, voters: &[PublicKeyBytes]) -> String {
-        let diag = self.check(voters);
-        diag.to_string()
+        self.check(voters).to_string()
     }
 
-    /// Can quorum still be reached if the given validators come online?
+    /// Sanity check: can the validator set ever reach quorum?
+    ///
+    /// This is `true` for any well-formed set (since `threshold ≤ total`).
+    /// It does **not** depend on the current voters. Prefer
+    /// [`validators_needed`](Self::validators_needed) to compute the actual
+    /// gap to quorum.
     #[must_use]
     pub fn can_reach_quorum(&self, _current_voters: &[PublicKeyBytes]) -> bool {
-        self.vset.total_power() >= self.threshold
+        self.total_power >= self.threshold
     }
 
     /// Minimum number of additional validators needed to reach quorum.
+    ///
+    /// Counts by validator (not by power), greedily choosing the
+    /// highest-power disconnected validators first.
+    ///
+    /// Returns [`usize::MAX`] if quorum is unreachable from the current
+    /// set — this cannot happen for a well-formed validator set (it would
+    /// require `threshold > total`), but is a safe sentinel.
     #[must_use]
     pub fn validators_needed(&self, current_voters: &[PublicKeyBytes]) -> usize {
         let diag = self.check(current_voters);
@@ -335,22 +379,22 @@ impl QuorumCalculator {
         remaining.sort_unstable_by(|a, b| b.cmp(a));
 
         let deficit = self.threshold.saturating_sub(diag.current_power);
-        let mut accumulated = 0u64;
+        let mut accumulated: u64 = 0;
         for (i, p) in remaining.iter().enumerate() {
-            accumulated += p;
+            accumulated = accumulated.saturating_add(*p);
             if accumulated >= deficit {
                 return i + 1;
             }
         }
-
-        remaining.len() + 1
+        // Even all remaining validators cannot reach quorum.
+        usize::MAX
     }
 }
 
 // ── ValidatorConnectivity ───────────────────────────────────────────────
 
 /// P2P connectivity diagnostic for validators.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ValidatorConnectivity {
     pub total_validators: usize,
     pub connected_validators: usize,
@@ -364,9 +408,7 @@ impl fmt::Display for ValidatorConnectivity {
         write!(
             f,
             "validators: {}/{} connected, quorum_ok={}",
-            self.connected_validators,
-            self.total_validators,
-            self.has_quorum_connectivity
+            self.connected_validators, self.total_validators, self.has_quorum_connectivity
         )
     }
 }
@@ -378,7 +420,8 @@ pub fn check_validator_connectivity(
     connected_pks: &[PublicKeyBytes],
 ) -> ValidatorConnectivity {
     let connected_set: HashSet<&PublicKeyBytes> = connected_pks.iter().collect();
-    let threshold = (vset.total_power() * 2 / 3) + 1;
+    let total = vset.total_power();
+    let threshold = if total == 0 { 1 } else { (total * 2 / 3) + 1 };
 
     let mut connected = Vec::new();
     let mut disconnected = Vec::new();
@@ -388,7 +431,7 @@ pub fn check_validator_connectivity(
         let pk_hex = hex::encode(&val.pk.0[..8]);
         if connected_set.contains(&val.pk) {
             connected.push(pk_hex);
-            connected_power += val.power;
+            connected_power = connected_power.saturating_add(val.power);
         } else {
             disconnected.push(pk_hex);
         }
@@ -403,69 +446,101 @@ pub fn check_validator_connectivity(
     }
 }
 
-// ── QuorumDiagManager (thread‑safe) ─────────────────────────────────────
+// ── QuorumDiagManager (thread-safe) ─────────────────────────────────────
 
-/// Thread‑safe manager for quorum diagnostics with caching and metrics.
+/// Cache key: a 32-byte blake3 fingerprint of `(validator set, sorted voters)`.
+///
+/// The fingerprint includes every validator's public key and power, so two
+/// validator sets with the same total power but different distributions
+/// produce different keys.
+fn cache_fingerprint(vset: &ValidatorSet, voters: &[PublicKeyBytes]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"iona/quorum_diag/cache/v1:");
+
+    // Canonical: validator set in order, with per-validator power.
+    hasher.update(&(vset.vals.len() as u64).to_le_bytes());
+    for v in &vset.vals {
+        hasher.update(&v.pk.0);
+        hasher.update(&v.power.to_le_bytes());
+    }
+
+    // Canonical: voters sorted by public key bytes.
+    let mut sorted: Vec<&PublicKeyBytes> = voters.iter().collect();
+    sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    hasher.update(&(sorted.len() as u64).to_le_bytes());
+    for pk in sorted {
+        hasher.update(&pk.0);
+    }
+
+    *hasher.finalize().as_bytes()
+}
+
+type CacheEntry = (QuorumDiagnostic, Instant);
+type Cache = LruCache<[u8; 32], CacheEntry>;
+
+/// Thread-safe manager for quorum diagnostics with caching and metrics.
 #[derive(Clone)]
 pub struct QuorumDiagManager {
     config: Arc<QuorumDiagConfig>,
     metrics: Arc<QuorumDiagMetrics>,
-    cache: Arc<Mutex<Option<LruCache<u64, QuorumDiagnostic>>>>,
-}
-
-#[derive(Hash, Eq, PartialEq)]
-struct CacheKey {
-    vset_version: u64,
-    voters_hash: u64,
-}
-
-impl CacheKey {
-    fn compute(vset: &ValidatorSet, voters: &[PublicKeyBytes]) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        // Hash validator set version (total power and count).
-        vset.total_power().hash(&mut hasher);
-        vset.vals.len().hash(&mut hasher);
-        // Hash voter public keys.
-        for pk in voters {
-            pk.0.hash(&mut hasher);
-        }
-        hasher.finish()
-    }
+    cache: Arc<Mutex<Option<Cache>>>,
+    ttl: Duration,
 }
 
 impl QuorumDiagManager {
     /// Create a new manager with the given configuration.
     pub fn new(config: QuorumDiagConfig) -> Result<Self, String> {
         config.validate()?;
-        let metrics = Arc::new(QuorumDiagMetrics::default());
+
+        // Try to register with the default Prometheus registry; fall back to
+        // an unregistered instance if names are already taken (e.g. a second
+        // manager in the same process). Never panic.
+        let metrics = if config.enable_metrics {
+            QuorumDiagMetrics::new().unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "quorum diag metrics already registered; using unregistered instance"
+                );
+                QuorumDiagMetrics::unregistered()
+            })
+        } else {
+            QuorumDiagMetrics::unregistered()
+        };
+
         let cache = if config.enable_cache {
             let size = NonZeroUsize::new(config.cache_size).ok_or("cache_size must be > 0")?;
             Some(LruCache::new(size))
         } else {
             None
         };
+
+        let ttl = Duration::from_secs(config.cache_ttl_secs);
+
         Ok(Self {
             config: Arc::new(config),
-            metrics,
+            metrics: Arc::new(metrics),
             cache: Arc::new(Mutex::new(cache)),
+            ttl,
         })
     }
 
-    /// Check quorum, using cache if enabled.
+    /// Check quorum, using the cache if enabled.
     pub fn check(&self, vset: &ValidatorSet, voters: &[PublicKeyBytes]) -> QuorumDiagnostic {
-        let key = CacheKey::compute(vset, voters);
-        let start = Instant::now();
+        let key = cache_fingerprint(vset, voters);
+        let now = Instant::now();
 
-        // Check cache.
+        // Try cache first.
         if self.config.enable_cache {
-            let mut cache_guard = self.cache.lock();
-            if let Some(cache) = cache_guard.as_mut() {
-                if let Some(entry) = cache.get(&key) {
-                    self.metrics.record_cache_hit();
-                    trace!("Quorum cache hit");
-                    return entry.clone();
+            let mut guard = self.cache.lock();
+            if let Some(cache) = guard.as_mut() {
+                if let Some((diag, stored_at)) = cache.get(&key) {
+                    if now.duration_since(*stored_at) < self.ttl {
+                        self.metrics.record_cache_hit();
+                        trace!("quorum cache hit");
+                        return diag.clone();
+                    }
+                    // Expired: drop and treat as a miss.
+                    cache.pop(&key);
                 }
                 self.metrics.record_cache_miss();
             }
@@ -477,32 +552,40 @@ impl QuorumDiagManager {
 
         // Record metrics.
         self.metrics.record_check(diag.has_quorum);
-        self.metrics.set_cache_size(self.cache_size());
 
-        // Log if enabled.
+        // Log: failures at `debug!`, successes at `trace!`.
         if self.config.log_diagnostics {
-            trace!(
-                has_quorum = diag.has_quorum,
-                current_power = diag.current_power,
-                threshold = diag.quorum_threshold,
-                voted = diag.voted.len(),
-                missing = diag.missing.len(),
-                "quorum check"
-            );
+            if !diag.has_quorum {
+                debug!(
+                    current_power = diag.current_power,
+                    threshold = diag.quorum_threshold,
+                    voted = diag.voted.len(),
+                    missing = diag.missing.len(),
+                    "quorum check failed"
+                );
+            } else {
+                trace!(
+                    current_power = diag.current_power,
+                    threshold = diag.quorum_threshold,
+                    "quorum check passed"
+                );
+            }
         }
 
         // Store in cache.
         if self.config.enable_cache {
-            let mut cache_guard = self.cache.lock();
-            if let Some(cache) = cache_guard.as_mut() {
-                cache.put(key, diag.clone());
+            let mut guard = self.cache.lock();
+            if let Some(cache) = guard.as_mut() {
+                cache.put(key, (diag.clone(), now));
+                self.metrics.set_cache_size(cache.len());
             }
         }
 
         diag
     }
 
-    /// Check quorum for a specific block.
+    /// Check quorum for a specific block, going through the cache.
+    #[must_use]
     pub fn check_for_block(
         &self,
         vset: &ValidatorSet,
@@ -526,12 +609,19 @@ impl QuorumDiagManager {
         self.metrics.record_connectivity();
         let result = check_validator_connectivity(vset, connected_pks);
         if self.config.log_diagnostics {
-            trace!(
-                connected = result.connected.len(),
-                total = result.total_validators,
-                has_quorum = result.has_quorum_connectivity,
-                "connectivity check"
-            );
+            if !result.has_quorum_connectivity {
+                debug!(
+                    connected = result.connected_validators,
+                    total = result.total_validators,
+                    "connectivity below quorum"
+                );
+            } else {
+                trace!(
+                    connected = result.connected_validators,
+                    total = result.total_validators,
+                    "connectivity check passed"
+                );
+            }
         }
         result
     }
@@ -541,20 +631,16 @@ impl QuorumDiagManager {
         if let Some(cache) = self.cache.lock().as_mut() {
             cache.clear();
             self.metrics.set_cache_size(0);
-            trace!("Quorum cache cleared");
+            trace!("quorum cache cleared");
         }
     }
 
-    /// Get current cache size.
+    /// Current cache size.
     pub fn cache_size(&self) -> usize {
-        if let Some(cache) = self.cache.lock().as_ref() {
-            cache.len()
-        } else {
-            0
-        }
+        self.cache.lock().as_ref().map_or(0, |c| c.len())
     }
 
-    /// Get metrics snapshot.
+    /// Metrics snapshot.
     pub fn metrics_snapshot(&self) -> QuorumDiagMetricsSnapshot {
         QuorumDiagMetricsSnapshot {
             quorum_checks: self.metrics.quorum_checks.get(),
@@ -567,14 +653,14 @@ impl QuorumDiagManager {
         }
     }
 
-    /// Get configuration.
+    /// Configuration.
     pub fn config(&self) -> &QuorumDiagConfig {
         &self.config
     }
 }
 
 /// Snapshot of quorum diagnostics metrics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QuorumDiagMetricsSnapshot {
     pub quorum_checks: u64,
     pub quorum_ok: u64,
@@ -587,14 +673,18 @@ pub struct QuorumDiagMetricsSnapshot {
 
 // ── Standalone functions (backward compatibility) ──────────────────────
 
+/// Convenience wrapper; prefer [`QuorumDiagManager::check`].
 #[deprecated(since = "30.0.0", note = "use QuorumDiagManager::check")]
 pub fn check_quorum(vset: &ValidatorSet, voters: &[PublicKeyBytes]) -> QuorumDiagnostic {
-    let qc = QuorumCalculator::new(vset);
-    qc.check(voters)
+    QuorumCalculator::new(vset).check(voters)
 }
 
+/// Convenience wrapper; prefer [`QuorumDiagManager::check_connectivity`].
 #[deprecated(since = "30.0.0", note = "use QuorumDiagManager::check_connectivity")]
-pub fn check_connectivity(vset: &ValidatorSet, connected_pks: &[PublicKeyBytes]) -> ValidatorConnectivity {
+pub fn check_connectivity(
+    vset: &ValidatorSet,
+    connected_pks: &[PublicKeyBytes],
+) -> ValidatorConnectivity {
     check_validator_connectivity(vset, connected_pks)
 }
 
@@ -607,21 +697,34 @@ mod tests {
     use crate::crypto::Signer;
 
     fn make_vset(n: usize) -> (ValidatorSet, Vec<PublicKeyBytes>) {
-        let mut vals = Vec::new();
-        let mut pks = Vec::new();
+        let mut vals = Vec::with_capacity(n);
+        let mut pks = Vec::with_capacity(n);
         for i in 0..n {
             let mut seed = [0u8; 32];
             seed[0] = (i + 1) as u8;
             let kp = Ed25519Keypair::from_seed(seed);
             let pk = kp.public_key();
-            vals.push(Validator {
-                pk: pk.clone(),
-                power: 1,
-            });
+            vals.push(Validator { pk: pk.clone(), power: 1 });
             pks.push(pk);
         }
         (ValidatorSet { vals }, pks)
     }
+
+    fn make_weighted_vset(powers: &[VotingPower]) -> (ValidatorSet, Vec<PublicKeyBytes>) {
+        let mut vals = Vec::with_capacity(powers.len());
+        let mut pks = Vec::with_capacity(powers.len());
+        for (i, p) in powers.iter().enumerate() {
+            let mut seed = [0u8; 32];
+            seed[0] = (i + 1) as u8;
+            let kp = Ed25519Keypair::from_seed(seed);
+            let pk = kp.public_key();
+            vals.push(Validator { pk: pk.clone(), power: *p });
+            pks.push(pk);
+        }
+        (ValidatorSet { vals }, pks)
+    }
+
+    // ── Basic quorum ────────────────────────────────────────────────────
 
     #[test]
     fn test_quorum_1_of_1() {
@@ -653,12 +756,24 @@ mod tests {
     }
 
     #[test]
+    fn test_weighted_quorum() {
+        let (vset, pks) = make_weighted_vset(&[10, 5, 5]);
+        let qc = QuorumCalculator::new(&vset);
+        assert_eq!(qc.threshold(), 14);
+
+        assert!(!qc.check(&[pks[0].clone()]).has_quorum);
+        assert!(qc.check(&[pks[0].clone(), pks[1].clone()]).has_quorum);
+        assert!(!qc.check(&[pks[1].clone(), pks[2].clone()]).has_quorum);
+    }
+
+    // ── Diagnostic content ──────────────────────────────────────────────
+
+    #[test]
     fn test_diagnostic_reason() {
         let (vset, pks) = make_vset(3);
         let qc = QuorumCalculator::new(&vset);
         let diag = qc.check(&pks[..1]);
         assert!(!diag.has_quorum);
-        assert!(diag.reason.is_some());
         assert!(diag.reason.as_ref().unwrap().contains("missing_quorum"));
         assert_eq!(diag.voted.len(), 1);
         assert_eq!(diag.missing.len(), 2);
@@ -668,10 +783,8 @@ mod tests {
     fn test_summary_format() {
         let (vset, pks) = make_vset(3);
         let qc = QuorumCalculator::new(&vset);
-        let summary_ok = qc.summary(&pks);
-        assert!(summary_ok.contains("quorum_ok"));
-        let summary_fail = qc.summary(&pks[..1]);
-        assert!(summary_fail.contains("NO_QUORUM"));
+        assert!(qc.summary(&pks).contains("quorum_ok"));
+        assert!(qc.summary(&pks[..1]).contains("NO_QUORUM"));
     }
 
     #[test]
@@ -685,6 +798,17 @@ mod tests {
     }
 
     #[test]
+    fn test_validators_needed_impossible_is_max() {
+        // A validator set with no validators cannot reach quorum.
+        let vset = ValidatorSet { vals: vec![] };
+        let qc = QuorumCalculator::new(&vset);
+        // threshold = 1, current = 0 → need 1, but there are none remaining.
+        assert_eq!(qc.validators_needed(&[]), usize::MAX);
+    }
+
+    // ── Connectivity ────────────────────────────────────────────────────
+
+    #[test]
     fn test_connectivity() {
         let (vset, pks) = make_vset(3);
         let conn = check_validator_connectivity(&vset, &pks[..2]);
@@ -695,70 +819,61 @@ mod tests {
     }
 
     #[test]
-    fn test_weighted_quorum() {
-        let mut seed1 = [0u8; 32];
-        seed1[0] = 1;
-        let mut seed2 = [0u8; 32];
-        seed2[0] = 2;
-        let mut seed3 = [0u8; 32];
-        seed3[0] = 3;
-        let pk1 = Ed25519Keypair::from_seed(seed1).public_key();
-        let pk2 = Ed25519Keypair::from_seed(seed2).public_key();
-        let pk3 = Ed25519Keypair::from_seed(seed3).public_key();
-        let vset = ValidatorSet {
-            vals: vec![
-                Validator {
-                    pk: pk1.clone(),
-                    power: 10,
-                },
-                Validator {
-                    pk: pk2.clone(),
-                    power: 5,
-                },
-                Validator {
-                    pk: pk3.clone(),
-                    power: 5,
-                },
-            ],
-        };
-        let qc = QuorumCalculator::new(&vset);
-        assert_eq!(qc.threshold(), 14);
-
-        assert!(!qc.check(&[pk1.clone()]).has_quorum);
-        assert!(qc.check(&[pk1.clone(), pk2.clone()]).has_quorum);
-        assert!(!qc.check(&[pk2.clone(), pk3.clone()]).has_quorum);
-    }
-
-    #[test]
-    fn test_display_impls() {
+    fn test_connectivity_quorum_met() {
         let (vset, pks) = make_vset(3);
-        let qc = QuorumCalculator::new(&vset);
-        let diag = qc.check(&pks[..1]);
-        let s = format!("{}", diag);
-        assert!(s.contains("NO_QUORUM"));
-
-        let conn = check_validator_connectivity(&vset, &pks[..2]);
-        let s = format!("{}", conn);
-        assert!(s.contains("connected"));
+        let conn = check_validator_connectivity(&vset, &pks);
+        assert!(conn.has_quorum_connectivity);
     }
 
+    // ── Cache correctness ───────────────────────────────────────────────
+
     #[test]
-    fn test_manager_cache() {
+    fn test_cache_does_not_collide_on_different_power_distributions() {
+        // Regression: the previous key hashed only `(total_power, count)`,
+        // so two validator sets with identical total power but different
+        // per-validator distributions shared a cache entry — one set's
+        // diagnostic could be returned for the other.
+        let (vset_a, pks_a) = make_weighted_vset(&[10, 5, 5]); // total 20, count 3
+        let (vset_b, pks_b) = make_weighted_vset(&[8, 6, 6]); // total 20, count 3, different keys
+
         let config = QuorumDiagConfig {
             enable_cache: true,
-            cache_size: 10,
+            cache_size: 16,
+            ..Default::default()
+        };
+        let manager = QuorumDiagManager::new(config).unwrap();
+
+        let diag_a = manager.check(&vset_a, &pks_a[..1]);
+        let diag_b = manager.check(&vset_b, &pks_b[..1]);
+
+        // Both have the same current_power (only first validator voted), but
+        // with different public keys in `voted`/`missing`. If they shared a
+        // cache entry, the second call would return the first's `voted` list.
+        assert_ne!(diag_a.voted, diag_b.voted);
+    }
+
+    #[test]
+    fn test_cache_hit_and_ttl() {
+        let config = QuorumDiagConfig {
+            enable_cache: true,
+            cache_size: 16,
+            cache_ttl_secs: 1,
+            log_diagnostics: false,
             ..Default::default()
         };
         let manager = QuorumDiagManager::new(config).unwrap();
         let (vset, pks) = make_vset(3);
-        let d1 = manager.check(&vset, &pks);
-        let d2 = manager.check(&vset, &pks);
-        assert_eq!(d1.has_quorum, d2.has_quorum);
-        assert!(manager.cache_size() > 0);
+
+        let _ = manager.check(&vset, &pks);
+        let _ = manager.check(&vset, &pks);
+
+        let snap = manager.metrics_snapshot();
+        assert_eq!(snap.cache_misses, 1);
+        assert_eq!(snap.cache_hits, 1);
     }
 
     #[test]
-    fn test_manager_clear_cache() {
+    fn test_cache_clear() {
         let config = QuorumDiagConfig {
             enable_cache: true,
             cache_size: 10,
@@ -773,14 +888,61 @@ mod tests {
     }
 
     #[test]
-    fn test_metrics_snapshot() {
-        let config = QuorumDiagConfig::default();
+    fn test_cache_disabled() {
+        let config = QuorumDiagConfig {
+            enable_cache: false,
+            ..Default::default()
+        };
         let manager = QuorumDiagManager::new(config).unwrap();
+        let (vset, pks) = make_vset(3);
+        let _ = manager.check(&vset, &pks);
+        let _ = manager.check(&vset, &pks);
+        assert_eq!(manager.cache_size(), 0);
+        let snap = manager.metrics_snapshot();
+        assert_eq!(snap.cache_hits, 0);
+        assert_eq!(snap.cache_misses, 0);
+    }
+
+    // ── Metrics ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_metrics_unregistered_is_repeatable() {
+        // Regression: `Default` used to chain `.unwrap()`, panicking on
+        // the second instantiation in the same process.
+        let _a = QuorumDiagMetrics::unregistered();
+        let _b = QuorumDiagMetrics::unregistered();
+        let _c = QuorumDiagMetrics::default();
+    }
+
+    #[test]
+    fn test_metrics_snapshot() {
+        let manager = QuorumDiagManager::new(QuorumDiagConfig::default()).unwrap();
         let (vset, pks) = make_vset(3);
         manager.check(&vset, &pks);
         manager.check_connectivity(&vset, &pks);
         let snap = manager.metrics_snapshot();
         assert!(snap.quorum_checks > 0);
         assert!(snap.connectivity_checks > 0);
+    }
+
+    // ── Config ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_config_validation() {
+        assert!(QuorumDiagConfig::default().validate().is_ok());
+        assert!(QuorumDiagConfig { cache_size: 0, ..Default::default() }
+            .validate()
+            .is_err());
+        assert!(QuorumDiagConfig { cache_ttl_secs: 0, ..Default::default() }
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn test_display_impls() {
+        let (vset, pks) = make_vset(3);
+        let qc = QuorumCalculator::new(&vset);
+        assert!(format!("{}", qc.check(&pks[..1])).contains("NO_QUORUM"));
+        assert!(format!("{}", check_validator_connectivity(&vset, &pks[..2])).contains("connected"));
     }
 }
