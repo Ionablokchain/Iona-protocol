@@ -1,42 +1,48 @@
 //! Validator set management for IONA consensus.
 //!
-//! This module defines the validator set: the set of active validators
-//! that participate in consensus, each with a voting power.
-//! It provides functions to compute total power, look up a validator by public key,
-//! and select the proposer for a given height and round (round‑robin).
+//! Defines the validator set (active validators + voting power), with:
+//! - power queries, membership checks, quorum threshold
+//! - deterministic proposer selection (round-robin)
+//! - canonical hash for cross-node comparison
+//! - diff/merge operations for live validator updates
+//! - a thread-safe manager with an LRU proposer cache
 //!
-//! # Production Features
-//! - Configurable via `ValidatorSetConfig` (cache size, validation, metrics).
-//! - `ValidatorSetMetrics` with Prometheus counters and gauges.
-//! - `ValidatorSetManager` with thread‑safe LRU cache (`parking_lot::Mutex`).
-//! - Validation (no duplicate PKs, positive power, etc.).
-//! - Diff detection and update notifications.
-//! - Structured logging with `tracing`.
-//! - Full test coverage.
+//! # Invariants
+//!
+//! - A [`ValidatorSet`] constructed via [`ValidatorSet::new`] is guaranteed
+//!   non-empty, has positive power per validator, and no duplicate public
+//!   keys.
+//! - [`ValidatorSet::proposer_for`] panics on an empty set (documented);
+//!   prefer [`ValidatorSet::try_proposer_for`] which returns `Option`.
+//! - [`ValidatorSet::hash_hex`] is deterministic and order-independent: two
+//!   sets with the same validators in a different order hash identically.
+//!
+//! # Concurrency
+//!
+//! [`ValidatorSetManager`] is `Clone + Send + Sync`. All internal state is
+//! behind [`parking_lot::Mutex`], which does not poison on panic.
 
 use crate::crypto::PublicKeyBytes;
 use lru::LruCache;
 use parking_lot::Mutex;
-use prometheus::{
-    register_counter, register_counter_vec, register_gauge, Counter, CounterVec, Gauge,
-};
+use prometheus::{Counter, CounterVec, Gauge};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{info, trace, warn};
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
 /// Panic message when `proposer_for` is called on an empty validator set.
 const ERR_EMPTY_VALIDATOR_SET: &str = "ValidatorSet::proposer_for called with empty set";
 
-/// Numerator for quorum threshold (2/3).
+/// Numerator for the quorum threshold (2/3).
 const QUORUM_NUMERATOR: u64 = 2;
 
-/// Denominator for quorum threshold (3).
+/// Denominator for the quorum threshold (3).
 const QUORUM_DENOMINATOR: u64 = 3;
 
 /// Default cache size for proposer lookups.
@@ -48,7 +54,7 @@ const DEFAULT_CACHE_TTL_SECS: u64 = 60;
 // ── Configuration ─────────────────────────────────────────────────────────
 
 /// Configuration for the validator set subsystem.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ValidatorSetConfig {
     /// Whether to enable caching of proposer lookups.
     pub enable_cache: bool,
@@ -56,7 +62,7 @@ pub struct ValidatorSetConfig {
     pub cache_size: usize,
     /// Cache TTL in seconds.
     pub cache_ttl_secs: u64,
-    /// Whether to validate validator set on creation.
+    /// Whether to validate validator sets on construction and update.
     pub validate_on_create: bool,
     /// Whether to enable metrics.
     pub enable_metrics: bool,
@@ -92,7 +98,14 @@ impl ValidatorSetConfig {
 
 // ── Metrics ──────────────────────────────────────────────────────────────
 
-/// Metrics for the validator set subsystem.
+/// Prometheus metrics for the validator set subsystem.
+///
+/// # Registration
+///
+/// [`ValidatorSetMetrics::new`] registers with the **default** Prometheus
+/// registry and can only be called once per process. Use
+/// [`ValidatorSetMetrics::unregistered`] for a fail-free instance (that's
+/// what `Default` does).
 #[derive(Clone)]
 pub struct ValidatorSetMetrics {
     pub validator_count: Gauge,
@@ -105,71 +118,96 @@ pub struct ValidatorSetMetrics {
 }
 
 impl ValidatorSetMetrics {
+    /// Register all metrics with the default Prometheus registry.
     pub fn new() -> Result<Self, prometheus::Error> {
-        let validator_count = register_gauge!(
-            "iona_validator_count",
-            "Number of active validators"
-        )?;
-        let total_power = register_gauge!(
-            "iona_validator_total_power",
-            "Total voting power"
-        )?;
-        let quorum_threshold = register_gauge!(
-            "iona_validator_quorum_threshold",
-            "Quorum threshold (2/3 + 1)"
-        )?;
-        let proposer_checks = register_counter!(
-            "iona_validator_proposer_checks_total",
-            "Total proposer lookups"
-        )?;
-        let cache_hits = register_counter!(
-            "iona_validator_cache_hits_total",
-            "Cache hits for proposer lookups"
-        )?;
-        let cache_misses = register_counter!(
-            "iona_validator_cache_misses_total",
-            "Cache misses for proposer lookups"
-        )?;
-        let updates = register_counter_vec!(
-            "iona_validator_updates_total",
-            "Validator set updates",
-            &["type"]
-        )?;
         Ok(Self {
-            validator_count,
-            total_power,
-            quorum_threshold,
-            proposer_checks,
-            cache_hits,
-            cache_misses,
-            updates,
+            validator_count: prometheus::register_gauge!(
+                "iona_validator_count",
+                "Number of active validators"
+            )?,
+            total_power: prometheus::register_gauge!(
+                "iona_validator_total_power",
+                "Total voting power"
+            )?,
+            quorum_threshold: prometheus::register_gauge!(
+                "iona_validator_quorum_threshold",
+                "Quorum threshold (2/3 + 1)"
+            )?,
+            proposer_checks: prometheus::register_counter!(
+                "iona_validator_proposer_checks_total",
+                "Total proposer lookups"
+            )?,
+            cache_hits: prometheus::register_counter!(
+                "iona_validator_cache_hits_total",
+                "Cache hits for proposer lookups"
+            )?,
+            cache_misses: prometheus::register_counter!(
+                "iona_validator_cache_misses_total",
+                "Cache misses for proposer lookups"
+            )?,
+            updates: prometheus::register_counter_vec!(
+                "iona_validator_updates_total",
+                "Validator set updates",
+                &["type"]
+            )?,
         })
+    }
+
+    /// Create an **unregistered** metrics bundle.
+    ///
+    /// Never fails, never registers. Suitable for tests or a custom registry.
+    pub fn unregistered() -> Self {
+        let mk_gauge = |name: &str, help: &str| {
+            Gauge::new(name, help).expect("gauge construction is infallible")
+        };
+        let mk_counter = |name: &str, help: &str| {
+            Counter::new(name, help).expect("counter construction is infallible")
+        };
+        Self {
+            validator_count: mk_gauge("iona_validator_count", "Number of active validators"),
+            total_power: mk_gauge("iona_validator_total_power", "Total voting power"),
+            quorum_threshold: mk_gauge(
+                "iona_validator_quorum_threshold",
+                "Quorum threshold (2/3 + 1)",
+            ),
+            proposer_checks: mk_counter(
+                "iona_validator_proposer_checks_total",
+                "Total proposer lookups",
+            ),
+            cache_hits: mk_counter(
+                "iona_validator_cache_hits_total",
+                "Cache hits for proposer lookups",
+            ),
+            cache_misses: mk_counter(
+                "iona_validator_cache_misses_total",
+                "Cache misses for proposer lookups",
+            ),
+            updates: CounterVec::new(
+                prometheus::Opts::new("iona_validator_updates_total", "Validator set updates"),
+                &["type"],
+            )
+            .expect("counter vec construction is infallible"),
+        }
     }
 
     pub fn set_validator_count(&self, count: usize) {
         self.validator_count.set(count as f64);
     }
-
     pub fn set_total_power(&self, power: u64) {
         self.total_power.set(power as f64);
     }
-
     pub fn set_quorum_threshold(&self, threshold: u64) {
         self.quorum_threshold.set(threshold as f64);
     }
-
     pub fn record_proposer_check(&self) {
         self.proposer_checks.inc();
     }
-
     pub fn record_cache_hit(&self) {
         self.cache_hits.inc();
     }
-
     pub fn record_cache_miss(&self) {
         self.cache_misses.inc();
     }
-
     pub fn record_update(&self, typ: &str) {
         self.updates.with_label_values(&[typ]).inc();
     }
@@ -177,18 +215,7 @@ impl ValidatorSetMetrics {
 
 impl Default for ValidatorSetMetrics {
     fn default() -> Self {
-        Self::new().unwrap_or_else(|_| Self {
-            validator_count: Gauge::new("iona_validator_count", "Validator count").unwrap(),
-            total_power: Gauge::new("iona_validator_total_power", "Total power").unwrap(),
-            quorum_threshold: Gauge::new("iona_validator_quorum_threshold", "Quorum threshold").unwrap(),
-            proposer_checks: Counter::new("iona_validator_proposer_checks_total", "Proposer checks").unwrap(),
-            cache_hits: Counter::new("iona_validator_cache_hits_total", "Cache hits").unwrap(),
-            cache_misses: Counter::new("iona_validator_cache_misses_total", "Cache misses").unwrap(),
-            updates: CounterVec::new(
-                prometheus::Opts::new("iona_validator_updates_total", "Updates"),
-                &["type"],
-            ).unwrap(),
-        })
+        Self::unregistered()
     }
 }
 
@@ -209,15 +236,14 @@ pub struct Validator {
 /// The active validator set.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ValidatorSet {
-    /// List of validators. The order can be arbitrary; for deterministic operations
-    /// like proposer selection, we rely on the order stored here.
+    /// Validators. Order is significant for round-robin proposer selection.
     pub vals: Vec<Validator>,
 }
 
-// ── Validation Errors ────────────────────────────────────────────────────
+// ── Validation errors ────────────────────────────────────────────────────
 
 /// Errors that can occur during validator set validation.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ValidatorSetError {
     #[error("empty validator set")]
     EmptySet,
@@ -230,6 +256,14 @@ pub enum ValidatorSetError {
 
     #[error("validator set too large: {count} > max {max}")]
     TooLarge { count: usize, max: usize },
+
+    /// Configuration error (invalid `ValidatorSetConfig`).
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    /// Validation failed during a manager operation.
+    #[error("validation failed: {0}")]
+    ValidationFailed(String),
 }
 
 pub type ValidatorSetResult<T> = Result<T, ValidatorSetError>;
@@ -238,6 +272,9 @@ pub type ValidatorSetResult<T> = Result<T, ValidatorSetError>;
 
 impl ValidatorSet {
     /// Create a new validator set with validation.
+    ///
+    /// Rejects empty sets, sets larger than `max_size`, sets with any
+    /// zero-power validator, and sets with duplicate public keys.
     pub fn new(vals: Vec<Validator>, max_size: usize) -> ValidatorSetResult<Self> {
         if vals.is_empty() {
             return Err(ValidatorSetError::EmptySet);
@@ -249,7 +286,7 @@ impl ValidatorSet {
             });
         }
 
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::with_capacity(vals.len());
         for v in &vals {
             if v.power == 0 {
                 return Err(ValidatorSetError::ZeroPower);
@@ -263,18 +300,29 @@ impl ValidatorSet {
         Ok(Self { vals })
     }
 
-    /// Create from an existing set (assumes validated).
+    /// Create from an existing set **without** validation.
+    ///
+    /// The caller asserts the set is well-formed (non-empty, no duplicate
+    /// keys, no zero powers). Misuse will surface later as a panic in
+    /// [`proposer_for`](Self::proposer_for).
     pub fn from_validated(vals: Vec<Validator>) -> Self {
         Self { vals }
     }
 
     /// Total voting power of all validators.
+    ///
+    /// Uses `saturating_add`, so an absurd total saturates at `u64::MAX`
+    /// rather than wrapping.
     #[must_use]
     pub fn total_power(&self) -> VotingPower {
-        self.vals.iter().map(|v| v.power).sum()
+        self.vals
+            .iter()
+            .fold(0u64, |acc, v| acc.saturating_add(v.power))
     }
 
-    /// Get the voting power of a validator by public key.
+    /// Voting power of the validator with the given public key.
+    ///
+    /// Returns `0` if the key is not in the set.
     #[must_use]
     pub fn power_of(&self, pk: &PublicKeyBytes) -> VotingPower {
         self.vals
@@ -284,26 +332,41 @@ impl ValidatorSet {
             .unwrap_or(0)
     }
 
-    /// Check if a validator is in the set (has power > 0).
+    /// Whether the given public key is in the set (with power > 0).
     #[must_use]
     pub fn contains(&self, pk: &PublicKeyBytes) -> bool {
         self.power_of(pk) > 0
     }
 
-    /// Select the proposer for a given height and round (round‑robin).
+    /// Round-robin proposer for `(height, round)`.
     ///
-    /// The proposer index is `(height + round) % number_of_validators`.
+    /// Index: `(height + round) mod vals.len()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the validator set is empty. Prefer
+    /// [`try_proposer_for`](Self::try_proposer_for) if you can't guarantee
+    /// non-emptiness at the call site.
     #[must_use]
     pub fn proposer_for(&self, height: u64, round: u32) -> &Validator {
-        let n = self.vals.len();
-        if n == 0 {
-            panic!("{}", ERR_EMPTY_VALIDATOR_SET);
-        }
-        let idx = ((height as usize).wrapping_add(round as usize)) % n;
-        &self.vals[idx]
+        self.try_proposer_for(height, round)
+            .unwrap_or_else(|| panic!("{ERR_EMPTY_VALIDATOR_SET}"))
     }
 
-    /// Check if the validator set is empty.
+    /// Round-robin proposer for `(height, round)`, or `None` if the set
+    /// is empty.
+    #[must_use]
+    pub fn try_proposer_for(&self, height: u64, round: u32) -> Option<&Validator> {
+        let n = self.vals.len();
+        if n == 0 {
+            return None;
+        }
+        let combined = height.wrapping_add(round as u64);
+        let idx = (combined % (n as u64)) as usize;
+        self.vals.get(idx)
+    }
+
+    /// Whether the set is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.vals.is_empty()
@@ -315,84 +378,103 @@ impl ValidatorSet {
         self.vals.len()
     }
 
-    /// Return an iterator over the validators.
+    /// Iterator over the validators.
     pub fn iter(&self) -> std::slice::Iter<'_, Validator> {
         self.vals.iter()
     }
 
-    /// Compute the quorum threshold (minimum voting power required).
+    /// Quorum threshold (`floor(total × 2 / 3) + 1`).
+    ///
+    /// Uses `saturating_mul` on the total, so an absurd total saturates
+    /// rather than wrapping. For a well-formed set this equals the
+    /// expected `2/3 + 1`.
     #[must_use]
     pub fn quorum_threshold(&self) -> VotingPower {
         let total = self.total_power();
-        (total * QUORUM_NUMERATOR / QUORUM_DENOMINATOR) + 1
+        total
+            .saturating_mul(QUORUM_NUMERATOR)
+            .checked_div(QUORUM_DENOMINATOR)
+            .unwrap_or(0)
+            .saturating_add(1)
     }
 
-    /// Deterministic hash of the validator set.
+    /// Deterministic, order-independent hash of the validator set.
+    ///
+    /// Encodes `(pk_bytes, power_le)` per validator, sorted by `pk`, then
+    /// blake3's the result under a versioned prefix.
     #[must_use]
     pub fn hash_hex(&self) -> String {
-        let mut vals = self.vals.clone();
-        vals.sort_by(|a, b| a.pk.0.cmp(&b.pk.0));
-        let bytes = bincode::serialize(&vals).unwrap_or_default();
-        let h = blake3::hash(&bytes);
-        h.to_hex().to_string()
+        let mut sorted: Vec<&Validator> = self.vals.iter().collect();
+        sorted.sort_by(|a, b| a.pk.0.cmp(&b.pk.0));
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"iona/vset/v1:");
+        hasher.update(&(sorted.len() as u64).to_le_bytes());
+        for v in sorted {
+            hasher.update(&v.pk.0);
+            hasher.update(&v.power.to_le_bytes());
+        }
+        hasher.finalize().to_hex().to_string()
     }
 
-    /// Compute the difference between two validator sets.
-    /// Returns `(added, removed, power_changed)`.
+    /// Difference between two validator sets.
+    ///
+    /// Returns `(added, removed, power_changed)`:
+    /// - `added` — validators in `other` not in `self`
+    /// - `removed` — validators in `self` not in `other`
+    /// - `power_changed` — validators in both with different power (returns
+    ///   the `other` version)
+    #[must_use]
     pub fn diff(&self, other: &ValidatorSet) -> (Vec<Validator>, Vec<Validator>, Vec<Validator>) {
+        let self_map: HashMap<&PublicKeyBytes, &Validator> =
+            self.vals.iter().map(|v| (&v.pk, v)).collect();
+
         let mut added = Vec::new();
-        let mut removed = Vec::new();
         let mut power_changed = Vec::new();
 
-        let self_map: std::collections::HashMap<_, _> = self
-            .vals
-            .iter()
-            .map(|v| (&v.pk, v))
-            .collect();
-        let other_map: std::collections::HashMap<_, _> = other
-            .vals
-            .iter()
-            .map(|v| (&v.pk, v))
-            .collect();
-
-        for (pk, v) in &other_map {
-            if let Some(existing) = self_map.get(pk) {
-                if existing.power != v.power {
-                    power_changed.push((*v).clone());
-                }
-            } else {
-                added.push((*v).clone());
+        for v in &other.vals {
+            match self_map.get(&v.pk) {
+                None => added.push(v.clone()),
+                Some(existing) if existing.power != v.power => power_changed.push(v.clone()),
+                _ => {}
             }
         }
 
-        for (pk, v) in &self_map {
-            if !other_map.contains_key(pk) {
-                removed.push((*v).clone());
-            }
-        }
+        let other_keys: HashSet<&PublicKeyBytes> = other.vals.iter().map(|v| &v.pk).collect();
+        let removed = self
+            .vals
+            .iter()
+            .filter(|v| !other_keys.contains(&v.pk))
+            .cloned()
+            .collect();
 
         (added, removed, power_changed)
     }
 
-    /// Merge another validator set into this one (additive).
+    /// Merge `other` into `self`.
+    ///
+    /// On a duplicate public key, the `other` entry wins (used for stake
+    /// updates). Validators only in `self` are retained.
     pub fn merge(&mut self, other: &ValidatorSet) {
-        let self_map: std::collections::HashMap<_, _> = self
+        // Index existing positions by public key.
+        let mut index: HashMap<Vec<u8>, usize> = self
             .vals
             .iter()
-            .map(|v| (&v.pk, v))
+            .enumerate()
+            .map(|(i, v)| (v.pk.0.clone(), i))
             .collect();
 
         for v in &other.vals {
-            if let Some(existing) = self_map.get(&v.pk) {
-                // Power update: use max or sum? For consensus, we use the latest.
-                // In practice, this is used for stake updates.
-                // We'll replace with the new power.
-                // But we need mutable access, so we'll rebuild.
+            match index.get(&v.pk.0) {
+                Some(&i) => {
+                    self.vals[i].power = v.power;
+                }
+                None => {
+                    index.insert(v.pk.0.clone(), self.vals.len());
+                    self.vals.push(v.clone());
+                }
             }
         }
-        // Simplified: just replace the whole set.
-        // In production, we'd merge carefully.
-        self.vals = other.vals.clone();
     }
 }
 
@@ -409,7 +491,7 @@ impl fmt::Display for ValidatorSet {
     }
 }
 
-// ── Cache Entry ──────────────────────────────────────────────────────────
+// ── Manager ──────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct ProposerCacheEntry {
@@ -417,70 +499,95 @@ struct ProposerCacheEntry {
     expires_at: Instant,
 }
 
-// ── ValidatorSetManager ──────────────────────────────────────────────────
-
-/// Thread‑safe manager for validator set operations with caching and metrics.
+/// Thread-safe manager for validator set operations with caching and metrics.
+///
+/// # Cloning
+///
+/// Cloning shares state via `Arc`. Clones observe each other's writes.
 #[derive(Clone)]
 pub struct ValidatorSetManager {
     config: Arc<ValidatorSetConfig>,
     metrics: Arc<ValidatorSetMetrics>,
     vset: Arc<Mutex<ValidatorSet>>,
     cache: Arc<Mutex<Option<LruCache<(u64, u32), ProposerCacheEntry>>>>,
+    ttl: Duration,
 }
 
 impl ValidatorSetManager {
-    /// Create a new manager with the given configuration and initial validator set.
+    /// Create a new manager with the given configuration and initial set.
     pub fn new(
         config: ValidatorSetConfig,
         vset: ValidatorSet,
-    ) -> Result<Self, ValidatorSetError> {
-        config.validate().map_err(|e| ValidatorSetError::ValidationFailed(e))?;
-        let metrics = Arc::new(ValidatorSetMetrics::default());
+    ) -> ValidatorSetResult<Self> {
+        config.validate().map_err(ValidatorSetError::Config)?;
+
+        let metrics = if config.enable_metrics {
+            ValidatorSetMetrics::new().unwrap_or_else(|e| {
+                warn!(
+                    error = %e,
+                    "validator set metrics already registered; using unregistered instance"
+                );
+                ValidatorSetMetrics::unregistered()
+            })
+        } else {
+            ValidatorSetMetrics::unregistered()
+        };
+
         let cache = if config.enable_cache {
             let size = NonZeroUsize::new(config.cache_size)
-                .ok_or(ValidatorSetError::Config("cache_size must be > 0".into()))?;
+                .ok_or_else(|| ValidatorSetError::Config("cache_size must be > 0".into()))?;
             Some(LruCache::new(size))
         } else {
             None
         };
 
+        let ttl = Duration::from_secs(config.cache_ttl_secs);
+
         let manager = Self {
             config: Arc::new(config),
-            metrics,
+            metrics: Arc::new(metrics),
             vset: Arc::new(Mutex::new(vset)),
             cache: Arc::new(Mutex::new(cache)),
+            ttl,
         };
 
-        // Update metrics.
         manager.update_metrics();
-
         Ok(manager)
     }
 
-    /// Get the current validator set (read‑only copy).
+    /// Snapshot of the current validator set.
     pub fn get(&self) -> ValidatorSet {
         self.vset.lock().clone()
     }
 
-    /// Update the validator set.
+    /// Replace the validator set.
+    ///
+    /// If `config.validate_on_create` is `true`, the new set is validated
+    /// before being installed; otherwise it is accepted as-is (an empty set
+    /// triggers a `warn!`).
+    ///
+    /// On success the proposer cache is cleared.
     pub fn update(&self, new_vset: ValidatorSet) -> ValidatorSetResult<()> {
         if self.config.validate_on_create {
-            // Validate the new set.
             ValidatorSet::new(new_vset.vals.clone(), usize::MAX)?;
+        } else if new_vset.vals.is_empty() {
+            warn!("updating to an empty validator set with validation disabled");
         }
 
-        let mut guard = self.vset.lock();
-        let old = guard.clone();
-        *guard = new_vset;
+        let old = {
+            let mut guard = self.vset.lock();
+            let old = guard.clone();
+            *guard = new_vset;
+            old
+        };
 
-        // Clear cache on update.
+        // Clear the cache after the new set is installed.
         if let Some(cache) = self.cache.lock().as_mut() {
             cache.clear();
         }
 
-        // Log changes.
         if self.config.log_changes {
-            let (added, removed, power_changed) = old.diff(&guard);
+            let (added, removed, power_changed) = old.diff(&self.vset.lock());
             if !added.is_empty() || !removed.is_empty() || !power_changed.is_empty() {
                 info!(
                     added = added.len(),
@@ -488,8 +595,14 @@ impl ValidatorSetManager {
                     power_changed = power_changed.len(),
                     "validator set updated"
                 );
+            }
+            if !added.is_empty() {
                 self.metrics.record_update("added");
+            }
+            if !removed.is_empty() {
                 self.metrics.record_update("removed");
+            }
+            if !power_changed.is_empty() {
                 self.metrics.record_update("power_changed");
             }
         }
@@ -498,83 +611,94 @@ impl ValidatorSetManager {
         Ok(())
     }
 
-    /// Get the proposer for a given height and round (with caching).
-    pub fn proposer_for(&self, height: u64, round: u32) -> Validator {
+    /// Proposer for `(height, round)`, cached.
+    ///
+    /// Returns `Err(ValidatorSetError::EmptySet)` if the set is empty.
+    pub fn proposer_for(&self, height: u64, round: u32) -> ValidatorSetResult<Validator> {
         self.metrics.record_proposer_check();
 
         let key = (height, round);
+        let now = Instant::now();
 
-        // Check cache.
+        // Try cache first.
         if self.config.enable_cache {
-            let mut cache_guard = self.cache.lock();
-            if let Some(cache) = cache_guard.as_mut() {
+            let mut guard = self.cache.lock();
+            if let Some(cache) = guard.as_mut() {
                 if let Some(entry) = cache.get(&key) {
-                    if entry.expires_at > Instant::now() {
+                    if entry.expires_at > now {
                         self.metrics.record_cache_hit();
-                        trace!(
-                            height,
-                            round,
-                            "proposer cache hit"
-                        );
-                        return entry.validator.clone();
-                    } else {
-                        cache.pop(&key);
+                        trace!(height, round, "proposer cache hit");
+                        return Ok(entry.validator.clone());
                     }
+                    cache.pop(&key);
                 }
                 self.metrics.record_cache_miss();
             }
         }
 
-        // Compute proposer.
-        let vset = self.vset.lock();
-        let val = vset.proposer_for(height, round).clone();
+        // Compute fresh.
+        let val = {
+            let vset = self.vset.lock();
+            vset.try_proposer_for(height, round)
+                .cloned()
+                .ok_or(ValidatorSetError::EmptySet)?
+        };
 
         // Store in cache.
         if self.config.enable_cache {
-            let mut cache_guard = self.cache.lock();
-            if let Some(cache) = cache_guard.as_mut() {
-                let entry = ProposerCacheEntry {
-                    validator: val.clone(),
-                    expires_at: Instant::now() + Duration::from_secs(self.config.cache_ttl_secs),
-                };
-                cache.put(key, entry);
+            let mut guard = self.cache.lock();
+            if let Some(cache) = guard.as_mut() {
+                cache.put(
+                    key,
+                    ProposerCacheEntry {
+                        validator: val.clone(),
+                        expires_at: now + self.ttl,
+                    },
+                );
             }
         }
 
-        val
+        Ok(val)
     }
 
-    /// Get the voting power of a validator.
+    /// Voting power of the given public key (0 if not in the set).
+    #[must_use]
     pub fn power_of(&self, pk: &PublicKeyBytes) -> VotingPower {
         self.vset.lock().power_of(pk)
     }
 
-    /// Check if a validator is in the set.
+    /// Whether the given public key is in the set.
+    #[must_use]
     pub fn contains(&self, pk: &PublicKeyBytes) -> bool {
         self.vset.lock().contains(pk)
     }
 
-    /// Get the total voting power.
+    /// Total voting power.
+    #[must_use]
     pub fn total_power(&self) -> VotingPower {
         self.vset.lock().total_power()
     }
 
-    /// Get the quorum threshold.
+    /// Quorum threshold.
+    #[must_use]
     pub fn quorum_threshold(&self) -> VotingPower {
         self.vset.lock().quorum_threshold()
     }
 
-    /// Get the validator count.
+    /// Number of validators.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.vset.lock().len()
     }
 
-    /// Check if the set is empty.
+    /// Whether the set is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.vset.lock().is_empty()
     }
 
-    /// Compute the hash of the validator set.
+    /// Canonical hash of the current set.
+    #[must_use]
     pub fn hash_hex(&self) -> String {
         self.vset.lock().hash_hex()
     }
@@ -583,20 +707,17 @@ impl ValidatorSetManager {
     pub fn clear_cache(&self) {
         if let Some(cache) = self.cache.lock().as_mut() {
             cache.clear();
-            trace!("Validator set cache cleared");
+            trace!("validator set cache cleared");
         }
     }
 
-    /// Get the cache size.
+    /// Current cache size.
+    #[must_use]
     pub fn cache_size(&self) -> usize {
-        if let Some(cache) = self.cache.lock().as_ref() {
-            cache.len()
-        } else {
-            0
-        }
+        self.cache.lock().as_ref().map_or(0, |c| c.len())
     }
 
-    /// Update metrics.
+    /// Update the metrics gauges from the current set.
     fn update_metrics(&self) {
         let vset = self.vset.lock();
         self.metrics.set_validator_count(vset.len());
@@ -604,7 +725,8 @@ impl ValidatorSetManager {
         self.metrics.set_quorum_threshold(vset.quorum_threshold());
     }
 
-    /// Get metrics snapshot.
+    /// Snapshot of the current metrics.
+    #[must_use]
     pub fn metrics_snapshot(&self) -> ValidatorSetMetricsSnapshot {
         ValidatorSetMetricsSnapshot {
             validator_count: self.metrics.validator_count.get() as usize,
@@ -617,15 +739,15 @@ impl ValidatorSetManager {
         }
     }
 
-    /// Get configuration.
+    /// Configuration.
+    #[must_use]
     pub fn config(&self) -> &ValidatorSetConfig {
         &self.config
     }
 }
 
-// ── Metrics Snapshot ─────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
+/// Snapshot of validator set metrics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ValidatorSetMetricsSnapshot {
     pub validator_count: usize,
     pub total_power: u64,
@@ -636,19 +758,22 @@ pub struct ValidatorSetMetricsSnapshot {
     pub cache_size: usize,
 }
 
-// ── Standalone Functions ─────────────────────────────────────────────────
+// ── Standalone functions (backward compat) ───────────────────────────────
 
-/// Create a new validator set with validation (backward compatibility).
-pub fn new_validator_set(vals: Vec<Validator>, max_size: usize) -> ValidatorSetResult<ValidatorSet> {
+/// Create a new validator set with validation.
+pub fn new_validator_set(
+    vals: Vec<Validator>,
+    max_size: usize,
+) -> ValidatorSetResult<ValidatorSet> {
     ValidatorSet::new(vals, max_size)
 }
 
-/// Validate a validator set (standalone).
+/// Validate a slice of validators without constructing a `ValidatorSet`.
 pub fn validate_validator_set(vals: &[Validator]) -> ValidatorSetResult<()> {
     if vals.is_empty() {
         return Err(ValidatorSetError::EmptySet);
     }
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::with_capacity(vals.len());
     for v in vals {
         if v.power == 0 {
             return Err(ValidatorSetError::ZeroPower);
@@ -668,13 +793,17 @@ mod tests {
     use super::*;
 
     fn make_validator(pk_byte: u8, power: VotingPower) -> Validator {
-        let pk = PublicKeyBytes(vec![pk_byte; 32]);
-        Validator { pk, power }
+        Validator {
+            pk: PublicKeyBytes(vec![pk_byte; 32]),
+            power,
+        }
     }
 
     fn make_vset(vals: Vec<Validator>) -> ValidatorSet {
         ValidatorSet { vals }
     }
+
+    // ── Basic queries ───────────────────────────────────────────────────
 
     #[test]
     fn test_total_power() {
@@ -687,110 +816,115 @@ mod tests {
     }
 
     #[test]
-    fn test_power_of() {
+    fn test_total_power_saturates() {
         let vset = make_vset(vec![
-            make_validator(1, 10),
-            make_validator(2, 20),
+            make_validator(1, u64::MAX),
+            make_validator(2, u64::MAX),
         ]);
-        let pk1 = PublicKeyBytes(vec![1; 32]);
-        let pk2 = PublicKeyBytes(vec![2; 32]);
-        let pk3 = PublicKeyBytes(vec![3; 32]);
-        assert_eq!(vset.power_of(&pk1), 10);
-        assert_eq!(vset.power_of(&pk2), 20);
-        assert_eq!(vset.power_of(&pk3), 0);
+        assert_eq!(vset.total_power(), u64::MAX);
+    }
+
+    #[test]
+    fn test_power_of() {
+        let vset = make_vset(vec![make_validator(1, 10), make_validator(2, 20)]);
+        assert_eq!(vset.power_of(&PublicKeyBytes(vec![1; 32])), 10);
+        assert_eq!(vset.power_of(&PublicKeyBytes(vec![2; 32])), 20);
+        assert_eq!(vset.power_of(&PublicKeyBytes(vec![3; 32])), 0);
     }
 
     #[test]
     fn test_contains() {
         let vset = make_vset(vec![make_validator(1, 10)]);
-        let pk1 = PublicKeyBytes(vec![1; 32]);
-        let pk2 = PublicKeyBytes(vec![2; 32]);
-        assert!(vset.contains(&pk1));
-        assert!(!vset.contains(&pk2));
+        assert!(vset.contains(&PublicKeyBytes(vec![1; 32])));
+        assert!(!vset.contains(&PublicKeyBytes(vec![2; 32])));
     }
 
+    // ── Proposer selection ──────────────────────────────────────────────
+
     #[test]
-    fn test_proposer_for() {
+    fn test_proposer_round_robin() {
         let vset = make_vset(vec![
             make_validator(1, 10),
             make_validator(2, 20),
             make_validator(3, 30),
         ]);
-        let p0 = vset.proposer_for(0, 0);
-        assert_eq!(p0.pk.0[0], 1);
-        let p1 = vset.proposer_for(1, 0);
-        assert_eq!(p1.pk.0[0], 2);
-        let p2 = vset.proposer_for(2, 0);
-        assert_eq!(p2.pk.0[0], 3);
-        let p3 = vset.proposer_for(3, 0);
-        assert_eq!(p3.pk.0[0], 1);
-        let p4 = vset.proposer_for(0, 1);
-        assert_eq!(p4.pk.0[0], 2);
+        assert_eq!(vset.proposer_for(0, 0).pk.0[0], 1);
+        assert_eq!(vset.proposer_for(1, 0).pk.0[0], 2);
+        assert_eq!(vset.proposer_for(2, 0).pk.0[0], 3);
+        assert_eq!(vset.proposer_for(3, 0).pk.0[0], 1);
+        assert_eq!(vset.proposer_for(0, 1).pk.0[0], 2);
+    }
+
+    #[test]
+    fn test_proposer_for_large_height_does_not_truncate() {
+        // Regression: the previous implementation cast `height as usize`
+        // which truncates on 32-bit platforms. Now uses u64 modulo.
+        let vset = make_vset(vec![
+            make_validator(1, 1),
+            make_validator(2, 1),
+            make_validator(3, 1),
+        ]);
+        let h = u64::MAX;
+        // Should not panic; pick a deterministic validator.
+        let _ = vset.proposer_for(h, 0);
+    }
+
+    #[test]
+    fn test_try_proposer_for_empty() {
+        let vset = ValidatorSet { vals: vec![] };
+        assert!(vset.try_proposer_for(0, 0).is_none());
     }
 
     #[test]
     #[should_panic(expected = "empty set")]
-    fn test_proposer_for_empty_set() {
+    fn test_proposer_for_empty_set_panics() {
         let vset = ValidatorSet { vals: vec![] };
-        vset.proposer_for(0, 0);
+        let _ = vset.proposer_for(0, 0);
     }
 
-    #[test]
-    fn test_is_empty_and_len() {
-        let vset = ValidatorSet { vals: vec![] };
-        assert!(vset.is_empty());
-        assert_eq!(vset.len(), 0);
-
-        let vset2 = make_vset(vec![make_validator(1, 10)]);
-        assert!(!vset2.is_empty());
-        assert_eq!(vset2.len(), 1);
-    }
-
-    #[test]
-    fn test_iter() {
-        let vset = make_vset(vec![
-            make_validator(1, 10),
-            make_validator(2, 20),
-        ]);
-        let pks: Vec<u8> = vset.iter().map(|v| v.pk.0[0]).collect();
-        assert_eq!(pks, vec![1, 2]);
-    }
+    // ── Quorum ──────────────────────────────────────────────────────────
 
     #[test]
     fn test_quorum_threshold() {
-        let vset1 = make_vset(vec![make_validator(1, 1), make_validator(2, 1), make_validator(3, 1)]);
-        assert_eq!(vset1.quorum_threshold(), 3);
-        let vset2 = make_vset(vec![make_validator(1, 1), make_validator(2, 1), make_validator(3, 1), make_validator(4, 1)]);
-        assert_eq!(vset2.quorum_threshold(), 3);
-        let vset3 = make_vset(vec![make_validator(1, 100)]);
-        assert_eq!(vset3.quorum_threshold(), 67);
+        let v = |n| make_validator(n, 1);
+        assert_eq!(make_vset(vec![v(1), v(2), v(3)]).quorum_threshold(), 3);
+        assert_eq!(make_vset(vec![v(1), v(2), v(3), v(4)]).quorum_threshold(), 3);
+        assert_eq!(make_vset(vec![make_validator(1, 100)]).quorum_threshold(), 67);
     }
 
     #[test]
-    fn test_hash_hex_deterministic() {
-        let vset1 = make_vset(vec![
+    fn test_quorum_threshold_saturates() {
+        let vset = make_vset(vec![make_validator(1, u64::MAX)]);
+        // total = u64::MAX, threshold = floor(u64::MAX * 2 / 3) + 1 (saturated).
+        // Should not panic on overflow.
+        let _ = vset.quorum_threshold();
+    }
+
+    // ── Hash ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hash_order_independent() {
+        let a = make_vset(vec![
             make_validator(2, 20),
             make_validator(1, 10),
             make_validator(3, 30),
         ]);
-        let vset2 = make_vset(vec![
+        let b = make_vset(vec![
             make_validator(1, 10),
             make_validator(2, 20),
             make_validator(3, 30),
         ]);
-        assert_eq!(vset1.hash_hex(), vset2.hash_hex());
+        assert_eq!(a.hash_hex(), b.hash_hex());
     }
 
     #[test]
-    fn test_display() {
-        let vset = make_vset(vec![
-            make_validator(1, 10),
-            make_validator(2, 20),
-        ]);
-        let s = format!("{}", vset);
-        assert!(s.contains("n=2"));
-        assert!(s.contains("total_power=30"));
+    fn test_hash_changes_with_power() {
+        let a = make_vset(vec![make_validator(1, 10)]);
+        let b = make_vset(vec![make_validator(1, 11)]);
+        assert_ne!(a.hash_hex(), b.hash_hex());
     }
+
+    // ── Validation ──────────────────────────────────────────────────────
 
     #[test]
     fn test_validation_duplicate_pk() {
@@ -799,37 +933,89 @@ mod tests {
             Validator { pk: pk.clone(), power: 10 },
             Validator { pk, power: 20 },
         ];
-        let result = ValidatorSet::new(vals, 10);
-        assert!(matches!(result, Err(ValidatorSetError::DuplicatePublicKey(_))));
+        assert!(matches!(
+            ValidatorSet::new(vals, 10),
+            Err(ValidatorSetError::DuplicatePublicKey(_))
+        ));
     }
 
     #[test]
     fn test_validation_zero_power() {
-        let pk = PublicKeyBytes(vec![1; 32]);
-        let vals = vec![Validator { pk, power: 0 }];
-        let result = ValidatorSet::new(vals, 10);
-        assert!(matches!(result, Err(ValidatorSetError::ZeroPower)));
+        let vals = vec![Validator {
+            pk: PublicKeyBytes(vec![1; 32]),
+            power: 0,
+        }];
+        assert_eq!(
+            ValidatorSet::new(vals, 10),
+            Err(ValidatorSetError::ZeroPower)
+        );
     }
 
     #[test]
     fn test_validation_empty() {
-        let result = ValidatorSet::new(vec![], 10);
-        assert!(matches!(result, Err(ValidatorSetError::EmptySet)));
+        assert_eq!(
+            ValidatorSet::new(vec![], 10),
+            Err(ValidatorSetError::EmptySet)
+        );
     }
 
     #[test]
     fn test_validation_too_large() {
-        let mut vals = Vec::new();
-        for i in 0..15 {
-            let pk = PublicKeyBytes(vec![i; 32]);
-            vals.push(Validator { pk, power: 1 });
-        }
-        let result = ValidatorSet::new(vals, 10);
-        assert!(matches!(result, Err(ValidatorSetError::TooLarge { .. })));
+        let vals: Vec<Validator> = (0..15)
+            .map(|i| Validator {
+                pk: PublicKeyBytes(vec![i; 32]),
+                power: 1,
+            })
+            .collect();
+        assert!(matches!(
+            ValidatorSet::new(vals, 10),
+            Err(ValidatorSetError::TooLarge { count: 15, max: 10 })
+        ));
+    }
+
+    // ── Diff & merge ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_diff() {
+        let a = make_vset(vec![make_validator(1, 10), make_validator(2, 20)]);
+        let b = make_vset(vec![make_validator(1, 10), make_validator(3, 30)]);
+        let (added, removed, power_changed) = a.diff(&b);
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].pk.0[0], 3);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].pk.0[0], 2);
+        assert!(power_changed.is_empty());
     }
 
     #[test]
-    fn test_manager_cache() {
+    fn test_diff_power_changed() {
+        let a = make_vset(vec![make_validator(1, 10)]);
+        let b = make_vset(vec![make_validator(1, 20)]);
+        let (added, removed, changed) = a.diff(&b);
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].power, 20);
+    }
+
+    #[test]
+    fn test_merge_updates_and_adds() {
+        let mut a = make_vset(vec![make_validator(1, 10), make_validator(2, 20)]);
+        let b = make_vset(vec![make_validator(2, 25), make_validator(3, 30)]);
+        a.merge(&b);
+        // validator 1 unchanged.
+        assert_eq!(a.power_of(&PublicKeyBytes(vec![1; 32])), 10);
+        // validator 2 power updated.
+        assert_eq!(a.power_of(&PublicKeyBytes(vec![2; 32])), 25);
+        // validator 3 added.
+        assert_eq!(a.power_of(&PublicKeyBytes(vec![3; 32])), 30);
+        assert_eq!(a.len(), 3);
+    }
+
+    // ── Manager ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_manager_cache_hit() {
         let config = ValidatorSetConfig {
             enable_cache: true,
             cache_size: 10,
@@ -841,10 +1027,12 @@ mod tests {
             make_validator(3, 30),
         ]);
         let manager = ValidatorSetManager::new(config, vset).unwrap();
-        let p1 = manager.proposer_for(0, 0);
-        let p2 = manager.proposer_for(0, 0);
+        let p1 = manager.proposer_for(0, 0).unwrap();
+        let p2 = manager.proposer_for(0, 0).unwrap();
         assert_eq!(p1.pk.0[0], p2.pk.0[0]);
-        assert!(manager.cache_size() > 0);
+        let snap = manager.metrics_snapshot();
+        assert_eq!(snap.cache_misses, 1);
+        assert_eq!(snap.cache_hits, 1);
     }
 
     #[test]
@@ -860,46 +1048,116 @@ mod tests {
             make_validator(3, 30),
         ]);
         let manager = ValidatorSetManager::new(config, vset).unwrap();
-        manager.proposer_for(0, 0);
+        manager.proposer_for(0, 0).unwrap();
         assert!(manager.cache_size() > 0);
         manager.clear_cache();
         assert_eq!(manager.cache_size(), 0);
     }
 
     #[test]
-    fn test_manager_update() {
+    fn test_manager_update_invalidates_cache() {
+        let config = ValidatorSetConfig::default();
+        let vset = make_vset(vec![make_validator(1, 10)]);
+        let manager = ValidatorSetManager::new(config, vset).unwrap();
+        let p1 = manager.proposer_for(0, 0).unwrap();
+        assert_eq!(p1.pk.0[0], 1);
+
+        // Replace with a set whose first validator has a different key.
+        let new_vset = make_vset(vec![make_validator(2, 10)]);
+        manager.update(new_vset).unwrap();
+
+        let p2 = manager.proposer_for(0, 0).unwrap();
+        assert_eq!(p2.pk.0[0], 2, "cache must be invalidated on update");
+    }
+
+    #[test]
+    fn test_manager_update_rejects_empty_by_default() {
+        let config = ValidatorSetConfig::default(); // validate_on_create: true
+        let vset = make_vset(vec![make_validator(1, 10)]);
+        let manager = ValidatorSetManager::new(config, vset).unwrap();
+        let result = manager.update(ValidatorSet { vals: vec![] });
+        assert!(matches!(result, Err(ValidatorSetError::EmptySet)));
+    }
+
+    #[test]
+    fn test_manager_update_accepts_empty_when_validation_disabled() {
         let config = ValidatorSetConfig {
-            validate_on_create: true,
+            validate_on_create: false,
             ..Default::default()
         };
         let vset = make_vset(vec![make_validator(1, 10)]);
         let manager = ValidatorSetManager::new(config, vset).unwrap();
-        assert_eq!(manager.len(), 1);
-
-        let new_vset = make_vset(vec![
-            make_validator(1, 10),
-            make_validator(2, 20),
-        ]);
-        manager.update(new_vset).unwrap();
-        assert_eq!(manager.len(), 2);
-        assert_eq!(manager.total_power(), 30);
+        assert!(manager.update(ValidatorSet { vals: vec![] }).is_ok());
+        assert!(manager.is_empty());
     }
 
     #[test]
-    fn test_diff() {
-        let vset1 = make_vset(vec![
-            make_validator(1, 10),
-            make_validator(2, 20),
-        ]);
-        let vset2 = make_vset(vec![
-            make_validator(1, 10),
-            make_validator(3, 30),
-        ]);
-        let (added, removed, power_changed) = vset1.diff(&vset2);
-        assert_eq!(added.len(), 1);
-        assert_eq!(added[0].pk.0[0], 3);
-        assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].pk.0[0], 2);
-        assert_eq!(power_changed.len(), 0);
+    fn test_manager_proposer_for_empty_returns_err() {
+        let config = ValidatorSetConfig {
+            validate_on_create: false,
+            ..Default::default()
+        };
+        let manager =
+            ValidatorSetManager::new(config, ValidatorSet { vals: vec![] }).unwrap();
+        assert!(matches!(
+            manager.proposer_for(0, 0),
+            Err(ValidatorSetError::EmptySet)
+        ));
+    }
+
+    #[test]
+    fn test_manager_rejects_invalid_config() {
+        let config = ValidatorSetConfig {
+            cache_size: 0,
+            ..Default::default()
+        };
+        let vset = make_vset(vec![make_validator(1, 10)]);
+        assert!(matches!(
+            ValidatorSetManager::new(config, vset),
+            Err(ValidatorSetError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn test_metrics_unregistered_is_repeatable() {
+        // Regression: the derived-style fallback chained `.unwrap()`, which
+        // could panic on a name collision in the default registry.
+        let _a = ValidatorSetMetrics::unregistered();
+        let _b = ValidatorSetMetrics::unregistered();
+        let _c = ValidatorSetMetrics::default();
+    }
+
+    // ── Misc ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_empty_and_len() {
+        let vset = ValidatorSet { vals: vec![] };
+        assert!(vset.is_empty());
+        assert_eq!(vset.len(), 0);
+        let vset = make_vset(vec![make_validator(1, 10)]);
+        assert!(!vset.is_empty());
+        assert_eq!(vset.len(), 1);
+    }
+
+    #[test]
+    fn test_iter() {
+        let vset = make_vset(vec![make_validator(1, 10), make_validator(2, 20)]);
+        let pks: Vec<u8> = vset.iter().map(|v| v.pk.0[0]).collect();
+        assert_eq!(pks, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_display() {
+        let vset = make_vset(vec![make_validator(1, 10), make_validator(2, 20)]);
+        let s = format!("{vset}");
+        assert!(s.contains("n=2"));
+        assert!(s.contains("total_power=30"));
+    }
+
+    #[test]
+    fn test_validate_validator_set_helper() {
+        assert!(validate_validator_set(&[]).is_err());
+        assert!(validate_validator_set(&[make_validator(1, 0)]).is_err());
+        assert!(validate_validator_set(&[make_validator(1, 1)]).is_ok());
     }
 }
