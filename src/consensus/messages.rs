@@ -1,26 +1,38 @@
 //! Quantum consensus message types and signing for IONA — Production-Grade.
 //!
-//! # Quantum Message Model
+//! # Model
 //!
-//! Each consensus message (Proposal, Vote) is modelled as a **quantum state**
-//! in a tensor product Hilbert space. The deterministic binary signing format
-//! acts as a **quantum fingerprint** that uniquely identifies each state.
+//! Each consensus message (`Proposal`, `Vote`) is a discrete struct with a
+//! deterministic binary signing format. The "quantum" naming
+//! (`purity`, `entanglement_fidelity`) is a **decorative scoreboard** exposed
+//! for observability only — see the module-level invariants below.
 //!
-//! # Production Features
-//! - Thread‑safe message validation with `thiserror` errors.
-//! - Configurable limits (max message size, signature fidelity thresholds).
-//! - Persistent statistics with atomic writes and file locking.
-//! - Structured logging with `tracing`.
-//! - Versioned serialization for forward compatibility.
-//! - Message builder/factory for consistent creation.
-//! - Comprehensive validation for all message types.
+//! # Invariants (must hold or the network forks / misbehaves)
+//!
+//! 1. **Domain separation.** Each `(message kind, value/nil)` pair has a
+//!    unique 4-byte domain tag. A prevote-nil and precommit-nil for the
+//!    same `(height, round)` **must not** produce identical sign bytes.
+//! 2. **Determinism.** `proposal_sign_bytes` and `vote_sign_bytes` are pure
+//!    functions of their arguments. Same inputs ⇒ same bytes.
+//! 3. **Bounded memory.** Per-message-size and stats-window limits are
+//!    enforced so a long-running node cannot be OOM'd by relayed traffic.
+//! 4. **Durability (optional).** When persistence is enabled, every write is
+//!    an fsync'd atomic rename; a crash never leaves a torn file.
+//! 5. **Purity is informational.** `purity` and `entanglement_fidelity`
+//!    never gate acceptance of a message.
+//!
+//! # Wire format note
+//!
+//! Wire size is computed via `serde_json::to_vec(value).len()`. This is the
+//! same JSON the network serializes, so the check is exact (not an estimate)
+//! and does not require a `bincode` dependency.
 
 use crate::crypto::{PublicKeyBytes, SignatureBytes};
 use crate::types::{Block, Hash32, Height, Round};
 use fs2::FileExt;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, Write},
     path::{Path, PathBuf},
@@ -28,74 +40,142 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, warn};
 
 // -----------------------------------------------------------------------------
-// Quantum Constants
+// Domain tags
 // -----------------------------------------------------------------------------
 
-/// Domain tag for proposals: `"PROP"` as 4‑byte little‑endian.
+/// Domain tag for proposals: `"PROP"`.
 const DOMAIN_PROPOSAL: [u8; 4] = *b"PROP";
 
-/// Domain tag for prevote (non‑nil): `"VTPY"` — prevote subspace.
+/// Domain tag for prevote with a block value: `"VTPY"`.
 const DOMAIN_PREVOTE: [u8; 4] = *b"VTPY";
 
-/// Domain tag for precommit (non‑nil): `"VTCX"` — precommit subspace.
+/// Domain tag for precommit with a block value: `"VTCX"`.
 const DOMAIN_PRECOMMIT: [u8; 4] = *b"VTCX";
 
-/// Domain tag for nil votes: `"VNIL"` — nil subspace.
-const DOMAIN_NIL_VOTE: [u8; 4] = *b"VNIL";
+/// Domain tag for a **nil** prevote.
+///
+/// **Invariant**: this must differ from [`DOMAIN_NIL_PRECOMMIT`]. Using a
+/// shared `"VNIL"` tag would make a nil prevote and a nil precommit for the
+/// same `(height, round)` produce identical sign bytes, allowing a signature
+/// on one to be replayed as the other.
+const DOMAIN_NIL_PREVOTE: [u8; 4] = *b"VNPY";
 
-/// Flag byte indicating a value is present (quantum state populated).
-const FLAG_PRESENT: u8 = 0x01;
-
-/// Flag byte indicating a value is absent (vacuum state |∅⟩).
-const FLAG_ABSENT: u8 = 0x00;
-
-/// Length of a block ID hash in bytes.
-const BLOCK_ID_LEN: usize = 32;
-
-/// Length of domain tag.
-const DOMAIN_LEN: usize = 4;
-
-/// Length of height (8 bytes LE).
-const HEIGHT_LEN: usize = 8;
-
-/// Length of round (4 bytes LE).
-const ROUND_LEN: usize = 4;
-
-/// Length of the optional value flag byte.
-const FLAG_LEN: usize = 1;
-
-/// Default maximum message size in bytes.
-const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
-
-/// Default signature fidelity threshold.
-const DEFAULT_SIGNATURE_FIDELITY_THRESHOLD: f64 = 0.999;
-
-/// Default decoherence rate per operation.
-const DEFAULT_DECOHERENCE_RATE: f64 = 0.00001;
-
-/// Kraus rank for domain quantum channels.
-const KRAUS_RANK: usize = 4;
-
-/// Lock timeout in seconds.
-const LOCK_TIMEOUT_SECS: u64 = 10;
-
-/// Temporary file extension for atomic writes.
-const TEMP_EXT: &str = ".tmp";
-
-/// Current serialization version.
-const CURRENT_VERSION: u32 = 1;
-
-/// Maximum statistics window size.
-const MAX_STATS_WINDOW: usize = 1000;
+/// Domain tag for a **nil** precommit. See [`DOMAIN_NIL_PREVOTE`].
+const DOMAIN_NIL_PRECOMMIT: [u8; 4] = *b"VNCX";
 
 // -----------------------------------------------------------------------------
-// Message Errors
+// Layout constants
+// -----------------------------------------------------------------------------
+
+const FLAG_PRESENT: u8 = 0x01;
+const FLAG_ABSENT: u8 = 0x00;
+const BLOCK_ID_LEN: usize = 32;
+const DOMAIN_LEN: usize = 4;
+const HEIGHT_LEN: usize = 8;
+const ROUND_LEN: usize = 4;
+const FLAG_LEN: usize = 1;
+
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
+
+const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
+const DEFAULT_DECOHERENCE_RATE: f64 = 0.00001;
+const DEFAULT_STATS_WINDOW: usize = 100;
+const MAX_ALLOWED_STATS_WINDOW: usize = 10_000;
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+const TEMP_SUFFIX: &str = ".tmp";
+const LOCK_SUFFIX: &str = ".lock";
+const CURRENT_VERSION: u32 = 1;
+
+/// Configuration for consensus messages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MessageConfig {
+    /// Maximum serialized message size in bytes.
+    pub max_message_size: usize,
+    /// Informational purity threshold — a message below this emits a
+    /// `warn!` but is **not** rejected.
+    pub min_purity: f64,
+    /// Informational entanglement-fidelity threshold — see `min_purity`.
+    pub min_entanglement_fidelity: f64,
+    /// Informational signature-fidelity threshold (currently unused; kept
+    /// for forward compatibility with a future partial-signature scheme).
+    pub signature_fidelity_threshold: f64,
+    /// Decoherence rate applied per message construction.
+    pub decoherence_rate: f64,
+    /// Whether `flush_stats` writes to disk. Note: this module does **not**
+    /// auto-flush; callers must invoke [`MessageFactory::flush_stats`].
+    pub persist_stats: bool,
+    /// Maximum number of samples retained in the rolling stats window.
+    ///
+    /// Bounds `purity_samples` and `entanglement_samples` so a long-running
+    /// node cannot be OOM'd by relayed traffic.
+    pub stats_window_size: usize,
+}
+
+impl Default for MessageConfig {
+    fn default() -> Self {
+        Self {
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            min_purity: 0.5,
+            min_entanglement_fidelity: 0.5,
+            signature_fidelity_threshold: 0.999,
+            decoherence_rate: DEFAULT_DECOHERENCE_RATE,
+            persist_stats: true,
+            stats_window_size: DEFAULT_STATS_WINDOW,
+        }
+    }
+}
+
+impl MessageConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_message_size == 0 {
+            return Err("max_message_size must be > 0".into());
+        }
+        if !self.min_purity.is_finite() || !(0.0..=1.0).contains(&self.min_purity) {
+            return Err("min_purity must be a finite value in [0.0, 1.0]".into());
+        }
+        if !self.min_entanglement_fidelity.is_finite()
+            || !(0.0..=1.0).contains(&self.min_entanglement_fidelity)
+        {
+            return Err(
+                "min_entanglement_fidelity must be a finite value in [0.0, 1.0]".into(),
+            );
+        }
+        if !self.signature_fidelity_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.signature_fidelity_threshold)
+        {
+            return Err(
+                "signature_fidelity_threshold must be a finite value in [0.0, 1.0]".into(),
+            );
+        }
+        if !self.decoherence_rate.is_finite()
+            || !(0.0..=1.0).contains(&self.decoherence_rate)
+        {
+            return Err("decoherence_rate must be a finite value in [0.0, 1.0]".into());
+        }
+        if self.stats_window_size == 0 {
+            return Err("stats_window_size must be > 0".into());
+        }
+        if self.stats_window_size > MAX_ALLOWED_STATS_WINDOW {
+            return Err(format!(
+                "stats_window_size must be <= {} (got {})",
+                MAX_ALLOWED_STATS_WINDOW, self.stats_window_size
+            ));
+        }
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Errors
 // -----------------------------------------------------------------------------
 
 /// Errors that can occur during message handling.
@@ -122,9 +202,6 @@ pub enum MessageError {
     #[error("proposer mismatch: expected {expected}, got {actual}")]
     ProposerMismatch { expected: String, actual: String },
 
-    #[error("quantum decoherence: purity {purity} below threshold {threshold}")]
-    Decoherence { purity: f64, threshold: f64 },
-
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -136,83 +213,15 @@ pub enum MessageError {
 
     #[error("configuration error: {0}")]
     Config(String),
-
-    #[error("nil vote cannot have a block hash")]
-    NilVoteWithBlockHash,
-
-    #[error("non‑nil vote must have a block hash")]
-    NonNilVoteWithoutBlockHash,
 }
 
 pub type MessageResult<T> = Result<T, MessageError>;
 
 // -----------------------------------------------------------------------------
-// Configuration
+// Vote type
 // -----------------------------------------------------------------------------
 
-/// Configuration for consensus messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MessageConfig {
-    /// Maximum message size in bytes.
-    pub max_message_size: usize,
-    /// Minimum required purity for messages (0.0 – 1.0).
-    pub min_purity: f64,
-    /// Minimum entanglement fidelity for messages.
-    pub min_entanglement_fidelity: f64,
-    /// Signature fidelity threshold.
-    pub signature_fidelity_threshold: f64,
-    /// Decoherence rate per operation.
-    pub decoherence_rate: f64,
-    /// Whether to persist statistics to disk.
-    pub persist_stats: bool,
-    /// Maximum statistics window size.
-    pub stats_window_size: usize,
-}
-
-impl Default for MessageConfig {
-    fn default() -> Self {
-        Self {
-            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-            min_purity: 0.5,
-            min_entanglement_fidelity: 0.5,
-            signature_fidelity_threshold: DEFAULT_SIGNATURE_FIDELITY_THRESHOLD,
-            decoherence_rate: DEFAULT_DECOHERENCE_RATE,
-            persist_stats: true,
-            stats_window_size: 100,
-        }
-    }
-}
-
-impl MessageConfig {
-    /// Validate the configuration.
-    pub fn validate(&self) -> Result<(), String> {
-        if self.max_message_size == 0 {
-            return Err("max_message_size must be > 0".into());
-        }
-        if !(0.0..=1.0).contains(&self.min_purity) {
-            return Err("min_purity must be between 0.0 and 1.0".into());
-        }
-        if !(0.0..=1.0).contains(&self.min_entanglement_fidelity) {
-            return Err("min_entanglement_fidelity must be between 0.0 and 1.0".into());
-        }
-        if !(0.0..=1.0).contains(&self.signature_fidelity_threshold) {
-            return Err("signature_fidelity_threshold must be between 0.0 and 1.0".into());
-        }
-        if !(0.0..=1.0).contains(&self.decoherence_rate) {
-            return Err("decoherence_rate must be between 0.0 and 1.0".into());
-        }
-        if self.stats_window_size == 0 {
-            return Err("stats_window_size must be > 0".into());
-        }
-        Ok(())
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Vote Types
-// -----------------------------------------------------------------------------
-
-/// Vote type — quantum number distinguishing prevote from precommit.
+/// Vote type — distinguishes prevote from precommit.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum VoteType {
     Prevote,
@@ -220,83 +229,31 @@ pub enum VoteType {
 }
 
 impl VoteType {
-    /// Quantum domain tag for this vote type.
+    /// Domain tag for a **value-bearing** vote of this type.
+    #[must_use]
     pub fn domain_tag(&self) -> [u8; 4] {
         match self {
             VoteType::Prevote => DOMAIN_PREVOTE,
             VoteType::Precommit => DOMAIN_PRECOMMIT,
         }
     }
-}
 
-// -----------------------------------------------------------------------------
-// Persistent Message Statistics
-// -----------------------------------------------------------------------------
-
-/// Persistent statistics state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StatsStateV1 {
-    version: u32,
-    proposals_sent: u64,
-    proposals_received: u64,
-    prevotes_sent: u64,
-    prevotes_received: u64,
-    precommits_sent: u64,
-    precommits_received: u64,
-    nil_votes: u64,
-    signature_failures: u64,
-    purity_samples: Vec<f64>,
-    entanglement_samples: Vec<f64>,
-    last_modified: u64,
-}
-
-impl StatsStateV1 {
-    fn from_stats(stats: &MessageStats) -> Self {
-        Self {
-            version: CURRENT_VERSION,
-            proposals_sent: stats.proposals_sent,
-            proposals_received: stats.proposals_received,
-            prevotes_sent: stats.prevotes_sent,
-            prevotes_received: stats.prevotes_received,
-            precommits_sent: stats.precommits_sent,
-            precommits_received: stats.precommits_received,
-            nil_votes: stats.nil_votes,
-            signature_failures: stats.signature_failures,
-            purity_samples: stats.purity_samples.clone(),
-            entanglement_samples: stats.entanglement_samples.clone(),
-            last_modified: current_timestamp(),
-        }
-    }
-
-    fn into_stats(self) -> MessageStats {
-        MessageStats {
-            proposals_sent: self.proposals_sent,
-            proposals_received: self.proposals_received,
-            prevotes_sent: self.prevotes_sent,
-            prevotes_received: self.prevotes_received,
-            precommits_sent: self.precommits_sent,
-            precommits_received: self.precommits_received,
-            nil_votes: self.nil_votes,
-            signature_failures: self.signature_failures,
-            purity_samples: self.purity_samples,
-            entanglement_samples: self.entanglement_samples,
+    /// Domain tag for a **nil** vote of this type.
+    #[must_use]
+    pub fn nil_domain_tag(&self) -> [u8; 4] {
+        match self {
+            VoteType::Prevote => DOMAIN_NIL_PREVOTE,
+            VoteType::Precommit => DOMAIN_NIL_PRECOMMIT,
         }
     }
 }
 
-fn current_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 // -----------------------------------------------------------------------------
-// Message Statistics
+// Statistics
 // -----------------------------------------------------------------------------
 
-/// Statistics for consensus messages.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Rolling statistics for consensus messages.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct MessageStats {
     pub proposals_sent: u64,
     pub proposals_received: u64,
@@ -306,81 +263,154 @@ pub struct MessageStats {
     pub precommits_received: u64,
     pub nil_votes: u64,
     pub signature_failures: u64,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Recent purity samples (bounded by `MessageConfig::stats_window_size`).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub purity_samples: Vec<f64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Recent entanglement-fidelity samples (bounded similarly).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub entanglement_samples: Vec<f64>,
 }
 
 impl MessageStats {
-    /// Average purity of received messages.
+    /// Average purity over the retained window. `1.0` if empty.
+    #[must_use]
     pub fn avg_purity(&self) -> f64 {
         if self.purity_samples.is_empty() {
             return 1.0;
         }
-        let sum: f64 = self.purity_samples.iter().sum();
-        sum / self.purity_samples.len() as f64
+        self.purity_samples.iter().sum::<f64>() / self.purity_samples.len() as f64
     }
 
-    /// Average entanglement fidelity.
+    /// Average entanglement fidelity over the retained window. `1.0` if empty.
+    #[must_use]
     pub fn avg_entanglement_fidelity(&self) -> f64 {
         if self.entanglement_samples.is_empty() {
             return 1.0;
         }
-        let sum: f64 = self.entanglement_samples.iter().sum();
-        sum / self.entanglement_samples.len() as f64
+        self.entanglement_samples.iter().sum::<f64>() / self.entanglement_samples.len() as f64
     }
 
-    /// Total messages received.
+    #[must_use]
     pub fn total_received(&self) -> u64 {
         self.proposals_received + self.prevotes_received + self.precommits_received
     }
 
-    /// Total messages sent.
+    #[must_use]
     pub fn total_sent(&self) -> u64 {
         self.proposals_sent + self.prevotes_sent + self.precommits_sent
     }
 
-    /// Total votes (prevotes + precommits).
+    #[must_use]
     pub fn total_votes(&self) -> u64 {
-        self.prevotes_sent + self.precommits_sent + self.prevotes_received + self.precommits_received
+        self.prevotes_sent
+            + self.precommits_sent
+            + self.prevotes_received
+            + self.precommits_received
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct StatsStateV1 {
+    version: u32,
+    #[serde(flatten)]
+    stats: MessageStats,
+    last_modified: u64,
+}
+
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 // -----------------------------------------------------------------------------
-// File I/O for Statistics
+// Atomic, durable persistence
 // -----------------------------------------------------------------------------
 
-fn acquire_lock(path: &Path) -> Result<File, MessageError> {
-    let lock_path = path.with_extension("lock");
+fn lock_path_for(path: &Path) -> PathBuf {
+    path.with_extension(LOCK_SUFFIX)
+}
+
+fn temp_path_for(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(TEMP_SUFFIX);
+    PathBuf::from(s)
+}
+
+fn acquire_lock(path: &Path) -> MessageResult<File> {
+    let lock_path = lock_path_for(path);
     let file = OpenOptions::new()
         .create(true)
+        .read(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path)
-        .map_err(|e| MessageError::LockFailed(e.to_string()))?;
-    let timeout = Duration::from_secs(LOCK_TIMEOUT_SECS);
-    let start = SystemTime::now();
+        .map_err(|e| MessageError::LockFailed(format!("open {}: {e}", lock_path.display())))?;
+
+    let deadline = Instant::now() + LOCK_TIMEOUT;
+    let mut delay = Duration::from_millis(1);
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
-            Err(_) => {
-                if start.elapsed().unwrap_or_default() > timeout {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
                     return Err(MessageError::LockFailed(format!(
-                        "timeout after {}s",
-                        LOCK_TIMEOUT_SECS
+                        "timeout on {} after {:?}",
+                        lock_path.display(),
+                        LOCK_TIMEOUT
                     )));
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(MessageError::LockFailed(format!(
+                    "lock error on {}: {e}",
+                    lock_path.display()
+                )));
             }
         }
     }
 }
 
-fn release_lock(file: File) -> Result<(), MessageError> {
-    file.unlock().map_err(|e| MessageError::LockFailed(e.to_string()))
+/// Write `bytes` atomically and durably: write temp + fsync + rename + fsync
+/// parent dir (Unix).
+fn atomic_write_durable(path: &Path, bytes: &[u8]) -> MessageResult<()> {
+    let temp_path = temp_path_for(path);
+
+    {
+        let f = File::create(&temp_path)?;
+        let mut w = BufWriter::new(f);
+        if let Err(e) = w.write_all(bytes) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(e.into());
+        }
+        if let Err(e) = w.flush() {
+            let _ = fs::remove_file(&temp_path);
+            return Err(e.into());
+        }
+        let f = w.into_inner().map_err(|e| {
+            MessageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })?;
+        f.sync_all()?;
+    }
+
+    fs::rename(&temp_path, path).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        MessageError::Io(e)
+    })?;
+
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
-fn load_stats(path: &Path) -> Result<MessageStats, MessageError> {
+fn load_stats(path: &Path) -> MessageResult<MessageStats> {
     if !path.exists() {
         return Ok(MessageStats::default());
     }
@@ -388,40 +418,129 @@ fn load_stats(path: &Path) -> Result<MessageStats, MessageError> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let raw: serde_json::Value = serde_json::from_reader(reader)?;
-    if let Some(version) = raw.get("version").and_then(|v| v.as_u64()) {
-        if version != CURRENT_VERSION as u64 {
-            return Err(MessageError::Config(format!(
-                "unsupported version: {} (expected {})",
-                version, CURRENT_VERSION
-            )));
+
+    match raw.get("version").and_then(|v| v.as_u64()) {
+        Some(v) if v == CURRENT_VERSION as u64 => {
+            let st: StatsStateV1 = serde_json::from_value(raw)?;
+            Ok(st.stats)
         }
-        let st: StatsStateV1 = serde_json::from_value(raw)?;
-        Ok(st.into_stats())
-    } else {
-        // Legacy format: try to parse as stats directly.
-        match serde_json::from_value::<MessageStats>(raw) {
-            Ok(stats) => Ok(stats),
-            Err(e) => Err(MessageError::Serialization(e)),
+        Some(v) => Err(MessageError::Config(format!(
+            "unsupported stats version: {v} (expected {CURRENT_VERSION})"
+        ))),
+        None => {
+            // Legacy: bare MessageStats without an envelope.
+            let stats: MessageStats = serde_json::from_value(raw)?;
+            Ok(stats)
         }
     }
 }
 
-fn save_stats(path: &Path, stats: &MessageStats) -> Result<(), MessageError> {
-    let st = StatsStateV1::from_stats(stats);
-    let json = serde_json::to_string_pretty(&st)?;
+fn save_stats(path: &Path, stats: &MessageStats) -> MessageResult<()> {
     let _lock = acquire_lock(path)?;
-    let temp_path = path.with_extension(TEMP_EXT);
-    fs::write(&temp_path, &json)?;
-    fs::rename(&temp_path, path)?;
-    Ok(())
+    let st = StatsStateV1 {
+        version: CURRENT_VERSION,
+        stats: stats.clone(),
+        last_modified: current_timestamp(),
+    };
+    let json = serde_json::to_vec_pretty(&st)?;
+    atomic_write_durable(path, &json)
 }
 
 // -----------------------------------------------------------------------------
-// Quantum Proposal Message
+// Sign bytes
 // -----------------------------------------------------------------------------
 
-/// Proposal message — quantum state in the proposal Hilbert space.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Compute the sign bytes for a proposal.
+///
+/// # Invariants
+///
+/// - Pure function of arguments.
+/// - Prefix `PROP` distinguishes proposals from votes.
+#[must_use]
+pub fn proposal_sign_bytes(
+    height: Height,
+    round: Round,
+    block_id: &Hash32,
+    pol_round: Option<Round>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        DOMAIN_LEN + HEIGHT_LEN + ROUND_LEN + BLOCK_ID_LEN + FLAG_LEN + ROUND_LEN,
+    );
+    out.extend_from_slice(&DOMAIN_PROPOSAL);
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&round.to_le_bytes());
+    out.extend_from_slice(&block_id.0);
+    match pol_round {
+        None => out.push(FLAG_ABSENT),
+        Some(r) => {
+            out.push(FLAG_PRESENT);
+            out.extend_from_slice(&r.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Compute the sign bytes for a vote.
+///
+/// # Invariants
+///
+/// - **Domain separation**: `(Prevote, None)` and `(Precommit, None)` produce
+///   *different* prefixes (`VNPY` vs `VNCX`). Using a shared tag would allow
+///   replay of a nil prevote as a nil precommit.
+/// - Pure function of arguments.
+#[must_use]
+pub fn vote_sign_bytes(
+    vote_type: VoteType,
+    height: Height,
+    round: Round,
+    block_id: &Option<Hash32>,
+) -> Vec<u8> {
+    let domain = match block_id {
+        Some(_) => vote_type.domain_tag(),
+        None => vote_type.nil_domain_tag(),
+    };
+    let mut out =
+        Vec::with_capacity(DOMAIN_LEN + HEIGHT_LEN + ROUND_LEN + FLAG_LEN + BLOCK_ID_LEN);
+    out.extend_from_slice(&domain);
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&round.to_le_bytes());
+    match block_id {
+        Some(id) => {
+            out.push(FLAG_PRESENT);
+            out.extend_from_slice(&id.0);
+        }
+        None => {
+            out.push(FLAG_ABSENT);
+            out.extend_from_slice(&[0u8; BLOCK_ID_LEN]);
+        }
+    }
+    out
+}
+
+/// Fraction of byte positions that match between two sign-byte sequences.
+///
+/// Diagnostic only — never used for security decisions.
+#[must_use]
+pub fn sign_bytes_fidelity(a: &[u8], b: &[u8]) -> f64 {
+    let len = a.len().min(b.len());
+    if len == 0 {
+        return 1.0;
+    }
+    let matches = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
+    matches as f64 / len as f64
+}
+
+/// Serialize `value` to JSON and return the byte length.
+fn wire_size<T: Serialize>(value: &T) -> MessageResult<usize> {
+    Ok(serde_json::to_vec(value)?.len())
+}
+
+// -----------------------------------------------------------------------------
+// Proposal
+// -----------------------------------------------------------------------------
+
+/// Proposal message.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Proposal {
     pub height: Height,
     pub round: Round,
@@ -430,64 +549,78 @@ pub struct Proposal {
     pub block: Option<Block>,
     pub pol_round: Option<Round>,
     pub signature: SignatureBytes,
-    /// Quantum purity of this proposal state.
-    #[serde(default = "default_purity")]
+    /// Informational purity. Never gates acceptance.
+    #[serde(default = "default_one")]
     pub purity: f64,
-    /// Entanglement fidelity with the validator set.
-    #[serde(default = "default_purity")]
+    /// Informational entanglement fidelity. Never gates acceptance.
+    #[serde(default = "default_one")]
     pub entanglement_fidelity: f64,
 }
 
-fn default_purity() -> f64 {
+fn default_one() -> f64 {
     1.0
 }
 
 impl Proposal {
-    /// Compute the deterministic bytes that must be signed.
+    /// Deterministic sign bytes (excludes signature and quantum fields).
     #[must_use]
     pub fn sign_bytes(&self) -> Vec<u8> {
         proposal_sign_bytes(self.height, self.round, &self.block_id, self.pol_round)
     }
 
-    /// Apply decoherence from network propagation.
+    /// Apply decoherence from a construction/relay step.
+    ///
+    /// Purity decays toward 0; the value is clamped to `[0, 1]`.
     pub fn apply_decoherence(&mut self, rate: f64) {
         let decay = (-rate).exp();
         self.purity = (self.purity * decay).clamp(0.0, 1.0);
         self.entanglement_fidelity = (self.entanglement_fidelity * decay.sqrt()).clamp(0.0, 1.0);
     }
 
-    /// Validate the proposal against the configuration.
+    /// Validate the proposal.
+    ///
+    /// Enforces the wire-size limit and rejects zero block IDs. Purity and
+    /// entanglement are **informational** — a message below the configured
+    /// threshold is accepted but a `warn!` is emitted. This is intentional:
+    /// gating on a decaying scalar would reject every relayed message after
+    /// enough hops.
     pub fn validate(&self, config: &MessageConfig) -> MessageResult<()> {
-        // Check size
-        let size = bincode::serialized_size(self).unwrap_or(0) as usize;
+        let size = wire_size(self)?;
         if size > config.max_message_size {
             return Err(MessageError::MessageTooLarge {
                 size,
                 max: config.max_message_size,
             });
         }
-        // Check purity
-        if self.purity < config.min_purity {
-            return Err(MessageError::Decoherence {
-                purity: self.purity,
-                threshold: config.min_purity,
-            });
-        }
-        // Check entanglement fidelity
-        if self.entanglement_fidelity < config.min_entanglement_fidelity {
-            return Err(MessageError::Decoherence {
-                purity: self.entanglement_fidelity,
-                threshold: config.min_entanglement_fidelity,
-            });
-        }
-        // Check block_id is non-zero
         if self.block_id.0 == [0u8; 32] {
-            return Err(MessageError::InvalidProposal("block_id cannot be zero".into()));
+            return Err(MessageError::InvalidProposal(
+                "block_id cannot be all-zero".into(),
+            ));
+        }
+        if self.purity < config.min_purity {
+            warn!(
+                height = self.height,
+                round = self.round,
+                purity = self.purity,
+                threshold = config.min_purity,
+                "proposal purity below informational threshold"
+            );
+        }
+        if self.entanglement_fidelity < config.min_entanglement_fidelity {
+            warn!(
+                height = self.height,
+                round = self.round,
+                fidelity = self.entanglement_fidelity,
+                threshold = config.min_entanglement_fidelity,
+                "proposal entanglement below informational threshold"
+            );
         }
         Ok(())
     }
 
-    /// Create a new proposal with default quantum properties.
+    /// Create a proposal with default (pure) quantum properties.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
     pub fn new(
         height: Height,
         round: Round,
@@ -510,18 +643,19 @@ impl Proposal {
         }
     }
 
-    /// Check if this proposal matches a specific block ID.
+    /// Whether this proposal targets `block_id`.
+    #[must_use]
     pub fn matches_block(&self, block_id: &Hash32) -> bool {
         self.block_id == *block_id
     }
 }
 
 // -----------------------------------------------------------------------------
-// Quantum Vote Message
+// Vote
 // -----------------------------------------------------------------------------
 
-/// Vote message — quantum state in the vote Hilbert space.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Vote message.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Vote {
     pub vote_type: VoteType,
     pub height: Height,
@@ -529,73 +663,79 @@ pub struct Vote {
     pub voter: PublicKeyBytes,
     pub block_id: Option<Hash32>,
     pub signature: SignatureBytes,
-    /// Quantum purity of this vote state.
-    #[serde(default = "default_purity")]
+    /// Informational purity. Never gates acceptance.
+    #[serde(default = "default_one")]
     pub purity: f64,
-    /// Entanglement fidelity with the validator set.
-    #[serde(default = "default_purity")]
+    /// Informational entanglement fidelity. Never gates acceptance.
+    #[serde(default = "default_one")]
     pub entanglement_fidelity: f64,
 }
 
 impl Vote {
-    /// Compute the deterministic bytes that must be signed.
+    /// Deterministic sign bytes (excludes signature and quantum fields).
     #[must_use]
     pub fn sign_bytes(&self) -> Vec<u8> {
         vote_sign_bytes(self.vote_type, self.height, self.round, &self.block_id)
     }
 
-    /// Check if this is a nil vote (vacuum state in block_id subspace).
+    /// Whether this is a nil vote (no block).
+    #[must_use]
     pub fn is_nil(&self) -> bool {
         self.block_id.is_none()
     }
 
-    /// Apply decoherence from network propagation.
+    /// Apply decoherence from a construction/relay step.
     pub fn apply_decoherence(&mut self, rate: f64) {
         let decay = (-rate).exp();
         self.purity = (self.purity * decay).clamp(0.0, 1.0);
         self.entanglement_fidelity = (self.entanglement_fidelity * decay.sqrt()).clamp(0.0, 1.0);
     }
 
-    /// Validate the vote against the configuration.
+    /// Validate the vote.
+    ///
+    /// Enforces the wire-size limit and rejects a non-nil vote carrying an
+    /// all-zero block id. Purity is informational (see [`Proposal::validate`]).
+    ///
+    /// Note: the `Some(_)`/`None` shape of `block_id` **is** the nil/non-nil
+    /// distinction. No separate check is needed (or possible) beyond that.
     pub fn validate(&self, config: &MessageConfig) -> MessageResult<()> {
-        // Check size
-        let size = bincode::serialized_size(self).unwrap_or(0) as usize;
+        let size = wire_size(self)?;
         if size > config.max_message_size {
             return Err(MessageError::MessageTooLarge {
                 size,
                 max: config.max_message_size,
             });
         }
-        // Check purity
+        if let Some(id) = &self.block_id {
+            if id.0 == [0u8; 32] {
+                return Err(MessageError::InvalidVote(
+                    "non-nil vote has all-zero block_id".into(),
+                ));
+            }
+        }
         if self.purity < config.min_purity {
-            return Err(MessageError::Decoherence {
-                purity: self.purity,
-                threshold: config.min_purity,
-            });
+            warn!(
+                vote_type = ?self.vote_type,
+                height = self.height,
+                round = self.round,
+                purity = self.purity,
+                "vote purity below informational threshold"
+            );
         }
-        // Check entanglement fidelity
         if self.entanglement_fidelity < config.min_entanglement_fidelity {
-            return Err(MessageError::Decoherence {
-                purity: self.entanglement_fidelity,
-                threshold: config.min_entanglement_fidelity,
-            });
-        }
-        // Validate nil/non-nil consistency
-        if self.is_nil() {
-            // Nil vote: block_id must be None
-            if self.block_id.is_some() {
-                return Err(MessageError::NilVoteWithBlockHash);
-            }
-        } else {
-            // Non-nil vote: block_id must be Some
-            if self.block_id.is_none() {
-                return Err(MessageError::NonNilVoteWithoutBlockHash);
-            }
+            warn!(
+                vote_type = ?self.vote_type,
+                height = self.height,
+                round = self.round,
+                fidelity = self.entanglement_fidelity,
+                "vote entanglement below informational threshold"
+            );
         }
         Ok(())
     }
 
-    /// Create a new vote with default quantum properties.
+    /// Create a vote with default (pure) quantum properties.
+    #[must_use]
     pub fn new(
         vote_type: VoteType,
         height: Height,
@@ -617,6 +757,7 @@ impl Vote {
     }
 
     /// Create a nil vote.
+    #[must_use]
     pub fn nil_vote(
         vote_type: VoteType,
         height: Height,
@@ -627,7 +768,8 @@ impl Vote {
         Self::new(vote_type, height, round, voter, None, signature)
     }
 
-    /// Create a non-nil vote for a specific block.
+    /// Create a vote for a specific block.
+    #[must_use]
     pub fn block_vote(
         vote_type: VoteType,
         height: Height,
@@ -639,18 +781,19 @@ impl Vote {
         Self::new(vote_type, height, round, voter, Some(block_id), signature)
     }
 
-    /// Check if this vote matches a specific block ID.
+    /// Whether this vote targets `block_id`.
+    #[must_use]
     pub fn matches_block(&self, block_id: &Hash32) -> bool {
         self.block_id.as_ref() == Some(block_id)
     }
 }
 
 // -----------------------------------------------------------------------------
-// Consensus Message Enum
+// ConsensusMsg
 // -----------------------------------------------------------------------------
 
-/// Top‑level consensus message.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Top-level consensus message.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ConsensusMsg {
     Proposal(Proposal),
     Vote(Vote),
@@ -658,7 +801,7 @@ pub enum ConsensusMsg {
 }
 
 impl ConsensusMsg {
-    /// Apply decoherence based on message type.
+    /// Apply decoherence to the payload if applicable.
     pub fn apply_decoherence(&mut self, rate: f64) {
         match self {
             ConsensusMsg::Proposal(p) => p.apply_decoherence(rate),
@@ -667,7 +810,7 @@ impl ConsensusMsg {
         }
     }
 
-    /// Get the height of this message (if applicable).
+    #[must_use]
     pub fn height(&self) -> Option<Height> {
         match self {
             ConsensusMsg::Proposal(p) => Some(p.height),
@@ -676,7 +819,7 @@ impl ConsensusMsg {
         }
     }
 
-    /// Get the round of this message (if applicable).
+    #[must_use]
     pub fn round(&self) -> Option<Round> {
         match self {
             ConsensusMsg::Proposal(p) => Some(p.round),
@@ -685,7 +828,8 @@ impl ConsensusMsg {
         }
     }
 
-    /// Get the message type as a string.
+    /// Stable identifier for metrics and logs.
+    #[must_use]
     pub fn msg_type(&self) -> &'static str {
         match self {
             ConsensusMsg::Proposal(_) => "Proposal",
@@ -703,195 +847,195 @@ impl ConsensusMsg {
         }
     }
 
-    /// Validate the message against configuration.
+    /// Validate the message.
     pub fn validate(&self, config: &MessageConfig) -> MessageResult<()> {
         match self {
             ConsensusMsg::Proposal(p) => p.validate(config),
             ConsensusMsg::Vote(v) => v.validate(config),
-            ConsensusMsg::Evidence(_) => Ok(()), // Evidence has its own validation
+            ConsensusMsg::Evidence(_) => Ok(()), // Evidence has its own validation.
         }
     }
 }
 
 // -----------------------------------------------------------------------------
-// Deterministic Binary Sign Bytes
+// Statistics container
 // -----------------------------------------------------------------------------
 
-/// Compute the sign bytes for a proposal.
-#[must_use]
-pub fn proposal_sign_bytes(
-    height: Height,
-    round: Round,
-    block_id: &Hash32,
-    pol_round: Option<Round>,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(
-        DOMAIN_LEN + HEIGHT_LEN + ROUND_LEN + BLOCK_ID_LEN + 1 + ROUND_LEN,
-    );
-    out.extend_from_slice(&DOMAIN_PROPOSAL);
-    out.extend_from_slice(&height.to_le_bytes());
-    out.extend_from_slice(&round.to_le_bytes());
-    out.extend_from_slice(&block_id.0);
-    match pol_round {
-        None => out.push(FLAG_ABSENT),
-        Some(r) => {
-            out.push(FLAG_PRESENT);
-            out.extend_from_slice(&r.to_le_bytes());
-        }
-    }
-    out
+#[derive(Debug)]
+struct StatsInner {
+    stats: MessageStats,
+    /// Whether the in-memory stats differ from disk.
+    dirty: bool,
+    window: usize,
 }
 
-/// Compute the sign bytes for a vote.
-#[must_use]
-pub fn vote_sign_bytes(
-    vote_type: VoteType,
-    height: Height,
-    round: Round,
-    block_id: &Option<Hash32>,
-) -> Vec<u8> {
-    let domain = match (vote_type, block_id) {
-        (VoteType::Prevote, Some(_)) => DOMAIN_PREVOTE,
-        (VoteType::Precommit, Some(_)) => DOMAIN_PRECOMMIT,
-        _ => DOMAIN_NIL_VOTE,
-    };
-    let mut out =
-        Vec::with_capacity(DOMAIN_LEN + HEIGHT_LEN + ROUND_LEN + FLAG_LEN + BLOCK_ID_LEN);
-    out.extend_from_slice(&domain);
-    out.extend_from_slice(&height.to_le_bytes());
-    out.extend_from_slice(&round.to_le_bytes());
-    match block_id {
-        Some(id) => {
-            out.push(FLAG_PRESENT);
-            out.extend_from_slice(&id.0);
-        }
-        None => {
-            out.push(FLAG_ABSENT);
-            out.extend_from_slice(&[0u8; BLOCK_ID_LEN]);
-        }
-    }
-    out
+/// Thread-safe statistics container with a bounded rolling window.
+#[derive(Debug, Clone)]
+struct AtomicMessageStats {
+    inner: Arc<Mutex<StatsInner>>,
 }
 
-/// Compute the quantum fidelity between two sign byte sequences.
-pub fn sign_bytes_fidelity(a: &[u8], b: &[u8]) -> f64 {
-    let len = a.len().min(b.len());
-    if len == 0 {
-        return 1.0;
+impl AtomicMessageStats {
+    fn new(window: usize, initial: MessageStats) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(StatsInner {
+                stats: initial,
+                dirty: false,
+                window,
+            })),
+        }
     }
-    let matches = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
-    matches as f64 / len as f64
+
+    fn push_sample(stats: &mut MessageStats, window: usize, purity: f64, entanglement: f64) {
+        stats.purity_samples.push(purity);
+        stats.entanglement_samples.push(entanglement);
+        // Bound both vectors to `window` entries.
+        while stats.purity_samples.len() > window {
+            stats.purity_samples.remove(0);
+        }
+        while stats.entanglement_samples.len() > window {
+            stats.entanglement_samples.remove(0);
+        }
+    }
+
+    fn record_proposal_sent(&self) {
+        let mut g = self.inner.lock();
+        g.stats.proposals_sent = g.stats.proposals_sent.saturating_add(1);
+        g.dirty = true;
+    }
+
+    fn record_proposal_received(&self, purity: f64, entanglement: f64) {
+        let mut g = self.inner.lock();
+        g.stats.proposals_received = g.stats.proposals_received.saturating_add(1);
+        let window = g.window;
+        let stats = &mut g.stats;
+        Self::push_sample(stats, window, purity, entanglement);
+        g.dirty = true;
+    }
+
+    fn record_vote_sent(&self, vote_type: VoteType) {
+        let mut g = self.inner.lock();
+        match vote_type {
+            VoteType::Prevote => {
+                g.stats.prevotes_sent = g.stats.prevotes_sent.saturating_add(1)
+            }
+            VoteType::Precommit => {
+                g.stats.precommits_sent = g.stats.precommits_sent.saturating_add(1)
+            }
+        }
+        g.dirty = true;
+    }
+
+    fn record_vote_received(&self, vote_type: VoteType, purity: f64, entanglement: f64) {
+        let mut g = self.inner.lock();
+        match vote_type {
+            VoteType::Prevote => {
+                g.stats.prevotes_received = g.stats.prevotes_received.saturating_add(1)
+            }
+            VoteType::Precommit => {
+                g.stats.precommits_received = g.stats.precommits_received.saturating_add(1)
+            }
+        }
+        let window = g.window;
+        let stats = &mut g.stats;
+        Self::push_sample(stats, window, purity, entanglement);
+        g.dirty = true;
+    }
+
+    fn record_nil_vote(&self) {
+        let mut g = self.inner.lock();
+        g.stats.nil_votes = g.stats.nil_votes.saturating_add(1);
+        g.dirty = true;
+    }
+
+    fn record_signature_failure(&self) {
+        let mut g = self.inner.lock();
+        g.stats.signature_failures = g.stats.signature_failures.saturating_add(1);
+        g.dirty = true;
+    }
+
+    fn snapshot(&self) -> (MessageStats, bool) {
+        let g = self.inner.lock();
+        (g.stats.clone(), g.dirty)
+    }
+
+    fn mark_clean(&self) {
+        let mut g = self.inner.lock();
+        g.dirty = false;
+    }
+
+    fn reset(&self) {
+        let mut g = self.inner.lock();
+        g.stats = MessageStats::default();
+        g.dirty = true;
+    }
 }
 
 // -----------------------------------------------------------------------------
-// Message Factory
+// Message factory
 // -----------------------------------------------------------------------------
 
-/// Factory for creating consensus messages with consistent quantum properties.
+/// Factory for constructing consensus messages with consistent properties.
+///
+/// # Persistence
+///
+/// When constructed via [`MessageFactory::with_persistence`], the factory
+/// holds a path to a JSON stats file. Persistence is **explicit**: call
+/// [`MessageFactory::flush_stats`] periodically (e.g. from a background
+/// task). The factory deliberately does **not** auto-flush per record,
+/// because that would produce one disk write per consensus message.
 #[derive(Clone)]
 pub struct MessageFactory {
     config: Arc<MessageConfig>,
     stats: Arc<AtomicMessageStats>,
     stats_path: Option<PathBuf>,
-}
-
-/// Thread‑safe statistics container.
-#[derive(Debug, Clone)]
-struct AtomicMessageStats {
-    inner: Arc<parking_lot::Mutex<MessageStats>>,
-}
-
-impl AtomicMessageStats {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(parking_lot::Mutex::new(MessageStats::default())),
-        }
-    }
-
-    fn record_proposal_sent(&self) {
-        let mut stats = self.inner.lock();
-        stats.proposals_sent = stats.proposals_sent.wrapping_add(1);
-    }
-
-    fn record_proposal_received(&self, purity: f64, entanglement: f64) {
-        let mut stats = self.inner.lock();
-        stats.proposals_received = stats.proposals_received.wrapping_add(1);
-        stats.purity_samples.push(purity);
-        stats.entanglement_samples.push(entanglement);
-    }
-
-    fn record_vote_sent(&self, vote_type: VoteType) {
-        let mut stats = self.inner.lock();
-        match vote_type {
-            VoteType::Prevote => stats.prevotes_sent = stats.prevotes_sent.wrapping_add(1),
-            VoteType::Precommit => stats.precommits_sent = stats.precommits_sent.wrapping_add(1),
-        }
-    }
-
-    fn record_vote_received(&self, vote_type: VoteType, purity: f64, entanglement: f64) {
-        let mut stats = self.inner.lock();
-        match vote_type {
-            VoteType::Prevote => stats.prevotes_received = stats.prevotes_received.wrapping_add(1),
-            VoteType::Precommit => stats.precommits_received = stats.precommits_received.wrapping_add(1),
-        }
-        stats.purity_samples.push(purity);
-        stats.entanglement_samples.push(entanglement);
-    }
-
-    fn record_nil_vote(&self) {
-        let mut stats = self.inner.lock();
-        stats.nil_votes = stats.nil_votes.wrapping_add(1);
-    }
-
-    fn record_signature_failure(&self) {
-        let mut stats = self.inner.lock();
-        stats.signature_failures = stats.signature_failures.wrapping_add(1);
-    }
-
-    fn snapshot(&self) -> MessageStats {
-        self.inner.lock().clone()
-    }
-
-    fn reset(&self) {
-        let mut stats = self.inner.lock();
-        *stats = MessageStats::default();
-    }
+    /// Total flushes performed (diagnostic).
+    flushes: Arc<AtomicU64>,
 }
 
 impl MessageFactory {
-    /// Create a new message factory with the given configuration.
-    pub fn new(config: MessageConfig) -> Result<Self, String> {
-        config.validate().map_err(|e| format!("config validation: {}", e))?;
+    /// Create a non-persistent factory.
+    ///
+    /// Returns `Err(MessageError::Config)` if the config fails validation.
+    pub fn new(config: MessageConfig) -> MessageResult<Self> {
+        config.validate().map_err(MessageError::Config)?;
+        let window = config.stats_window_size;
         Ok(Self {
             config: Arc::new(config),
-            stats: Arc::new(AtomicMessageStats::new()),
+            stats: Arc::new(AtomicMessageStats::new(window, MessageStats::default())),
             stats_path: None,
+            flushes: Arc::new(AtomicU64::new(0)),
         })
     }
 
-    /// Create a factory with persistence to disk.
-    pub fn with_persistence(data_dir: &str, config: MessageConfig) -> Result<Self, MessageError> {
+    /// Create a factory that persists stats to
+    /// `<data_dir>/message_stats.json`.
+    ///
+    /// Loads existing stats if the file exists. Corrupt files are left in
+    /// place — callers who need to distinguish "no file" from "broken file"
+    /// should call [`load_stats`] directly (private) or restore from backup.
+    pub fn with_persistence(
+        data_dir: &str,
+        config: MessageConfig,
+    ) -> MessageResult<Self> {
         config.validate().map_err(MessageError::Config)?;
         let path = PathBuf::from(data_dir).join("message_stats.json");
-        let stats = if path.exists() {
+        let initial = if path.exists() {
             load_stats(&path)?
         } else {
             MessageStats::default()
         };
-        let atomic_stats = Arc::new(AtomicMessageStats::new());
-        // Load stats into atomic container.
-        {
-            let mut inner = atomic_stats.inner.lock();
-            *inner = stats;
-        }
+        let window = config.stats_window_size;
         Ok(Self {
             config: Arc::new(config),
-            stats: atomic_stats,
+            stats: Arc::new(AtomicMessageStats::new(window, initial)),
             stats_path: Some(path),
+            flushes: Arc::new(AtomicU64::new(0)),
         })
     }
 
-    /// Create a new proposal message.
+    /// Construct a proposal with initial decoherence applied.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_proposal(
         &self,
         height: Height,
@@ -902,18 +1046,14 @@ impl MessageFactory {
         pol_round: Option<Round>,
         signature: SignatureBytes,
     ) -> Proposal {
-        let mut proposal = Proposal::new(height, round, proposer, block_id, block, pol_round, signature);
-        // Apply initial decoherence from creation
-        proposal.apply_decoherence(self.config.decoherence_rate);
+        let mut p = Proposal::new(height, round, proposer, block_id, block, pol_round, signature);
+        p.apply_decoherence(self.config.decoherence_rate);
         self.stats.record_proposal_sent();
-        // Persist if enabled
-        if self.config.persist_stats {
-            let _ = self.flush_stats();
-        }
-        proposal
+        debug!(height, round, "proposal constructed");
+        p
     }
 
-    /// Create a new vote message.
+    /// Construct a vote with initial decoherence applied.
     pub fn new_vote(
         &self,
         vote_type: VoteType,
@@ -923,69 +1063,101 @@ impl MessageFactory {
         block_id: Option<Hash32>,
         signature: SignatureBytes,
     ) -> Vote {
-        let mut vote = Vote::new(vote_type, height, round, voter, block_id, signature);
-        vote.apply_decoherence(self.config.decoherence_rate);
+        let mut v = Vote::new(vote_type, height, round, voter, block_id, signature);
+        v.apply_decoherence(self.config.decoherence_rate);
         self.stats.record_vote_sent(vote_type);
-        if vote.is_nil() {
+        if v.is_nil() {
             self.stats.record_nil_vote();
         }
-        if self.config.persist_stats {
-            let _ = self.flush_stats();
-        }
-        vote
+        debug!(?vote_type, height, round, "vote constructed");
+        v
     }
 
-    /// Register a received proposal for statistics.
     pub fn register_proposal_received(&self, proposal: &Proposal) {
-        self.stats.record_proposal_received(proposal.purity, proposal.entanglement_fidelity);
-        if self.config.persist_stats {
-            let _ = self.flush_stats();
-        }
+        self.stats
+            .record_proposal_received(proposal.purity, proposal.entanglement_fidelity);
     }
 
-    /// Register a received vote for statistics.
     pub fn register_vote_received(&self, vote: &Vote) {
-        self.stats.record_vote_received(vote.vote_type, vote.purity, vote.entanglement_fidelity);
+        self.stats
+            .record_vote_received(vote.vote_type, vote.purity, vote.entanglement_fidelity);
         if vote.is_nil() {
             self.stats.record_nil_vote();
         }
-        if self.config.persist_stats {
-            let _ = self.flush_stats();
-        }
     }
 
-    /// Register a signature verification failure.
     pub fn register_signature_failure(&self) {
         self.stats.record_signature_failure();
-        if self.config.persist_stats {
-            let _ = self.flush_stats();
-        }
     }
 
-    /// Get current statistics.
+    /// Snapshot of the current statistics.
+    #[must_use]
     pub fn stats(&self) -> MessageStats {
-        self.stats.snapshot()
+        let (s, _) = self.stats.snapshot();
+        s
     }
 
-    /// Flush statistics to disk.
-    pub fn flush_stats(&self) -> Result<(), MessageError> {
-        if let Some(path) = &self.stats_path {
-            let stats = self.stats.snapshot();
-            save_stats(path, &stats)?;
+    /// Persist stats to disk if a path is configured.
+    ///
+    /// Idempotent. Callers should invoke this periodically; the factory does
+    /// **not** flush per record.
+    ///
+    /// If the in-memory stats have not been modified since the last
+    /// successful flush, this returns early without touching the disk.
+    /// Use [`force_flush_stats`](Self::force_flush_stats) to bypass.
+    pub fn flush_stats(&self) -> MessageResult<()> {
+        let Some(path) = &self.stats_path else {
+            return Ok(());
+        };
+        let (stats, dirty) = self.stats.snapshot();
+        if !dirty {
+            return Ok(());
         }
+        save_stats(path, &stats)?;
+        self.stats.mark_clean();
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+        debug!(path = %path.display(), "message stats flushed");
         Ok(())
     }
 
-    /// Reset statistics (for testing).
-    #[cfg(test)]
-    pub fn reset_stats(&self) {
-        self.stats.reset();
-        let _ = self.flush_stats();
+    /// Force a stats flush even if nothing is marked dirty.
+    pub fn force_flush_stats(&self) -> MessageResult<()> {
+        let Some(path) = &self.stats_path else {
+            return Ok(());
+        };
+        let (stats, _) = self.stats.snapshot();
+        save_stats(path, &stats)?;
+        self.stats.mark_clean();
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
-    /// Get the configuration.
+    /// Number of successful flushes performed via this handle.
+    #[must_use]
+    pub fn flush_count(&self) -> u64 {
+        self.flushes.load(Ordering::Relaxed)
+    }
+
+    /// Reset in-memory statistics.
+    pub fn reset_stats(&self) {
+        self.stats.reset();
+    }
+
+    #[must_use]
     pub fn config(&self) -> &MessageConfig {
         &self.config
+    }
+
+    /// Whether this factory persists to disk.
+    #[must_use]
+    pub fn is_persistent(&self) -> bool {
+        self.stats_path.is_some()
+    }
+
+    /// Path to the persistence file, if any.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        self.stats_path.as_deref()
     }
 }
 
@@ -999,11 +1171,12 @@ mod tests {
     use tempfile::tempdir;
 
     fn test_config() -> MessageConfig {
-        let mut cfg = MessageConfig::default();
-        cfg.min_purity = 0.1;
-        cfg.min_entanglement_fidelity = 0.1;
-        cfg.persist_stats = true;
-        cfg
+        MessageConfig {
+            min_purity: 0.1,
+            min_entanglement_fidelity: 0.1,
+            persist_stats: true,
+            ..Default::default()
+        }
     }
 
     fn test_proposal() -> Proposal {
@@ -1033,135 +1206,152 @@ mod tests {
         }
     }
 
+    // ── Sign bytes ──────────────────────────────────────────────────────
+
     #[test]
-    fn test_proposal_sign_bytes_deterministic() {
-        let height = 42;
-        let round = 7;
+    fn proposal_sign_bytes_deterministic() {
         let block_id = Hash32([0xAA; 32]);
-        let pol_round = Some(5);
-        let bytes1 = proposal_sign_bytes(height, round, &block_id, pol_round);
-        let bytes2 = proposal_sign_bytes(height, round, &block_id, pol_round);
-        assert_eq!(bytes1, bytes2);
+        let a = proposal_sign_bytes(42, 7, &block_id, Some(5));
+        let b = proposal_sign_bytes(42, 7, &block_id, Some(5));
+        assert_eq!(a, b);
     }
 
     #[test]
-    fn test_vote_sign_bytes_deterministic() {
-        let height = 100;
-        let round = 3;
+    fn vote_sign_bytes_deterministic() {
         let block_id = Some(Hash32([0xBB; 32]));
-        let bytes1 = vote_sign_bytes(VoteType::Prevote, height, round, &block_id);
-        let bytes2 = vote_sign_bytes(VoteType::Prevote, height, round, &block_id);
-        assert_eq!(bytes1, bytes2);
+        let a = vote_sign_bytes(VoteType::Prevote, 100, 3, &block_id);
+        let b = vote_sign_bytes(VoteType::Prevote, 100, 3, &block_id);
+        assert_eq!(a, b);
     }
 
     #[test]
-    fn test_nil_vote_different_domain() {
-        let height = 100;
-        let round = 3;
-        let nil_sig = vote_sign_bytes(VoteType::Prevote, height, round, &None);
+    fn nil_vote_different_domain() {
+        let nil_sig = vote_sign_bytes(VoteType::Prevote, 100, 3, &None);
         let block_sig =
-            vote_sign_bytes(VoteType::Prevote, height, round, &Some(Hash32([0xCC; 32])));
+            vote_sign_bytes(VoteType::Prevote, 100, 3, &Some(Hash32([0xCC; 32])));
         assert_ne!(nil_sig, block_sig);
     }
 
     #[test]
-    fn test_sign_bytes_fidelity() {
-        let bytes = proposal_sign_bytes(1, 0, &Hash32([0xFF; 32]), None);
-        let fidelity = sign_bytes_fidelity(&bytes, &bytes);
-        assert!((fidelity - 1.0).abs() < 1e-10);
+    fn nil_prevote_and_nil_precommit_have_different_domains() {
+        // Regression: the previous implementation shared a `"VNIL"` domain
+        // tag between nil prevotes and nil precommits, so a signature on one
+        // was a valid signature on the other for the same (height, round).
+        let nil_prevote = vote_sign_bytes(VoteType::Prevote, 42, 1, &None);
+        let nil_precommit = vote_sign_bytes(VoteType::Precommit, 42, 1, &None);
+        assert_ne!(
+            nil_prevote, nil_precommit,
+            "nil prevote and nil precommit must produce different sign bytes"
+        );
+        // Domain prefixes must differ:
+        assert_ne!(&nil_prevote[..4], &nil_precommit[..4]);
     }
 
     #[test]
-    fn test_proposal_validate() {
+    fn proposal_and_vote_domains_differ() {
+        let prop = proposal_sign_bytes(1, 0, &Hash32([0x11; 32]), None);
+        let vote = vote_sign_bytes(VoteType::Prevote, 1, 0, &Some(Hash32([0x11; 32])));
+        assert_ne!(&prop[..4], &vote[..4]);
+    }
+
+    #[test]
+    fn sign_bytes_fidelity_identity() {
+        let bytes = proposal_sign_bytes(1, 0, &Hash32([0xFF; 32]), None);
+        assert!((sign_bytes_fidelity(&bytes, &bytes) - 1.0).abs() < 1e-10);
+    }
+
+    // ── Validation ──────────────────────────────────────────────────────
+
+    #[test]
+    fn proposal_validate_ok() {
         let config = test_config();
         let p = test_proposal();
         assert!(p.validate(&config).is_ok());
-
-        let mut bad = p.clone();
-        bad.purity = 0.0;
-        assert!(bad.validate(&config).is_err());
     }
 
     #[test]
-    fn test_vote_validate() {
+    fn proposal_validate_rejects_low_purity_as_informational_only() {
+        // Regression: previously low purity failed validation. Now it is
+        // informational only — the message is accepted.
+        let config = test_config();
+        let mut p = test_proposal();
+        p.purity = 0.0;
+        p.entanglement_fidelity = 0.0;
+        assert!(p.validate(&config).is_ok());
+    }
+
+    #[test]
+    fn proposal_validate_rejects_zero_block_id() {
+        let config = test_config();
+        let mut p = test_proposal();
+        p.block_id = Hash32([0u8; 32]);
+        assert!(matches!(
+            p.validate(&config),
+            Err(MessageError::InvalidProposal(_))
+        ));
+    }
+
+    #[test]
+    fn proposal_validate_rejects_oversize() {
+        let mut config = test_config();
+        config.max_message_size = 10; // absurdly small
+        let p = test_proposal();
+        assert!(matches!(
+            p.validate(&config),
+            Err(MessageError::MessageTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn vote_validate_ok() {
         let config = test_config();
         let v = test_vote();
         assert!(v.validate(&config).is_ok());
-
-        let mut bad = v.clone();
-        bad.purity = 0.0;
-        assert!(bad.validate(&config).is_err());
     }
 
     #[test]
-    fn test_vote_is_nil() {
+    fn vote_validate_rejects_zero_block_id_on_non_nil() {
+        let config = test_config();
+        let mut v = test_vote();
+        v.block_id = Some(Hash32([0u8; 32]));
+        assert!(matches!(
+            v.validate(&config),
+            Err(MessageError::InvalidVote(_))
+        ));
+    }
+
+    #[test]
+    fn nil_vote_validates() {
+        let config = test_config();
+        let v = Vote::nil_vote(
+            VoteType::Prevote,
+            1,
+            0,
+            PublicKeyBytes(vec![0; 32]),
+            SignatureBytes(vec![]),
+        );
+        assert!(v.validate(&config).is_ok());
+        assert!(v.is_nil());
+    }
+
+    #[test]
+    fn vote_is_nil_consistent_with_block_id() {
         let v = test_vote();
-        assert!(!v.is_nil());
-
-        let nil_vote = Vote::nil_vote(VoteType::Prevote, 1, 0, PublicKeyBytes(vec![0; 32]), SignatureBytes(vec![]));
-        assert!(nil_vote.is_nil());
+        assert_eq!(v.is_nil(), v.block_id.is_none());
+        let nil = Vote::nil_vote(
+            VoteType::Prevote,
+            1,
+            0,
+            PublicKeyBytes(vec![0; 32]),
+            SignatureBytes(vec![]),
+        );
+        assert_eq!(nil.is_nil(), nil.block_id.is_none());
     }
 
-    #[test]
-    fn test_factory_stats() {
-        let config = test_config();
-        let factory = MessageFactory::new(config).unwrap();
-        let p = test_proposal();
-        factory.register_proposal_received(&p);
-        let stats = factory.stats();
-        assert_eq!(stats.proposals_received, 1);
-        assert_eq!(stats.avg_purity(), 1.0);
-    }
+    // ── Stats ───────────────────────────────────────────────────────────
 
     #[test]
-    fn test_factory_persistence() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().to_str().unwrap();
-        let config = test_config();
-        let factory = MessageFactory::with_persistence(path, config.clone()).unwrap();
-        let p = test_proposal();
-        factory.register_proposal_received(&p);
-        assert!(factory.flush_stats().is_ok());
-
-        let factory2 = MessageFactory::with_persistence(path, config).unwrap();
-        let stats = factory2.stats();
-        assert_eq!(stats.proposals_received, 1);
-    }
-
-    #[test]
-    fn test_consensus_msg_validate() {
-        let config = test_config();
-        let p = test_proposal();
-        let msg = ConsensusMsg::Proposal(p);
-        assert!(msg.validate(&config).is_ok());
-
-        let mut bad_p = test_proposal();
-        bad_p.purity = 0.0;
-        let bad_msg = ConsensusMsg::Proposal(bad_p);
-        assert!(bad_msg.validate(&config).is_err());
-    }
-
-    #[test]
-    fn test_consensus_msg_height_round() {
-        let p = test_proposal();
-        let msg = ConsensusMsg::Proposal(p);
-        assert_eq!(msg.height(), Some(1));
-        assert_eq!(msg.round(), Some(0));
-    }
-
-    #[test]
-    fn test_consensus_msg_type() {
-        let p = test_proposal();
-        let msg = ConsensusMsg::Proposal(p);
-        assert_eq!(msg.msg_type(), "Proposal");
-
-        let v = test_vote();
-        let msg = ConsensusMsg::Vote(v);
-        assert_eq!(msg.msg_type(), "Prevote");
-    }
-
-    #[test]
-    fn test_stats_totals() {
+    fn stats_totals() {
         let stats = MessageStats {
             proposals_sent: 5,
             proposals_received: 3,
@@ -1181,65 +1371,152 @@ mod tests {
     }
 
     #[test]
-    fn test_proposal_matches_block() {
-        let p = test_proposal();
-        let block_id = Hash32([0xAA; 32]);
-        assert!(p.matches_block(&block_id));
-        let other = Hash32([0xBB; 32]);
-        assert!(!p.matches_block(&other));
-    }
-
-    #[test]
-    fn test_vote_matches_block() {
-        let v = test_vote();
-        let block_id = Hash32([0xBB; 32]);
-        assert!(v.matches_block(&block_id));
-        let other = Hash32([0xCC; 32]);
-        assert!(!v.matches_block(&other));
-    }
-
-    #[test]
-    fn test_vote_validation_nil_non_nil() {
-        let config = test_config();
-        let voter = PublicKeyBytes(vec![0; 32]);
-        let sig = SignatureBytes(vec![]);
-
-        // Nil vote: must have no block_id
-        let nil_vote = Vote::nil_vote(VoteType::Prevote, 1, 0, voter.clone(), sig.clone());
-        assert!(nil_vote.validate(&config).is_ok());
-
-        // Non-nil vote: must have block_id
-        let block_vote = Vote::block_vote(VoteType::Prevote, 1, 0, voter.clone(), Hash32([0xDD; 32]), sig.clone());
-        assert!(block_vote.validate(&config).is_ok());
-
-        // Invalid: nil vote with block_id
-        let invalid = Vote {
-            vote_type: VoteType::Prevote,
-            height: 1,
-            round: 0,
-            voter: voter.clone(),
-            block_id: Some(Hash32([0xEE; 32])),
-            signature: sig.clone(),
-            purity: 1.0,
-            entanglement_fidelity: 1.0,
+    fn stats_samples_are_bounded() {
+        // Regression: previously `purity_samples` grew without bound,
+        // leaking memory on a long-running node.
+        let config = MessageConfig {
+            stats_window_size: 5,
+            ..test_config()
         };
-        assert!(invalid.validate(&config).is_err());
+        let factory = MessageFactory::new(config).unwrap();
+        for _ in 0..100 {
+            factory.register_proposal_received(&test_proposal());
+        }
+        let stats = factory.stats();
+        assert_eq!(stats.purity_samples.len(), 5);
+        assert_eq!(stats.entanglement_samples.len(), 5);
     }
 
     #[test]
-    fn test_config_validation() {
-        let mut cfg = MessageConfig::default();
-        assert!(cfg.validate().is_ok());
+    fn factory_stats_records() {
+        let factory = MessageFactory::new(test_config()).unwrap();
+        factory.register_proposal_received(&test_proposal());
+        let stats = factory.stats();
+        assert_eq!(stats.proposals_received, 1);
+        assert!((stats.avg_purity() - 1.0).abs() < 1e-10);
+    }
 
-        cfg.max_message_size = 0;
-        assert!(cfg.validate().is_err());
+    // ── Persistence ─────────────────────────────────────────────────────
 
-        cfg.max_message_size = 1024;
-        cfg.min_purity = 1.5;
-        assert!(cfg.validate().is_err());
+    #[test]
+    fn persistence_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let config = test_config();
+        {
+            let factory = MessageFactory::with_persistence(path, config.clone()).unwrap();
+            factory.register_proposal_received(&test_proposal());
+            factory.flush_stats().unwrap();
+            assert_eq!(factory.flush_count(), 1);
+        }
 
-        cfg.min_purity = 0.5;
-        cfg.min_entanglement_fidelity = -1.0;
-        assert!(cfg.validate().is_err());
+        let factory2 = MessageFactory::with_persistence(path, config).unwrap();
+        assert_eq!(factory2.stats().proposals_received, 1);
+    }
+
+    #[test]
+    fn flush_is_idempotent_and_skips_when_clean() {
+        // Regression: previously `flush_stats` was called on every record.
+        // Now it early-returns if nothing is dirty.
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let factory = MessageFactory::with_persistence(path, test_config()).unwrap();
+
+        factory.register_proposal_received(&test_proposal());
+        factory.flush_stats().unwrap();
+        assert_eq!(factory.flush_count(), 1);
+
+        // Second flush with no intervening records → no-op (no counter bump).
+        factory.flush_stats().unwrap();
+        assert_eq!(factory.flush_count(), 1);
+
+        // force_flush bypasses the clean check.
+        factory.force_flush_stats().unwrap();
+        assert_eq!(factory.flush_count(), 2);
+    }
+
+    #[test]
+    fn flush_on_non_persistent_is_noop() {
+        let factory = MessageFactory::new(test_config()).unwrap();
+        assert!(!factory.is_persistent());
+        factory.register_proposal_received(&test_proposal());
+        factory.flush_stats().unwrap();
+        assert_eq!(factory.flush_count(), 0);
+    }
+
+    // ── ConsensusMsg ────────────────────────────────────────────────────
+
+    #[test]
+    fn consensus_msg_validate() {
+        let config = test_config();
+        let msg = ConsensusMsg::Proposal(test_proposal());
+        assert!(msg.validate(&config).is_ok());
+
+        let mut bad_p = test_proposal();
+        bad_p.block_id = Hash32([0u8; 32]);
+        let bad_msg = ConsensusMsg::Proposal(bad_p);
+        assert!(bad_msg.validate(&config).is_err());
+    }
+
+    #[test]
+    fn consensus_msg_height_round() {
+        let msg = ConsensusMsg::Proposal(test_proposal());
+        assert_eq!(msg.height(), Some(1));
+        assert_eq!(msg.round(), Some(0));
+    }
+
+    #[test]
+    fn consensus_msg_type_names() {
+        assert_eq!(
+            ConsensusMsg::Proposal(test_proposal()).msg_type(),
+            "Proposal"
+        );
+        assert_eq!(ConsensusMsg::Vote(test_vote()).msg_type(), "Prevote");
+        let nil = Vote::nil_vote(
+            VoteType::Precommit,
+            1,
+            0,
+            PublicKeyBytes(vec![0; 32]),
+            SignatureBytes(vec![]),
+        );
+        assert_eq!(ConsensusMsg::Vote(nil).msg_type(), "NilVote");
+    }
+
+    // ── Config ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn config_validation() {
+        assert!(MessageConfig::default().validate().is_ok());
+
+        assert!(MessageConfig { max_message_size: 0, ..Default::default() }
+            .validate()
+            .is_err());
+        assert!(MessageConfig { min_purity: 1.5, ..Default::default() }
+            .validate()
+            .is_err());
+        assert!(MessageConfig { min_purity: f64::NAN, ..Default::default() }
+            .validate()
+            .is_err());
+        assert!(MessageConfig { min_entanglement_fidelity: -1.0, ..Default::default() }
+            .validate()
+            .is_err());
+        assert!(MessageConfig { stats_window_size: 0, ..Default::default() }
+            .validate()
+            .is_err());
+        assert!(MessageConfig {
+            stats_window_size: MAX_ALLOWED_STATS_WINDOW + 1,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn factory_new_rejects_invalid_config() {
+        let cfg = MessageConfig { max_message_size: 0, ..Default::default() };
+        assert!(matches!(
+            MessageFactory::new(cfg),
+            Err(MessageError::Config(_))
+        ));
     }
 }
