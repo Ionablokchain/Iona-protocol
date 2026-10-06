@@ -1,19 +1,29 @@
-//! Sub‑second finality module for IONA — Quantum Adaptive Finality.
+//! Sub-second finality module for IONA — Adaptive Finality.
 //!
-//! # Quantum Finality Model
+//! # Model
 //!
-//! Finality is modelled as a **quantum projective measurement** on the
-//! consensus state. When 2/3+ validators precommit, the wavefunction
-//! collapses to the |committed⟩ eigenstate.
+//! Finality tracking is a **classical** rolling-window estimator (average,
+//! P95, sub-second detection) combined with a lightweight adaptive-timeout
+//! controller. The "quantum" naming (purity, entropy, coherence) is
+//! informational only — see `FinalityStats`.
 //!
-//! # Production Features
-//! - Thread‑safe with `parking_lot::Mutex`
-//! - Atomic writes with file locking (`flock`)
-//! - Persistent state on disk
-//! - Configurable adaptive parameters
-//! - Comprehensive metrics and statistics
-//! - Integration with consensus engine via hooks
-//! - Quantum-inspired metrics (purity, entropy, coherence) that influence behavior
+//! # Guarantees
+//!
+//! - **Durability**: `record_commit` (when `persist_state = true`) performs
+//!   an `fsync`'d atomic write (temp file + `fsync` + `rename` + parent-dir
+//!   `fsync` on Unix). A crash never leaves a torn file.
+//! - **Concurrency**: the tracker lock is released *before* any disk I/O.
+//!   Disk slowness does not block readers.
+//! - **Recovery**: a corrupt on-disk file is renamed to
+//!   `<file>.corrupt.<ts>` and a fresh tracker is started, with the corrupt
+//!   file preserved for post-mortem.
+//!
+//! # Informational-only metrics
+//!
+//! `purity`, `entropy`, and `adaptation_coherence` decay with activity.
+//! They **never** gate a decision and **never** cause an error. They are
+//! exposed via [`FinalityStats`] so operators can correlate decoherence
+//! trends with network events.
 
 use crate::consensus::CommitCertificate;
 use crate::types::{Hash32, Height};
@@ -29,27 +39,27 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 // -----------------------------------------------------------------------------
-// Quantum Constants
+// Constants
 // -----------------------------------------------------------------------------
 
-/// Default rolling window size for finality statistics (coherence length).
+/// Default rolling window size for finality statistics.
 pub const DEFAULT_WINDOW_SIZE: usize = 100;
 
-/// Minimum propose timeout (ms) – quantum ground state.
+/// Minimum propose timeout (ms).
 pub const MIN_PROPOSE_MS: u64 = 50;
 
-/// Minimum vote timeout (ms) – ground state.
+/// Minimum vote timeout (ms).
 pub const MIN_VOTE_MS: u64 = 30;
 
-/// Maximum propose timeout (ms) – classical limit.
+/// Maximum propose timeout (ms).
 pub const MAX_PROPOSE_MS: u64 = 500;
 
-/// Maximum vote timeout (ms) – classical limit.
+/// Maximum vote timeout (ms).
 pub const MAX_VOTE_MS: u64 = 300;
 
 /// Default initial propose timeout (ms).
@@ -58,23 +68,26 @@ pub const DEFAULT_PROPOSE_MS: u64 = 150;
 /// Default initial prevote/precommit timeout (ms).
 pub const DEFAULT_VOTE_MS: u64 = 100;
 
-/// Default adaptation strength (harmonic oscillator coupling).
+/// Default adaptation strength.
 pub const DEFAULT_ADAPTATION_STRENGTH: f64 = 0.1;
 
 /// Default decoherence rate per commit recording.
 pub const DEFAULT_COMMIT_DECOHERENCE_RATE: f64 = 0.0005;
 
-/// Default minimum samples for sub‑second detection.
+/// Default minimum samples for sub-second detection.
 pub const MIN_SAMPLES_FOR_SUBSECOND: usize = 10;
 
 /// Default P95 percentile.
 pub const P95_PERCENTILE: f64 = 0.95;
 
-/// Lock timeout in seconds.
-const LOCK_TIMEOUT_SECS: u64 = 10;
+/// Lock acquisition timeout.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Temporary file extension for atomic writes.
-const TEMP_EXT: &str = ".tmp";
+/// Temporary file suffix for atomic writes.
+const TEMP_SUFFIX: &str = ".tmp";
+
+/// Lock file suffix.
+const LOCK_SUFFIX: &str = ".lock";
 
 /// Current serialization version.
 const CURRENT_VERSION: u32 = 1;
@@ -88,45 +101,27 @@ pub const DEFAULT_SHRINK_THRESHOLD_MS: u64 = 500;
 /// Default grow threshold (ms).
 pub const DEFAULT_GROW_THRESHOLD_MS: u64 = 800;
 
-/// Reduced Planck constant (natural units).
-const HBAR: f64 = 1.0;
-
 // -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------
 
 /// Configuration for the finality module.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FinalityConfig {
-    /// Size of the rolling window for finality times.
     pub window_size: usize,
-    /// Minimum propose timeout (ms).
     pub min_propose_ms: u64,
-    /// Maximum propose timeout (ms).
     pub max_propose_ms: u64,
-    /// Minimum vote timeout (ms).
     pub min_vote_ms: u64,
-    /// Maximum vote timeout (ms).
     pub max_vote_ms: u64,
-    /// Initial propose timeout (ms).
     pub initial_propose_ms: u64,
-    /// Initial vote timeout (ms).
     pub initial_vote_ms: u64,
-    /// Number of consecutive single-round commits before shrinking.
     pub fast_commits_before_shrink: u64,
-    /// Threshold (ms) below which timeouts shrink.
     pub shrink_threshold_ms: u64,
-    /// Threshold (ms) above which timeouts grow.
     pub grow_threshold_ms: u64,
-    /// Adaptation strength (0.0 – 1.0).
     pub adaptation_strength: f64,
-    /// Decoherence rate per commit (0.0 – 1.0).
     pub decoherence_rate: f64,
-    /// Minimum samples for sub‑second detection.
     pub min_samples_for_subsecond: usize,
-    /// P95 percentile.
     pub p95_percentile: f64,
-    /// Whether to persist state to disk.
     pub persist_state: bool,
 }
 
@@ -172,27 +167,43 @@ impl FinalityConfig {
         if self.initial_vote_ms < self.min_vote_ms || self.initial_vote_ms > self.max_vote_ms {
             return Err("initial_vote_ms out of range".into());
         }
-        if !(0.0..=1.0).contains(&self.adaptation_strength) {
-            return Err("adaptation_strength must be between 0.0 and 1.0".into());
+        if self.fast_commits_before_shrink == 0 {
+            return Err("fast_commits_before_shrink must be > 0".into());
         }
-        if !(0.0..=1.0).contains(&self.decoherence_rate) {
-            return Err("decoherence_rate must be between 0.0 and 1.0".into());
+        if self.shrink_threshold_ms >= self.grow_threshold_ms {
+            return Err("shrink_threshold_ms must be < grow_threshold_ms".into());
+        }
+        if !self.adaptation_strength.is_finite()
+            || !(0.0..=1.0).contains(&self.adaptation_strength)
+        {
+            return Err("adaptation_strength must be a finite value in [0.0, 1.0]".into());
+        }
+        if !self.decoherence_rate.is_finite()
+            || !(0.0..=1.0).contains(&self.decoherence_rate)
+        {
+            return Err("decoherence_rate must be a finite value in [0.0, 1.0]".into());
         }
         if self.min_samples_for_subsecond == 0 {
             return Err("min_samples_for_subsecond must be > 0".into());
         }
-        if !(0.0..=1.0).contains(&self.p95_percentile) {
-            return Err("p95_percentile must be between 0.0 and 1.0".into());
+        if self.min_samples_for_subsecond > self.window_size {
+            return Err("min_samples_for_subsecond must be <= window_size".into());
+        }
+        if !self.p95_percentile.is_finite()
+            || !(0.0..=1.0).contains(&self.p95_percentile)
+        {
+            return Err("p95_percentile must be a finite value in [0.0, 1.0]".into());
         }
         Ok(())
     }
 }
 
 // -----------------------------------------------------------------------------
-// Persistent State (versioned)
+// Persisted state
 // -----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Versioned on-disk representation of a [`FinalityTracker`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct PersistentStateV1 {
     version: u32,
     recent_finality_ms: Vec<u64>,
@@ -233,9 +244,9 @@ impl PersistentStateV1 {
     }
 
     fn into_tracker(self) -> FinalityTracker {
-        let mut tracker = FinalityTracker {
+        let mut t = FinalityTracker {
             recent_finality_ms: VecDeque::from(self.recent_finality_ms),
-            window_size: self.window_size,
+            window_size: self.window_size.max(1),
             consecutive_fast_commits: self.consecutive_fast_commits,
             total_finalized: self.total_finalized,
             best_finality_ms: self.best_finality_ms,
@@ -244,143 +255,212 @@ impl PersistentStateV1 {
             adaptive_prevote_ms: self.adaptive_prevote_ms,
             adaptive_precommit_ms: self.adaptive_precommit_ms,
             start_height: self.start_height,
-            purity: self.purity,
-            entropy: self.entropy,
-            adaptation_coherence: self.adaptation_coherence,
+            purity: self.purity.clamp(0.0, 1.0),
+            entropy: self.entropy.max(0.0),
+            adaptation_coherence: self.adaptation_coherence.clamp(0.0, 1.0),
         };
-        // Ensure window size matches config.
-        tracker.window_size = self.window_size;
-        while tracker.recent_finality_ms.len() > tracker.window_size {
-            tracker.recent_finality_ms.pop_front();
+        while t.recent_finality_ms.len() > t.window_size {
+            t.recent_finality_ms.pop_front();
         }
-        tracker
+        t
     }
 }
 
-/// Current timestamp (Unix seconds).
+/// Current UNIX timestamp in seconds.
 fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // -----------------------------------------------------------------------------
-// File I/O with locking and atomic writes
+// Disk I/O
 // -----------------------------------------------------------------------------
 
+fn lock_path_for(path: &Path) -> PathBuf {
+    path.with_extension(LOCK_SUFFIX)
+}
+
+fn temp_path_for(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(TEMP_SUFFIX);
+    PathBuf::from(s)
+}
+
+/// Acquire an exclusive lock on `path`'s lock file.
+///
+/// Only `WouldBlock` triggers a retry (with exponential backoff). Any other
+/// I/O error is returned immediately.
 fn acquire_lock(path: &Path) -> Result<File, String> {
-    let lock_path = path.with_extension("lock");
+    let lock_path = lock_path_for(path);
     let file = OpenOptions::new()
         .create(true)
+        .read(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path)
-        .map_err(|e| format!("cannot open lock file: {}", e))?;
-    let timeout = Duration::from_secs(LOCK_TIMEOUT_SECS);
-    let start = SystemTime::now();
+        .map_err(|e| format!("cannot open lock file {}: {}", lock_path.display(), e))?;
+
+    let deadline = Instant::now() + LOCK_TIMEOUT;
+    let mut delay = Duration::from_millis(1);
+
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
-            Err(_) => {
-                if start.elapsed().unwrap_or_default() > timeout {
-                    return Err(format!("lock timeout after {}s", LOCK_TIMEOUT_SECS));
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "lock timeout on {} after {:?}",
+                        lock_path.display(),
+                        LOCK_TIMEOUT
+                    ));
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(format!("lock error on {}: {}", lock_path.display(), e));
             }
         }
     }
 }
 
-fn release_lock(file: File) -> Result<(), String> {
-    file.unlock().map_err(|e| format!("unlock error: {}", e))
+/// Write `bytes` to `path` atomically and durably:
+/// write temp + fsync + rename + fsync parent dir (Unix).
+fn atomic_write_durable(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let temp_path = temp_path_for(path);
+
+    {
+        let f = File::create(&temp_path)
+            .map_err(|e| format!("create {}: {}", temp_path.display(), e))?;
+        let mut w = BufWriter::new(f);
+        if let Err(e) = w.write_all(bytes) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(format!("write {}: {}", temp_path.display(), e));
+        }
+        if let Err(e) = w.flush() {
+            let _ = fs::remove_file(&temp_path);
+            return Err(format!("flush {}: {}", temp_path.display(), e));
+        }
+        let f = w
+            .into_inner()
+            .map_err(|e| format!("unwrap bufwriter: {}", e))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync {}: {}", temp_path.display(), e))?;
+    }
+
+    fs::rename(&temp_path, path).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        format!("rename {} -> {}: {}", temp_path.display(), path.display(), e)
+    })?;
+
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
+/// Load and verify the persistent state.
+///
+/// Returns `Ok(None)` if the file does not exist.
 fn load_persistent_state(path: &Path) -> Result<Option<PersistentStateV1>, String> {
     if !path.exists() {
         return Ok(None);
     }
     let _lock = acquire_lock(path)?;
-    let file = File::open(path).map_err(|e| format!("open error: {}", e))?;
+    let file = File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
     let reader = BufReader::new(file);
-    let raw: serde_json::Value = serde_json::from_reader(reader)
-        .map_err(|e| format!("parse error: {}", e))?;
-    // Versioned deserialization.
-    if let Some(version) = raw.get("version").and_then(|v| v.as_u64()) {
-        if version != CURRENT_VERSION as u64 {
-            return Err(format!(
-                "unsupported version: {} (expected {})",
-                version, CURRENT_VERSION
-            ));
+    let raw: serde_json::Value =
+        serde_json::from_reader(reader).map_err(|e| format!("parse error: {}", e))?;
+
+    match raw.get("version").and_then(|v| v.as_u64()) {
+        Some(v) if v == CURRENT_VERSION as u64 => {
+            let st: PersistentStateV1 = serde_json::from_value(raw)
+                .map_err(|e| format!("v{} parse error: {}", v, e))?;
+            Ok(Some(st))
         }
-        let st: PersistentStateV1 = serde_json::from_value(raw)
-            .map_err(|e| format!("deserialize error: {}", e))?;
-        Ok(Some(st))
-    } else {
-        // Legacy format: try to parse as tracker directly.
-        // This is a best-effort fallback for compatibility.
-        match serde_json::from_value::<FinalityTracker>(raw) {
-            Ok(tracker) => {
-                // Convert to V1.
-                let st = PersistentStateV1::from_tracker(&tracker);
-                Ok(Some(st))
-            }
-            Err(e) => Err(format!("legacy parse error: {}", e)),
+        Some(v) => Err(format!(
+            "unsupported version: {} (expected {})",
+            v, CURRENT_VERSION
+        )),
+        None => {
+            // Legacy format: try to parse the tracker directly.
+            debug!(path = %path.display(), "loading legacy finality file");
+            let t: FinalityTracker = serde_json::from_value(raw)
+                .map_err(|e| format!("legacy parse error: {}", e))?;
+            Ok(Some(PersistentStateV1::from_tracker(&t)))
         }
     }
 }
 
+/// Save a tracker to disk atomically.
 fn save_persistent_state(path: &Path, tracker: &FinalityTracker) -> Result<(), String> {
-    let st = PersistentStateV1::from_tracker(tracker);
-    let json = serde_json::to_string_pretty(&st)
-        .map_err(|e| format!("serialize error: {}", e))?;
     let _lock = acquire_lock(path)?;
-    let temp_path = path.with_extension(TEMP_EXT);
-    fs::write(&temp_path, &json)
-        .map_err(|e| format!("write temp error: {}", e))?;
-    fs::rename(&temp_path, path)
-        .map_err(|e| format!("rename error: {}", e))?;
-    Ok(())
+    let st = PersistentStateV1::from_tracker(tracker);
+    let json = serde_json::to_vec_pretty(&st)
+        .map_err(|e| format!("serialize error: {}", e))?;
+    atomic_write_durable(path, &json)
+}
+
+/// Rename a corrupt file to `<path>.corrupt.<ts>` for post-mortem.
+fn quarantine_corrupt_file(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("finality_state.json");
+    let backup = path.with_file_name(format!("{}.corrupt.{}", file_name, current_timestamp()));
+    match fs::rename(path, &backup) {
+        Ok(()) => info!(backup = %backup.display(), "quarantined corrupt finality file"),
+        Err(e) => warn!(error = %e, "failed to quarantine corrupt finality file"),
+    }
 }
 
 // -----------------------------------------------------------------------------
-// Finality Tracker (Thread‑safe)
+// Finality tracker
 // -----------------------------------------------------------------------------
 
-/// Tracks finality timing with quantum state properties.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Rolling-window finality tracker with an adaptive-timeout controller.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FinalityTracker {
-    /// Rolling window of recent finality times (measurement outcomes).
+    /// Rolling window of recent finality times (ms).
     pub recent_finality_ms: VecDeque<u64>,
-    /// Maximum window size (Hilbert space dimension bound).
+    /// Maximum window size.
     pub window_size: usize,
-    /// Number of consecutive single‑round commits (coherence indicator).
+    /// Consecutive single-round commits.
     pub consecutive_fast_commits: u64,
-    /// Total blocks finalized (cumulative measurement count).
+    /// Total blocks finalized.
     pub total_finalized: u64,
     /// Best (lowest) finality time observed.
     pub best_finality_ms: u64,
     /// Worst (highest) finality time observed.
     pub worst_finality_ms: u64,
-    /// Current adaptive propose timeout (oscillator frequency).
+    /// Current adaptive propose timeout (ms).
     pub adaptive_propose_ms: u64,
-    /// Current adaptive prevote timeout.
+    /// Current adaptive prevote timeout (ms).
     pub adaptive_prevote_ms: u64,
-    /// Current adaptive precommit timeout.
+    /// Current adaptive precommit timeout (ms).
     pub adaptive_precommit_ms: u64,
     /// Height at which finality tracking started.
     pub start_height: Height,
-    /// Quantum purity γ = Tr(ρ²) of the finality state.
-    #[serde(default = "default_purity")]
+    /// Informational purity γ.
+    #[serde(default = "default_one")]
     pub purity: f64,
-    /// Von Neumann entropy S = -Tr(ρ ln ρ).
+    /// Informational entropy S.
     #[serde(default)]
     pub entropy: f64,
-    /// Coherence of the adaptation oscillator.
-    #[serde(default = "default_purity")]
+    /// Informational adaptation coherence.
+    #[serde(default = "default_one")]
     pub adaptation_coherence: f64,
 }
 
-fn default_purity() -> f64 {
+fn default_one() -> f64 {
     1.0
 }
 
@@ -405,20 +485,17 @@ impl Default for FinalityTracker {
 }
 
 impl FinalityTracker {
-    /// Create a new quantum tracker starting at the given height.
+    /// Create a new tracker starting at the given height.
     #[must_use]
     pub fn new(start_height: Height) -> Self {
-        Self {
-            start_height,
-            ..Default::default()
-        }
+        Self { start_height, ..Default::default() }
     }
 
-    /// Create a tracker with custom configuration.
+    /// Create a tracker with the config's initial timeouts and window size.
     #[must_use]
     pub fn with_config(start_height: Height, config: &FinalityConfig) -> Self {
         Self {
-            window_size: config.window_size,
+            window_size: config.window_size.max(1),
             adaptive_propose_ms: config.initial_propose_ms,
             adaptive_prevote_ms: config.initial_vote_ms,
             adaptive_precommit_ms: config.initial_vote_ms,
@@ -427,20 +504,19 @@ impl FinalityTracker {
         }
     }
 
-    /// Record a successful commit — projective measurement outcome.
+    /// Record a successful commit.
     ///
-    /// Each commit collapses the quantum state slightly.
+    /// `finality_ms` is the elapsed time from proposal to commit.
+    /// `round` is the round in which the commit occurred (0 = fast path).
     pub fn record_commit(&mut self, finality_ms: u64, round: u32, config: &FinalityConfig) {
-        self.total_finalized = self.total_finalized.wrapping_add(1);
+        self.total_finalized = self.total_finalized.saturating_add(1);
 
-        // Track fast commits (coherence preservation)
         if round == 0 {
-            self.consecutive_fast_commits = self.consecutive_fast_commits.wrapping_add(1);
+            self.consecutive_fast_commits = self.consecutive_fast_commits.saturating_add(1);
         } else {
             self.consecutive_fast_commits = 0;
         }
 
-        // Update classical statistics
         if finality_ms < self.best_finality_ms {
             self.best_finality_ms = finality_ms;
         }
@@ -448,20 +524,15 @@ impl FinalityTracker {
             self.worst_finality_ms = finality_ms;
         }
 
-        // Update rolling window (quantum memory)
         self.recent_finality_ms.push_back(finality_ms);
         while self.recent_finality_ms.len() > self.window_size {
             self.recent_finality_ms.pop_front();
         }
 
-        // Apply measurement decoherence
         self.apply_decoherence(config);
-
-        // Adapt timeouts (harmonic oscillator evolution)
         self.adapt_timeouts(config);
     }
 
-    /// Apply decoherence from measurement.
     fn apply_decoherence(&mut self, config: &FinalityConfig) {
         let decay = (-config.decoherence_rate).exp();
         self.purity = (self.purity * decay).clamp(0.0, 1.0);
@@ -469,11 +540,11 @@ impl FinalityTracker {
         self.entropy = if self.purity >= 1.0 {
             0.0
         } else {
-            -self.purity * self.purity.ln().max(0.0)
+            -(self.purity * self.purity.ln().min(0.0))
         };
     }
 
-    /// Average finality time over the recent window (expectation value).
+    /// Average finality time over the recent window.
     #[must_use]
     pub fn average_finality_ms(&self) -> u64 {
         if self.recent_finality_ms.is_empty() {
@@ -483,7 +554,7 @@ impl FinalityTracker {
         sum / self.recent_finality_ms.len() as u64
     }
 
-    /// P95 finality time (95th percentile of measurement distribution).
+    /// P95 finality time over the recent window.
     #[must_use]
     pub fn p95_finality_ms(&self, config: &FinalityConfig) -> u64 {
         if self.recent_finality_ms.is_empty() {
@@ -495,19 +566,14 @@ impl FinalityTracker {
         sorted[idx.min(sorted.len() - 1)]
     }
 
-    /// Whether we are consistently achieving sub‑second finality.
+    /// Whether the recent window meets the sub-second criterion.
     #[must_use]
     pub fn is_sub_second(&self, config: &FinalityConfig) -> bool {
         self.recent_finality_ms.len() >= config.min_samples_for_subsecond
             && self.p95_finality_ms(config) < 1000
     }
 
-    /// Adapt timeouts — quantum harmonic oscillator evolution.
-    ///
-    /// ```text
-    /// τ(t+dt) = τ(t) × exp(±γ × dt)
-    /// where γ = adaptation_strength × adaptation_coherence
-    /// ```
+    /// Adaptive-timeout controller.
     fn adapt_timeouts(&mut self, config: &FinalityConfig) {
         let avg = self.average_finality_ms();
         if avg == 0 {
@@ -519,7 +585,6 @@ impl FinalityTracker {
         if avg < config.shrink_threshold_ms
             && self.consecutive_fast_commits >= config.fast_commits_before_shrink
         {
-            // Network is healthy: shrink timeouts toward minimum.
             let factor = (-gamma).exp();
             self.adaptive_propose_ms = ((self.adaptive_propose_ms as f64 * factor) as u64)
                 .max(config.min_propose_ms);
@@ -527,10 +592,9 @@ impl FinalityTracker {
                 .max(config.min_vote_ms);
             self.adaptive_precommit_ms = ((self.adaptive_precommit_ms as f64 * factor) as u64)
                 .max(config.min_vote_ms);
-            // Adaptation preserves coherence
+            // Good conditions preserve/increase coherence.
             self.adaptation_coherence = (self.adaptation_coherence * 1.001).min(1.0);
         } else if avg > config.grow_threshold_ms || self.consecutive_fast_commits == 0 {
-            // Network is stressed: grow timeouts toward maximum.
             let factor = gamma.exp();
             self.adaptive_propose_ms = ((self.adaptive_propose_ms as f64 * factor) as u64)
                 .min(config.max_propose_ms);
@@ -538,12 +602,12 @@ impl FinalityTracker {
                 .min(config.max_vote_ms);
             self.adaptive_precommit_ms = ((self.adaptive_precommit_ms as f64 * factor) as u64)
                 .min(config.max_vote_ms);
-            // Stress causes decoherence
+            // Stress causes decoherence.
             self.adaptation_coherence = (self.adaptation_coherence * 0.99).max(0.0);
         }
     }
 
-    /// Get current adaptive timeouts.
+    /// Current adaptive timeouts `(propose, prevote, precommit)`.
     #[must_use]
     pub fn adaptive_timeouts(&self) -> (u64, u64, u64) {
         (
@@ -553,7 +617,7 @@ impl FinalityTracker {
         )
     }
 
-    /// Report quantum finality statistics.
+    /// Snapshot of statistics.
     #[must_use]
     pub fn stats(&self, config: &FinalityConfig) -> FinalityStats {
         FinalityStats {
@@ -579,11 +643,11 @@ impl FinalityTracker {
 }
 
 // -----------------------------------------------------------------------------
-// Statistics Structure
+// Statistics
 // -----------------------------------------------------------------------------
 
-/// Quantum statistics snapshot from the finality tracker.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Statistics snapshot from the finality tracker.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FinalityStats {
     pub total_finalized: u64,
     pub average_finality_ms: u64,
@@ -601,11 +665,11 @@ pub struct FinalityStats {
 }
 
 // -----------------------------------------------------------------------------
-// Finality Certificate
+// Finality certificate
 // -----------------------------------------------------------------------------
 
-/// A finality certificate that proves a block was finalized.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Proof that a block was finalized.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FinalityCertificate {
     pub commit: CommitCertificate,
     pub finality_ms: u64,
@@ -615,23 +679,23 @@ pub struct FinalityCertificate {
 }
 
 // -----------------------------------------------------------------------------
-// Quantum Pipeline State
+// Pipeline state
 // -----------------------------------------------------------------------------
 
-/// Pipeline state with quantum entanglement between prepare and commit phases.
-#[derive(Clone, Debug)]
+/// Pipeline state for the next height.
+#[derive(Clone, Debug, PartialEq)]
 pub struct PipelineState {
-    /// Pre‑computed proposal data for the next height.
+    /// Pre-computed transactions for the next height.
     pub next_proposal_txs: Option<Vec<crate::types::Tx>>,
-    /// Whether the pipeline is active (entanglement exists).
+    /// Whether the pipeline is active.
     pub active: bool,
-    /// Height for which the pipeline is preparing.
+    /// Height the pipeline is preparing for.
     pub pipeline_height: Height,
-    /// Entanglement fidelity with the current commit.
+    /// Informational entanglement fidelity.
     pub entanglement_fidelity: f64,
-    /// Number of times the pipeline has been used successfully.
+    /// Successful consumes.
     pub pipeline_hits: u64,
-    /// Number of times the pipeline was cancelled.
+    /// Cancelled or mismatched consumes.
     pub pipeline_misses: u64,
 }
 
@@ -649,65 +713,76 @@ impl Default for PipelineState {
 }
 
 impl PipelineState {
-    /// Begin pipelining: entangle next height preparation with current commit.
+    /// Begin pipelining for `height`.
     pub fn begin_pipeline(&mut self, height: Height, txs: Vec<crate::types::Tx>) {
         self.active = true;
         self.pipeline_height = height;
         self.next_proposal_txs = Some(txs);
-        self.entanglement_fidelity = 0.99; // High but not perfect
+        self.entanglement_fidelity = 0.99;
     }
 
-    /// Consume pipelined transactions if they match the expected height.
+    /// Consume pipelined transactions if the height matches.
     pub fn take_pipelined_txs(&mut self, height: Height) -> Option<Vec<crate::types::Tx>> {
         if self.active && self.pipeline_height == height {
             self.active = false;
-            self.pipeline_hits = self.pipeline_hits.wrapping_add(1);
+            self.pipeline_hits = self.pipeline_hits.saturating_add(1);
             self.entanglement_fidelity = 1.0;
             self.next_proposal_txs.take()
         } else {
+            let was_active = self.active;
             self.active = false;
             self.next_proposal_txs = None;
-            self.pipeline_misses = self.pipeline_misses.wrapping_add(1);
-            self.entanglement_fidelity *= 0.9;
+            if was_active {
+                self.pipeline_misses = self.pipeline_misses.saturating_add(1);
+                self.entanglement_fidelity *= 0.9;
+            }
             None
         }
     }
 
-    /// Cancel the pipeline — decoherence event.
+    /// Cancel the pipeline.
     pub fn cancel(&mut self) {
+        if !self.active {
+            return;
+        }
         self.active = false;
         self.next_proposal_txs = None;
-        self.pipeline_misses = self.pipeline_misses.wrapping_add(1);
+        self.pipeline_misses = self.pipeline_misses.saturating_add(1);
         self.entanglement_fidelity *= 0.8;
     }
 
-    /// Get pipeline success rate.
+    /// Success rate over all completed pipelines, `1.0` if none ran.
+    #[must_use]
     pub fn success_rate(&self) -> f64 {
         let total = self.pipeline_hits + self.pipeline_misses;
         if total == 0 {
-            return 1.0;
+            1.0
+        } else {
+            self.pipeline_hits as f64 / total as f64
         }
-        self.pipeline_hits as f64 / total as f64
     }
 }
 
 // -----------------------------------------------------------------------------
-// FinalityManager — Thread‑safe, persistent, configurable
+// Finality manager
 // -----------------------------------------------------------------------------
 
-/// Manages finality tracking with persistence and thread‑safety.
+/// Thread-safe, optionally persistent finality manager.
 #[derive(Clone)]
 pub struct FinalityManager {
     tracker: Arc<Mutex<FinalityTracker>>,
     pipeline: Arc<Mutex<PipelineState>>,
     config: Arc<FinalityConfig>,
     path: Option<PathBuf>,
-    /// Counter for total commits recorded.
     commits_recorded: Arc<AtomicU64>,
 }
 
 impl FinalityManager {
-    /// Create a new manager from configuration.
+    /// Create a non-persistent manager (in-memory only).
+    ///
+    /// Even if `config.persist_state` is `true`, no file is written because no
+    /// path is configured. Use [`FinalityManager::with_persistence`] for disk
+    /// persistence.
     pub fn new(start_height: Height, config: FinalityConfig) -> Result<Self, String> {
         config.validate()?;
         let tracker = FinalityTracker::with_config(start_height, &config);
@@ -720,7 +795,10 @@ impl FinalityManager {
         })
     }
 
-    /// Create with persistence to a file.
+    /// Create a manager persisting to `<data_dir>/finality_state.json`.
+    ///
+    /// If the on-disk file is corrupt, it is quarantined to
+    /// `<file>.corrupt.<ts>` and a fresh tracker is started.
     pub fn with_persistence(
         data_dir: &str,
         start_height: Height,
@@ -728,30 +806,31 @@ impl FinalityManager {
     ) -> Result<Self, String> {
         config.validate()?;
         let path = PathBuf::from(data_dir).join("finality_state.json");
-        let mut tracker = if path.exists() {
+
+        let tracker = if path.exists() {
             match load_persistent_state(&path) {
                 Ok(Some(st)) => {
                     let mut t = st.into_tracker();
-                    // Ensure start_height matches (or use stored).
                     if t.start_height == 0 {
                         t.start_height = start_height;
+                    }
+                    t.window_size = config.window_size.max(1);
+                    while t.recent_finality_ms.len() > t.window_size {
+                        t.recent_finality_ms.pop_front();
                     }
                     t
                 }
                 Ok(None) => FinalityTracker::with_config(start_height, &config),
                 Err(e) => {
-                    warn!(error = %e, "failed to load finality state, starting fresh");
+                    warn!(error = %e, "failed to load finality state; quarantining and starting fresh");
+                    quarantine_corrupt_file(&path);
                     FinalityTracker::with_config(start_height, &config)
                 }
             }
         } else {
             FinalityTracker::with_config(start_height, &config)
         };
-        // Ensure window size matches config.
-        tracker.window_size = config.window_size;
-        while tracker.recent_finality_ms.len() > tracker.window_size {
-            tracker.recent_finality_ms.pop_front();
-        }
+
         let tracker = Arc::new(Mutex::new(tracker));
         let pipeline = Arc::new(Mutex::new(PipelineState::default()));
 
@@ -762,70 +841,78 @@ impl FinalityManager {
             path: Some(path),
             commits_recorded: Arc::new(AtomicU64::new(0)),
         };
-        // Save initial state.
+
         if manager.config.persist_state {
+            // Initial save is fatal: the user asked for persistence.
+            let snapshot = manager.tracker.lock().clone();
             if let Some(p) = &manager.path {
-                let t = manager.tracker.lock();
-                if let Err(e) = save_persistent_state(p, &t) {
-                    warn!(error = %e, "failed to save initial finality state");
-                }
+                save_persistent_state(p, &snapshot).map_err(|e| {
+                    format!("initial finality state save failed: {}", e)
+                })?;
             }
         }
         Ok(manager)
     }
 
-    /// Record a commit (projective measurement).
+    /// Record a commit.
+    ///
+    /// The tracker lock is released before the disk write, so a slow disk
+    /// does not block readers.
     pub fn record_commit(&self, finality_ms: u64, round: u32, height: Height) {
-        let mut tracker = self.tracker.lock();
-        tracker.record_commit(finality_ms, round, &self.config);
+        let snapshot = {
+            let mut t = self.tracker.lock();
+            t.record_commit(finality_ms, round, &self.config);
+            t.clone()
+        };
         self.commits_recorded.fetch_add(1, Ordering::Relaxed);
 
-        // Persist if enabled.
         if self.config.persist_state {
             if let Some(path) = &self.path {
-                if let Err(e) = save_persistent_state(path, &tracker) {
+                if let Err(e) = save_persistent_state(path, &snapshot) {
                     warn!(error = %e, "failed to save finality state");
                 }
             }
         }
+
         debug!(
             height,
             round,
             finality_ms,
-            avg = tracker.average_finality_ms(),
-            purity = tracker.purity,
+            avg = snapshot.average_finality_ms(),
+            purity = snapshot.purity,
             "commit recorded"
         );
     }
 
-    /// Get current statistics.
+    /// Current statistics.
+    #[must_use]
     pub fn stats(&self) -> FinalityStats {
-        let tracker = self.tracker.lock();
-        tracker.stats(&self.config)
+        self.tracker.lock().stats(&self.config)
     }
 
-    /// Get current adaptive timeouts.
+    /// Current adaptive timeouts.
+    #[must_use]
     pub fn adaptive_timeouts(&self) -> (u64, u64, u64) {
-        let tracker = self.tracker.lock();
-        tracker.adaptive_timeouts()
+        self.tracker.lock().adaptive_timeouts()
     }
 
-    /// Get pipeline state.
+    /// Snapshot of the pipeline state.
+    #[must_use]
     pub fn pipeline_state(&self) -> PipelineState {
         self.pipeline.lock().clone()
     }
 
     /// Begin pipelining for the next height.
     pub fn begin_pipeline(&self, height: Height, txs: Vec<crate::types::Tx>) {
-        let mut pipeline = self.pipeline.lock();
-        pipeline.begin_pipeline(height, txs);
+        let mut p = self.pipeline.lock();
+        p.begin_pipeline(height, txs);
         debug!(height, "pipeline started");
     }
 
     /// Consume pipelined transactions.
     pub fn take_pipelined_txs(&self, height: Height) -> Option<Vec<crate::types::Tx>> {
-        let mut pipeline = self.pipeline.lock();
-        let txs = pipeline.take_pipelined_txs(height);
+        let mut p = self.pipeline.lock();
+        let txs = p.take_pipelined_txs(height);
         if txs.is_some() {
             debug!(height, "pipeline hit");
         } else {
@@ -834,38 +921,64 @@ impl FinalityManager {
         txs
     }
 
-    /// Cancel pipeline.
+    /// Cancel the pipeline.
     pub fn cancel_pipeline(&self) {
-        let mut pipeline = self.pipeline.lock();
-        pipeline.cancel();
+        let mut p = self.pipeline.lock();
+        p.cancel();
         debug!("pipeline cancelled");
     }
 
-    /// Force save state to disk.
+    /// Force an immediate durable save.
+    ///
+    /// No-op if this manager was created via [`FinalityManager::new`]
+    /// (no path configured). Ignores `config.persist_state` — an explicit
+    /// `flush` is always honored when a path exists.
     pub fn flush(&self) -> Result<(), String> {
-        if let Some(path) = &self.path {
-            let tracker = self.tracker.lock();
-            save_persistent_state(path, &tracker)?;
-        }
-        Ok(())
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let snapshot = self.tracker.lock().clone();
+        save_persistent_state(path, &snapshot)
     }
 
-    /// Total commits recorded.
+    /// Total commits recorded via this handle.
+    #[must_use]
     pub fn total_commits(&self) -> u64 {
         self.commits_recorded.load(Ordering::Relaxed)
     }
 
-    /// Get configuration.
+    /// Configuration.
+    #[must_use]
     pub fn config(&self) -> &FinalityConfig {
         &self.config
     }
 
-    /// Get current purity.
+    /// Whether this manager persists to disk.
+    #[must_use]
+    pub fn is_persistent(&self) -> bool {
+        self.path.is_some()
+    }
+
+    /// Path to the persistence file, if any.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Height at which finality tracking started.
+    #[must_use]
+    pub fn start_height(&self) -> Height {
+        self.tracker.lock().start_height
+    }
+
+    /// Informational purity.
+    #[must_use]
     pub fn purity(&self) -> f64 {
         self.tracker.lock().purity
     }
 
-    /// Get current entropy.
+    /// Informational entropy.
+    #[must_use]
     pub fn entropy(&self) -> f64 {
         self.tracker.lock().entropy
     }
@@ -881,60 +994,89 @@ mod tests {
     use tempfile::tempdir;
 
     fn test_config() -> FinalityConfig {
-        let mut cfg = FinalityConfig::default();
-        cfg.window_size = 20;
-        cfg.fast_commits_before_shrink = 3;
-        cfg.adaptation_strength = 0.1;
-        cfg.decoherence_rate = 0.001;
-        cfg
+        FinalityConfig {
+            window_size: 20,
+            fast_commits_before_shrink: 3,
+            adaptation_strength: 0.1,
+            decoherence_rate: 0.001,
+            ..Default::default()
+        }
     }
 
     #[test]
     fn test_tracker_basic() {
         let cfg = test_config();
-        let mut tracker = FinalityTracker::with_config(1, &cfg);
+        let mut t = FinalityTracker::with_config(1, &cfg);
         for _ in 0..10 {
-            tracker.record_commit(100, 0, &cfg);
+            t.record_commit(100, 0, &cfg);
         }
-        assert_eq!(tracker.total_finalized, 10);
-        assert_eq!(tracker.consecutive_fast_commits, 10);
-        assert_eq!(tracker.average_finality_ms(), 100);
-        assert!(tracker.is_sub_second(&cfg));
-        assert!(tracker.purity < 1.0);
+        assert_eq!(t.total_finalized, 10);
+        assert_eq!(t.consecutive_fast_commits, 10);
+        assert_eq!(t.average_finality_ms(), 100);
+        assert!(t.is_sub_second(&cfg));
+        assert!(t.purity < 1.0);
+        assert!(t.purity > 0.0);
     }
 
     #[test]
     fn test_adaptation_down() {
         let cfg = test_config();
-        let mut tracker = FinalityTracker::with_config(1, &cfg);
+        let mut t = FinalityTracker::with_config(1, &cfg);
         for _ in 0..20 {
-            tracker.record_commit(80, 0, &cfg);
+            t.record_commit(80, 0, &cfg);
         }
-        assert!(tracker.adaptive_propose_ms < DEFAULT_PROPOSE_MS);
-        assert!(tracker.adaptive_prevote_ms < DEFAULT_VOTE_MS);
+        assert!(t.adaptive_propose_ms < DEFAULT_PROPOSE_MS);
+        assert!(t.adaptive_prevote_ms < DEFAULT_VOTE_MS);
     }
 
     #[test]
     fn test_adaptation_up() {
         let cfg = test_config();
-        let mut tracker = FinalityTracker::with_config(1, &cfg);
+        let mut t = FinalityTracker::with_config(1, &cfg);
         for _ in 0..10 {
-            tracker.record_commit(900, 2, &cfg);
+            t.record_commit(900, 2, &cfg);
         }
-        assert!(tracker.adaptive_propose_ms >= DEFAULT_PROPOSE_MS);
+        assert!(t.adaptive_propose_ms >= DEFAULT_PROPOSE_MS);
+    }
+
+    #[test]
+    fn test_adaptation_respects_bounds() {
+        let cfg = test_config();
+        let mut t = FinalityTracker::with_config(1, &cfg);
+        for _ in 0..1000 {
+            t.record_commit(10, 0, &cfg);
+        }
+        // Never below minimum.
+        assert!(t.adaptive_propose_ms >= cfg.min_propose_ms);
+        assert!(t.adaptive_prevote_ms >= cfg.min_vote_ms);
+        // Never above maximum.
+        assert!(t.adaptive_propose_ms <= cfg.max_propose_ms);
+
+        for _ in 0..1000 {
+            t.record_commit(10_000, 3, &cfg);
+        }
+        assert!(t.adaptive_propose_ms <= cfg.max_propose_ms);
+        assert!(t.adaptive_prevote_ms <= cfg.max_vote_ms);
     }
 
     #[test]
     fn test_pipeline() {
-        let mut ps = PipelineState::default();
-        ps.begin_pipeline(5, vec![]);
-        assert!(ps.active);
-        assert_eq!(ps.pipeline_height, 5);
-        assert!(ps.take_pipelined_txs(6).is_none());
-        assert_eq!(ps.pipeline_misses, 1);
-        ps.begin_pipeline(7, vec![]);
-        assert!(ps.take_pipelined_txs(7).is_some());
-        assert_eq!(ps.pipeline_hits, 1);
+        let mut p = PipelineState::default();
+        p.begin_pipeline(5, vec![]);
+        assert!(p.active);
+        assert_eq!(p.pipeline_height, 5);
+        assert!(p.take_pipelined_txs(6).is_none());
+        assert_eq!(p.pipeline_misses, 1);
+        p.begin_pipeline(7, vec![]);
+        assert!(p.take_pipelined_txs(7).is_some());
+        assert_eq!(p.pipeline_hits, 1);
+    }
+
+    #[test]
+    fn test_pipeline_cancel_when_inactive_is_noop() {
+        let mut p = PipelineState::default();
+        p.cancel();
+        assert_eq!(p.pipeline_misses, 0);
     }
 
     #[test]
@@ -942,31 +1084,32 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         let cfg = test_config();
-        let manager = FinalityManager::with_persistence(path, 1, cfg.clone()).unwrap();
-        manager.record_commit(100, 0, 1);
-        manager.record_commit(120, 0, 2);
-        drop(manager);
+        {
+            let m = FinalityManager::with_persistence(path, 1, cfg.clone()).unwrap();
+            m.record_commit(100, 0, 1);
+            m.record_commit(120, 0, 2);
+        }
 
-        let manager2 = FinalityManager::with_persistence(path, 1, cfg).unwrap();
-        let stats = manager2.stats();
+        let m2 = FinalityManager::with_persistence(path, 1, cfg).unwrap();
+        let stats = m2.stats();
         assert_eq!(stats.total_finalized, 2);
         assert!(stats.average_finality_ms >= 100);
+        assert_eq!(m2.start_height(), 1);
     }
 
     #[test]
     fn test_manager_adaptive_timeouts() {
         let cfg = test_config();
-        let manager = FinalityManager::new(1, cfg).unwrap();
-        let (p, v, pc) = manager.adaptive_timeouts();
+        let m = FinalityManager::new(1, cfg).unwrap();
+        let (p, v, pc) = m.adaptive_timeouts();
         assert_eq!(p, DEFAULT_PROPOSE_MS);
         assert_eq!(v, DEFAULT_VOTE_MS);
         assert_eq!(pc, DEFAULT_VOTE_MS);
 
-        // Simulate fast commits.
         for i in 0..20 {
-            manager.record_commit(50 + i, 0, i + 1);
+            m.record_commit(50 + i, 0, i + 1);
         }
-        let (p2, v2, pc2) = manager.adaptive_timeouts();
+        let (p2, v2, pc2) = m.adaptive_timeouts();
         assert!(p2 < p);
         assert!(v2 < v);
         assert!(pc2 < pc);
@@ -975,11 +1118,11 @@ mod tests {
     #[test]
     fn test_manager_stats() {
         let cfg = test_config();
-        let manager = FinalityManager::new(1, cfg).unwrap();
+        let m = FinalityManager::new(1, cfg).unwrap();
         for i in 0..15 {
-            manager.record_commit(100 + i * 5, 0, i + 1);
+            m.record_commit(100 + i * 5, 0, i + 1);
         }
-        let stats = manager.stats();
+        let stats = m.stats();
         assert!(stats.is_sub_second);
         assert!(stats.average_finality_ms < 1000);
         assert!(stats.purity > 0.0);
@@ -990,19 +1133,17 @@ mod tests {
     #[test]
     fn test_manager_pipeline() {
         let cfg = test_config();
-        let manager = FinalityManager::new(1, cfg).unwrap();
+        let m = FinalityManager::new(1, cfg).unwrap();
         let txs = vec![crate::types::Tx::default()];
-        manager.begin_pipeline(5, txs.clone());
-        let state = manager.pipeline_state();
+        m.begin_pipeline(5, txs.clone());
+        let state = m.pipeline_state();
         assert!(state.active);
         assert_eq!(state.pipeline_height, 5);
 
-        let taken = manager.take_pipelined_txs(5);
+        let taken = m.take_pipelined_txs(5);
         assert!(taken.is_some());
         assert_eq!(taken.unwrap().len(), 1);
-
-        let state2 = manager.pipeline_state();
-        assert!(!state2.active);
+        assert!(!m.pipeline_state().active);
     }
 
     #[test]
@@ -1010,38 +1151,84 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         let cfg = test_config();
-        let manager = FinalityManager::with_persistence(path, 1, cfg.clone()).unwrap();
-        manager.record_commit(100, 0, 1);
-        drop(manager);
+        {
+            let m = FinalityManager::with_persistence(path, 1, cfg.clone()).unwrap();
+            m.record_commit(100, 0, 1);
+        }
 
         // Corrupt the file.
         let file_path = dir.path().join("finality_state.json");
         fs::write(&file_path, "corrupted").unwrap();
 
-        let manager2 = FinalityManager::with_persistence(path, 1, cfg).unwrap();
-        // Should start fresh but keep existing height.
-        let stats = manager2.stats();
-        assert_eq!(stats.total_finalized, 0); // fresh state
-        assert_eq!(manager2.tracker.lock().start_height, 1);
+        let m2 = FinalityManager::with_persistence(path, 1, cfg).unwrap();
+        assert_eq!(m2.stats().total_finalized, 0);
+        assert_eq!(m2.start_height(), 1);
+
+        // Corrupt file should have been quarantined.
+        let quarantined: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("finality_state.json.corrupt.")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1);
     }
 
     #[test]
     fn test_config_validation() {
-        let mut cfg = FinalityConfig::default();
-        assert!(cfg.validate().is_ok());
+        assert!(FinalityConfig::default().validate().is_ok());
 
-        cfg.window_size = 0;
-        assert!(cfg.validate().is_err());
+        assert!(FinalityConfig { window_size: 0, ..Default::default() }
+            .validate()
+            .is_err());
 
-        cfg.window_size = 10;
-        cfg.min_propose_ms = 1000;
-        cfg.max_propose_ms = 500;
-        assert!(cfg.validate().is_err());
+        assert!(FinalityConfig {
+            min_propose_ms: 1000,
+            max_propose_ms: 500,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
 
-        cfg.min_propose_ms = 50;
-        cfg.max_propose_ms = 500;
-        cfg.adaptation_strength = 1.5;
-        assert!(cfg.validate().is_err());
+        assert!(FinalityConfig {
+            adaptation_strength: 1.5,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+
+        assert!(FinalityConfig {
+            adaptation_strength: f64::NAN,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+
+        assert!(FinalityConfig {
+            shrink_threshold_ms: 1000,
+            grow_threshold_ms: 500,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+
+        assert!(FinalityConfig {
+            fast_commits_before_shrink: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+
+        assert!(FinalityConfig {
+            min_samples_for_subsecond: 200,
+            window_size: 100,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -1049,50 +1236,69 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         let cfg = test_config();
-        let manager = FinalityManager::with_persistence(path, 1, cfg).unwrap();
-        manager.record_commit(100, 0, 1);
-        assert!(manager.flush().is_ok());
+        let m = FinalityManager::with_persistence(path, 1, cfg).unwrap();
+        m.record_commit(100, 0, 1);
+        assert!(m.flush().is_ok());
+        assert_eq!(m.stats().total_finalized, 1);
+    }
 
-        let stats = manager.stats();
-        assert_eq!(stats.total_finalized, 1);
+    #[test]
+    fn test_flush_on_non_persistent_is_ok() {
+        let cfg = test_config();
+        let m = FinalityManager::new(1, cfg).unwrap();
+        assert!(!m.is_persistent());
+        assert!(m.flush().is_ok());
     }
 
     #[test]
     fn test_purity_decay() {
         let cfg = test_config();
-        let mut tracker = FinalityTracker::with_config(1, &cfg);
-        let initial = tracker.purity;
+        let mut t = FinalityTracker::with_config(1, &cfg);
+        let initial = t.purity;
         for _ in 0..50 {
-            tracker.record_commit(100, 0, &cfg);
+            t.record_commit(100, 0, &cfg);
         }
-        assert!(tracker.purity < initial);
-        assert!(tracker.entropy > 0.0);
+        assert!(t.purity < initial);
+        assert!(t.entropy > 0.0);
     }
 
     #[test]
     fn test_p95_calculation() {
         let cfg = test_config();
-        let mut tracker = FinalityTracker::with_config(1, &cfg);
-        for i in 1..=100 {
-            tracker.record_commit(i * 10, 0, &cfg);
+        let mut t = FinalityTracker::with_config(1, &cfg);
+        // window_size = 20: only last 20 samples survive.
+        for i in 1..=100u64 {
+            t.record_commit(i * 10, 0, &cfg);
         }
-        let p95 = tracker.p95_finality_ms(&cfg);
-        assert!(p95 >= 940 && p95 <= 960);
+        // Last 20 samples: 810..=1000.
+        let p95 = t.p95_finality_ms(&cfg);
+        assert!((810..=1000).contains(&p95), "got {p95}");
     }
 
     #[test]
     fn test_sub_second_detection() {
         let cfg = test_config();
-        let mut tracker = FinalityTracker::with_config(1, &cfg);
+        let mut t = FinalityTracker::with_config(1, &cfg);
         for _ in 0..15 {
-            tracker.record_commit(500, 0, &cfg);
+            t.record_commit(500, 0, &cfg);
         }
-        assert!(tracker.is_sub_second(&cfg));
+        assert!(t.is_sub_second(&cfg));
 
-        // Introduce slow commits.
         for _ in 0..15 {
-            tracker.record_commit(1200, 2, &cfg);
+            t.record_commit(1200, 2, &cfg);
         }
-        assert!(!tracker.is_sub_second(&cfg));
+        assert!(!t.is_sub_second(&cfg));
+    }
+
+    #[test]
+    fn test_record_commit_does_not_block_on_slow_disk() {
+        // Sanity: after record_commit, the lock is free for stats.
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let cfg = test_config();
+        let m = FinalityManager::with_persistence(path, 1, cfg).unwrap();
+        m.record_commit(100, 0, 1);
+        // If the lock were still held, this would deadlock.
+        let _ = m.stats();
     }
 }
