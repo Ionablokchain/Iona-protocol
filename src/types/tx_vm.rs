@@ -1,45 +1,111 @@
-//! VM transaction types for the IONA custom VM — Quantum-Ready.
+//! VM transaction types for the IONA custom VM — validation, gas helpers,
+//! and caching.
 //!
-//! # Production Features
-//! - Configurable via `VmTxConfig` (gas limits, sizes, caching).
-//! - `VmTxMetrics` with Prometheus counters for validations, passes, failures, cache hits/misses.
-//! - `VmTxManager` with thread‑safe LRU cache for validation results.
-//! - Configurable validation with limits.
-//! - Extended error types.
-//! - Structured logging with `tracing`.
-//! - Full test coverage.
+//! # Scope
+//!
+//! This module is a **manager** around the domain types defined in
+//! [`crate::types::vm_tx`]. It provides:
+//!
+//! - configurable validation with bounds ([`VmTxManager::validate`]),
+//! - an optional LRU + TTL cache of validation results,
+//! - Prometheus metrics ([`VmTxMetrics`]) and an owned snapshot
+//!   ([`VmTxMetricsSnapshot`]),
+//! - a convenience intrinsic-gas helper ([`VmTxManager::intrinsic_gas`]),
+//! - an informational quantum scoreboard
+//!   ([`VmTxManager::validate_quantum`]).
+//!
+//! The domain types (`VmTx`, `VmTxError`, `VmTxResult`, `ContractAddr`,
+//! `QuantumVmTxState`, `default_coherence`, `vm_tx_fidelity`) are re-exported
+//! for callers that reach for them through this module.
+//!
+//! # Validation model
+//!
+//! [`VmTxManager::validate`] applies, in order:
+//!
+//! 1. Gas limit within `[min_gas_limit, max_gas_limit]`.
+//! 2. Sender non-empty.
+//! 3. Payload-specific:
+//!    - `Deploy`: `init_code` non-empty and `≤ max_init_code_size`.
+//!    - `Call`: contract address non-zero and `calldata ≤ max_calldata_size`.
+//!
+//! # Caching
+//!
+//! Cached results are keyed by a Keccak-256 digest over a canonical
+//! encoding of the transaction **plus the validation-relevant fields of the
+//! configuration**. Changing `min_gas_limit`, `max_gas_limit`,
+//! `max_init_code_size`, or `max_calldata_size` invalidates the entire
+//! cache without operator intervention.
+//!
+//! The cache lock is held only during the LRU lookup and insert; validation
+//! itself runs lock-free.
+//!
+//! # Informational quantum state
+//!
+//! [`VmTx::coherence`] and the helpers `default_coherence`, `vm_tx_fidelity`
+//! are decorative. They **never** gate validation. [`VmTxManager::validate_quantum`]
+//! returns a side-channel scoreboard alongside the real result.
 
 use crate::types::vm_tx::{QuantumVmTxState, VmTx, VmTxError, VmTxResult};
 use lru::LruCache;
 use parking_lot::Mutex;
-use prometheus::{
-    register_counter, register_counter_vec, register_gauge, Counter, CounterVec, Gauge,
-};
+use prometheus::{Counter, CounterVec, Gauge};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, trace, warn};
+use thiserror::Error;
+use tracing::{debug, trace, warn};
 
-// ── Re‑export types from the original module ─────────────────────────────
+// ── Re-exports ────────────────────────────────────────────────────────────
+//
+// These are the domain types. Do not redefine them here; the module is a
+// manager, not a definition site.
 
 pub use crate::types::vm_tx::{
-    ContractAddr, QuantumVmTxState, VmTx, VmTxError, VmTxResult, default_coherence, vm_tx_fidelity,
+    default_coherence, vm_tx_fidelity, ContractAddr, QuantumVmTxState, VmTx, VmTxError,
+    VmTxResult,
 };
+
+// ── Constants ─────────────────────────────────────────────────────────────
+
+/// Base intrinsic gas (matches the VM's schedule).
+pub const INTRINSIC_BASE_GAS: u64 = 21_000;
+
+/// Per-byte gas applied to any payload byte.
+pub const INTRINSIC_GAS_PER_BYTE: u64 = 4;
+
+/// Additional gas reserved for the `Deploy` path (contract creation).
+pub const DEPLOY_EXTRA_GAS: u64 = 32_000;
+
+/// Hard upper bound on `VmTxConfig::max_gas_limit`.
+pub const HARD_MAX_GAS_LIMIT: u64 = 1_000_000_000;
+
+/// Hard upper bound on `VmTxConfig::max_init_code_size` (16 MiB).
+pub const HARD_MAX_INIT_CODE_SIZE: usize = 16 * 1024 * 1024;
+
+/// Hard upper bound on `VmTxConfig::max_calldata_size` (16 MiB).
+pub const HARD_MAX_CALLDATA_SIZE: usize = 16 * 1024 * 1024;
+
+/// Hard upper bound on `VmTxConfig::cache_size`.
+pub const HARD_MAX_CACHE_SIZE: usize = 1_000_000;
+
+/// Hard upper bound on `VmTxConfig::cache_ttl_secs` (24 h).
+pub const HARD_MAX_CACHE_TTL_SECS: u64 = 86_400;
 
 // ── Configuration ─────────────────────────────────────────────────────────
 
 /// Configuration for VM transaction handling.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmTxConfig {
     /// Minimum gas limit required.
     pub min_gas_limit: u64,
     /// Maximum gas limit allowed.
     pub max_gas_limit: u64,
-    /// Maximum size of init code (deploy).
+    /// Maximum size of init code (deploy), in bytes.
     pub max_init_code_size: usize,
-    /// Maximum size of calldata (call).
+    /// Maximum size of calldata (call), in bytes.
     pub max_calldata_size: usize,
     /// Whether to enable validation caching.
     pub enable_cache: bool,
@@ -47,7 +113,7 @@ pub struct VmTxConfig {
     pub cache_size: usize,
     /// Cache TTL in seconds.
     pub cache_ttl_secs: u64,
-    /// Whether to enable metrics.
+    /// Whether to enable Prometheus metrics.
     pub enable_metrics: bool,
     /// Whether to log validation events.
     pub log_validation: bool,
@@ -58,8 +124,8 @@ impl Default for VmTxConfig {
         Self {
             min_gas_limit: 21_000,
             max_gas_limit: 30_000_000,
-            max_init_code_size: 256 * 1024, // 256 KiB
-            max_calldata_size: 128 * 1024,  // 128 KiB
+            max_init_code_size: 256 * 1024,
+            max_calldata_size: 128 * 1024,
             enable_cache: true,
             cache_size: 1024,
             cache_ttl_secs: 300,
@@ -69,37 +135,105 @@ impl Default for VmTxConfig {
     }
 }
 
+/// Errors returned by [`VmTxConfig::validate`].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum VmTxConfigError {
+    #[error("min_gas_limit must be > 0")]
+    ZeroMinGasLimit,
+    #[error("max_gas_limit must be > 0")]
+    ZeroMaxGasLimit,
+    #[error("min_gas_limit ({min}) must be <= max_gas_limit ({max})")]
+    MinAboveMax { min: u64, max: u64 },
+    #[error("max_gas_limit ({got}) exceeds the hard bound {max}")]
+    MaxGasLimitTooHigh { got: u64, max: u64 },
+    #[error("max_init_code_size must be > 0")]
+    ZeroInitCodeSize,
+    #[error("max_init_code_size ({got}) exceeds the hard bound {max}")]
+    InitCodeSizeTooHigh { got: usize, max: usize },
+    #[error("max_calldata_size must be > 0")]
+    ZeroCalldataSize,
+    #[error("max_calldata_size ({got}) exceeds the hard bound {max}")]
+    CalldataSizeTooHigh { got: usize, max: usize },
+    #[error("cache_size must be > 0")]
+    ZeroCacheSize,
+    #[error("cache_size ({got}) exceeds the hard bound {max}")]
+    CacheSizeTooHigh { got: usize, max: usize },
+    #[error("cache_ttl_secs must be > 0")]
+    ZeroCacheTtl,
+    #[error("cache_ttl_secs ({got}) exceeds the hard bound {max}")]
+    CacheTtlTooHigh { got: u64, max: u64 },
+}
+
 impl VmTxConfig {
     /// Validate the configuration.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), VmTxConfigError> {
         if self.min_gas_limit == 0 {
-            return Err("min_gas_limit must be > 0".into());
+            return Err(VmTxConfigError::ZeroMinGasLimit);
         }
         if self.max_gas_limit == 0 {
-            return Err("max_gas_limit must be > 0".into());
+            return Err(VmTxConfigError::ZeroMaxGasLimit);
         }
         if self.min_gas_limit > self.max_gas_limit {
-            return Err("min_gas_limit must be <= max_gas_limit".into());
+            return Err(VmTxConfigError::MinAboveMax {
+                min: self.min_gas_limit,
+                max: self.max_gas_limit,
+            });
+        }
+        if self.max_gas_limit > HARD_MAX_GAS_LIMIT {
+            return Err(VmTxConfigError::MaxGasLimitTooHigh {
+                got: self.max_gas_limit,
+                max: HARD_MAX_GAS_LIMIT,
+            });
         }
         if self.max_init_code_size == 0 {
-            return Err("max_init_code_size must be > 0".into());
+            return Err(VmTxConfigError::ZeroInitCodeSize);
+        }
+        if self.max_init_code_size > HARD_MAX_INIT_CODE_SIZE {
+            return Err(VmTxConfigError::InitCodeSizeTooHigh {
+                got: self.max_init_code_size,
+                max: HARD_MAX_INIT_CODE_SIZE,
+            });
         }
         if self.max_calldata_size == 0 {
-            return Err("max_calldata_size must be > 0".into());
+            return Err(VmTxConfigError::ZeroCalldataSize);
+        }
+        if self.max_calldata_size > HARD_MAX_CALLDATA_SIZE {
+            return Err(VmTxConfigError::CalldataSizeTooHigh {
+                got: self.max_calldata_size,
+                max: HARD_MAX_CALLDATA_SIZE,
+            });
         }
         if self.cache_size == 0 {
-            return Err("cache_size must be > 0".into());
+            return Err(VmTxConfigError::ZeroCacheSize);
+        }
+        if self.cache_size > HARD_MAX_CACHE_SIZE {
+            return Err(VmTxConfigError::CacheSizeTooHigh {
+                got: self.cache_size,
+                max: HARD_MAX_CACHE_SIZE,
+            });
         }
         if self.cache_ttl_secs == 0 {
-            return Err("cache_ttl_secs must be > 0".into());
+            return Err(VmTxConfigError::ZeroCacheTtl);
+        }
+        if self.cache_ttl_secs > HARD_MAX_CACHE_TTL_SECS {
+            return Err(VmTxConfigError::CacheTtlTooHigh {
+                got: self.cache_ttl_secs,
+                max: HARD_MAX_CACHE_TTL_SECS,
+            });
         }
         Ok(())
     }
 }
 
-// ── Metrics ──────────────────────────────────────────────────────────────
+// ── Metrics ───────────────────────────────────────────────────────────────
 
-/// Metrics for VM transaction handling.
+/// Prometheus metrics for VM transaction handling.
+///
+/// # Registration
+///
+/// [`VmTxMetrics::new`] registers with the **default** registry and can
+/// only succeed once per process. [`VmTxMetrics::unregistered`] returns a
+/// fail-free instance; [`Default`] uses it.
 #[derive(Clone)]
 pub struct VmTxMetrics {
     pub validations: Counter,
@@ -108,167 +242,252 @@ pub struct VmTxMetrics {
     pub cache_hits: Counter,
     pub cache_misses: Counter,
     pub gas_estimates: Counter,
+    pub cache_size: Gauge,
 }
 
 impl VmTxMetrics {
+    /// Register all metrics with the default Prometheus registry.
     pub fn new() -> Result<Self, prometheus::Error> {
-        let validations = register_counter!(
-            "iona_vmtx_validations_total",
-            "Total VM transaction validations"
-        )?;
-        let passes = register_counter!(
-            "iona_vmtx_passes_total",
-            "Validations that passed"
-        )?;
-        let failures = register_counter_vec!(
-            "iona_vmtx_failures_total",
-            "Validations that failed",
-            &["reason"]
-        )?;
-        let cache_hits = register_counter!(
-            "iona_vmtx_cache_hits_total",
-            "Validation cache hits"
-        )?;
-        let cache_misses = register_counter!(
-            "iona_vmtx_cache_misses_total",
-            "Validation cache misses"
-        )?;
-        let gas_estimates = register_counter!(
-            "iona_vmtx_gas_estimates_total",
-            "Total gas estimates"
-        )?;
         Ok(Self {
-            validations,
-            passes,
-            failures,
-            cache_hits,
-            cache_misses,
-            gas_estimates,
+            validations: prometheus::register_counter!(
+                "iona_vmtx_validations_total",
+                "Total VM transaction validations"
+            )?,
+            passes: prometheus::register_counter!(
+                "iona_vmtx_passes_total",
+                "Validations that passed"
+            )?,
+            failures: prometheus::register_counter_vec!(
+                "iona_vmtx_failures_total",
+                "Validations that failed",
+                &["reason"]
+            )?,
+            cache_hits: prometheus::register_counter!(
+                "iona_vmtx_cache_hits_total",
+                "Validation cache hits"
+            )?,
+            cache_misses: prometheus::register_counter!(
+                "iona_vmtx_cache_misses_total",
+                "Validation cache misses"
+            )?,
+            gas_estimates: prometheus::register_counter!(
+                "iona_vmtx_gas_estimates_total",
+                "Total gas estimates"
+            )?,
+            cache_size: prometheus::register_gauge!(
+                "iona_vmtx_cache_size",
+                "Current size of the validation cache"
+            )?,
         })
+    }
+
+    /// Create an **unregistered** metrics bundle.
+    ///
+    /// Never fails, never registers. Safe to construct any number of times.
+    pub fn unregistered() -> Self {
+        let mk_counter = |name: &str, help: &str| {
+            Counter::new(name, help).expect("counter construction is infallible")
+        };
+        Self {
+            validations: mk_counter(
+                "iona_vmtx_validations_total",
+                "Total VM transaction validations",
+            ),
+            passes: mk_counter("iona_vmtx_passes_total", "Validations that passed"),
+            failures: CounterVec::new(
+                prometheus::Opts::new("iona_vmtx_failures_total", "Validations that failed"),
+                &["reason"],
+            )
+            .expect("counter vec construction is infallible"),
+            cache_hits: mk_counter("iona_vmtx_cache_hits_total", "Validation cache hits"),
+            cache_misses: mk_counter(
+                "iona_vmtx_cache_misses_total",
+                "Validation cache misses",
+            ),
+            gas_estimates: mk_counter("iona_vmtx_gas_estimates_total", "Total gas estimates"),
+            cache_size: Gauge::new(
+                "iona_vmtx_cache_size",
+                "Current size of the validation cache",
+            )
+            .expect("gauge construction is infallible"),
+        }
     }
 
     pub fn record_validation(&self) {
         self.validations.inc();
     }
-
     pub fn record_pass(&self) {
         self.passes.inc();
     }
-
     pub fn record_failure(&self, reason: &str) {
         self.failures.with_label_values(&[reason]).inc();
     }
-
     pub fn record_cache_hit(&self) {
         self.cache_hits.inc();
     }
-
     pub fn record_cache_miss(&self) {
         self.cache_misses.inc();
     }
-
     pub fn record_gas_estimate(&self) {
         self.gas_estimates.inc();
+    }
+    pub fn set_cache_size(&self, size: usize) {
+        self.cache_size.set(size as f64);
     }
 }
 
 impl Default for VmTxMetrics {
     fn default() -> Self {
-        Self::new().unwrap_or_else(|_| Self {
-            validations: Counter::new("iona_vmtx_validations_total", "Validations").unwrap(),
-            passes: Counter::new("iona_vmtx_passes_total", "Passes").unwrap(),
-            failures: CounterVec::new(
-                prometheus::Opts::new("iona_vmtx_failures_total", "Failures"),
-                &["reason"],
-            ).unwrap(),
-            cache_hits: Counter::new("iona_vmtx_cache_hits_total", "Cache hits").unwrap(),
-            cache_misses: Counter::new("iona_vmtx_cache_misses_total", "Cache misses").unwrap(),
-            gas_estimates: Counter::new("iona_vmtx_gas_estimates_total", "Gas estimates").unwrap(),
-        })
+        Self::unregistered()
     }
 }
 
-// ── Cache Entry ──────────────────────────────────────────────────────────
+// ── Snapshot ──────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
+/// Owned snapshot of [`VmTxMetrics`].
+///
+/// Unlike the collector, this type is `Serialize`, `Deserialize`,
+/// `PartialEq`, and `Eq`, and does not hold a live reference into the
+/// Prometheus registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmTxMetricsSnapshot {
+    pub validations: u64,
+    pub passes: u64,
+    /// Per-reason failure counts, sorted by reason.
+    pub failures: BTreeMap<String, u64>,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub gas_estimates: u64,
+    pub cache_size: usize,
+}
+
+// ── Cache ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
 struct ValidationCacheEntry {
-    result: VmTxResult<()>,
+    result: Result<(), String>,
     expires_at: Instant,
 }
 
-// ── VmTxManager ─────────────────────────────────────────────────────────
+/// Cache key: a 32-byte Keccak digest over the transaction's canonical
+/// encoding plus the validation-relevant configuration fields.
+type CacheKey = [u8; 32];
 
-/// Thread‑safe manager for VM transaction validation, caching, and metrics.
+// ── Manager ───────────────────────────────────────────────────────────────
+
+/// Thread-safe manager for VM transaction validation, caching, and metrics.
+///
+/// Cloning shares the underlying cache, metrics, and configuration.
 #[derive(Clone)]
 pub struct VmTxManager {
     config: Arc<VmTxConfig>,
     metrics: Arc<VmTxMetrics>,
-    cache: Arc<Mutex<Option<LruCache<Vec<u8>, ValidationCacheEntry>>>>,
+    cache: Arc<Mutex<Option<LruCache<CacheKey, ValidationCacheEntry>>>>,
+    ttl: Duration,
 }
 
 impl VmTxManager {
     /// Create a new manager with the given configuration.
-    pub fn new(config: VmTxConfig) -> Result<Self, String> {
+    ///
+    /// Tries to register Prometheus metrics with the default registry; on
+    /// collision (e.g. a second manager in the same process) it falls back
+    /// to an unregistered instance with a `warn!`.
+    pub fn new(config: VmTxConfig) -> Result<Self, VmTxConfigError> {
         config.validate()?;
-        let metrics = Arc::new(VmTxMetrics::default());
+
+        let metrics = if config.enable_metrics {
+            match VmTxMetrics::new() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "VM tx metrics already registered; using unregistered instance"
+                    );
+                    VmTxMetrics::unregistered()
+                }
+            }
+        } else {
+            VmTxMetrics::unregistered()
+        };
+        let metrics = Arc::new(metrics);
+
         let cache = if config.enable_cache {
-            let size = NonZeroUsize::new(config.cache_size).ok_or("cache_size must be > 0")?;
+            let size =
+                NonZeroUsize::new(config.cache_size).ok_or(VmTxConfigError::ZeroCacheSize)?;
             Some(LruCache::new(size))
         } else {
             None
         };
+
+        let ttl = Duration::from_secs(config.cache_ttl_secs);
+
         Ok(Self {
             config: Arc::new(config),
             metrics,
             cache: Arc::new(Mutex::new(cache)),
+            ttl,
         })
     }
 
-    /// Validate a transaction using the configured limits.
+    /// Validate a transaction.
+    ///
+    /// The cache, if enabled, is consulted before any work and stores only
+    /// the final outcome.
+    #[must_use = "the validation result must be handled"]
     pub fn validate(&self, tx: &VmTx) -> VmTxResult<()> {
         self.metrics.record_validation();
 
-        // Compute cache key from serialized transaction (excluding coherence).
-        let key = self.compute_cache_key(tx);
+        let cache_key = if self.cache.lock().is_some() {
+            Some(self.compute_cache_key(tx))
+        } else {
+            None
+        };
 
-        // Check cache.
-        if self.config.enable_cache {
-            let mut cache_guard = self.cache.lock();
-            if let Some(cache) = cache_guard.as_mut() {
+        // ── Cache lookup ────────────────────────────────────────────────
+        if let Some(key) = cache_key {
+            let mut guard = self.cache.lock();
+            if let Some(cache) = guard.as_mut() {
                 if let Some(entry) = cache.get(&key) {
                     if entry.expires_at > Instant::now() {
+                        let cached = entry.result.clone();
+                        drop(guard);
                         self.metrics.record_cache_hit();
                         trace!("validation cache hit");
-                        return entry.result.clone();
-                    } else {
-                        cache.pop(&key);
+                        return decode_cached(cached);
                     }
+                    cache.pop(&key);
                 }
-                self.metrics.record_cache_miss();
+            }
+            drop(guard);
+            self.metrics.record_cache_miss();
+        }
+
+        // ── Validate (outside any lock) ─────────────────────────────────
+        let outcome = self.validate_inner(tx);
+
+        // ── Cache insert ────────────────────────────────────────────────
+        if let Some(key) = cache_key {
+            let mut guard = self.cache.lock();
+            if let Some(cache) = guard.as_mut() {
+                cache.put(
+                    key,
+                    ValidationCacheEntry {
+                        result: encode_for_cache(&outcome),
+                        expires_at: Instant::now() + self.ttl,
+                    },
+                );
+                let size = cache.len();
+                drop(guard);
+                self.metrics.set_cache_size(size);
             }
         }
 
-        // Perform validation.
-        let result = self.validate_internal(tx);
-
-        // Store in cache.
-        if self.config.enable_cache {
-            let mut cache_guard = self.cache.lock();
-            if let Some(cache) = cache_guard.as_mut() {
-                let entry = ValidationCacheEntry {
-                    result: result.clone(),
-                    expires_at: Instant::now() + Duration::from_secs(self.config.cache_ttl_secs),
-                };
-                cache.put(key, entry);
-            }
-        }
-
-        result
+        outcome
     }
 
-    /// Internal validation with configuration limits.
-    fn validate_internal(&self, tx: &VmTx) -> VmTxResult<()> {
-        // Gas limit bounds.
+    /// Actual validation logic — pure, no locking, no caching.
+    fn validate_inner(&self, tx: &VmTx) -> VmTxResult<()> {
+        // 1) Gas limits.
         let gas = tx.gas_limit();
         if gas == 0 {
             self.metrics.record_failure("zero_gas_limit");
@@ -289,13 +508,13 @@ impl VmTxManager {
             });
         }
 
-        // Sender check.
+        // 2) Sender.
         if tx.sender().is_empty() {
             self.metrics.record_failure("empty_sender");
             return Err(VmTxError::EmptySender);
         }
 
-        // Payload checks.
+        // 3) Payload.
         match tx {
             VmTx::Deploy { init_code, .. } => {
                 if init_code.is_empty() {
@@ -325,22 +544,26 @@ impl VmTxManager {
             }
         }
 
-        // All checks passed.
         self.metrics.record_pass();
         if self.config.log_validation {
-            trace!("validation passed for {:?}", tx);
+            trace!("validation passed");
         }
         Ok(())
     }
 
-    /// Validate with quantum state tracking.
+    /// Validate and return an informational quantum scoreboard alongside
+    /// the real result.
+    ///
+    /// **The scoreboard never gates a decision.** It is a diagnostic
+    /// side-channel for observability.
+    #[must_use = "both the result and the scoreboard should be handled"]
     pub fn validate_quantum(&self, tx: &VmTx) -> (VmTxResult<()>, QuantumVmTxState) {
         let result = self.validate(tx);
         let mut qstate = QuantumVmTxState::new();
         match &result {
-            Ok(_) => {
-                qstate.record_pass();
-                qstate.record_pass();
+            Ok(()) => {
+                // Regression: the previous implementation recorded a pass
+                // three times, over-counting every successful validation.
                 qstate.record_pass();
                 qstate.apply_payload_decoherence(tx.payload_size());
             }
@@ -352,136 +575,201 @@ impl VmTxManager {
         (result, qstate)
     }
 
-    /// Compute a cache key from the transaction.
-    fn compute_cache_key(&self, tx: &VmTx) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        match tx {
-            VmTx::Deploy { sender, init_code, gas_limit, .. } => {
-                bytes.extend_from_slice(&[0u8]); // type marker
-                bytes.extend_from_slice(sender.as_bytes());
-                bytes.extend_from_slice(&gas_limit.to_le_bytes());
-                bytes.extend_from_slice(init_code);
-            }
-            VmTx::Call { sender, contract, calldata, gas_limit, .. } => {
-                bytes.extend_from_slice(&[1u8]);
-                bytes.extend_from_slice(sender.as_bytes());
-                bytes.extend_from_slice(contract);
-                bytes.extend_from_slice(&gas_limit.to_le_bytes());
-                bytes.extend_from_slice(calldata);
+    /// Canonical cache key: Keccak-256 over the transaction's body **and**
+    /// the four validation-relevant config fields.
+    ///
+    /// Including the config means that changing `min_gas_limit` or a size
+    /// bound invalidates the entire cache without operator intervention.
+    fn compute_cache_key(&self, tx: &VmTx) -> CacheKey {
+        let mut hasher = Keccak256::new();
+        hasher.update(b"iona/vm_tx_cache/v1:");
+        hasher.update(self.config.min_gas_limit.to_le_bytes());
+        hasher.update(self.config.max_gas_limit.to_le_bytes());
+        hasher.update((self.config.max_init_code_size as u64).to_le_bytes());
+        hasher.update((self.config.max_calldata_size as u64).to_le_bytes());
+        encode_tx_into(&mut hasher, tx);
+        let out: [u8; 32] = hasher.finalize().into();
+        out
+    }
+
+    /// Intrinsic gas for `tx`: the fixed cost of admission, before any VM
+    /// execution.
+    ///
+    /// This is **not** an `estimate_gas` in the "predict execution" sense —
+    /// it is the floor below which `gas_limit` will always fail. Actual
+    /// execution cost is a VM concern and is out of scope here.
+    #[must_use]
+    pub fn intrinsic_gas(&self, tx: &VmTx) -> u64 {
+        self.metrics.record_gas_estimate();
+
+        let payload = tx.payload_size() as u64;
+        let mut gas = INTRINSIC_BASE_GAS
+            .saturating_add(INTRINSIC_GAS_PER_BYTE.saturating_mul(payload));
+        if tx.is_deploy() {
+            gas = gas.saturating_add(DEPLOY_EXTRA_GAS);
+        }
+        gas
+    }
+
+    /// Owned snapshot of the current metrics.
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> VmTxMetricsSnapshot {
+        let mut failures: BTreeMap<String, u64> = BTreeMap::new();
+        for mf in self.metrics.failures.collect() {
+            for m in mf.get_metric() {
+                let label = m
+                    .get_label()
+                    .iter()
+                    .find(|l| l.get_name() == "reason")
+                    .map(|l| l.get_value().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let value = m.get_counter().get_value() as u64;
+                *failures.entry(label).or_insert(0) += value;
             }
         }
-        // Hash the bytes to get a fixed-size key.
-        let hash = Keccak256::digest(&bytes);
-        hash.to_vec()
-    }
 
-    /// Estimate gas for the transaction (intrinsic + overhead).
-    pub fn estimate_gas(&self, tx: &VmTx) -> u64 {
-        self.metrics.record_gas_estimate();
-        // Base gas: 21,000 + 4 per byte of payload (simplified).
-        let payload_size = tx.payload_size();
-        let base = 21_000 + 4 * payload_size;
-        // For deploy, add extra for creation.
-        let extra = if tx.is_deploy() { 32_000 } else { 0 };
-        base + extra
-    }
-
-    /// Get metrics snapshot.
-    pub fn metrics_snapshot(&self) -> VmTxMetricsSnapshot {
         VmTxMetricsSnapshot {
             validations: self.metrics.validations.get(),
             passes: self.metrics.passes.get(),
-            failures: self.metrics.failures.clone(),
+            failures,
             cache_hits: self.metrics.cache_hits.get(),
             cache_misses: self.metrics.cache_misses.get(),
             gas_estimates: self.metrics.gas_estimates.get(),
+            cache_size: self.cache_size(),
         }
     }
 
-    /// Get configuration.
+    /// Configuration.
+    #[must_use]
     pub fn config(&self) -> &VmTxConfig {
         &self.config
     }
 
-    /// Clear the cache.
+    /// Clear the validation cache.
     pub fn clear_cache(&self) {
-        if let Some(cache) = self.cache.lock().as_mut() {
+        let mut guard = self.cache.lock();
+        if let Some(cache) = guard.as_mut() {
             cache.clear();
+            drop(guard);
+            self.metrics.set_cache_size(0);
             trace!("VM tx cache cleared");
         }
     }
 
-    /// Get cache size.
+    /// Current cache size.
+    #[must_use]
     pub fn cache_size(&self) -> usize {
-        if let Some(cache) = self.cache.lock().as_ref() {
-            cache.len()
-        } else {
-            0
+        self.cache.lock().as_ref().map_or(0, |c| c.len())
+    }
+
+    /// Whether caching is enabled.
+    #[must_use]
+    pub fn is_cache_enabled(&self) -> bool {
+        self.config.enable_cache
+    }
+}
+
+// ── Cache serialization helpers ──────────────────────────────────────────
+
+/// Reduce an `VmTxResult<()>` to a stringly-typed value for caching.
+fn encode_for_cache(result: &VmTxResult<()>) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Reconstruct a cached outcome.
+///
+/// Cache hits for failures cannot recover the exact `VmTxError` variant
+/// (it is not `Clone + Serialize`); the original `Display` string is
+/// logged but the returned error is a `Decoherence` sentinel. Callers that
+/// need exact variants should disable the cache
+/// (`VmTxConfig::enable_cache = false`).
+fn decode_cached(cached: Result<(), String>) -> VmTxResult<()> {
+    match cached {
+        Ok(()) => Ok(()),
+        Err(msg) => {
+            debug!(cached_error = %msg, "cache hit for a failed validation");
+            Err(VmTxError::Decoherence {
+                coherence: 0.0,
+                threshold: 0.0,
+            })
         }
     }
 }
 
-/// Snapshot of VM transaction metrics.
-#[derive(Debug, Clone)]
-pub struct VmTxMetricsSnapshot {
-    pub validations: u64,
-    pub passes: u64,
-    pub failures: CounterVec,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
-    pub gas_estimates: u64,
+// ── Canonical tx encoding ────────────────────────────────────────────────
+
+/// Feed a canonical, length-prefixed encoding of `tx` into `hasher`.
+fn encode_tx_into(hasher: &mut Keccak256, tx: &VmTx) {
+    let mut feed = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+
+    match tx {
+        VmTx::Deploy {
+            sender,
+            init_code,
+            gas_limit,
+            ..
+        } => {
+            hasher.update([0u8]);
+            feed(sender.as_bytes());
+            hasher.update(gas_limit.to_le_bytes());
+            feed(init_code);
+        }
+        VmTx::Call {
+            sender,
+            contract,
+            calldata,
+            gas_limit,
+            ..
+        } => {
+            hasher.update([1u8]);
+            feed(sender.as_bytes());
+            hasher.update(contract);
+            hasher.update(gas_limit.to_le_bytes());
+            feed(calldata);
+        }
+    }
 }
 
-// ── Extended Error Types ─────────────────────────────────────────────────
+// ── Standalone helpers ───────────────────────────────────────────────────
 
-/// Extended error types for VM transaction validation.
-#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
-pub enum VmTxErrorExt {
-    #[error("gas limit {limit} exceeds max {max}")]
-    GasLimitTooHigh { limit: u64, max: u64 },
+/// Process-wide default manager for the free-function helpers.
+static DEFAULT_MANAGER: std::sync::OnceLock<VmTxManager> = std::sync::OnceLock::new();
 
-    #[error("gas limit {limit} below minimum {min}")]
-    GasLimitTooLow { limit: u64, min: u64 },
-
-    #[error("init code size {size} exceeds max {max}")]
-    InitCodeTooLarge { size: usize, max: usize },
-
-    #[error("calldata size {size} exceeds max {max}")]
-    CalldataTooLarge { size: usize, max: usize },
-
-    #[error("gas limit must be > 0, got {0}")]
-    ZeroGasLimit(u64),
-
-    #[error("init code cannot be empty for deployment")]
-    EmptyInitCode,
-
-    #[error("sender address cannot be empty")]
-    EmptySender,
-
-    #[error("contract address cannot be all zeroes")]
-    ZeroContractAddress,
-
-    #[error("quantum decoherence: vm tx coherence {coherence} below threshold {threshold}")]
-    Decoherence { coherence: f64, threshold: f64 },
+fn default_manager() -> Result<&'static VmTxManager, VmTxConfigError> {
+    if let Some(m) = DEFAULT_MANAGER.get() {
+        return Ok(m);
+    }
+    let config = VmTxConfig {
+        enable_metrics: false,
+        ..Default::default()
+    };
+    let m = VmTxManager::new(config)?;
+    let _ = DEFAULT_MANAGER.set(m);
+    Ok(DEFAULT_MANAGER.get().expect("set or already present"))
 }
 
-// ── Standalone functions ────────────────────────────────────────────────
-
-/// Validate a VM transaction with default configuration.
+/// Validate a VM transaction using a process-wide default manager.
 pub fn validate_vm_tx(tx: &VmTx) -> VmTxResult<()> {
-    let config = VmTxConfig::default();
-    let manager = VmTxManager::new(config).map_err(|e| VmTxError::Decoherence {
+    let manager = default_manager().map_err(|_| VmTxError::Decoherence {
         coherence: 0.0,
         threshold: 0.0,
     })?;
     manager.validate(tx)
 }
 
-/// Estimate gas for a VM transaction with default config.
+/// Intrinsic gas using a process-wide default manager.
+#[must_use]
 pub fn estimate_vm_gas(tx: &VmTx) -> u64 {
-    let config = VmTxConfig::default();
-    let manager = VmTxManager::new(config).unwrap();
-    manager.estimate_gas(tx)
+    match default_manager() {
+        Ok(m) => m.intrinsic_gas(tx),
+        Err(_) => 0,
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -509,190 +797,327 @@ mod tests {
         }
     }
 
+    fn manager(cfg: VmTxConfig) -> VmTxManager {
+        // Never register metrics in tests to avoid registry collisions.
+        let cfg = VmTxConfig {
+            enable_metrics: false,
+            ..cfg
+        };
+        VmTxManager::new(cfg).unwrap()
+    }
+
+    // ── Validation ──────────────────────────────────────────────────────
+
     #[test]
-    fn test_manager_validate_ok() {
-        let config = VmTxConfig::default();
-        let manager = VmTxManager::new(config).unwrap();
-        assert!(manager.validate(&valid_deploy()).is_ok());
-        assert!(manager.validate(&valid_call()).is_ok());
+    fn validate_ok() {
+        let m = manager(VmTxConfig::default());
+        assert!(m.validate(&valid_deploy()).is_ok());
+        assert!(m.validate(&valid_call()).is_ok());
     }
 
     #[test]
-    fn test_manager_validate_gas_limit_too_high() {
-        let config = VmTxConfig {
+    fn validate_gas_limit_too_high() {
+        let m = manager(VmTxConfig {
             max_gas_limit: 50_000,
             ..Default::default()
-        };
-        let manager = VmTxManager::new(config).unwrap();
-        let tx = valid_deploy();
-        let result = manager.validate(&tx);
+        });
         assert!(matches!(
-            result,
-            Err(VmTxError::GasLimitTooHigh { .. })
+            m.validate(&valid_deploy()).unwrap_err(),
+            VmTxError::GasLimitTooHigh { .. }
         ));
     }
 
     #[test]
-    fn test_manager_validate_gas_limit_too_low() {
-        let config = VmTxConfig {
+    fn validate_gas_limit_too_low() {
+        let m = manager(VmTxConfig {
             min_gas_limit: 200_000,
             ..Default::default()
-        };
-        let manager = VmTxManager::new(config).unwrap();
-        let tx = valid_deploy();
-        let result = manager.validate(&tx);
+        });
         assert!(matches!(
-            result,
-            Err(VmTxError::GasLimitTooLow { .. })
+            m.validate(&valid_deploy()).unwrap_err(),
+            VmTxError::GasLimitTooLow { .. }
         ));
     }
 
     #[test]
-    fn test_manager_validate_init_code_too_large() {
-        let config = VmTxConfig {
+    fn validate_init_code_too_large() {
+        let m = manager(VmTxConfig {
             max_init_code_size: 2,
             ..Default::default()
-        };
-        let manager = VmTxManager::new(config).unwrap();
-        let tx = valid_deploy();
-        let result = manager.validate(&tx);
+        });
         assert!(matches!(
-            result,
-            Err(VmTxError::InitCodeTooLarge { .. })
+            m.validate(&valid_deploy()).unwrap_err(),
+            VmTxError::InitCodeTooLarge { .. }
         ));
     }
 
     #[test]
-    fn test_manager_validate_calldata_too_large() {
-        let config = VmTxConfig {
+    fn validate_calldata_too_large() {
+        let m = manager(VmTxConfig {
             max_calldata_size: 1,
             ..Default::default()
-        };
-        let manager = VmTxManager::new(config).unwrap();
-        let tx = valid_call();
-        let result = manager.validate(&tx);
+        });
         assert!(matches!(
-            result,
-            Err(VmTxError::CalldataTooLarge { .. })
+            m.validate(&valid_call()).unwrap_err(),
+            VmTxError::CalldataTooLarge { .. }
         ));
     }
 
     #[test]
-    fn test_manager_validate_empty_sender() {
-        let config = VmTxConfig::default();
-        let manager = VmTxManager::new(config).unwrap();
+    fn validate_empty_sender() {
+        let m = manager(VmTxConfig::default());
         let mut tx = valid_deploy();
         if let VmTx::Deploy { sender, .. } = &mut tx {
             sender.clear();
         }
-        let result = manager.validate(&tx);
-        assert!(matches!(result, Err(VmTxError::EmptySender)));
+        assert!(matches!(m.validate(&tx).unwrap_err(), VmTxError::EmptySender));
     }
 
     #[test]
-    fn test_manager_validate_empty_init_code() {
-        let config = VmTxConfig::default();
-        let manager = VmTxManager::new(config).unwrap();
+    fn validate_empty_init_code() {
+        let m = manager(VmTxConfig::default());
         let mut tx = valid_deploy();
         if let VmTx::Deploy { init_code, .. } = &mut tx {
             init_code.clear();
         }
-        let result = manager.validate(&tx);
-        assert!(matches!(result, Err(VmTxError::EmptyInitCode)));
+        assert!(matches!(
+            m.validate(&tx).unwrap_err(),
+            VmTxError::EmptyInitCode
+        ));
     }
 
     #[test]
-    fn test_manager_validate_zero_contract() {
-        let config = VmTxConfig::default();
-        let manager = VmTxManager::new(config).unwrap();
+    fn validate_zero_contract() {
+        let m = manager(VmTxConfig::default());
         let mut tx = valid_call();
         if let VmTx::Call { contract, .. } = &mut tx {
             *contract = [0u8; 32];
         }
-        let result = manager.validate(&tx);
-        assert!(matches!(result, Err(VmTxError::ZeroContractAddress)));
+        assert!(matches!(
+            m.validate(&tx).unwrap_err(),
+            VmTxError::ZeroContractAddress
+        ));
     }
 
+    // ── Quantum scoreboard ──────────────────────────────────────────────
+
     #[test]
-    fn test_manager_validate_quantum() {
-        let config = VmTxConfig::default();
-        let manager = VmTxManager::new(config).unwrap();
-        let tx = valid_deploy();
-        let (result, qstate) = manager.validate_quantum(&tx);
+    fn validate_quantum_records_pass_once() {
+        // Regression: the previous implementation called `record_pass`
+        // three times per successful validation.
+        let m = manager(VmTxConfig::default());
+        let (result, qstate) = m.validate_quantum(&valid_deploy());
         assert!(result.is_ok());
-        assert!(qstate.total_checks > 0);
-        assert!(qstate.purity < 1.0);
+        assert_eq!(qstate.total_checks, 1);
+        assert_eq!(qstate.total_failures, 0);
     }
 
     #[test]
-    fn test_manager_estimate_gas() {
-        let config = VmTxConfig::default();
-        let manager = VmTxManager::new(config).unwrap();
-        let deploy = valid_deploy();
-        let gas = manager.estimate_gas(&deploy);
-        assert!(gas >= 21_000 + 3 * 4 + 32_000);
-        let call = valid_call();
-        let gas = manager.estimate_gas(&call);
-        assert!(gas >= 21_000 + 2 * 4);
-    }
-
-    #[test]
-    fn test_manager_cache() {
-        let config = VmTxConfig {
-            enable_cache: true,
-            cache_size: 10,
+    fn validate_quantum_records_failure_once() {
+        let m = manager(VmTxConfig {
+            max_init_code_size: 1,
             ..Default::default()
-        };
-        let manager = VmTxManager::new(config).unwrap();
-        let tx = valid_deploy();
-        manager.validate(&tx).unwrap();
-        manager.validate(&tx).unwrap();
-        assert!(manager.cache_size() > 0);
-        let snap = manager.metrics_snapshot();
-        assert!(snap.cache_hits > 0);
-        assert!(snap.cache_misses > 0);
+        });
+        let (result, qstate) = m.validate_quantum(&valid_deploy());
+        assert!(result.is_err());
+        assert_eq!(qstate.total_checks, 1);
+        assert_eq!(qstate.total_failures, 1);
+    }
+
+    // ── Gas ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn intrinsic_gas_deploy_includes_extra() {
+        let m = manager(VmTxConfig::default());
+        let gas = m.intrinsic_gas(&valid_deploy());
+        let expected = INTRINSIC_BASE_GAS
+            + INTRINSIC_GAS_PER_BYTE * 3
+            + DEPLOY_EXTRA_GAS;
+        assert_eq!(gas, expected);
     }
 
     #[test]
-    fn test_manager_clear_cache() {
-        let config = VmTxConfig {
-            enable_cache: true,
-            cache_size: 10,
+    fn intrinsic_gas_call_has_no_deploy_extra() {
+        let m = manager(VmTxConfig::default());
+        let gas = m.intrinsic_gas(&valid_call());
+        let expected = INTRINSIC_BASE_GAS + INTRINSIC_GAS_PER_BYTE * 2;
+        assert_eq!(gas, expected);
+    }
+
+    // ── Cache ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn cache_hit_on_second_validation() {
+        let m = manager(VmTxConfig::default());
+        let tx = valid_deploy();
+        assert!(m.validate(&tx).is_ok());
+        assert!(m.validate(&tx).is_ok());
+        let snap = m.metrics_snapshot();
+        assert_eq!(snap.cache_misses, 1);
+        assert_eq!(snap.cache_hits, 1);
+        assert_eq!(snap.cache_size, 1);
+    }
+
+    #[test]
+    fn cache_key_depends_on_limits() {
+        // Two managers with different `max_gas_limit` must not share a
+        // cache entry even for an identical tx.
+        let tx = valid_call();
+        let strict = manager(VmTxConfig {
+            max_gas_limit: 100_000,
+            min_gas_limit: 21_000,
             ..Default::default()
-        };
-        let manager = VmTxManager::new(config).unwrap();
-        let tx = valid_deploy();
-        manager.validate(&tx).unwrap();
-        assert!(manager.cache_size() > 0);
-        manager.clear_cache();
-        assert_eq!(manager.cache_size(), 0);
+        });
+        let permissive = manager(VmTxConfig {
+            max_gas_limit: 1_000_000,
+            min_gas_limit: 21_000,
+            ..Default::default()
+        });
+
+        assert!(strict.validate(&tx).is_err()); // 200k > 100k
+        assert!(permissive.validate(&tx).is_ok());
     }
 
     #[test]
-    fn test_config_validation() {
-        let mut config = VmTxConfig::default();
-        assert!(config.validate().is_ok());
-        config.min_gas_limit = 0;
-        assert!(config.validate().is_err());
-        config.min_gas_limit = 10;
-        config.max_gas_limit = 5;
-        assert!(config.validate().is_err());
-        config.max_gas_limit = 10;
-        config.max_init_code_size = 0;
-        assert!(config.validate().is_err());
-        config.max_init_code_size = 1024;
-        config.max_calldata_size = 0;
-        assert!(config.validate().is_err());
-        config.max_calldata_size = 1024;
-        config.cache_size = 0;
-        assert!(config.validate().is_err());
-        config.cache_size = 10;
-        config.cache_ttl_secs = 0;
-        assert!(config.validate().is_err());
+    fn cache_disabled_does_not_populate() {
+        let m = manager(VmTxConfig {
+            enable_cache: false,
+            ..Default::default()
+        });
+        assert!(m.validate(&valid_deploy()).is_ok());
+        assert_eq!(m.cache_size(), 0);
+        assert!(!m.is_cache_enabled());
     }
 
     #[test]
-    fn test_standalone_validate() {
+    fn clear_cache_empties_it() {
+        let m = manager(VmTxConfig::default());
+        assert!(m.validate(&valid_deploy()).is_ok());
+        assert!(m.cache_size() > 0);
+        m.clear_cache();
+        assert_eq!(m.cache_size(), 0);
+    }
+
+    // ── Metrics snapshot ────────────────────────────────────────────────
+
+    #[test]
+    fn metrics_snapshot_is_owned() {
+        let m = manager(VmTxConfig::default());
+        assert!(m.validate(&valid_deploy()).is_ok());
+        let snap = m.metrics_snapshot();
+        assert_eq!(snap.validations, 1);
+        assert_eq!(snap.passes, 1);
+        assert!(snap.failures.is_empty());
+    }
+
+    #[test]
+    fn metrics_snapshot_records_failure_reason() {
+        let m = manager(VmTxConfig {
+            max_init_code_size: 1,
+            ..Default::default()
+        });
+        let _ = m.validate(&valid_deploy());
+        let snap = m.metrics_snapshot();
+        assert_eq!(snap.failures.get("init_code_too_large"), Some(&1));
+    }
+
+    #[test]
+    fn metrics_snapshot_is_serializable() {
+        let m = manager(VmTxConfig::default());
+        let _ = m.validate(&valid_deploy());
+        let snap = m.metrics_snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: VmTxMetricsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn metrics_unregistered_is_repeatable() {
+        // Regression: `Default` previously chained `.unwrap()` calls that
+        // panicked when a name collision occurred in the default registry.
+        let _a = VmTxMetrics::unregistered();
+        let _b = VmTxMetrics::unregistered();
+        let _c = VmTxMetrics::default();
+    }
+
+    // ── Config validation ───────────────────────────────────────────────
+
+    #[test]
+    fn config_validation_accepts_default() {
+        assert!(VmTxConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn config_validation_rejects_each_invalid_field() {
+        let cases: &[(VmTxConfig, &str)] = &[
+            (
+                VmTxConfig { min_gas_limit: 0, ..Default::default() },
+                "min_gas_limit",
+            ),
+            (
+                VmTxConfig { max_gas_limit: 0, ..Default::default() },
+                "max_gas_limit",
+            ),
+            (
+                VmTxConfig {
+                    min_gas_limit: 100,
+                    max_gas_limit: 50,
+                    ..Default::default()
+                },
+                "min > max",
+            ),
+            (
+                VmTxConfig {
+                    max_gas_limit: HARD_MAX_GAS_LIMIT + 1,
+                    min_gas_limit: 1,
+                    ..Default::default()
+                },
+                "max_gas_limit hard bound",
+            ),
+            (
+                VmTxConfig { max_init_code_size: 0, ..Default::default() },
+                "max_init_code_size",
+            ),
+            (
+                VmTxConfig {
+                    max_init_code_size: HARD_MAX_INIT_CODE_SIZE + 1,
+                    ..Default::default()
+                },
+                "max_init_code_size hard bound",
+            ),
+            (
+                VmTxConfig { max_calldata_size: 0, ..Default::default() },
+                "max_calldata_size",
+            ),
+            (
+                VmTxConfig {
+                    max_calldata_size: HARD_MAX_CALLDATA_SIZE + 1,
+                    ..Default::default()
+                },
+                "max_calldata_size hard bound",
+            ),
+            (
+                VmTxConfig { cache_size: 0, ..Default::default() },
+                "cache_size",
+            ),
+            (
+                VmTxConfig { cache_ttl_secs: 0, ..Default::default() },
+                "cache_ttl_secs",
+            ),
+        ];
+
+        for (cfg, label) in cases {
+            assert!(
+                cfg.validate().is_err(),
+                "config with {label} should fail"
+            );
+        }
+    }
+
+    // ── Standalone helpers ──────────────────────────────────────────────
+
+    #[test]
+    fn standalone_validate_success_and_failure() {
         assert!(validate_vm_tx(&valid_deploy()).is_ok());
         let mut tx = valid_deploy();
         if let VmTx::Deploy { init_code, .. } = &mut tx {
@@ -702,17 +1127,8 @@ mod tests {
     }
 
     #[test]
-    fn test_standalone_estimate_gas() {
-        let deploy = valid_deploy();
-        let gas = estimate_vm_gas(&deploy);
-        assert!(gas > 0);
-    }
-
-    #[test]
-    fn test_error_extension() {
-        let err = VmTxErrorExt::GasLimitTooHigh { limit: 100, max: 50 };
-        assert_eq!(err.to_string(), "gas limit 100 exceeds max 50");
-        let err = VmTxErrorExt::InitCodeTooLarge { size: 1000, max: 500 };
-        assert_eq!(err.to_string(), "init code size 1000 exceeds max 500");
+    fn standalone_estimate_gas_is_positive() {
+        assert!(estimate_vm_gas(&valid_deploy()) > 0);
+        assert!(estimate_vm_gas(&valid_call()) > 0);
     }
 }
