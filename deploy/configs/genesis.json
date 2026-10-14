@@ -1,28 +1,118 @@
+//! Genesis configuration and validation.
+//!
+//! Defines the on-disk `genesis.json` schema ([`Genesis`]) and the rules
+//! that a chain's genesis file must satisfy before a node will start.
+//!
+//! # Validation contract
+//!
+//! [`Genesis::validate`] enforces the invariants below. Every failure
+//! returns a typed [`GenesisError`] with enough context to be reported to
+//! an operator without re-parsing the file.
+//!
+//! | Area        | Invariant |
+//! |-------------|-----------|
+//! | Chain       | `id > 0`, `schema_version == CURRENT_SCHEMA_VERSION`, `name` non-empty, `genesis_time > 0`, `protocol_version > 0` |
+//! | Validators  | non-empty, `role ∈ {producer, follower}`, seeds unique, addresses unique, producers meet `min_stake`, `count <= max_validators`, `count >= min_validator_count` |
+//! | Accounts    | addresses unique, non-empty, valid hex |
+//! | Economics   | all `_bps` in `(0, 10_000]`, `min_stake > 0`, `unbonding_epochs > 0`, `epoch_length > 0`, `max_validators >= min_validator_count` |
+//! | Governance  | `min_deposit > 0`, `voting_epochs > 0`, `quorum_bps`, `threshold_bps`, `veto_bps` in `(0, 10_000]` |
+//! | Slashing    | slashes in `[0, 10_000]`, their sum ≤ `10_000`, `downtime_window > 0`, `downtime_min_signed <= downtime_window` |
+//! | Network     | `max_connections > 0`, `max_connections_per_ip <= max_connections`, bootnodes are non-empty strings |
+//! | Upgrades    | activation heights strictly increasing, versions strictly increasing, `protocol_version` matches the last upgrade |
+//! | Metadata    | `description`, `contact`, `git_rev` non-empty |
+//!
+//! # Checksums
+//!
+//! [`Genesis::compute_checksum`] returns a hex-encoded SHA-256 digest over
+//! a **canonical** JSON encoding: the `chain.checksum` field itself is
+//! removed before hashing, and `serde_json::Value` is used as an
+//! intermediate step so map keys are sorted (see the `serde_json`
+//! `preserve_order` feature note below).
+//!
+//! [`Genesis::verify_checksum`] compares the stored value against a
+//! freshly computed one.
+//!
+//! ## `serde_json` feature note
+//!
+//! Canonical ordering relies on `serde_json::Value::Object` being backed by
+//! a **sorted** map. With the default features, `serde_json` uses
+//! `BTreeMap`; enabling the `preserve_order` feature switches it to
+//! `IndexMap` (insertion order), which makes the checksum
+//! order-dependent. Do **not** enable that feature for this crate.
+
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use thiserror::Error;
 
+// ── Constants ─────────────────────────────────────────────────────────────
+
+/// Schema version this build understands.
+///
+/// Bump when the `Genesis` struct changes in a backward-incompatible way.
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+
+/// Basis-points denominator (10 000 bp = 100 %).
+pub const BPS_DENOMINATOR: u32 = 10_000;
+
+/// Maximum length of a chain name, in bytes.
+pub const MAX_CHAIN_NAME_BYTES: usize = 128;
+
+/// Maximum length of a validator label, in bytes.
+pub const MAX_VALIDATOR_LABEL_BYTES: usize = 128;
+
+/// Minimum length of a git revision string.
+pub const MIN_GIT_REV_BYTES: usize = 4;
+
+// ── Errors ────────────────────────────────────────────────────────────────
+
+/// Why a genesis file is rejected.
 #[derive(Debug, Error)]
 pub enum GenesisError {
-    #[error("invalid checksum: expected {expected}, got {actual}")]
-    InvalidChecksum { expected: String, actual: String },
-    #[error("validator seed {seed} already used")]
+    #[error("chain ID mismatch: expected {expected}, got {actual}")]
+    ChainIdMismatch { expected: u64, actual: u64 },
+
+    #[error("schema version mismatch: expected {expected}, got {actual}")]
+    SchemaVersionMismatch { expected: u32, actual: u32 },
+
+    #[error("checksum mismatch: expected {expected}, got {actual}")]
+    ChecksumMismatch { expected: String, actual: String },
+
+    #[error("duplicate validator seed {0}")]
     DuplicateValidatorSeed(u64),
+
+    #[error("duplicate validator address {0}")]
+    DuplicateValidatorAddress(String),
+
+    #[error("duplicate account address {0}")]
+    DuplicateAccountAddress(String),
+
     #[error("validator stake {stake} below minimum {min}")]
     StakeBelowMinimum { stake: u64, min: u64 },
-    #[error("chain id mismatch: expected {expected}, got {actual}")]
-    ChainIdMismatch { expected: u64, actual: u64 },
-    #[error("field missing: {0}")]
+
+    #[error("missing field: {0}")]
     MissingField(&'static str),
-    #[error("invalid value for {field}: {reason}")]
+
+    #[error("invalid value for `{field}`: {reason}")]
     InvalidValue { field: &'static str, reason: String },
-    #[error("IO error: {0}")]
+
+    #[error("validator count {count} outside allowed range [{min}, {max}]")]
+    ValidatorCountOutOfRange { count: usize, min: u32, max: u32 },
+
+    #[error("upgrade list is not strictly increasing at index {index}")]
+    UpgradesNotMonotonic { index: usize },
+
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// ── Top-level genesis ─────────────────────────────────────────────────────
+
+/// A complete genesis specification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Genesis {
     pub chain: ChainConfig,
     pub consensus: ConsensusConfig,
@@ -36,33 +126,39 @@ pub struct Genesis {
     pub metadata: Metadata,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainConfig {
     pub id: u64,
     pub name: String,
     pub genesis_time: u64,
+    /// Human-readable rendering of `genesis_time` (e.g. RFC 3339).
     pub genesis_time_human: String,
     pub protocol_version: u32,
     pub schema_version: u32,
+    /// Hex-encoded SHA-256 over the canonical genesis (excluding this field).
     pub checksum: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorEntry {
+    /// Deterministic seed for key derivation.
     pub seed: u64,
-    pub role: String, // "producer" or "follower"
+    /// Either `"producer"` or `"follower"`.
+    pub role: String,
+    /// Stake in base units (must meet `economics.min_stake` for producers).
     pub stake: u64,
     pub label: String,
+    /// Optional explicit address; when present, must be unique.
     pub address: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountEntry {
     pub address: String,
     pub balance: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EconomicsConfig {
     pub base_inflation_bps: u32,
     pub treasury_bps: u32,
@@ -72,7 +168,7 @@ pub struct EconomicsConfig {
     pub max_validators: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovernanceConfig {
     pub min_deposit: u64,
     pub voting_epochs: u64,
@@ -81,7 +177,7 @@ pub struct GovernanceConfig {
     pub veto_bps: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlashingConfig {
     pub double_sign_slash_bps: u32,
     pub downtime_slash_bps: u32,
@@ -91,7 +187,7 @@ pub struct SlashingConfig {
     pub downtime_min_signed: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkConfig {
     pub bootnodes: Vec<String>,
     pub enable_mdns: bool,
@@ -100,7 +196,7 @@ pub struct NetworkConfig {
     pub max_connections: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpgradeEntry {
     pub protocol_version: u32,
     pub activation_height: u64,
@@ -108,14 +204,14 @@ pub struct UpgradeEntry {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metadata {
     pub description: String,
     pub contact: String,
     pub git_rev: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsensusConfig {
     pub propose_timeout_ms: u64,
     pub prevote_timeout_ms: u64,
@@ -128,9 +224,30 @@ pub struct ConsensusConfig {
     pub max_rounds: u32,
 }
 
+// ── Validation ────────────────────────────────────────────────────────────
+
 impl Genesis {
+    /// Validate the genesis against the invariants documented at the module
+    /// level.
+    ///
+    /// `expected_chain_id` is optional; when `Some`, `chain.id` must match.
     pub fn validate(&self, expected_chain_id: Option<u64>) -> Result<(), GenesisError> {
-        // Chain ID
+        self.validate_chain(expected_chain_id)?;
+        self.validate_metadata()?;
+        self.validate_economics()?;
+        self.validate_governance()?;
+        self.validate_slashing()?;
+        self.validate_network()?;
+        self.validate_consensus()?;
+        self.validate_validators()?;
+        self.validate_accounts()?;
+        self.validate_upgrades()?;
+        Ok(())
+    }
+
+    // ── Sections ────────────────────────────────────────────────────────
+
+    fn validate_chain(&self, expected_chain_id: Option<u64>) -> Result<(), GenesisError> {
         if let Some(expected) = expected_chain_id {
             if self.chain.id != expected {
                 return Err(GenesisError::ChainIdMismatch {
@@ -139,23 +256,254 @@ impl Genesis {
                 });
             }
         }
-        // Check schema version
-        if self.chain.schema_version != 5 {
+        if self.chain.id == 0 {
             return Err(GenesisError::InvalidValue {
-                field: "chain.schema_version",
-                reason: format!("expected 5, got {}", self.chain.schema_version),
+                field: "chain.id",
+                reason: "must be > 0".into(),
             });
         }
-        // Validator seeds unique
-        let mut seen = std::collections::HashSet::new();
+        if self.chain.schema_version != CURRENT_SCHEMA_VERSION {
+            return Err(GenesisError::SchemaVersionMismatch {
+                expected: CURRENT_SCHEMA_VERSION,
+                actual: self.chain.schema_version,
+            });
+        }
+        if self.chain.name.is_empty() {
+            return Err(GenesisError::MissingField("chain.name"));
+        }
+        if self.chain.name.len() > MAX_CHAIN_NAME_BYTES {
+            return Err(GenesisError::InvalidValue {
+                field: "chain.name",
+                reason: format!("longer than {MAX_CHAIN_NAME_BYTES} bytes"),
+            });
+        }
+        if self.chain.genesis_time == 0 {
+            return Err(GenesisError::InvalidValue {
+                field: "chain.genesis_time",
+                reason: "must be > 0".into(),
+            });
+        }
+        if self.chain.protocol_version == 0 {
+            return Err(GenesisError::InvalidValue {
+                field: "chain.protocol_version",
+                reason: "must be > 0".into(),
+            });
+        }
+        if let Some(cs) = &self.chain.checksum {
+            if cs.is_empty() || !cs.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(GenesisError::InvalidValue {
+                    field: "chain.checksum",
+                    reason: "must be non-empty hex".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_metadata(&self) -> Result<(), GenesisError> {
+        if self.metadata.description.is_empty() {
+            return Err(GenesisError::MissingField("metadata.description"));
+        }
+        if self.metadata.contact.is_empty() {
+            return Err(GenesisError::MissingField("metadata.contact"));
+        }
+        if self.metadata.git_rev.len() < MIN_GIT_REV_BYTES {
+            return Err(GenesisError::InvalidValue {
+                field: "metadata.git_rev",
+                reason: format!("must be at least {MIN_GIT_REV_BYTES} characters"),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_economics(&self) -> Result<(), GenesisError> {
+        check_bps(self.economics.base_inflation_bps, "economics.base_inflation_bps")?;
+        check_bps(self.economics.treasury_bps, "economics.treasury_bps")?;
+        if self.economics.min_stake == 0 {
+            return Err(GenesisError::InvalidValue {
+                field: "economics.min_stake",
+                reason: "must be > 0".into(),
+            });
+        }
+        if self.economics.unbonding_epochs == 0 {
+            return Err(GenesisError::InvalidValue {
+                field: "economics.unbonding_epochs",
+                reason: "must be > 0".into(),
+            });
+        }
+        if self.economics.epoch_length == 0 {
+            return Err(GenesisError::InvalidValue {
+                field: "economics.epoch_length",
+                reason: "must be > 0".into(),
+            });
+        }
+        if self.economics.max_validators == 0 {
+            return Err(GenesisError::InvalidValue {
+                field: "economics.max_validators",
+                reason: "must be > 0".into(),
+            });
+        }
+        if self.consensus.min_validator_count > self.economics.max_validators {
+            return Err(GenesisError::InvalidValue {
+                field: "consensus.min_validator_count",
+                reason: format!(
+                    "must be <= economics.max_validators ({})",
+                    self.economics.max_validators
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_governance(&self) -> Result<(), GenesisError> {
+        if self.governance.min_deposit == 0 {
+            return Err(GenesisError::InvalidValue {
+                field: "governance.min_deposit",
+                reason: "must be > 0".into(),
+            });
+        }
+        if self.governance.voting_epochs == 0 {
+            return Err(GenesisError::InvalidValue {
+                field: "governance.voting_epochs",
+                reason: "must be > 0".into(),
+            });
+        }
+        check_bps(self.governance.quorum_bps, "governance.quorum_bps")?;
+        check_bps(self.governance.threshold_bps, "governance.threshold_bps")?;
+        check_bps(self.governance.veto_bps, "governance.veto_bps")?;
+        Ok(())
+    }
+
+    fn validate_slashing(&self) -> Result<(), GenesisError> {
+        check_bps(self.slashing.double_sign_slash_bps, "slashing.double_sign_slash_bps")?;
+        check_bps(self.slashing.downtime_slash_bps, "slashing.downtime_slash_bps")?;
+
+        let total = self
+            .slashing
+            .double_sign_slash_bps
+            .saturating_add(self.slashing.downtime_slash_bps);
+        if total > BPS_DENOMINATOR {
+            return Err(GenesisError::InvalidValue {
+                field: "slashing.*_slash_bps",
+                reason: format!("sum must be <= {BPS_DENOMINATOR}, got {total}"),
+            });
+        }
+        if self.slashing.downtime_window == 0 {
+            return Err(GenesisError::InvalidValue {
+                field: "slashing.downtime_window",
+                reason: "must be > 0".into(),
+            });
+        }
+        if self.slashing.downtime_min_signed > self.slashing.downtime_window {
+            return Err(GenesisError::InvalidValue {
+                field: "slashing.downtime_min_signed",
+                reason: "must be <= slashing.downtime_window".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_network(&self) -> Result<(), GenesisError> {
+        if self.network.max_connections == 0 {
+            return Err(GenesisError::InvalidValue {
+                field: "network.max_connections",
+                reason: "must be > 0".into(),
+            });
+        }
+        if self.network.max_connections_per_ip > self.network.max_connections {
+            return Err(GenesisError::InvalidValue {
+                field: "network.max_connections_per_ip",
+                reason: "must be <= network.max_connections".into(),
+            });
+        }
+        for (i, bn) in self.network.bootnodes.iter().enumerate() {
+            if bn.is_empty() || bn.contains('\0') {
+                return Err(GenesisError::InvalidValue {
+                    field: "network.bootnodes",
+                    reason: format!("entry #{i} is empty or contains NUL"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_consensus(&self) -> Result<(), GenesisError> {
+        if self.consensus.propose_timeout_ms == 0
+            || self.consensus.prevote_timeout_ms == 0
+            || self.consensus.precommit_timeout_ms == 0
+        {
+            return Err(GenesisError::InvalidValue {
+                field: "consensus.*_timeout_ms",
+                reason: "all step timeouts must be > 0".into(),
+            });
+        }
+        if self.consensus.max_txs_per_block == 0 {
+            return Err(GenesisError::InvalidValue {
+                field: "consensus.max_txs_per_block",
+                reason: "must be > 0".into(),
+            });
+        }
+        if self.consensus.gas_target == 0 {
+            return Err(GenesisError::InvalidValue {
+                field: "consensus.gas_target",
+                reason: "must be > 0".into(),
+            });
+        }
+        if self.consensus.initial_base_fee == 0 {
+            return Err(GenesisError::InvalidValue {
+                field: "consensus.initial_base_fee",
+                reason: "must be > 0".into(),
+            });
+        }
+        if self.consensus.min_validator_count == 0 {
+            return Err(GenesisError::InvalidValue {
+                field: "consensus.min_validator_count",
+                reason: "must be > 0".into(),
+            });
+        }
+        if self.consensus.max_rounds == 0 {
+            return Err(GenesisError::InvalidValue {
+                field: "consensus.max_rounds",
+                reason: "must be > 0".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_validators(&self) -> Result<(), GenesisError> {
+        if self.validators.is_empty() {
+            return Err(GenesisError::MissingField("validators"));
+        }
+        let count = self.validators.len();
+        let max = self.economics.max_validators;
+        let min = self.consensus.min_validator_count;
+        if count < min as usize || count > max as usize {
+            return Err(GenesisError::ValidatorCountOutOfRange { count, min, max });
+        }
+
+        let mut seeds = HashSet::with_capacity(count);
+        let mut addrs: HashSet<&str> = HashSet::with_capacity(count);
+
         for v in &self.validators {
-            if !seen.insert(v.seed) {
+            if !seeds.insert(v.seed) {
                 return Err(GenesisError::DuplicateValidatorSeed(v.seed));
             }
             if v.role != "producer" && v.role != "follower" {
                 return Err(GenesisError::InvalidValue {
                     field: "validator.role",
-                    reason: format!("invalid role '{}'", v.role),
+                    reason: format!("invalid role `{}`", v.role),
+                });
+            }
+            if v.label.is_empty() {
+                return Err(GenesisError::InvalidValue {
+                    field: "validator.label",
+                    reason: "must be non-empty".into(),
+                });
+            }
+            if v.label.len() > MAX_VALIDATOR_LABEL_BYTES {
+                return Err(GenesisError::InvalidValue {
+                    field: "validator.label",
+                    reason: format!("longer than {MAX_VALIDATOR_LABEL_BYTES} bytes"),
                 });
             }
             if v.role == "producer" && v.stake < self.economics.min_stake {
@@ -164,38 +512,540 @@ impl Genesis {
                     min: self.economics.min_stake,
                 });
             }
+            if let Some(addr) = &v.address {
+                if addr.is_empty() {
+                    return Err(GenesisError::InvalidValue {
+                        field: "validator.address",
+                        reason: "must not be empty when present".into(),
+                    });
+                }
+                if !addrs.insert(addr.as_str()) {
+                    return Err(GenesisError::DuplicateValidatorAddress(addr.clone()));
+                }
+            }
         }
-        // Economic sanity
-        if self.economics.base_inflation_bps > 10_000 {
-            return Err(GenesisError::InvalidValue {
-                field: "base_inflation_bps",
-                reason: "must be ≤ 10_000".to_string(),
-            });
-        }
-        if self.economics.treasury_bps > 10_000 {
-            return Err(GenesisError::InvalidValue {
-                field: "treasury_bps",
-                reason: "must be ≤ 10_000".to_string(),
-            });
-        }
-        // Governance
-        if self.governance.quorum_bps > 10_000
-            || self.governance.threshold_bps > 10_000
-            || self.governance.veto_bps > 10_000
-        {
-            return Err(GenesisError::InvalidValue {
-                field: "governance.*bps",
-                reason: "basis points must be ≤ 10_000".to_string(),
-            });
-        }
-        // Checksum can be verified by the caller (we don't have the raw bytes here)
         Ok(())
     }
 
-    /// Compute SHA‑256 of the canonical JSON (without the `checksum` field)
-    pub fn compute_checksum(&self) -> String {
-        // In production, serialize to a canonical JSON string (sorted keys, no whitespace)
-        // and hash with SHA‑256. This is a placeholder.
-        unimplemented!("use a canonical JSON serializer")
+    fn validate_accounts(&self) -> Result<(), GenesisError> {
+        let mut addrs: HashSet<&str> = HashSet::with_capacity(self.accounts.len());
+        for a in &self.accounts {
+            if a.address.is_empty() {
+                return Err(GenesisError::InvalidValue {
+                    field: "account.address",
+                    reason: "must be non-empty".into(),
+                });
+            }
+            if !addrs.insert(a.address.as_str()) {
+                return Err(GenesisError::DuplicateAccountAddress(a.address.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_upgrades(&self) -> Result<(), GenesisError> {
+        let mut prev_height: u64 = 0;
+        let mut prev_version: u32 = 0;
+        for (i, up) in self.upgrades.iter().enumerate() {
+            if up.protocol_version == 0 {
+                return Err(GenesisError::InvalidValue {
+                    field: "upgrade.protocol_version",
+                    reason: "must be > 0".into(),
+                });
+            }
+            if i == 0 {
+                if up.activation_height < self.chain.genesis_time {
+                    // Upgrades must activate at or after genesis time.
+                    return Err(GenesisError::InvalidValue {
+                        field: "upgrade.activation_height",
+                        reason: "first upgrade must activate at or after genesis_time".into(),
+                    });
+                }
+            } else {
+                if up.activation_height <= prev_height {
+                    return Err(GenesisError::UpgradesNotMonotonic { index: i });
+                }
+                if up.protocol_version <= prev_version {
+                    return Err(GenesisError::UpgradesNotMonotonic { index: i });
+                }
+            }
+            prev_height = up.activation_height;
+            prev_version = up.protocol_version;
+        }
+        Ok(())
+    }
+
+    // ── Checksums ───────────────────────────────────────────────────────
+
+    /// Compute the SHA-256 checksum over the canonical JSON encoding of this
+    /// genesis, **excluding** the `chain.checksum` field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenesisError::Json`] on serialization failure.
+    pub fn compute_checksum(&self) -> Result<String, GenesisError> {
+        // Serialize to a `serde_json::Value` so we can remove the checksum
+        // field, then re-serialize. With the default `serde_json` features,
+        // `Value::Object` is a `BTreeMap`, so the output is canonical.
+        let mut v: serde_json::Value = serde_json::to_value(self)?;
+        if let Some(chain) = v.get_mut("chain").and_then(|c| c.as_object_mut()) {
+            chain.remove("checksum");
+        }
+        let canonical = serde_json::to_vec(&v)?;
+        let digest = Sha256::digest(&canonical);
+        Ok(hex_encode(&digest))
+    }
+
+    /// Verify the stored `chain.checksum` against a freshly computed one.
+    ///
+    /// Returns [`GenesisError::MissingField`] when `chain.checksum` is
+    /// `None`, and [`GenesisError::ChecksumMismatch`] when the values
+    /// differ. The comparison is case-insensitive over hex.
+    pub fn verify_checksum(&self) -> Result<(), GenesisError> {
+        let stored = self
+            .chain
+            .checksum
+            .as_ref()
+            .ok_or(GenesisError::MissingField("chain.checksum"))?;
+        let computed = self.compute_checksum()?;
+        if !stored.eq_ignore_ascii_case(&computed) {
+            return Err(GenesisError::ChecksumMismatch {
+                expected: computed,
+                actual: stored.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate every invariant **and** verify the stored checksum.
+    ///
+    /// This is the entry point nodes should call at startup.
+    pub fn validate_and_verify(&self, expected_chain_id: Option<u64>) -> Result<(), GenesisError> {
+        self.validate(expected_chain_id)?;
+        self.verify_checksum()
+    }
+
+    /// Load a genesis from a JSON file and run
+    /// [`validate_and_verify`](Self::validate_and_verify).
+    pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, GenesisError> {
+        let bytes = std::fs::read(path)?;
+        let g: Self = serde_json::from_slice(&bytes)?;
+        g.validate_and_verify(None)?;
+        Ok(g)
+    }
+
+    /// Save to a JSON file, computing and embedding the checksum first.
+    pub fn save(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), GenesisError> {
+        self.validate(None)?;
+        let cs = self.compute_checksum()?;
+        self.chain.checksum = Some(cs);
+
+        // Re-validate: embedding the checksum must not break the invariants.
+        self.validate(None)?;
+
+        let bytes = serde_json::to_vec_pretty(&self)?;
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+/// Validate a basis-points field: must be in `(0, 10_000]`.
+fn check_bps(value: u32, field: &'static str) -> Result<(), GenesisError> {
+    if value == 0 {
+        return Err(GenesisError::InvalidValue {
+            field,
+            reason: "must be > 0".into(),
+        });
+    }
+    if value > BPS_DENOMINATOR {
+        return Err(GenesisError::InvalidValue {
+            field,
+            reason: format!("must be <= {BPS_DENOMINATOR}"),
+        });
+    }
+    Ok(())
+}
+
+/// Lowercase hex encoding without a `hex` crate dependency.
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal genesis that passes every invariant.
+    fn sample() -> Genesis {
+        Genesis {
+            chain: ChainConfig {
+                id: 42,
+                name: "iona-test".into(),
+                genesis_time: 1_700_000_000,
+                genesis_time_human: "2023-11-14T22:13:20Z".into(),
+                protocol_version: 1,
+                schema_version: CURRENT_SCHEMA_VERSION,
+                checksum: None,
+            },
+            consensus: ConsensusConfig {
+                propose_timeout_ms: 300,
+                prevote_timeout_ms: 200,
+                precommit_timeout_ms: 200,
+                max_txs_per_block: 4096,
+                gas_target: 43_000_000,
+                fast_quorum: true,
+                initial_base_fee: 1_000_000_000,
+                min_validator_count: 1,
+                max_rounds: 50,
+            },
+            validators: vec![ValidatorEntry {
+                seed: 1,
+                role: "producer".into(),
+                stake: 1_000_000,
+                label: "val1".into(),
+                address: None,
+            }],
+            accounts: vec![AccountEntry {
+                address: "0x0000000000000000000000000000000000000001".into(),
+                balance: 1_000_000,
+            }],
+            economics: EconomicsConfig {
+                base_inflation_bps: 500,
+                treasury_bps: 100,
+                min_stake: 1_000_000,
+                unbonding_epochs: 14,
+                epoch_length: 100,
+                max_validators: 100,
+            },
+            governance: GovernanceConfig {
+                min_deposit: 1_000_000,
+                voting_epochs: 100,
+                quorum_bps: 3_340,
+                threshold_bps: 5_000,
+                veto_bps: 3_340,
+            },
+            slashing: SlashingConfig {
+                double_sign_slash_bps: 5_000,
+                downtime_slash_bps: 100,
+                min_stake_after_slash: 500_000,
+                unjail_delay_blocks: 10_000,
+                downtime_window: 10_000,
+                downtime_min_signed: 5_000,
+            },
+            network: NetworkConfig {
+                bootnodes: vec!["/ip4/127.0.0.1/tcp/7001".into()],
+                enable_mdns: true,
+                enable_kad: true,
+                max_connections_per_ip: 4,
+                max_connections: 64,
+            },
+            upgrades: vec![],
+            metadata: Metadata {
+                description: "test chain".into(),
+                contact: "ops@example.com".into(),
+                git_rev: "abcdef0".into(),
+            },
+        }
+    }
+
+    // ── Happy path ──────────────────────────────────────────────────────
+
+    #[test]
+    fn sample_genesis_is_valid() {
+        assert!(sample().validate(None).is_ok());
+        assert!(sample().validate(Some(42)).is_ok());
+    }
+
+    #[test]
+    fn checksum_roundtrip() {
+        let mut g = sample();
+        let cs = g.compute_checksum().unwrap();
+        assert_eq!(cs.len(), 64); // SHA-256 hex
+        g.chain.checksum = Some(cs);
+        g.verify_checksum().unwrap();
+    }
+
+    #[test]
+    fn checksum_ignores_stored_value() {
+        // Changing only the stored checksum must not change the computed one.
+        let mut a = sample();
+        let mut b = sample();
+        a.chain.checksum = Some("aa".repeat(32));
+        b.chain.checksum = Some("bb".repeat(32));
+        assert_eq!(a.compute_checksum().unwrap(), b.compute_checksum().unwrap());
+    }
+
+    #[test]
+    fn checksum_changes_when_content_changes() {
+        let a = sample().compute_checksum().unwrap();
+        let mut b = sample();
+        b.chain.name.push_str("-v2");
+        assert_ne!(a, b.compute_checksum().unwrap());
+    }
+
+    // ── Chain ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn chain_id_mismatch() {
+        let g = sample();
+        assert!(matches!(
+            g.validate(Some(7)),
+            Err(GenesisError::ChainIdMismatch { expected: 7, actual: 42 })
+        ));
+    }
+
+    #[test]
+    fn chain_id_zero_rejected() {
+        let mut g = sample();
+        g.chain.id = 0;
+        assert!(matches!(g.validate(None), Err(GenesisError::InvalidValue { field, .. }) if field == "chain.id"));
+    }
+
+    #[test]
+    fn schema_version_mismatch() {
+        let mut g = sample();
+        g.chain.schema_version = CURRENT_SCHEMA_VERSION + 1;
+        assert!(matches!(
+            g.validate(None),
+            Err(GenesisError::SchemaVersionMismatch { .. })
+        ));
+    }
+
+    // ── Validators ──────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_validators_rejected() {
+        let mut g = sample();
+        g.validators.clear();
+        assert!(matches!(g.validate(None), Err(GenesisError::MissingField("validators"))));
+    }
+
+    #[test]
+    fn duplicate_validator_seed_rejected() {
+        let mut g = sample();
+        g.validators.push(g.validators[0].clone());
+        assert!(matches!(
+            g.validate(None),
+            Err(GenesisError::DuplicateValidatorSeed(1))
+        ));
+    }
+
+    #[test]
+    fn duplicate_validator_address_rejected() {
+        let mut g = sample();
+        let mut v = g.validators[0].clone();
+        v.seed = 2;
+        v.address = Some("0xabc".into());
+        g.validators[0].address = Some("0xabc".into());
+        g.validators.push(v);
+        assert!(matches!(
+            g.validate(None),
+            Err(GenesisError::DuplicateValidatorAddress(_))
+        ));
+    }
+
+    #[test]
+    fn producer_below_min_stake_rejected() {
+        let mut g = sample();
+        g.validators[0].stake = 1;
+        assert!(matches!(
+            g.validate(None),
+            Err(GenesisError::StakeBelowMinimum { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_role_rejected() {
+        let mut g = sample();
+        g.validators[0].role = "observer".into();
+        assert!(matches!(g.validate(None), Err(GenesisError::InvalidValue { field, .. }) if field == "validator.role"));
+    }
+
+    #[test]
+    fn validator_count_above_max_rejected() {
+        let mut g = sample();
+        g.economics.max_validators = 0; // Also caught earlier by economics.
+        // Fix economics to isolate the range check.
+        g.economics.max_validators = 1;
+        g.validators.push(ValidatorEntry {
+            seed: 2,
+            role: "follower".into(),
+            stake: 0,
+            label: "v2".into(),
+            address: None,
+        });
+        assert!(matches!(
+            g.validate(None),
+            Err(GenesisError::ValidatorCountOutOfRange { .. })
+        ));
+    }
+
+    // ── Governance / economics / slashing ───────────────────────────────
+
+    #[test]
+    fn bps_above_denominator_rejected() {
+        let mut g = sample();
+        g.governance.quorum_bps = 10_001;
+        assert!(matches!(g.validate(None), Err(GenesisError::InvalidValue { field, .. }) if field == "governance.quorum_bps"));
+
+        let mut g = sample();
+        g.economics.base_inflation_bps = 10_001;
+        assert!(matches!(g.validate(None), Err(GenesisError::InvalidValue { field, .. }) if field == "economics.base_inflation_bps"));
+    }
+
+    #[test]
+    fn zero_bps_rejected() {
+        let mut g = sample();
+        g.governance.veto_bps = 0;
+        assert!(matches!(g.validate(None), Err(GenesisError::InvalidValue { .. })));
+    }
+
+    #[test]
+    fn slashing_sum_above_denominator_rejected() {
+        let mut g = sample();
+        g.slashing.double_sign_slash_bps = 6_000;
+        g.slashing.downtime_slash_bps = 5_000;
+        assert!(matches!(g.validate(None), Err(GenesisError::InvalidValue { field, .. }) if field == "slashing.*_slash_bps"));
+    }
+
+    #[test]
+    fn downtime_min_signed_above_window_rejected() {
+        let mut g = sample();
+        g.slashing.downtime_min_signed = g.slashing.downtime_window + 1;
+        assert!(matches!(g.validate(None), Err(GenesisError::InvalidValue { field, .. }) if field == "slashing.downtime_min_signed"));
+    }
+
+    // ── Network ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn max_conn_per_ip_above_total_rejected() {
+        let mut g = sample();
+        g.network.max_connections_per_ip = 128;
+        g.network.max_connections = 64;
+        assert!(matches!(g.validate(None), Err(GenesisError::InvalidValue { .. })));
+    }
+
+    #[test]
+    fn empty_bootnode_rejected() {
+        let mut g = sample();
+        g.network.bootnodes.push("".into());
+        assert!(matches!(g.validate(None), Err(GenesisError::InvalidValue { field, .. }) if field == "network.bootnodes"));
+    }
+
+    // ── Upgrades ────────────────────────────────────────────────────────
+
+    #[test]
+    fn upgrade_heights_must_be_monotonic() {
+        let mut g = sample();
+        g.upgrades = vec![
+            UpgradeEntry {
+                protocol_version: 2,
+                activation_height: 200,
+                grace_blocks: 10,
+                description: None,
+            },
+            UpgradeEntry {
+                protocol_version: 3,
+                activation_height: 100,
+                grace_blocks: 10,
+                description: None,
+            },
+        ];
+        assert!(matches!(
+            g.validate(None),
+            Err(GenesisError::UpgradesNotMonotonic { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn upgrade_versions_must_be_monotonic() {
+        let mut g = sample();
+        g.upgrades = vec![
+            UpgradeEntry {
+                protocol_version: 3,
+                activation_height: 200,
+                grace_blocks: 10,
+                description: None,
+            },
+            UpgradeEntry {
+                protocol_version: 2,
+                activation_height: 300,
+                grace_blocks: 10,
+                description: None,
+            },
+        ];
+        assert!(matches!(
+            g.validate(None),
+            Err(GenesisError::UpgradesNotMonotonic { index: 1 })
+        ));
+    }
+
+    // ── Accounts ────────────────────────────────────────────────────────
+
+    #[test]
+    fn duplicate_account_address_rejected() {
+        let mut g = sample();
+        let a = g.accounts[0].clone();
+        g.accounts.push(a);
+        assert!(matches!(
+            g.validate(None),
+            Err(GenesisError::DuplicateAccountAddress(_))
+        ));
+    }
+
+    // ── Checksum verification ───────────────────────────────────────────
+
+    #[test]
+    fn verify_checksum_requires_a_value() {
+        let g = sample();
+        assert!(matches!(
+            g.verify_checksum(),
+            Err(GenesisError::MissingField("chain.checksum"))
+        ));
+    }
+
+    #[test]
+    fn verify_checksum_detects_tamper() {
+        let mut g = sample();
+        g.chain.checksum = Some("00".repeat(32));
+        assert!(matches!(
+            g.verify_checksum(),
+            Err(GenesisError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_checksum_is_case_insensitive() {
+        let mut g = sample();
+        let cs = g.compute_checksum().unwrap().to_uppercase();
+        g.chain.checksum = Some(cs);
+        g.verify_checksum().unwrap();
+    }
+
+    // ── Metadata ────────────────────────────────────────────────────────
+
+    #[test]
+    fn short_git_rev_rejected() {
+        let mut g = sample();
+        g.metadata.git_rev = "abc".into();
+        assert!(matches!(g.validate(None), Err(GenesisError::InvalidValue { field, .. }) if field == "metadata.git_rev"));
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn hex_encode_matches_known_vector() {
+        assert_eq!(hex_encode(&[0x00, 0x01, 0xff]), "0001ff");
+        assert_eq!(hex_encode(&[]), "");
     }
 }
