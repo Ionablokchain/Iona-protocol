@@ -1,18 +1,29 @@
 //! State root reproducibility verification.
 //!
 //! Verifies that state roots are reproducible across:
-//! - Different binary builds (same source, different compiler/platform)
-//! - Multiple executions on the same machine
-//! - Parallel vs serial execution paths
+//!
+//! - Different binary builds (same source, different compiler/platform).
+//! - Multiple executions on the same machine.
+//! - Parallel vs serial execution paths.
 //!
 //! This is critical for consensus safety: if two nodes compute different
 //! state roots for the same block, the chain splits.
 //!
 //! # Approach
 //!
-//! 1. Execute the same block N times and verify identical roots
-//! 2. Compare roots against golden vectors (known-good values)
-//! 3. Detect platform-specific nondeterminism (float ops, hashmap order)
+//! 1. Execute each block `N` times from the **same** pre-block state and
+//!    verify that all executions produce identical roots.
+//! 2. Compare roots against golden vectors (known-good values) when
+//!    supplied.
+//! 3. Optionally capture a [`NdLogger`] report describing any
+//!    nondeterminism observed during verification.
+//!
+//! # Bounds
+//!
+//! [`ReproducibilityConfig::iterations_per_block`] is capped at
+//! [`MAX_ITERATIONS_PER_BLOCK`]. The cost of verification is
+//! `blocks × iterations_per_block` block executions; without a cap a
+//! caller could pass `usize::MAX` and hang the tool.
 //!
 //! # Usage
 //!
@@ -20,31 +31,69 @@
 //! use iona::replay::state_root_verify::{ReproducibilityConfig, verify_chain_reproducibility};
 //!
 //! let config = ReproducibilityConfig::default();
-//! let result = verify_chain_reproducibility(&blocks, &state, &config);
+//! let result = verify_chain_reproducibility(&blocks, &state, &config)?;
 //! assert!(result.all_reproducible);
 //! ```
 
 use crate::execution::{execute_block, KvState};
-use crate::replay::nondeterminism::{NdLogger, NdSource};
-use crate::types::{Block, Hash32, Height, Receipt};
+use crate::replay::nondeterminism::{NdLogger, NdSeverity, NdSource};
+use crate::types::{Block, Hash32, Height};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use thiserror::Error;
 use tracing::{debug, info, warn};
 
-// -----------------------------------------------------------------------------
-// Configuration
-// -----------------------------------------------------------------------------
+// ── Limits ────────────────────────────────────────────────────────────────
+
+/// Upper bound on [`ReproducibilityConfig::iterations_per_block`].
+///
+/// A single verification pass re-executes each block
+/// `iterations_per_block` times. At 1 000 the total work is
+/// `blocks × 1 000`; combined with a large block slice this already takes
+/// hours. Values above the cap are rejected.
+pub const MAX_ITERATIONS_PER_BLOCK: usize = 1_000;
+
+// ── Errors ────────────────────────────────────────────────────────────────
+
+/// Errors returned by the reproducibility verifiers.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ReproducibilityError {
+    /// `iterations_per_block == 0` would make the check a no-op and
+    /// `roots[0]` would panic.
+    #[error("iterations_per_block must be > 0")]
+    ZeroIterations,
+
+    /// `iterations_per_block > MAX_ITERATIONS_PER_BLOCK`.
+    #[error("iterations_per_block ({0}) exceeds MAX_ITERATIONS_PER_BLOCK ({MAX_ITERATIONS_PER_BLOCK})")]
+    TooManyIterations(usize),
+
+    /// A block's proposer public key could not be converted into an
+    /// address.
+    #[error("invalid proposer pubkey at height {height}: {reason}")]
+    InvalidProposer { height: Height, reason: String },
+
+    /// The initial state failed `KvState::root()` consistency check.
+    #[error("state root not consistent: {0}")]
+    StateRootInconsistent(String),
+}
+
+// ── Configuration ─────────────────────────────────────────────────────────
 
 /// Configuration for reproducibility verification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReproducibilityConfig {
-    /// Number of times to execute each block.
+    /// Number of times to execute each block. Must be in
+    /// `[1, MAX_ITERATIONS_PER_BLOCK]`.
     pub iterations_per_block: usize,
-    /// If true, stop at the first failure.
+    /// Stop at the first block whose iterations produce different roots.
     pub stop_on_first_failure: bool,
-    /// If true, use nondeterminism logger to record sources of divergence.
+    /// Record nondeterminism events into an [`NdLogger`] alongside the
+    /// verification.
     pub enable_nondeterminism_logging: bool,
-    /// Base fee for execution (used for all blocks).
+    /// Base fee used for every block execution.
+    ///
+    /// The real chain derives this from EIP-1559; the verifier does not
+    /// attempt to reproduce the EIP-1559 schedule, it only checks that
+    /// execution is a pure function of `(state, block, base_fee)`.
     pub base_fee_per_gas: u64,
 }
 
@@ -59,37 +108,70 @@ impl Default for ReproducibilityConfig {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Result types (with serialization)
-// -----------------------------------------------------------------------------
+impl ReproducibilityConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), ReproducibilityError> {
+        if self.iterations_per_block == 0 {
+            return Err(ReproducibilityError::ZeroIterations);
+        }
+        if self.iterations_per_block > MAX_ITERATIONS_PER_BLOCK {
+            return Err(ReproducibilityError::TooManyIterations(
+                self.iterations_per_block,
+            ));
+        }
+        if self.base_fee_per_gas == 0 {
+            // Not a hard error — the caller may legitimately want to
+            // exercise zero-fee execution. Documented, not enforced.
+        }
+        Ok(())
+    }
+}
+
+// ── Result types ──────────────────────────────────────────────────────────
 
 /// Result of a reproducibility check for a single block.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReproducibilityResult {
     pub height: Height,
     pub iterations: usize,
     pub all_match: bool,
-    /// The canonical root (from first execution).
+    /// The canonical root (from the first execution).
     pub canonical_root: Hash32,
-    /// If any mismatch, which iteration diverged (0‑based).
+    /// The pre-block state root, for cross-referencing divergence reports.
+    pub input_root: Hash32,
+    /// If any mismatch, the 0-based iteration at which divergence was
+    /// detected.
     pub diverged_at: Option<usize>,
-    /// All computed roots (for debugging).
+    /// All computed roots, in execution order.
     pub roots: Vec<Hash32>,
-    /// Optional: diff between the canonical root and the divergent root.
+    /// Human-readable description of the divergence, when present.
     pub diff_description: Option<String>,
 }
 
 /// Result of verifying reproducibility across multiple blocks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchReproducibilityResult {
+    /// Number of blocks actually verified. When `stop_on_first_failure`
+    /// is set, this can be less than the input length.
     pub total_blocks: usize,
+    /// Total number of block executions performed
+    /// (`sum(results[i].iterations)`).
     pub total_iterations: usize,
     pub all_reproducible: bool,
     pub results: Vec<ReproducibilityResult>,
-    /// First block that was not reproducible (if any).
+    /// First block whose iterations produced different roots.
     pub first_failure: Option<Height>,
-    /// Summary of nondeterministic events collected during verification.
+    /// `Display` of the [`NdLogger::report`] when
+    /// `enable_nondeterminism_logging` is set.
     pub nondeterminism_report: Option<String>,
+}
+
+impl BatchReproducibilityResult {
+    /// Blocks that were not reproducible.
+    #[must_use]
+    pub fn failures(&self) -> Vec<&ReproducibilityResult> {
+        self.results.iter().filter(|r| !r.all_match).collect()
+    }
 }
 
 impl std::fmt::Display for BatchReproducibilityResult {
@@ -105,182 +187,225 @@ impl std::fmt::Display for BatchReproducibilityResult {
         )?;
         writeln!(
             f,
-            "  blocks={}, iterations_per_block={}",
+            "  blocks={}, total_iterations={}",
             self.total_blocks, self.total_iterations
         )?;
         if let Some(h) = self.first_failure {
             writeln!(f, "  FIRST FAILURE at height {h}")?;
         }
         if let Some(report) = &self.nondeterminism_report {
-            writeln!(f, "\n{}", report)?;
+            writeln!(f, "\n{report}")?;
         }
         Ok(())
     }
 }
 
-// -----------------------------------------------------------------------------
-// Verification functions
-// -----------------------------------------------------------------------------
+// ── Verification ──────────────────────────────────────────────────────────
 
-/// Verify that executing a block N times produces the same state root.
+/// Verify that executing `block` `N` times produces the same state root.
+///
+/// Also returns the **post-block state** from the first (canonical)
+/// execution so a chain verifier does not need to execute the block a
+/// second time to advance.
+///
+/// # Errors
+///
+/// - [`ReproducibilityError::ZeroIterations`] when the config is
+///   invalid.
+/// - [`ReproducibilityError::InvalidProposer`] when the block's proposer
+///   public key cannot be turned into an address.
 pub fn verify_block_reproducibility(
     block: &Block,
     initial_state: &KvState,
     config: &ReproducibilityConfig,
-    logger: Option<&mut NdLogger>,
-) -> ReproducibilityResult {
-    let proposer_addr = if block.header.proposer_pk.is_empty() {
-        "0000000000000000000000000000000000000000".to_string()
-    } else {
-        crate::crypto::tx::derive_address(&block.header.proposer_pk)
-    };
+    logger: Option<&NdLogger>,
+) -> Result<(ReproducibilityResult, KvState), ReproducibilityError> {
+    config.validate()?;
+    let proposer_addr = resolve_proposer(block)?;
+    let height = block.header.height;
+    let input_root = initial_state.root();
 
-    let mut roots = Vec::with_capacity(config.iterations_per_block);
+    let mut roots: Vec<Hash32> = Vec::with_capacity(config.iterations_per_block);
+    let mut canonical_state: Option<KvState> = None;
 
     for i in 0..config.iterations_per_block {
-        if let Some(ref mut l) = logger {
-            l.log(
-                NdSource::HashmapIteration,
-                format!("block execution iteration {i} at height {}", block.header.height),
-                None,
-                Some(file!()),
-            );
-        }
-
         let (new_state, _gas, _receipts) = execute_block(
             initial_state,
             &block.txs,
             config.base_fee_per_gas,
             &proposer_addr,
         );
-        roots.push(new_state.root());
+        let root = new_state.root();
 
-        if config.enable_nondeterminism_logging && i > 0 && roots[i] != roots[0] {
-            if let Some(ref mut l) = logger {
+        if i == 0 {
+            canonical_state = Some(new_state);
+        }
+        roots.push(root);
+    }
+
+    // The first execution established the canonical state.
+    let canonical_state = canonical_state.expect("iterations_per_block > 0 guaranteed above");
+    let canonical_root = roots[0];
+
+    let diverged_at = roots
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, r)| **r != canonical_root)
+        .map(|(i, _)| i);
+
+    // Log only on actual divergence. Logging every iteration would drown
+    // the audit trail.
+    if let Some(l) = logger {
+        if config.enable_nondeterminism_logging {
+            if let Some(idx) = diverged_at {
+                l.set_height(height);
                 l.log(
-                    NdSource::Custom("State root divergence".into()),
-                    format!("iteration {} root differs from canonical", i),
-                    Some(format!("root: {:?}", roots[i])),
-                    Some(file!()),
+                    NdSource::Other("state_root_divergence".into()),
+                    NdSeverity::Critical,
+                    &format!(
+                        "iteration {idx} produced a different state root \
+                         (input_root={}, canonical={}, divergent={})",
+                        short_hex(&input_root),
+                        short_hex(&canonical_root),
+                        short_hex(&roots[idx]),
+                    ),
+                    &short_hex(&roots[idx]),
+                    Some("check KvState::root and any HashMap/HashSet usage"),
                 );
+            } else {
+                debug!(height, iterations = config.iterations_per_block, "block reproducible");
             }
         }
     }
 
-    let canonical = roots[0].clone();
-    let diverged_at = roots
-        .iter()
-        .enumerate()
-        .find(|(_, r)| **r != canonical)
-        .map(|(i, _)| i);
-
     let diff_description = diverged_at.map(|idx| {
         format!(
-            "Iteration {} diverged: root = {:?}, canonical = {:?}",
-            idx,
+            "iteration {idx} diverged: root=0x{}, canonical=0x{}",
             hex::encode(roots[idx].0),
-            hex::encode(canonical.0)
+            hex::encode(canonical_root.0),
         )
     });
 
-    ReproducibilityResult {
-        height: block.header.height,
+    let result = ReproducibilityResult {
+        height,
         iterations: config.iterations_per_block,
         all_match: diverged_at.is_none(),
-        canonical_root: canonical,
+        canonical_root,
+        input_root,
         diverged_at,
         roots,
         diff_description,
-    }
+    };
+
+    Ok((result, canonical_state))
 }
 
 /// Verify reproducibility for a chain of blocks.
+///
+/// # Errors
+///
+/// Same as [`verify_block_reproducibility`]. A failed verification is
+/// **not** an error: it is reported through
+/// [`BatchReproducibilityResult::all_reproducible`].
 pub fn verify_chain_reproducibility(
     blocks: &[Block],
     initial_state: &KvState,
     config: &ReproducibilityConfig,
-) -> BatchReproducibilityResult {
-    let mut logger = if config.enable_nondeterminism_logging {
-        Some(NdLogger::new())
+) -> Result<BatchReproducibilityResult, ReproducibilityError> {
+    config.validate()?;
+
+    // Sanity: the initial state must have a stable root.
+    let _ = verify_state_root_consistency(initial_state, 3)?;
+
+    let logger = if config.enable_nondeterminism_logging {
+        Some(NdLogger::new(true))
     } else {
         None
     };
 
     let mut results = Vec::with_capacity(blocks.len());
-    let mut first_failure = None;
+    let mut first_failure: Option<Height> = None;
     let mut state = initial_state.clone();
+    let mut total_iterations: usize = 0;
 
     for (idx, block) in blocks.iter().enumerate() {
-        debug!("Verifying reproducibility for block height {}", block.header.height);
-        let result = verify_block_reproducibility(block, &state, config, logger.as_mut());
+        debug!(
+            height = block.header.height,
+            index = idx,
+            "verifying block reproducibility"
+        );
 
-        if !result.all_match && first_failure.is_none() {
+        let (result, canonical_state) =
+            verify_block_reproducibility(block, &state, config, logger.as_ref())?;
+
+        total_iterations = total_iterations.saturating_add(result.iterations);
+
+        let failed = !result.all_match;
+        if failed && first_failure.is_none() {
             first_failure = Some(block.header.height);
             warn!(
-                "Non‑determinism detected at height {}: root mismatch at iteration {:?}",
-                block.header.height, result.diverged_at
+                height = block.header.height,
+                diverged_at = ?result.diverged_at,
+                "nondeterminism detected"
             );
-            if config.stop_on_first_failure {
-                results.push(result);
-                break;
-            }
         }
 
-        // Advance state using first execution's result (the canonical one).
-        let proposer_addr = if block.header.proposer_pk.is_empty() {
-            "0000000000000000000000000000000000000000".to_string()
-        } else {
-            crate::crypto::tx::derive_address(&block.header.proposer_pk)
-        };
-        let (new_state, _, _) = execute_block(
-            &state,
-            &block.txs,
-            config.base_fee_per_gas,
-            &proposer_addr,
-        );
-        state = new_state;
-
+        // Advance the working state using the canonical execution's
+        // post-state.
+        state = canonical_state;
         results.push(result);
-        info!("Verified block {} / {}", idx + 1, blocks.len());
+
+        info!(
+            height = block.header.height,
+            idx = idx + 1,
+            total = blocks.len(),
+            "verified"
+        );
+
+        if failed && config.stop_on_first_failure {
+            break;
+        }
     }
 
-    let nondeterminism_report = logger.map(|l| format!("{}", l.finalize()));
+    let nondeterminism_report = logger.as_ref().map(|l| l.report().to_string());
 
     let all_reproducible = first_failure.is_none();
-    BatchReproducibilityResult {
+    Ok(BatchReproducibilityResult {
         total_blocks: results.len(),
-        total_iterations: config.iterations_per_block,
+        total_iterations,
         all_reproducible,
         results,
         first_failure,
         nondeterminism_report,
-    }
+    })
 }
 
-/// Compare a computed state root against a golden vector.
+// ── Golden-vector verification ────────────────────────────────────────────
+
+/// Compare the computed state root against a golden value.
+///
+/// # Errors
+///
+/// - [`ReproducibilityError::InvalidProposer`] on a malformed proposer
+///   key.
+/// - A string error describing the mismatch when the root differs from
+///   the golden value.
 pub fn verify_against_golden(
     block: &Block,
     initial_state: &KvState,
     base_fee_per_gas: u64,
     golden_root: Hash32,
 ) -> Result<Hash32, String> {
-    let proposer_addr = if block.header.proposer_pk.is_empty() {
-        "0000000000000000000000000000000000000000".to_string()
-    } else {
-        crate::crypto::tx::derive_address(&block.header.proposer_pk)
-    };
+    let proposer_addr = resolve_proposer(block).map_err(|e| e.to_string())?;
 
-    let (new_state, _, _) = execute_block(
-        initial_state,
-        &block.txs,
-        base_fee_per_gas,
-        &proposer_addr,
-    );
+    let (new_state, _gas, _receipts) =
+        execute_block(initial_state, &block.txs, base_fee_per_gas, &proposer_addr);
 
     let computed = new_state.root();
     if computed != golden_root {
         return Err(format!(
-            "golden vector mismatch at height {}: expected {}, got {}",
+            "golden vector mismatch at height {}: expected 0x{}, got 0x{}",
             block.header.height,
             hex::encode(golden_root.0),
             hex::encode(computed.0),
@@ -289,89 +414,110 @@ pub fn verify_against_golden(
     Ok(computed)
 }
 
-/// Verify that KvState::root() is deterministic (no hashmap ordering issues).
-pub fn verify_state_root_consistency(state: &KvState, iterations: usize) -> Result<Hash32, String> {
+// ── Root consistency ──────────────────────────────────────────────────────
+
+/// Verify that `KvState::root()` is itself deterministic.
+///
+/// `KvState::root()` is a pure function of the state. If the state uses
+/// a `HashMap` internally, `root()` may iterate in an
+/// iteration-order-dependent way and produce different values across
+/// calls. This check catches that class of bug directly.
+pub fn verify_state_root_consistency(
+    state: &KvState,
+    iterations: usize,
+) -> Result<Hash32, ReproducibilityError> {
+    // `iterations == 0` is treated as `1` — the caller gets the root
+    // with no consistency check performed, which is what a zero-count
+    // means in practice.
+    let iterations = iterations.max(1);
     let first = state.root();
     for i in 1..iterations {
         let root = state.root();
         if root != first {
-            return Err(format!(
-                "state root inconsistency at iteration {i}: \
-                 first={}, current={}",
+            return Err(ReproducibilityError::StateRootInconsistent(format!(
+                "iteration {i}: first=0x{}, current=0x{}",
                 hex::encode(first.0),
                 hex::encode(root.0),
-            ));
+            )));
         }
     }
     Ok(first)
 }
 
-/// Compare two states and return a list of differences (for debugging).
+// ── State diff ────────────────────────────────────────────────────────────
+
+/// Compare two states field-by-field and return a human-readable list of
+/// differences.
+///
+/// Intended for post-mortem debugging: a caller that finds a divergent
+/// root can print this list to see which account or KV entry moved.
+#[must_use]
 pub fn compare_states(a: &KvState, b: &KvState) -> Vec<String> {
     let mut diffs = Vec::new();
-
-    // Compare balances
-    for (addr, bal_a) in &a.balances {
-        match b.balances.get(addr) {
-            Some(bal_b) if bal_a != bal_b => {
-                diffs.push(format!("balance {}: {} vs {}", addr, bal_a, bal_b));
-            }
-            None => {
-                diffs.push(format!("balance {} only in A: {}", addr, bal_a));
-            }
-        }
-    }
-    for (addr, bal_b) in &b.balances {
-        if !a.balances.contains_key(addr) {
-            diffs.push(format!("balance {} only in B: {}", addr, bal_b));
-        }
-    }
-
-    // Compare nonces
-    for (addr, nonce_a) in &a.nonces {
-        match b.nonces.get(addr) {
-            Some(nonce_b) if nonce_a != nonce_b => {
-                diffs.push(format!("nonce {}: {} vs {}", addr, nonce_a, nonce_b));
-            }
-            None => {
-                diffs.push(format!("nonce {} only in A: {}", addr, nonce_a));
-            }
-        }
-    }
-    for (addr, nonce_b) in &b.nonces {
-        if !a.nonces.contains_key(addr) {
-            diffs.push(format!("nonce {} only in B: {}", addr, nonce_b));
-        }
-    }
-
-    // Compare KV
-    for (key, val_a) in &a.kv {
-        match b.kv.get(key) {
-            Some(val_b) if val_a != val_b => {
-                diffs.push(format!("kv {}: {:?} vs {:?}", key, val_a, val_b));
-            }
-            None => {
-                diffs.push(format!("kv {} only in A: {:?}", key, val_a));
-            }
-        }
-    }
-    for (key, val_b) in &b.kv {
-        if !a.kv.contains_key(key) {
-            diffs.push(format!("kv {} only in B: {:?}", key, val_b));
-        }
-    }
-
+    compare_map(&mut diffs, "balance", &a.balances, &b.balances);
+    compare_map(&mut diffs, "nonce", &a.nonces, &b.nonces);
+    compare_map(&mut diffs, "kv", &a.kv, &b.kv);
     diffs
 }
 
-// -----------------------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------------------
+fn compare_map<V>(
+    diffs: &mut Vec<String>,
+    label: &str,
+    a: &std::collections::BTreeMap<String, V>,
+    b: &std::collections::BTreeMap<String, V>,
+) where
+    V: std::fmt::Debug + PartialEq,
+{
+    for (k, va) in a {
+        match b.get(k) {
+            Some(vb) if va != vb => {
+                diffs.push(format!("{label} {k}: {va:?} vs {vb:?}"));
+            }
+            None => {
+                diffs.push(format!("{label} {k} only in A: {va:?}"));
+            }
+            _ => {}
+        }
+    }
+    for (k, vb) in b {
+        if !a.contains_key(k) {
+            diffs.push(format!("{label} {k} only in B: {vb:?}"));
+        }
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+/// Resolve the proposer address from a block header, or a hard error.
+fn resolve_proposer(block: &Block) -> Result<String, ReproducibilityError> {
+    let pk = &block.header.proposer_pk;
+    let height = block.header.height;
+
+    if pk.is_empty() {
+        return Ok("0000000000000000000000000000000000000000".to_string());
+    }
+
+    let addr = crate::crypto::tx::derive_address(pk);
+    if addr.is_empty() {
+        return Err(ReproducibilityError::InvalidProposer {
+            height,
+            reason: "derive_address returned an empty string".into(),
+        });
+    }
+    Ok(addr.to_string())
+}
+
+/// First eight hex characters of a 32-byte hash, prefixed with `0x`.
+fn short_hex(h: &Hash32) -> String {
+    format!("0x{}", hex::encode(&h.0[..8]))
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Block, BlockHeader};
+    use crate::types::{receipts_root, tx_root, BlockHeader};
 
     fn empty_block(height: Height, state_root: Hash32) -> Block {
         Block {
@@ -380,8 +526,8 @@ mod tests {
                 round: 0,
                 prev: Hash32::zero(),
                 proposer_pk: vec![0u8; 32],
-                tx_root: Hash32::zero(),
-                receipts_root: Hash32::zero(),
+                tx_root: tx_root(&[]),
+                receipts_root: receipts_root(&[]),
                 state_root,
                 base_fee_per_gas: 1,
                 gas_used: 0,
@@ -389,7 +535,7 @@ mod tests {
                 exec_gas_used: 0,
                 vm_gas_used: 0,
                 evm_gas_used: 0,
-                chain_id: 6126151,
+                chain_id: 6_126_151,
                 timestamp: height * 1000,
                 protocol_version: 1,
             },
@@ -397,85 +543,224 @@ mod tests {
         }
     }
 
+    fn config(iterations: usize) -> ReproducibilityConfig {
+        ReproducibilityConfig {
+            iterations_per_block: iterations,
+            ..Default::default()
+        }
+    }
+
+    // ── Config ──────────────────────────────────────────────────────────
+
     #[test]
-    fn test_block_reproducibility() {
+    fn default_config_validates() {
+        assert_eq!(ReproducibilityConfig::default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn config_rejects_zero_iterations() {
+        let c = config(0);
+        assert_eq!(c.validate(), Err(ReproducibilityError::ZeroIterations));
+    }
+
+    #[test]
+    fn config_rejects_excessive_iterations() {
+        let c = config(MAX_ITERATIONS_PER_BLOCK + 1);
+        assert!(matches!(
+            c.validate(),
+            Err(ReproducibilityError::TooManyIterations(_))
+        ));
+    }
+
+    // ── Single-block verification ───────────────────────────────────────
+
+    #[test]
+    fn block_reproducibility_succeeds() {
         let state = KvState::default();
         let root = state.root();
-        let block = empty_block(1, root.clone());
-        let config = ReproducibilityConfig::default();
+        let block = empty_block(1, root);
+        let c = config(3);
 
-        let result = verify_block_reproducibility(&block, &state, &config, None);
-        assert!(result.all_match, "not reproducible at iteration {:?}", result.diverged_at);
+        let (result, new_state) =
+            verify_block_reproducibility(&block, &state, &c, None).unwrap();
+
+        assert!(result.all_match, "not reproducible at {:?}", result.diverged_at);
         assert_eq!(result.iterations, 3);
         assert_eq!(result.roots.len(), 3);
+        assert_eq!(result.canonical_root, root);
+        assert_eq!(result.input_root, root);
+        assert_eq!(new_state.root(), root);
     }
 
     #[test]
-    fn test_chain_reproducibility() {
+    fn block_reproducibility_rejects_zero_iterations() {
+        let state = KvState::default();
+        let block = empty_block(1, state.root());
+        let c = config(0);
+        assert!(matches!(
+            verify_block_reproducibility(&block, &state, &c, None),
+            Err(ReproducibilityError::ZeroIterations)
+        ));
+    }
+
+    // ── Chain verification ──────────────────────────────────────────────
+
+    #[test]
+    fn chain_reproducibility_succeeds() {
         let state = KvState::default();
         let root = state.root();
-        let blocks = vec![empty_block(1, root.clone()), empty_block(2, root.clone())];
-        let config = ReproducibilityConfig::default();
+        let blocks = vec![
+            empty_block(1, root),
+            empty_block(2, root),
+        ];
+        let c = config(3);
 
-        let result = verify_chain_reproducibility(&blocks, &state, &config);
-        assert!(result.all_reproducible, "result: {result}");
-        assert_eq!(result.total_blocks, 2);
+        let r = verify_chain_reproducibility(&blocks, &state, &c).unwrap();
+        assert!(r.all_reproducible, "result: {r}");
+        assert_eq!(r.total_blocks, 2);
+        // 2 blocks × 3 iterations = 6 total executions.
+        assert_eq!(r.total_iterations, 6);
+        assert!(r.failures().is_empty());
     }
 
     #[test]
-    fn test_golden_vector_match() {
+    fn chain_reproducibility_total_iterations_reflects_actual_work() {
+        // This is the regression for a bug where `total_iterations` was
+        // set to `config.iterations_per_block` instead of the sum over
+        // all verified blocks.
         let state = KvState::default();
         let root = state.root();
-        let block = empty_block(1, root.clone());
+        let blocks = vec![
+            empty_block(1, root),
+            empty_block(2, root),
+            empty_block(3, root),
+        ];
+        let c = config(4);
 
-        let result = verify_against_golden(&block, &state, 1, root);
-        assert!(result.is_ok());
+        let r = verify_chain_reproducibility(&blocks, &state, &c).unwrap();
+        assert_eq!(r.total_blocks, 3);
+        assert_eq!(r.total_iterations, 12);
     }
 
     #[test]
-    fn test_golden_vector_mismatch() {
+    fn chain_reproducibility_empty_blocks_is_ok() {
+        let state = KvState::default();
+        let r = verify_chain_reproducibility(&[], &state, &config(3)).unwrap();
+        assert!(r.all_reproducible);
+        assert_eq!(r.total_blocks, 0);
+        assert_eq!(r.total_iterations, 0);
+    }
+
+    // ── Golden vector ───────────────────────────────────────────────────
+
+    #[test]
+    fn golden_vector_matches() {
         let state = KvState::default();
         let root = state.root();
-        let block = empty_block(1, root.clone());
-
-        let bad_golden = Hash32([0xFF; 32]);
-        let result = verify_against_golden(&block, &state, 1, bad_golden);
-        assert!(result.is_err());
+        let block = empty_block(1, root);
+        assert_eq!(verify_against_golden(&block, &state, 1, root), Ok(root));
     }
 
     #[test]
-    fn test_state_root_consistency() {
+    fn golden_vector_mismatch_is_reported() {
+        let state = KvState::default();
+        let root = state.root();
+        let block = empty_block(1, root);
+        let bad = Hash32([0xFF; 32]);
+        let err = verify_against_golden(&block, &state, 1, bad).unwrap_err();
+        assert!(err.contains("golden vector mismatch"));
+    }
+
+    // ── State root consistency ──────────────────────────────────────────
+
+    #[test]
+    fn state_root_is_consistent() {
         let mut state = KvState::default();
         state.balances.insert("alice".into(), 1000);
-        state.kv.insert("key1".into(), "val1".into());
+        state.balances.insert("bob".into(), 500);
+        state.kv.insert("k".into(), "v".into());
         state.nonces.insert("alice".into(), 5);
 
-        let result = verify_state_root_consistency(&state, 100);
-        assert!(result.is_ok());
+        assert!(verify_state_root_consistency(&state, 100).is_ok());
     }
 
     #[test]
-    fn test_compare_states() {
+    fn state_root_consistency_zero_iterations_returns_root() {
+        let state = KvState::default();
+        // `iterations == 0` is treated as `1`; no panic.
+        let root = verify_state_root_consistency(&state, 0).unwrap();
+        assert_eq!(root, state.root());
+    }
+
+    // ── State diff ──────────────────────────────────────────────────────
+
+    #[test]
+    fn compare_states_reports_all_differences() {
         let mut a = KvState::default();
         let mut b = KvState::default();
 
         a.balances.insert("alice".into(), 100);
-        b.balances.insert("alice".into(), 200);
-        b.balances.insert("bob".into(), 50);
+        b.balances.insert("alice".into(), 200); // differs
+        b.balances.insert("bob".into(), 50);    // only in B
+        a.nonces.insert("alice".into(), 1);
+        a.nonces.insert("carol".into(), 7);     // only in A
+        a.kv.insert("k1".into(), "v1".into());
+        b.kv.insert("k1".into(), "v2".into());  // differs
 
         let diffs = compare_states(&a, &b);
-        assert!(diffs.iter().any(|d| d.contains("alice") && d.contains("100 vs 200")));
-        assert!(diffs.iter().any(|d| d.contains("bob") && d.contains("only in B")));
+        assert!(diffs.iter().any(|d| d.contains("balance alice") && d.contains("100 vs 200")));
+        assert!(diffs.iter().any(|d| d.contains("balance bob") && d.contains("only in B")));
+        assert!(diffs.iter().any(|d| d.contains("nonce carol") && d.contains("only in A")));
+        assert!(diffs.iter().any(|d| d.contains("kv k1")));
+    }
+
+    // ── Display ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn batch_result_display_reports_success() {
+        let state = KvState::default();
+        let root = state.root();
+        let blocks = vec![empty_block(1, root)];
+        let r = verify_chain_reproducibility(&blocks, &state, &config(2)).unwrap();
+        let s = r.to_string();
+        assert!(s.contains("ALL REPRODUCIBLE"));
+        assert!(s.contains("blocks=1"));
+        assert!(s.contains("total_iterations=2"));
+    }
+
+    // ── Nondeterminism logging ──────────────────────────────────────────
+
+    #[test]
+    fn nondeterminism_logger_is_attached_when_enabled() {
+        let state = KvState::default();
+        let root = state.root();
+        let blocks = vec![empty_block(1, root)];
+        let c = ReproducibilityConfig {
+            enable_nondeterminism_logging: true,
+            ..config(2)
+        };
+        let r = verify_chain_reproducibility(&blocks, &state, &c).unwrap();
+        assert!(r.all_reproducible);
+        assert!(r.nondeterminism_report.is_some());
     }
 
     #[test]
-    fn test_batch_result_display() {
+    fn nondeterminism_logger_not_attached_when_disabled() {
         let state = KvState::default();
         let root = state.root();
-        let blocks = vec![empty_block(1, root.clone())];
-        let config = ReproducibilityConfig::default();
-        let result = verify_chain_reproducibility(&blocks, &state, &config);
-        let s = format!("{result}");
-        assert!(s.contains("State Root Reproducibility"));
+        let blocks = vec![empty_block(1, root)];
+        let c = config(2);
+        let r = verify_chain_reproducibility(&blocks, &state, &c).unwrap();
+        assert!(r.nondeterminism_report.is_none());
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn short_hex_is_eight_bytes() {
+        let h = Hash32([0xAB; 32]);
+        let s = short_hex(&h);
+        assert_eq!(s.len(), 2 + 16); // "0x" + 8 bytes
+        assert!(s.starts_with("0x"));
     }
 }
