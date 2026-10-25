@@ -1,93 +1,95 @@
 //! Cryptographic primitives for IONA.
 //!
-//! This module provides:
-//! - Public key and signature type wrappers with hex and base64 serialisation.
-//! - Traits `Signer` and `Verifier` for pluggable signing backends.
-//! - Ed25519 implementation (ed25519 module).
-//! - Transaction signing utilities (tx module).
-//! - Encrypted keystore (keystore module).
-//! - Remote signer client (remote_signer module).
-//! - HSM support (hsm module, optional).
+//! Provides:
+//! - [`PublicKeyBytes`] and [`SignatureBytes`] type wrappers with hex
+//!   and base64 serialization.
+//! - The infallible [`Signer`] trait for **local** signing backends, and
+//!   the (separate, fallible) `HsmSigner` trait for remote/HSM backends
+//!   — see the [`hsm`] module.
+//! - [`Verifier`], a stateless trait for signature validation.
+//! - [`CryptoManager`], a thread-safe container that binds a signer, a
+//!   verifier, and a metrics bundle.
 //!
-//! # Production Features
-//! - Unified `CryptoConfig` for all cryptographic subsystems.
-//! - `CryptoManager` as a thread‑safe container for signers and verifiers.
-//! - `CryptoMetrics` for monitoring signing operations, errors, and latency.
-//! - Support for key backup and restoration.
-//! - Comprehensive validation and error handling.
-//! - Structured logging with `tracing`.
-//! - Full test coverage.
+//! # Which trait do I want?
+//!
+//! | Backend                  | Trait       | Failure mode            |
+//! |--------------------------|-------------|-------------------------|
+//! | Local Ed25519 keypair    | [`Signer`]  | infallible (`SignatureBytes`) |
+//! | Remote signer / HSM/KMS  | `HsmSigner` | fallible (`Result<SignatureBytes, CryptoError>`) |
+//!
+//! `CryptoManager` wraps a `Signer` and is intended for the local case.
+//! For a remote/HSM backend, construct an `HsmManager` directly — the
+//! two managers are distinct because their failure models differ, and a
+//! uniform "signature or error" return type would force every local-only
+//! caller to `.expect()` on every signature.
+//!
+//! # Base64
+//!
+//! This module targets the `base64` 0.13–0.20 free-function API
+//! (`base64::encode` / `base64::decode`). For `base64 >= 0.21`, replace
+//! with `base64::engine::general_purpose::STANDARD.encode / decode`.
+//!
+//! # Hex
+//!
+//! Hex input accepts an optional `0x`/`0X` prefix, matching the rest of
+//! the codebase. Output is always lowercase, unprefixed hex.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tracing::{debug, error, info, trace, warn};
+use tracing::trace;
 
 // ── Submodules ────────────────────────────────────────────────────────────
 
 pub mod ed25519;
-pub mod tx;
+pub mod hsm;
 pub mod keystore;
 pub mod remote_signer;
-pub mod hsm;
+pub mod tx;
 
-// ── Re‑exports ───────────────────────────────────────────────────────────
+// ── Re-exports ────────────────────────────────────────────────────────────
 
 pub use ed25519::{Ed25519Signer, Ed25519Verifier};
-pub use tx::{derive_address, tx_sign_bytes, tx_verify_signature};
 pub use keystore::{KeystoreConfig, KeystoreManager, KeystoreOptions, SecretString};
 pub use remote_signer::{RemoteSigner, RemoteSignerConfig};
+pub use tx::{derive_address, tx_sign_bytes, tx_verify_signature};
+
 #[cfg(feature = "hsm")]
 pub use hsm::{HsmManager, HsmSigner, KeyBackendConfig};
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
-/// Length of an Ed25519 public key in bytes.
+/// Length of an Ed25519 public key, in bytes.
 pub const PUBLIC_KEY_LEN: usize = 32;
 
-/// Length of an Ed25519 signature in bytes.
+/// Length of an Ed25519 signature, in bytes.
 pub const SIGNATURE_LEN: usize = 64;
 
-/// Default network timeout in seconds.
 pub const DEFAULT_NETWORK_TIMEOUT_SECS: u64 = 10;
-
-/// Default retry attempts for crypto operations.
 pub const DEFAULT_RETRY_ATTEMPTS: u32 = 3;
-
-/// Default initial backoff in milliseconds.
 pub const DEFAULT_INITIAL_BACKOFF_MS: u64 = 100;
-
-/// Default maximum backoff in milliseconds.
-pub const DEFAULT_MAX_BACKOFF_MS: u64 = 5000;
+pub const DEFAULT_MAX_BACKOFF_MS: u64 = 5_000;
 
 // ── Configuration ─────────────────────────────────────────────────────────
 
-/// Unified configuration for cryptographic subsystems.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Unified configuration for the cryptographic subsystems.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CryptoConfig {
-    /// Network timeout in seconds.
     pub network_timeout_secs: u64,
-    /// Retry attempts for operations.
     pub retry_attempts: u32,
-    /// Initial backoff in milliseconds.
     pub initial_backoff_ms: u64,
-    /// Maximum backoff in milliseconds.
     pub max_backoff_ms: u64,
-    /// Keystore configuration.
     pub keystore: keystore::KeystoreConfig,
-    /// Remote signer configuration (optional).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_signer: Option<remote_signer::RemoteSignerConfig>,
-    /// HSM configuration (optional).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hsm: Option<hsm::KeyBackendConfig>,
-    /// Whether to enable metrics.
     #[serde(default = "default_true")]
     pub enable_metrics: bool,
-    /// Whether to log operations.
     #[serde(default = "default_true")]
     pub log_operations: bool,
 }
@@ -102,36 +104,39 @@ impl Default for CryptoConfig {
             keystore: keystore::KeystoreConfig::default(),
             remote_signer: None,
             hsm: None,
-            enable_metrics: default_true(),
-            log_operations: default_true(),
+            enable_metrics: true,
+            log_operations: true,
         }
     }
 }
 
 impl CryptoConfig {
     /// Validate the configuration.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), CryptoError> {
         if self.network_timeout_secs == 0 {
-            return Err("network_timeout_secs must be > 0".into());
+            return Err(CryptoError::Config("network_timeout_secs must be > 0".into()));
         }
         if self.retry_attempts == 0 {
-            return Err("retry_attempts must be > 0".into());
+            return Err(CryptoError::Config("retry_attempts must be > 0".into()));
         }
         if self.initial_backoff_ms == 0 {
-            return Err("initial_backoff_ms must be > 0".into());
+            return Err(CryptoError::Config("initial_backoff_ms must be > 0".into()));
         }
-        if self.max_backoff_ms == 0 {
-            return Err("max_backoff_ms must be > 0".into());
+        if self.max_backoff_ms < self.initial_backoff_ms {
+            return Err(CryptoError::Config(
+                "max_backoff_ms must be >= initial_backoff_ms".into(),
+            ));
         }
-        self.keystore.validate()
-            .map_err(|e| format!("keystore validation: {}", e))?;
-        if let Some(ref rs) = self.remote_signer {
+        self.keystore
+            .validate()
+            .map_err(|e| CryptoError::Config(format!("keystore: {e}")))?;
+        if let Some(rs) = &self.remote_signer {
             rs.validate()
-                .map_err(|e| format!("remote signer validation: {}", e))?;
+                .map_err(|e| CryptoError::Config(format!("remote signer: {e}")))?;
         }
-        if let Some(ref hsm) = self.hsm {
+        if let Some(hsm) = &self.hsm {
             hsm.validate()
-                .map_err(|e| format!("HSM validation: {}", e))?;
+                .map_err(|e| CryptoError::Config(format!("hsm: {e}")))?;
         }
         Ok(())
     }
@@ -141,101 +146,160 @@ fn default_true() -> bool {
     true
 }
 
-// ── Errors ───────────────────────────────────────────────────────────────
+// ── Errors ────────────────────────────────────────────────────────────────
 
-/// Cryptographic errors that can occur during signature verification or key handling.
+/// Cryptographic errors.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CryptoError {
-    /// Signature verification failed.
     #[error("invalid signature")]
     InvalidSignature,
 
-    /// Invalid key.
     #[error("invalid key: {0}")]
     InvalidKey(String),
 
-    /// Key length mismatch.
     #[error("invalid key length: expected {expected}, got {actual}")]
     KeyLength { expected: usize, actual: usize },
 
-    /// Configuration error.
+    #[error("key not found")]
+    KeyNotFound,
+
+    #[error("backend unsupported: {0}")]
+    BackendUnsupported(String),
+
+    #[error("batch length mismatch: {msgs} messages, {sigs} signatures")]
+    BatchLengthMismatch { msgs: usize, sigs: usize },
+
     #[error("configuration error: {0}")]
     Config(String),
 
-    /// Network error.
     #[error("network error: {0}")]
     Network(String),
 
-    /// Timeout error.
     #[error("timeout")]
     Timeout,
 
-    /// Backend‑specific error.
     #[error("backend error: {0}")]
     Backend(String),
 
-    /// Internal error.
     #[error("internal error: {0}")]
     Internal(String),
 }
 
 pub type CryptoResult<T> = Result<T, CryptoError>;
 
-// ── PublicKeyBytes ───────────────────────────────────────────────────────
+// ── Hex / base64 helpers ──────────────────────────────────────────────────
 
-/// Public key bytes wrapper with hex and base64 serialisation.
+/// Decode hex, tolerating an optional `0x`/`0X` prefix.
+fn decode_hex(s: &str) -> CryptoResult<Vec<u8>> {
+    let trimmed = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    hex::decode(trimmed).map_err(|e| CryptoError::InvalidKey(format!("hex: {e}")))
+}
+
+/// Decode base64. See the module doc for the base64 version note.
+fn decode_base64(s: &str) -> CryptoResult<Vec<u8>> {
+    base64::decode(s).map_err(|e| CryptoError::InvalidKey(format!("base64: {e}")))
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    base64::encode(bytes)
+}
+
+// ── PublicKeyBytes ────────────────────────────────────────────────────────
+
+/// Public key bytes with hex/base64 serialization.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct PublicKeyBytes(pub Vec<u8>);
 
 impl PublicKeyBytes {
-    /// Create a new public key from a hex string.
+    /// Parse from a hex string (optional `0x` prefix). Enforces
+    /// [`PUBLIC_KEY_LEN`].
     pub fn from_hex(s: &str) -> CryptoResult<Self> {
-        let bytes = hex::decode(s).map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
+        let bytes = decode_hex(s)?;
         if bytes.len() != PUBLIC_KEY_LEN {
             return Err(CryptoError::KeyLength {
                 expected: PUBLIC_KEY_LEN,
                 actual: bytes.len(),
             });
         }
-        Ok(PublicKeyBytes(bytes))
+        Ok(Self(bytes))
     }
 
-    /// Create a new public key from a base64 string.
+    /// Parse from a base64 string. Enforces [`PUBLIC_KEY_LEN`].
     pub fn from_base64(s: &str) -> CryptoResult<Self> {
-        let bytes = base64::decode(s).map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
+        let bytes = decode_base64(s)?;
         if bytes.len() != PUBLIC_KEY_LEN {
             return Err(CryptoError::KeyLength {
                 expected: PUBLIC_KEY_LEN,
                 actual: bytes.len(),
             });
         }
-        Ok(PublicKeyBytes(bytes))
+        Ok(Self(bytes))
     }
 
-    /// Encode the public key as a hex string.
+    /// Build from a raw byte slice. Enforces [`PUBLIC_KEY_LEN`].
+    pub fn try_from_slice(bytes: &[u8]) -> CryptoResult<Self> {
+        if bytes.len() != PUBLIC_KEY_LEN {
+            return Err(CryptoError::KeyLength {
+                expected: PUBLIC_KEY_LEN,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+
+    /// Lowercase, unprefixed hex.
+    #[must_use]
     pub fn to_hex(&self) -> String {
         hex::encode(&self.0)
     }
 
-    /// Encode the public key as a base64 string.
+    /// Standard base64. See the module doc for the version note.
+    #[must_use]
     pub fn to_base64(&self) -> String {
-        base64::encode(&self.0)
+        encode_base64(&self.0)
     }
 
-    /// Check if the public key is empty.
-    pub fn is_empty(&self) -> bool {
-        self.0.iter().all(|&b| b == 0)
+    /// Whether every byte is zero.
+    ///
+    /// **Not** the same as "empty": an all-zero 32-byte Ed25519 key is a
+    /// syntactically valid key that will never verify a signature. The
+    /// previous `is_empty()` name was misleading — this method has been
+    /// renamed.
+    #[must_use]
+    pub fn is_all_zero(&self) -> bool {
+        !self.0.is_empty() && self.0.iter().all(|&b| b == 0)
     }
 
-    /// Get the public key as a byte slice.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the byte vector is empty (length 0). Valid keys are never
+    /// empty; this exists for `is_empty`/`len` symmetry.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl AsRef<[u8]> for PublicKeyBytes {
+    fn as_ref(&self) -> &[u8] {
         &self.0
     }
 }
 
 impl fmt::Display for PublicKeyBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_hex())
+        f.write_str(&self.to_hex())
     }
 }
 
@@ -248,68 +312,96 @@ impl FromStr for PublicKeyBytes {
 }
 
 impl Serialize for PublicKeyBytes {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_hex())
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_hex())
     }
 }
 
 impl<'de> Deserialize<'de> for PublicKeyBytes {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
         Self::from_hex(&s).map_err(serde::de::Error::custom)
     }
 }
 
-// ── SignatureBytes ──────────────────────────────────────────────────────
+// ── SignatureBytes ────────────────────────────────────────────────────────
 
-/// Signature bytes wrapper (usually 64 bytes for Ed25519).
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// Signature bytes (64 bytes for Ed25519).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub struct SignatureBytes(pub Vec<u8>);
 
 impl SignatureBytes {
-    /// Create a new signature from a hex string.
+    /// Parse from a hex string (optional `0x` prefix). Enforces
+    /// [`SIGNATURE_LEN`].
     pub fn from_hex(s: &str) -> CryptoResult<Self> {
-        let bytes = hex::decode(s).map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
+        let bytes = decode_hex(s)?;
         if bytes.len() != SIGNATURE_LEN {
             return Err(CryptoError::KeyLength {
                 expected: SIGNATURE_LEN,
                 actual: bytes.len(),
             });
         }
-        Ok(SignatureBytes(bytes))
+        Ok(Self(bytes))
     }
 
-    /// Create a new signature from a base64 string.
+    /// Parse from a base64 string. Enforces [`SIGNATURE_LEN`].
     pub fn from_base64(s: &str) -> CryptoResult<Self> {
-        let bytes = base64::decode(s).map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
+        let bytes = decode_base64(s)?;
         if bytes.len() != SIGNATURE_LEN {
             return Err(CryptoError::KeyLength {
                 expected: SIGNATURE_LEN,
                 actual: bytes.len(),
             });
         }
-        Ok(SignatureBytes(bytes))
+        Ok(Self(bytes))
     }
 
-    /// Encode the signature as a hex string.
+    /// Build from a raw byte slice. Enforces [`SIGNATURE_LEN`].
+    pub fn try_from_slice(bytes: &[u8]) -> CryptoResult<Self> {
+        if bytes.len() != SIGNATURE_LEN {
+            return Err(CryptoError::KeyLength {
+                expected: SIGNATURE_LEN,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+
+    #[must_use]
     pub fn to_hex(&self) -> String {
         hex::encode(&self.0)
     }
 
-    /// Encode the signature as a base64 string.
+    #[must_use]
     pub fn to_base64(&self) -> String {
-        base64::encode(&self.0)
+        encode_base64(&self.0)
     }
 
-    /// Get the signature as a byte slice.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl AsRef<[u8]> for SignatureBytes {
+    fn as_ref(&self) -> &[u8] {
         &self.0
     }
 }
 
 impl fmt::Display for SignatureBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_hex())
+        f.write_str(&self.to_hex())
     }
 }
 
@@ -321,44 +413,53 @@ impl FromStr for SignatureBytes {
     }
 }
 
-// ── Signer trait ─────────────────────────────────────────────────────────
+// ── Signer trait (infallible, local) ──────────────────────────────────────
 
-/// A signer that can produce signatures for arbitrary messages.
+/// Infallible signer for **local** keypairs.
+///
+/// A `Signer` must be able to produce a signature without any I/O. That
+/// is true for in-memory Ed25519 keys and false for remote signers, HSMs,
+/// and cloud KMS — those use the separate (fallible) `HsmSigner` trait in
+/// the [`hsm`] module.
+///
+/// If you find yourself wanting to return an error from `sign`, you
+/// probably want `HsmSigner`, not this trait.
 pub trait Signer: Send + Sync {
-    /// Return the public key corresponding to this signer.
     fn public_key(&self) -> PublicKeyBytes;
-
-    /// Sign the given message and return the signature.
     fn sign(&self, msg: &[u8]) -> SignatureBytes;
 
-    /// Return a human‑readable name of the signing backend.
-    fn backend_name(&self) -> &str {
+    /// Human-readable backend name for logs and metrics labels.
+    fn backend_name(&self) -> &'static str {
         "unknown"
     }
 
-    /// Check if the signer is healthy / reachable.
+    /// Liveness probe. For a local signer this returns `Ok(())`.
     fn health_check(&self) -> CryptoResult<()> {
         Ok(())
     }
 }
 
-// ── Verifier trait ──────────────────────────────────────────────────────
+// ── Verifier trait ────────────────────────────────────────────────────────
 
-/// A stateless verifier that can validate signatures against public keys.
+/// Stateless signature verifier.
 pub trait Verifier: Send + Sync {
-    /// Verify that `sig` is a valid signature for `msg` under `pk`.
     fn verify(pk: &PublicKeyBytes, msg: &[u8], sig: &SignatureBytes) -> CryptoResult<()>;
 
-    /// Verify a batch of signatures (same key, multiple messages).
+    /// Verify a batch. The default implementation loops over `verify`.
+    ///
+    /// # Errors
+    ///
+    /// - [`CryptoError::BatchLengthMismatch`] if `msgs.len() != sigs.len()`.
+    /// - Any error returned by [`verify`](Self::verify).
     fn verify_batch(
         pk: &PublicKeyBytes,
         msgs: &[&[u8]],
         sigs: &[SignatureBytes],
     ) -> CryptoResult<()> {
         if msgs.len() != sigs.len() {
-            return Err(CryptoError::KeyLength {
-                expected: msgs.len(),
-                actual: sigs.len(),
+            return Err(CryptoError::BatchLengthMismatch {
+                msgs: msgs.len(),
+                sigs: sigs.len(),
             });
         }
         for (msg, sig) in msgs.iter().zip(sigs.iter()) {
@@ -368,58 +469,110 @@ pub trait Verifier: Send + Sync {
     }
 }
 
-// ── CryptoManager ──────────────────────────────────────────────────────
+// ── CryptoManager ─────────────────────────────────────────────────────────
 
-/// Thread‑safe manager for cryptographic operations.
+/// Thread-safe container for a signer, a verifier, and metrics.
+///
+/// Cloning shares state via `Arc`. `CryptoManager` wraps the infallible
+/// [`Signer`] trait, so it is intended for **local** keypairs. For a
+/// remote/HSM backend, use `HsmManager` directly.
 #[derive(Clone)]
 pub struct CryptoManager {
     config: Arc<CryptoConfig>,
-    signer: Arc<Box<dyn Signer>>,
+    signer: Arc<dyn Signer>,
     verifier: Arc<dyn Verifier>,
     metrics: Arc<CryptoMetrics>,
 }
 
 impl CryptoManager {
-    /// Create a new manager with the given signer and verifier.
+    /// Construct a manager with unregistered metrics.
+    ///
+    /// `enable_metrics` in the config is honoured: when `true`, the
+    /// constructor tries to register with the default Prometheus
+    /// registry and falls back to unregistered metrics on a name
+    /// collision (a very common test-suite situation).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(CryptoError::Config)` if `config.validate()` fails.
     pub fn new(
         config: CryptoConfig,
         signer: Box<dyn Signer>,
         verifier: Arc<dyn Verifier>,
-    ) -> Result<Self, String> {
+    ) -> CryptoResult<Self> {
         config.validate()?;
-        let metrics = Arc::new(CryptoMetrics::default());
+        let metrics = if config.enable_metrics {
+            match CryptoMetrics::new() {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "crypto metrics already registered; using unregistered instance"
+                    );
+                    CryptoMetrics::unregistered()
+                }
+            }
+        } else {
+            CryptoMetrics::unregistered()
+        };
         Ok(Self {
             config: Arc::new(config),
-            signer: Arc::new(signer),
+            signer: Arc::from(signer),
             verifier,
-            metrics,
+            metrics: Arc::new(metrics),
         })
     }
 
-    /// Get the public key.
+    /// Construct with a caller-supplied metrics handle. Use this when
+    /// the caller has already registered metrics once at startup.
+    pub fn with_metrics(
+        config: CryptoConfig,
+        signer: Box<dyn Signer>,
+        verifier: Arc<dyn Verifier>,
+        metrics: CryptoMetrics,
+    ) -> CryptoResult<Self> {
+        config.validate()?;
+        Ok(Self {
+            config: Arc::new(config),
+            signer: Arc::from(signer),
+            verifier,
+            metrics: Arc::new(metrics),
+        })
+    }
+
+    #[must_use]
     pub fn public_key(&self) -> PublicKeyBytes {
         self.signer.public_key()
     }
 
-    /// Sign a message, recording metrics.
+    /// Sign a message.
+    ///
+    /// This method is infallible because it wraps a [`Signer`], which is
+    /// the infallible (local) trait. For remote/HSM signing, use
+    /// `HsmManager::sign` instead.
     pub fn sign(&self, msg: &[u8]) -> SignatureBytes {
         let start = Instant::now();
-        let result = self.signer.sign(msg);
+        let sig = self.signer.sign(msg);
         let duration = start.elapsed();
         self.metrics.record_sign(self.signer.backend_name(), duration);
         if self.config.log_operations {
             trace!(
                 backend = self.signer.backend_name(),
                 msg_len = msg.len(),
-                duration_ms = duration.as_millis(),
+                duration_us = duration.as_micros() as u64,
                 "signature generated"
             );
         }
-        result
+        sig
     }
 
     /// Verify a signature.
-    pub fn verify(&self, pk: &PublicKeyBytes, msg: &[u8], sig: &SignatureBytes) -> CryptoResult<()> {
+    pub fn verify(
+        &self,
+        pk: &PublicKeyBytes,
+        msg: &[u8],
+        sig: &SignatureBytes,
+    ) -> CryptoResult<()> {
         let start = Instant::now();
         let result = self.verifier.verify(pk, msg, sig);
         let duration = start.elapsed();
@@ -427,15 +580,14 @@ impl CryptoManager {
         self.metrics.record_verify(status, duration);
         if self.config.log_operations {
             trace!(
-                status = status,
-                duration_ms = duration.as_millis(),
+                status,
+                duration_us = duration.as_micros() as u64,
                 "signature verification"
             );
         }
         result
     }
 
-    /// Verify a batch of signatures.
     pub fn verify_batch(
         &self,
         pk: &PublicKeyBytes,
@@ -445,30 +597,34 @@ impl CryptoManager {
         self.verifier.verify_batch(pk, msgs, sigs)
     }
 
-    /// Health check.
     pub fn health_check(&self) -> CryptoResult<()> {
         self.signer.health_check()
     }
 
-    /// Get the backend name.
-    pub fn backend_name(&self) -> &str {
+    #[must_use]
+    pub fn backend_name(&self) -> &'static str {
         self.signer.backend_name()
     }
 
-    /// Get configuration.
+    #[must_use]
     pub fn config(&self) -> &CryptoConfig {
         &self.config
     }
 
-    /// Get metrics snapshot.
+    /// Owned snapshot of the current metrics.
+    #[must_use]
     pub fn metrics_snapshot(&self) -> CryptoMetricsSnapshot {
         self.metrics.snapshot()
     }
 }
 
-// ── CryptoMetrics ──────────────────────────────────────────────────────
+// ── CryptoMetrics ────────────────────────────────────────────────────────
 
-/// Metrics for cryptographic operations.
+/// Prometheus metrics for cryptographic operations.
+///
+/// [`new`](Self::new) registers with the default registry and can only
+/// succeed once per process. [`unregistered`](Self::unregistered) is
+/// fail-free; [`Default`] uses it.
 #[derive(Clone)]
 pub struct CryptoMetrics {
     pub sign_operations: prometheus::CounterVec,
@@ -478,112 +634,152 @@ pub struct CryptoMetrics {
 }
 
 impl CryptoMetrics {
+    /// Register with the default Prometheus registry.
     pub fn new() -> Result<Self, prometheus::Error> {
-        let sign_operations = prometheus::register_counter_vec!(
-            "iona_crypto_sign_operations_total",
-            "Total sign operations",
-            &["backend"]
-        )?;
-        let sign_latency = prometheus::register_histogram_vec!(
-            "iona_crypto_sign_latency_seconds",
-            "Sign latency",
-            &["backend"]
-        )?;
-        let verify_operations = prometheus::register_counter_vec!(
-            "iona_crypto_verify_operations_total",
-            "Total verify operations",
-            &["status"]
-        )?;
-        let verify_latency = prometheus::register_histogram_vec!(
-            "iona_crypto_verify_latency_seconds",
-            "Verify latency",
-            &["status"]
-        )?;
         Ok(Self {
-            sign_operations,
-            sign_latency,
-            verify_operations,
-            verify_latency,
+            sign_operations: prometheus::register_counter_vec!(
+                "iona_crypto_sign_operations_total",
+                "Sign operations",
+                &["backend"]
+            )?,
+            sign_latency: prometheus::register_histogram_vec!(
+                "iona_crypto_sign_latency_seconds",
+                "Sign latency",
+                &["backend"]
+            )?,
+            verify_operations: prometheus::register_counter_vec!(
+                "iona_crypto_verify_operations_total",
+                "Verify operations",
+                &["status"]
+            )?,
+            verify_latency: prometheus::register_histogram_vec!(
+                "iona_crypto_verify_latency_seconds",
+                "Verify latency",
+                &["status"]
+            )?,
         })
     }
 
-    pub fn record_sign(&self, backend: &str, duration: Duration) {
-        self.sign_operations.with_label_values(&[backend]).inc();
-        self.sign_latency.with_label_values(&[backend]).observe(duration.as_secs_f64());
-    }
-
-    pub fn record_verify(&self, status: &str, duration: Duration) {
-        self.verify_operations.with_label_values(&[status]).inc();
-        self.verify_latency.with_label_values(&[status]).observe(duration.as_secs_f64());
-    }
-
-    pub fn snapshot(&self) -> CryptoMetricsSnapshot {
-        CryptoMetricsSnapshot {
-            sign_operations: self.sign_operations.clone(),
-            verify_operations: self.verify_operations.clone(),
-        }
-    }
-}
-
-impl Default for CryptoMetrics {
-    fn default() -> Self {
-        Self::new().unwrap_or_else(|_| Self {
+    /// Fail-free metrics bundle; never registers with Prometheus.
+    pub fn unregistered() -> Self {
+        Self {
             sign_operations: prometheus::CounterVec::new(
-                prometheus::Opts::new("iona_crypto_sign_operations_total", "Sign ops"),
+                prometheus::Opts::new("iona_crypto_sign_operations_total", "Sign operations"),
                 &["backend"],
-            ).unwrap(),
+            )
+            .expect("counter vec construction is infallible"),
             sign_latency: prometheus::HistogramVec::new(
                 prometheus::HistogramOpts::new(
                     "iona_crypto_sign_latency_seconds",
                     "Sign latency",
                 ),
                 &["backend"],
-            ).unwrap(),
+            )
+            .expect("histogram vec construction is infallible"),
             verify_operations: prometheus::CounterVec::new(
-                prometheus::Opts::new("iona_crypto_verify_operations_total", "Verify ops"),
+                prometheus::Opts::new(
+                    "iona_crypto_verify_operations_total",
+                    "Verify operations",
+                ),
                 &["status"],
-            ).unwrap(),
+            )
+            .expect("counter vec construction is infallible"),
             verify_latency: prometheus::HistogramVec::new(
                 prometheus::HistogramOpts::new(
                     "iona_crypto_verify_latency_seconds",
                     "Verify latency",
                 ),
                 &["status"],
-            ).unwrap(),
-        })
+            )
+            .expect("histogram vec construction is infallible"),
+        }
+    }
+
+    pub fn record_sign(&self, backend: &str, duration: Duration) {
+        self.sign_operations
+            .with_label_values(&[backend])
+            .inc();
+        self.sign_latency
+            .with_label_values(&[backend])
+            .observe(duration.as_secs_f64());
+    }
+
+    pub fn record_verify(&self, status: &str, duration: Duration) {
+        self.verify_operations
+            .with_label_values(&[status])
+            .inc();
+        self.verify_latency
+            .with_label_values(&[status])
+            .observe(duration.as_secs_f64());
+    }
+
+    /// Owned, serializable snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> CryptoMetricsSnapshot {
+        CryptoMetricsSnapshot {
+            sign_operations: collect(&self.sign_operations),
+            verify_operations: collect(&self.verify_operations),
+        }
     }
 }
 
-/// Snapshot of crypto metrics.
-#[derive(Debug, Clone)]
-pub struct CryptoMetricsSnapshot {
-    pub sign_operations: prometheus::CounterVec,
-    pub verify_operations: prometheus::CounterVec,
+impl Default for CryptoMetrics {
+    fn default() -> Self {
+        Self::unregistered()
+    }
 }
 
-// ── Convenience functions ──────────────────────────────────────────────
+/// Owned snapshot of one counter family.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CounterSnapshot {
+    pub labels: BTreeMap<String, String>,
+    pub value: u64,
+}
+
+/// Owned snapshot of [`CryptoMetrics`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CryptoMetricsSnapshot {
+    pub sign_operations: Vec<CounterSnapshot>,
+    pub verify_operations: Vec<CounterSnapshot>,
+}
+
+fn collect(vec: &prometheus::CounterVec) -> Vec<CounterSnapshot> {
+    let mut out = Vec::new();
+    for mf in vec.collect() {
+        for m in mf.get_metric() {
+            let mut labels = BTreeMap::new();
+            for l in m.get_label() {
+                labels.insert(l.get_name().to_string(), l.get_value().to_string());
+            }
+            out.push(CounterSnapshot {
+                labels,
+                value: m.get_counter().get_value() as u64,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.labels.cmp(&b.labels));
+    out
+}
+
+// ── Convenience helpers ──────────────────────────────────────────────────
 
 /// Verify an Ed25519 signature.
 pub fn verify_ed25519(pk: &PublicKeyBytes, msg: &[u8], sig: &SignatureBytes) -> CryptoResult<()> {
     ed25519::Ed25519Verifier::verify(pk, msg, sig)
 }
 
-/// Create a public key from a hex string.
 pub fn public_key_from_hex(s: &str) -> CryptoResult<PublicKeyBytes> {
     PublicKeyBytes::from_hex(s)
 }
 
-/// Create a public key from a base64 string.
 pub fn public_key_from_base64(s: &str) -> CryptoResult<PublicKeyBytes> {
     PublicKeyBytes::from_base64(s)
 }
 
-/// Create a signature from a hex string.
 pub fn signature_from_hex(s: &str) -> CryptoResult<SignatureBytes> {
     SignatureBytes::from_hex(s)
 }
 
-/// Create a signature from a base64 string.
 pub fn signature_from_base64(s: &str) -> CryptoResult<SignatureBytes> {
     SignatureBytes::from_base64(s)
 }
@@ -593,96 +789,237 @@ pub fn signature_from_base64(s: &str) -> CryptoResult<SignatureBytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::ed25519::{Ed25519Signer, Ed25519Verifier};
-    use std::sync::Arc;
+
+    // ── PublicKeyBytes ──────────────────────────────────────────────────
 
     #[test]
-    fn test_public_key_bytes_hex_roundtrip() {
+    fn public_key_hex_roundtrip() {
         let orig = PublicKeyBytes(vec![0xAA; 32]);
-        let hex = orig.to_hex();
-        let restored = PublicKeyBytes::from_hex(&hex).unwrap();
-        assert_eq!(orig, restored);
+        assert_eq!(PublicKeyBytes::from_hex(&orig.to_hex()).unwrap(), orig);
     }
 
     #[test]
-    fn test_public_key_bytes_base64_roundtrip() {
+    fn public_key_hex_accepts_0x_prefix() {
+        let orig = PublicKeyBytes(vec![0x11; 32]);
+        let with_prefix = format!("0x{}", orig.to_hex());
+        assert_eq!(PublicKeyBytes::from_hex(&with_prefix).unwrap(), orig);
+    }
+
+    #[test]
+    fn public_key_base64_roundtrip() {
         let orig = PublicKeyBytes(vec![0xBB; 32]);
-        let b64 = orig.to_base64();
-        let restored = PublicKeyBytes::from_base64(&b64).unwrap();
-        assert_eq!(orig, restored);
+        assert_eq!(
+            PublicKeyBytes::from_base64(&orig.to_base64()).unwrap(),
+            orig
+        );
     }
 
     #[test]
-    fn test_public_key_bytes_display_fromstr() {
-        let orig = PublicKeyBytes(vec![0xCC; 32]);
-        let s = orig.to_string();
-        let restored: PublicKeyBytes = s.parse().unwrap();
-        assert_eq!(orig, restored);
+    fn public_key_rejects_wrong_length() {
+        let hex = "00".repeat(31);
+        let err = PublicKeyBytes::from_hex(&hex).unwrap_err();
+        assert!(matches!(
+            err,
+            CryptoError::KeyLength { expected: 32, actual: 31 }
+        ));
     }
 
     #[test]
-    fn test_public_key_bytes_serialize() {
+    fn public_key_rejects_non_hex() {
+        assert!(matches!(
+            PublicKeyBytes::from_hex("not-hex"),
+            Err(CryptoError::InvalidKey(_))
+        ));
+    }
+
+    #[test]
+    fn is_all_zero_distinguishes_from_empty() {
+        // Regression: the previous `is_empty()` returned true for any
+        // all-zero key, which is a *valid* (if useless) Ed25519 key.
+        let zero = PublicKeyBytes(vec![0u8; 32]);
+        let empty = PublicKeyBytes(vec![]);
+        assert!(zero.is_all_zero());
+        assert!(!zero.is_empty());
+        assert!(!empty.is_all_zero());
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn public_key_display_and_fromstr() {
+        let pk = PublicKeyBytes(vec![0xCC; 32]);
+        let parsed: PublicKeyBytes = pk.to_string().parse().unwrap();
+        assert_eq!(pk, parsed);
+    }
+
+    #[test]
+    fn public_key_serde_roundtrip() {
         let pk = PublicKeyBytes(vec![0xDD; 32]);
         let json = serde_json::to_string(&pk).unwrap();
         assert!(json.contains(&pk.to_hex()));
-        let restored: PublicKeyBytes = serde_json::from_str(&json).unwrap();
-        assert_eq!(pk, restored);
+        let back: PublicKeyBytes = serde_json::from_str(&json).unwrap();
+        assert_eq!(pk, back);
+    }
+
+    // ── SignatureBytes ──────────────────────────────────────────────────
+
+    #[test]
+    fn signature_hex_roundtrip() {
+        let s = SignatureBytes(vec![0xEE; 64]);
+        assert_eq!(SignatureBytes::from_hex(&s.to_hex()).unwrap(), s);
     }
 
     #[test]
-    fn test_signature_bytes_hex_roundtrip() {
-        let orig = SignatureBytes(vec![0xEE; 64]);
-        let hex = orig.to_hex();
-        let restored = SignatureBytes::from_hex(&hex).unwrap();
-        assert_eq!(orig, restored);
+    fn signature_base64_roundtrip() {
+        let s = SignatureBytes(vec![0xFF; 64]);
+        assert_eq!(SignatureBytes::from_base64(&s.to_base64()).unwrap(), s);
     }
 
     #[test]
-    fn test_signature_bytes_display_fromstr() {
-        let orig = SignatureBytes(vec![0xFF; 64]);
-        let s = orig.to_string();
-        let restored: SignatureBytes = s.parse().unwrap();
-        assert_eq!(orig, restored);
+    fn signature_rejects_wrong_length() {
+        let hex = "00".repeat(63);
+        let err = SignatureBytes::from_hex(&hex).unwrap_err();
+        assert!(matches!(
+            err,
+            CryptoError::KeyLength { expected: 64, actual: 63 }
+        ));
     }
 
-    #[test]
-    fn test_crypto_manager() {
-        let signer = Box::new(Ed25519Signer::random());
-        let verifier = Arc::new(Ed25519Verifier);
-        let config = CryptoConfig::default();
-        let manager = CryptoManager::new(config, signer, verifier).unwrap();
+    // ── Verifier::verify_batch ─────────────────────────────────────────
 
-        let pk = manager.public_key();
-        let msg = b"hello world";
-        let sig = manager.sign(msg);
-        assert!(manager.verify(&pk, msg, &sig).is_ok());
-        assert!(manager.health_check().is_ok());
-        assert_eq!(manager.backend_name(), "local");
+    #[test]
+    fn verify_batch_reports_length_mismatch() {
+        // Regression: the previous implementation returned
+        // `KeyLength { expected: msgs.len(), actual: sigs.len() }`, which
+        // was semantically wrong (a count, not a byte length) and
+        // indistinguishable from a malformed key length.
+        let signer = ed25519::Ed25519Signer::random();
+        let pk = signer.public_key();
+        let sigs = vec![signer.sign(b"a"), signer.sign(b"b")];
+        let err =
+            ed25519::Ed25519Verifier::verify_batch(&pk, &[b"a".as_slice()], &sigs).unwrap_err();
+        assert!(matches!(
+            err,
+            CryptoError::BatchLengthMismatch { msgs: 1, sigs: 2 }
+        ));
     }
 
+    // ── CryptoManager ──────────────────────────────────────────────────
+
     #[test]
-    fn test_config_validation() {
+    fn manager_roundtrip() {
+        let signer = Box::new(ed25519::Ed25519Signer::random());
+        let verifier = Arc::new(ed25519::Ed25519Verifier);
         let mut config = CryptoConfig::default();
-        assert!(config.validate().is_ok());
-        config.network_timeout_secs = 0;
-        assert!(config.validate().is_err());
-        config.network_timeout_secs = 10;
-        config.retry_attempts = 0;
-        assert!(config.validate().is_err());
-        config.retry_attempts = 3;
-        config.initial_backoff_ms = 0;
-        assert!(config.validate().is_err());
-        config.initial_backoff_ms = 100;
-        config.max_backoff_ms = 0;
-        assert!(config.validate().is_err());
+        config.enable_metrics = false; // avoid global registry in tests
+        let m = CryptoManager::new(config, signer, verifier).unwrap();
+
+        let pk = m.public_key();
+        let sig = m.sign(b"hello");
+        m.verify(&pk, b"hello", &sig).unwrap();
+        assert_eq!(m.backend_name(), "local");
+        assert!(m.health_check().is_ok());
     }
 
     #[test]
-    fn test_crypto_error_display() {
-        let err = CryptoError::InvalidSignature;
-        assert_eq!(err.to_string(), "invalid signature");
-        let err = CryptoError::KeyLength { expected: 32, actual: 16 };
-        assert!(err.to_string().contains("32"));
-        assert!(err.to_string().contains("16"));
+    fn manager_verify_rejects_wrong_message() {
+        let signer = Box::new(ed25519::Ed25519Signer::random());
+        let verifier = Arc::new(ed25519::Ed25519Verifier);
+        let mut config = CryptoConfig::default();
+        config.enable_metrics = false;
+        let m = CryptoManager::new(config, signer, verifier).unwrap();
+
+        let pk = m.public_key();
+        let sig = m.sign(b"hello");
+        assert!(matches!(
+            m.verify(&pk, b"goodbye", &sig),
+            Err(CryptoError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn manager_metrics_are_recorded_and_snapshotted() {
+        let signer = Box::new(ed25519::Ed25519Signer::random());
+        let verifier = Arc::new(ed25519::Ed25519Verifier);
+        let mut config = CryptoConfig::default();
+        config.enable_metrics = false;
+        let m = CryptoManager::new(config, signer, verifier).unwrap();
+
+        let pk = m.public_key();
+        let sig = m.sign(b"x");
+        m.verify(&pk, b"x", &sig).unwrap();
+        m.verify(&pk, b"y", &sig).unwrap_err();
+
+        let snap = m.metrics_snapshot();
+        let ok = snap
+            .verify_operations
+            .iter()
+            .find(|c| c.labels.get("status").map(String::as_str) == Some("ok"));
+        let err = snap
+            .verify_operations
+            .iter()
+            .find(|c| c.labels.get("status").map(String::as_str) == Some("error"));
+        assert_eq!(ok.map(|c| c.value), Some(1));
+        assert_eq!(err.map(|c| c.value), Some(1));
+    }
+
+    // ── Metrics default ────────────────────────────────────────────────
+
+    #[test]
+    fn metrics_default_does_not_panic() {
+        // Regression: the previous `Default::default()` chained `.unwrap()`
+        // inside `unwrap_or_else`, so a second instantiation in the same
+        // process panicked on the Prometheus name collision.
+        let _a = CryptoMetrics::unregistered();
+        let _b = CryptoMetrics::unregistered();
+        let _c = CryptoMetrics::default();
+    }
+
+    #[test]
+    fn metrics_snapshot_is_serializable() {
+        let m = CryptoMetrics::unregistered();
+        m.record_sign("local", Duration::from_micros(123));
+        m.record_verify("ok", Duration::from_micros(45));
+        let snap = m.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: CryptoMetricsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    // ── Config ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn config_default_validates() {
+        assert!(CryptoConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn config_rejects_bad_values() {
+        let mut c = CryptoConfig::default();
+        c.network_timeout_secs = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = CryptoConfig::default();
+        c.retry_attempts = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = CryptoConfig::default();
+        c.initial_backoff_ms = 1000;
+        c.max_backoff_ms = 100;
+        assert!(c.validate().is_err());
+    }
+
+    // ── Errors ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn error_display() {
+        assert_eq!(CryptoError::InvalidSignature.to_string(), "invalid signature");
+        assert_eq!(
+            CryptoError::KeyLength { expected: 32, actual: 16 }.to_string(),
+            "invalid key length: expected 32, got 16"
+        );
+        assert_eq!(
+            CryptoError::BatchLengthMismatch { msgs: 3, sigs: 4 }.to_string(),
+            "batch length mismatch: 3 messages, 4 signatures"
+        );
     }
 }
