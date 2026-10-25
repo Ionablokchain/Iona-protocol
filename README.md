@@ -1,3 +1,6 @@
+<img width="2560" height="1440" alt="Test_Iona_protocol25 10 2025" src="https://github.com/user-attachments/assets/579fed4c-b8de-4d98-b2b6-0a0e3baec270" />
+
+
 # IONA
 
 IONA is an experimental open-source framework for deterministic execution verification, reproducibility testing, and upgrade safety in distributed systems.
