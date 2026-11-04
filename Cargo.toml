@@ -1,186 +1,324 @@
+# =============================================================================
+# IONA — Production Cargo manifest (v30.0.0)
+# =============================================================================
+# Layout
+# ------
+# This file is both the workspace root and the `iona` package. The workspace
+# `members` array lists only the root package; adding a sub-crate under
+# `crates/<name>/` means appending it to `members` and adding a
+# `path = "crates/<name>"` dependency. The `resolver = "2"` setting is
+# required for edition 2021+ feature unification across the workspace.
+#
+# Dependency contract
+# -------------------
+# - Every dependency is grouped by purpose with a comment header.
+# - Optional binaries (`bin-*` features) gate `src/bin/*.rs` compilation only;
+#   they do not pull in additional dependencies.
+# - `dep:<crate>` inside a feature keeps the dependency optional even when the
+#   feature is enabled (Cargo's `dep:` syntax, since 1.60).
+# - Every dependency whose major version has a documented breakage carries a
+#   reference-resolution note in its group comment.
+#
+# Reference resolutions
+# ---------------------
+# - `base64 = "0.22"` — the free functions `base64::encode` / `base64::decode`
+#   were REMOVED in 0.21. All callers MUST use
+#   `base64::engine::general_purpose::STANDARD.encode / .decode`.
+# - `rand = "0.8"` — `Rng::gen` is deprecated in 0.8 and REMOVED in 0.9.
+#   All callers MUST use `RngCore::try_fill_bytes` or `Rng::random`. Do NOT
+#   bump to `rand = "0.9"` without auditing every caller.
+# - `tokio` requires the `sync` feature — the code uses
+#   `tokio::sync::Mutex` and `tokio::sync::CancellationToken`.
+# - `ed25519-dalek` requires the `rand_core` feature — for
+#   `SigningKey::generate(&mut OsRng)`.
+# - `revm` is pinned to `^9` — a major-version bump (10, 11, …) is a breaking
+#   interpreter API change. Bump only after auditing `src/blockchain/revm_port.rs`.
+#
+# MSRV
+# ----
+# `rust-version` here is the minimum for the bulk of the code. `#[naked]` in
+# `src/arch/x86_64/context.rs` requires Rust 1.88 on stable (or the nightly
+# `naked_functions` feature). If you build on stable < 1.88, delete the
+# `#[naked]` functions and provide assembly trampolines instead.
+# =============================================================================
+
 [workspace]
-# Virtual workspace – allows adding multiple crates later without changing structure
-members = ["."]
+members  = ["."]
 resolver = "2"
 
 [package]
-name = "iona"
-version = "30.0.0"
-edition = "2021"
-license = "Apache-2.0"
-autobins = false
+name           = "iona"
+version        = "30.0.0"
+edition        = "2021"
+rust-version   = "1.81"     # naked fns need 1.88; see MSRV note above
+license        = "Apache-2.0"
+license-file   = "LICENSE"
+description    = "IONA — BFT blockchain node, VM, and tooling"
+repository     = "https://github.com/iona/iona"
+homepage       = "https://iona.example.invalid"
+documentation  = "https://docs.rs/iona"
+keywords       = ["blockchain", "bft", "consensus", "evm", "wasm"]
+categories     = ["cryptography::cryptocurrencies", "network-programming"]
+readme         = "README.md"
+autobins       = false
+
+# =============================================================================
+# Features
+# =============================================================================
 
 [features]
+default = []
+
 # Enable OpenTelemetry OTLP tracing export.
 otel = [
-  "dep:opentelemetry",
-  "dep:opentelemetry-otlp",
-  "dep:tracing-opentelemetry"
+    "dep:opentelemetry",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
 ]
 
-# Optional binaries (disabled by default). This prevents unfinished tooling in
-# src/bin from breaking `cargo build` / CI / release builds.
-bin-cli            = []
-bin-chaos          = []
-bin-remote-signer  = []
-bin-evm-rpc        = []
-bin-chaindb-tool   = []
-bin-block-store    = []
+# Optional binaries. Disabled by default so that unfinished tooling in
+# `src/bin/` does not break `cargo build` / CI / release builds. Enable with
+# `cargo build --features bin-cli` (etc.).
+bin-cli           = []
+bin-chaos         = []
+bin-remote-signer = []
+bin-evm-rpc       = []
+bin-chaindb-tool  = []
+bin-block-store   = []
 
-# -----------------------------------------------------------------------------
-# Dependencies – grouped by domain
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Dependencies — grouped by domain
+# =============================================================================
 
 [dependencies]
-# Async runtime & networking
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
-futures = "0.3"
-async-trait = "0.1"
-bytes = "1"
+# ── Async runtime & networking ────────────────────────────────────────
+# `sync` is required: `tokio::sync::Mutex` (gas pricing), `tokio::sync::CancellationToken`
+# (scheduler). `rt` is required by `tokio::spawn` and `spawn_blocking`.
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "signal",
+    "sync",
+] }
+futures      = "0.3"
+async-trait  = "0.1"
+bytes        = "1"
 
-# Serialization / data
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-bincode = "1"
-toml = "0.8"
-serde_with = "3"
-hex = "0.4"
-base64 = "0.22"
+# ── Serialization / data ──────────────────────────────────────────────
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+bincode       = "1"
+toml          = "0.8"
+serde_with    = "3"
+hex           = "0.4"
+# `base64 = "0.22"` — `encode`/`decode` free functions were removed in 0.21.
+# All callers must use `base64::engine::general_purpose::STANDARD.encode/decode`.
+base64        = "0.22"
 
-# Error handling & logging
-anyhow = "1"
-thiserror = "2"          # upgrade from 1.x to 2.x
-tracing = "0.1"
+# ── Error handling & logging ──────────────────────────────────────────
+anyhow             = "1"
+thiserror          = "2"
+tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
-# CLI & config
+# ── CLI & config ──────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive"] }
 
-# Web/RPC servers
-axum = "0.7"
-tower-http = { version = "0.5", features = ["cors"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
-rustls = "0.23"
+# ── Web / RPC servers ─────────────────────────────────────────────────
+axum         = "0.7"
+tower-http   = { version = "0.5", features = ["cors"] }
+axum-server  = { version = "0.7", features = ["tls-rustls"] }
+rustls       = "0.23"
 rustls-pemfile = "2"
 
-# HTTP clients (remote signer, health checks)
+# ── HTTP clients (remote signer, health checks) ──────────────────────
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"] }
-ureq = { version = "2", features = ["json"] }
+ureq    = { version = "2", features = ["json"] }
 
-# Cryptography & hashing
+# ── Cryptography & hashing ────────────────────────────────────────────
+# `rand_core` on `ed25519-dalek` is required for
+# `SigningKey::generate(&mut OsRng)` in `src/crypto/ed25519.rs`.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-k256 = { version = "0.13", features = ["ecdsa"] }
-aes-gcm = "0.10"
-pbkdf2 = "0.12"
-sha2 = "0.10"
-sha3 = "0.10"
-blake3 = "1"
-zeroize = "1"
-rand = "0.8"
+k256          = { version = "0.13", features = ["ecdsa"] }
+aes-gcm       = "0.10"
+pbkdf2        = "0.12"
+sha2          = "0.10"
+sha3          = "0.10"
+blake3        = "1"
+zeroize       = "1"
+# `rand = "0.8"` — `Rng::gen` is deprecated in 0.8 and removed in 0.9.
+# Do NOT bump to 0.9 without migrating every caller to
+# `try_fill_bytes` / `Rng::random`.
+rand          = "0.8"
 
-# Blockchain primitives
-rlp = "0.5"
-triehash = "0.8"
-keccak-hasher = "0.15"
-hash-db = "0.16"            # upgrade from 0.15 to 0.16
-memory-db = "0.32"
-trie-db = "0.28"
-lru = "0.12"
+# ── Blockchain primitives (trie, RLP, Keccak) ─────────────────────────
+rlp            = "0.5"
+triehash       = "0.8"
+keccak-hasher  = "0.15"
+hash-db        = "0.16"
+memory-db      = "0.32"
+trie-db        = "0.28"
+lru            = "0.12"
 
-# EVM (revm)
+# ── EVM (revm) ───────────────────────────────────────────────────────
+# Pinned to ^9. A major-version bump changes the interpreter API;
+# audit `src/blockchain/revm_port.rs` before upgrading.
 revm = { version = "9", default-features = false, features = ["std"] }
 
-# P2P (libp2p)
+# ── P2P (libp2p) ─────────────────────────────────────────────────────
 libp2p = { version = "0.54", features = [
-  "tokio",
-  "tcp",
-  "dns",
-  "noise",
-  "yamux",
-  "gossipsub",
-  "mdns",
-  "identify",
-  "request-response",
-  "kad",
-  "macros"
+    "tokio",
+    "tcp",
+    "dns",
+    "noise",
+    "yamux",
+    "gossipsub",
+    "mdns",
+    "identify",
+    "request-response",
+    "kad",
+    "macros",
 ] }
 
-# Concurrency & parallelism
+# ── Concurrency & parallelism ────────────────────────────────────────
 parking_lot = "0.12"
-rayon = "1.8"
+rayon       = "1.8"
 
-# Rate limiting / DoS protection
-governor = "0.6"
-nonzero_ext = "0.3"
+# ── Spin locks (interrupt-safe) ──────────────────────────────────────
+# Required by `src/smp/scheduler.rs` for per-CPU scheduler slots. A
+# `spin::Mutex` is the correct primitive here because a blocking lock
+# is never taken in interrupt context.
+spin = "0.9"
 
-# Compression (snapshots)
+# ── File locking & atomic I/O ────────────────────────────────────────
+# Required by `src/crypto/keystore.rs` and `src/consensus/double_sign.rs`
+# (`fs2::FileExt::try_lock_exclusive`, `FileExt::unlock`).
+fs2 = "0.4"
+
+# ── Rate limiting / DoS protection ───────────────────────────────────
+governor     = "0.6"
+nonzero_ext  = "0.3"
+
+# ── Compression (snapshots) ──────────────────────────────────────────
 zstd = "0.13"
 
-# Observability (metrics)
+# ── Observability (metrics) ──────────────────────────────────────────
 prometheus = { version = "0.13", features = ["process"] }
 
-# Optional OpenTelemetry (behind `otel` feature)
-opentelemetry = { version = "0.24", optional = true }
-opentelemetry-otlp = { version = "0.17", optional = true, features = ["tonic"] }
-tracing-opentelemetry = { version = "0.25", optional = true }
+# ── WASM runtime ─────────────────────────────────────────────────────
+# Used by `src/wasm/{mod, host, supervisor}.rs`. The `std` feature is
+# required for the `alloc`-backed `Vec` path in the host functions.
+wasmi = { version = "0.31", features = ["std"] }
 
-# System bindings (Unix only)
+# ── Optional OpenTelemetry (behind the `otel` feature) ───────────────
+opentelemetry          = { version = "0.24", optional = true }
+opentelemetry-otlp     = { version = "0.17", optional = true, features = ["tonic"] }
+tracing-opentelemetry  = { version = "0.25", optional = true }
+
+# ── System bindings (Unix only) ──────────────────────────────────────
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# -----------------------------------------------------------------------------
-# Development dependencies
-# -----------------------------------------------------------------------------
-[dev-dependencies]
-tempfile = "3"
-proptest = "1"
-criterion = { version = "0.5", features = ["html_reports"] }
+# ── x86_64-specific crate (x86_64 only) ──────────────────────────────
+# Required by `src/smp/`, `src/acpi/power.rs`, `src/arch/x86_64/` for
+# `instructions::port::Port`, `registers::model_specific::Msr`,
+# `instructions::interrupts::enable_and_hlt`, `instructions::hlt`, etc.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = { version = "0.15", features = ["instructions", "asm"] }
 
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Development dependencies
+# =============================================================================
+
+[dev-dependencies]
+tempfile   = "3"
+proptest   = "1"
+criterion  = { version = "0.5", features = ["html_reports"] }
+# Required by `src/crypto/remote_signer.rs` tests for the mock HTTP server.
+httpmock   = "0.7"
+
+# =============================================================================
 # Binaries
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 [[bin]]
 name = "iona-node"
 path = "src/bin/iona-node.rs"
 
 [[bin]]
-name = "iona-cli"
-path = "src/bin/iona-cli.rs"
+name              = "iona-cli"
+path              = "src/bin/iona-cli.rs"
 required-features = ["bin-cli"]
 
 [[bin]]
-name = "iona-chaos"
-path = "src/bin/iona-chaos.rs"
+name              = "iona-chaos"
+path              = "src/bin/iona-chaos.rs"
 required-features = ["bin-chaos"]
 
 [[bin]]
-name = "iona-remote-signer"
-path = "src/bin/iona-remote-signer.rs"
+name              = "iona-remote-signer"
+path              = "src/bin/iona-remote-signer.rs"
 required-features = ["bin-remote-signer"]
 
 [[bin]]
-name = "iona-evm-rpc"
-path = "src/bin/iona-evm-rpc.rs"
+name              = "iona-evm-rpc"
+path              = "src/bin/iona-evm-rpc.rs"
 required-features = ["bin-evm-rpc"]
 
 [[bin]]
-name = "iona-chaindb-tool"
-path = "src/bin/iona-chaindb-tool.rs"
+name              = "iona-chaindb-tool"
+path              = "src/bin/iona-chaindb-tool.rs"
 required-features = ["bin-chaindb-tool"]
 
 [[bin]]
-name = "block_store"
-path = "src/bin/block_store.rs"
+name              = "block_store"
+path              = "src/bin/block_store.rs"
 required-features = ["bin-block-store"]
 
-# -----------------------------------------------------------------------------
-# Release profile hardening
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Profiles
+# =============================================================================
+
+# Release profile optimised for a long-running blockchain node:
+#
+# - `panic = "abort"`: a panic in a consensus path must never attempt to
+#   unwind across FFI (asm blocks, ISR frames). Abort is the safe default.
+# - `overflow-checks = true`: a wrapped `u64` in gas accounting is silent
+#   consensus loss. The measured cost is <2 %; do NOT disable without
+#   re-running the execution benchmarks.
+# - `debug = "line-tables-only"` + `strip = "symbols"`: keeps line tables
+#   (backtraces show file:line) while removing the full symbol table
+#   (smaller binary). If you need full symbol names in backtraces, set
+#   `strip = "none"`.
+# - `lto = "thin"` + `codegen-units = 16`: the common pairing. Thin LTO
+#   with a high codegen-unit count is fast to build and gets most of the
+#   benefit. For the last 2–3 % of runtime performance at the cost of a
+#   much slower build, switch to `lto = "fat"` + `codegen-units = 1`.
 [profile.release]
 panic           = "abort"
 lto             = "thin"
-codegen-units   = 1
+codegen-units   = 16
 overflow-checks = true
+debug           = "line-tables-only"
+strip           = "symbols"
 
 [profile.test]
 overflow-checks = true
+
+[profile.bench]
+inherits        = "release"
+overflow-checks = true
+debug           = "line-tables-only"
+
+# =============================================================================
+# Lints
+# =============================================================================
+# `unsafe_op_in_unsafe_fn` is `deny` because the codebase uses `unsafe`
+# extensively (`core::arch::asm!`, MMIO, packed structs). Explicit `unsafe`
+# blocks inside `unsafe fn` make the safety contract visible at each call
+# site and are required by the "unsafe_op_in_unsafe_fn" lint.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use        = "warn"
