@@ -13,7 +13,7 @@
       }
     ]
   },
-  "description": "Production dashboard for IONA validator operators. Requires Prometheus datasource with IONA metrics.",
+  "description": "Production dashboard for IONA validator operators. Requires a Prometheus datasource named \"Prometheus\" that scrapes the IONA exporter AND node_exporter (the Disk Usage and Memory Usage panels depend on the latter).",
   "editable": true,
   "gnetId": null,
   "graphTooltip": 1,
@@ -56,7 +56,7 @@
       "type": "row"
     },
     {
-      "__comment": "Connected Peers (Stat)",
+      "__comment": "Connected Peers. Metric corrected: iona_peer_count → iona_p2p_peer_count.",
       "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
@@ -92,9 +92,7 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "iona_peer_count{instance=\"$instance\"}",
-          "format": "time_series",
-          "intervalFactor": 2,
+          "expr": "iona_p2p_peer_count{instance=~\"$instance\"}",
           "legendFormat": "Peers",
           "refId": "A"
         }
@@ -103,7 +101,7 @@
       "type": "stat"
     },
     {
-      "__comment": "Consensus Height Lag (Stat)",
+      "__comment": "Consensus Height Lag. Metric corrected: iona_consensus_height_lag → iona_consensus_finality_lag_blocks.",
       "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
@@ -138,9 +136,7 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "iona_consensus_height_lag{instance=\"$instance\"}",
-          "format": "time_series",
-          "intervalFactor": 2,
+          "expr": "iona_consensus_finality_lag_blocks{instance=~\"$instance\"}",
           "legendFormat": "Height Lag",
           "refId": "A"
         }
@@ -149,7 +145,7 @@
       "type": "stat"
     },
     {
-      "__comment": "Mempool Utilization (Gauge)",
+      "__comment": "Mempool Utilization. Zero-guard added for the denominator.",
       "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
@@ -162,7 +158,9 @@
               { "color": "red", "value": 0.9 }
             ]
           },
-          "unit": "percentunit"
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
         },
         "overrides": []
       },
@@ -185,9 +183,7 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "iona_mempool_size{instance=\"$instance\"} / iona_mempool_capacity{instance=\"$instance\"}",
-          "format": "time_series",
-          "intervalFactor": 2,
+          "expr": "iona_mempool_size{instance=~\"$instance\"} / (iona_mempool_capacity{instance=~\"$instance\"} > 0)",
           "legendFormat": "Mempool %",
           "refId": "A"
         }
@@ -196,7 +192,7 @@
       "type": "stat"
     },
     {
-      "__comment": "Blocks Signed (Stat — last 24h)",
+      "__comment": "Blocks Produced. Metric corrected: iona_blocks_signed_total → iona_consensus_blocks_produced. increase() handles counter resets correctly.",
       "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
@@ -231,18 +227,16 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "increase(iona_blocks_signed_total{instance=\"$instance\"}[24h])",
-          "format": "time_series",
-          "intervalFactor": 2,
-          "legendFormat": "Blocks Signed (24h)",
+          "expr": "increase(iona_consensus_blocks_produced{instance=~\"$instance\"}[24h])",
+          "legendFormat": "Blocks Produced (24h)",
           "refId": "A"
         }
       ],
-      "title": "Blocks Signed (24h)",
+      "title": "Blocks Produced (24h)",
       "type": "stat"
     },
     {
-      "__comment": "Validator Status (Text Panel)",
+      "__comment": "Validator Status. Metric corrected: iona_validator_active → iona_consensus_is_validator.",
       "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
@@ -279,9 +273,7 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "iona_validator_active{instance=\"$instance\"}",
-          "format": "time_series",
-          "intervalFactor": 2,
+          "expr": "iona_consensus_is_validator{instance=~\"$instance\"}",
           "legendFormat": "Status",
           "refId": "A"
         }
@@ -300,7 +292,7 @@
       "type": "row"
     },
     {
-      "__comment": "RPC Request Rate (5m) — Timeseries",
+      "__comment": "RPC Request Rate. Uses $__rate_interval so the window adapts to the dashboard's time range and refresh interval.",
       "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
@@ -338,18 +330,16 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "rate(iona_rpc_requests_total{instance=\"$instance\"}[5m])",
-          "format": "time_series",
-          "intervalFactor": 2,
+          "expr": "rate(iona_rpc_requests_total{instance=~\"$instance\"}[$__rate_interval])",
           "legendFormat": "RPC Request Rate",
           "refId": "A"
         }
       ],
-      "title": "RPC Request Rate (5m avg)",
+      "title": "RPC Request Rate",
       "type": "timeseries"
     },
     {
-      "__comment": "RPC P99 Latency — Timeseries",
+      "__comment": "RPC P99 Latency. Uses $__rate_interval; value scaled from seconds to ms by × 1000.",
       "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
@@ -394,9 +384,7 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, rate(iona_rpc_request_duration_seconds_bucket{instance=\"$instance\"}[5m])) * 1000",
-          "format": "time_series",
-          "intervalFactor": 2,
+          "expr": "histogram_quantile(0.99, rate(iona_rpc_request_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])) * 1000",
           "legendFormat": "P99 Latency",
           "refId": "A"
         }
@@ -415,7 +403,7 @@
       "type": "row"
     },
     {
-      "__comment": "WAL Growth Rate (10m) — Timeseries",
+      "__comment": "WAL Growth Rate. Metric corrected: iona_wal_bytes_total → iona_wal_size_bytes. deriv() is the correct primitive for a gauge; rate() requires a counter.",
       "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
@@ -459,18 +447,16 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "rate(iona_wal_bytes_total{instance=\"$instance\"}[10m])",
-          "format": "time_series",
-          "intervalFactor": 2,
+          "expr": "deriv(iona_wal_size_bytes{instance=~\"$instance\"}[10m])",
           "legendFormat": "WAL Growth Rate",
           "refId": "A"
         }
       ],
-      "title": "WAL Growth Rate (10m avg)",
+      "title": "WAL Growth Rate (10m)",
       "type": "timeseries"
     },
     {
-      "__comment": "Disk Usage (Stat — requires node_exporter)",
+      "__comment": "Disk Usage (requires node_exporter). Query returns 0..1 to match the percentunit unit. Thresholds are 0.7 / 0.9.",
       "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
@@ -479,11 +465,13 @@
             "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
-              { "color": "yellow", "value": 70 },
-              { "color": "red", "value": 90 }
+              { "color": "yellow", "value": 0.7 },
+              { "color": "red", "value": 0.9 }
             ]
           },
-          "unit": "percentunit"
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
         },
         "overrides": []
       },
@@ -505,10 +493,8 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "100 - (node_filesystem_avail_bytes{mountpoint=\"/\",instance=\"$instance\"} / node_filesystem_size_bytes{mountpoint=\"/\",instance=\"$instance\"} * 100)",
-          "format": "time_series",
-          "intervalFactor": 2,
-          "legendFormat": "Disk Usage %",
+          "expr": "1 - (node_filesystem_avail_bytes{mountpoint=\"/\",instance=~\"$instance\"} / node_filesystem_size_bytes{mountpoint=\"/\",instance=~\"$instance\"})",
+          "legendFormat": "Disk Usage",
           "refId": "A"
         }
       ],
@@ -516,7 +502,7 @@
       "type": "stat"
     },
     {
-      "__comment": "Memory Usage (Stat — requires node_exporter)",
+      "__comment": "Memory Usage (requires node_exporter). Query returns 0..1 to match the percentunit unit. Thresholds are 0.7 / 0.9.",
       "datasource": "Prometheus",
       "fieldConfig": {
         "defaults": {
@@ -525,11 +511,13 @@
             "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
-              { "color": "yellow", "value": 70 },
-              { "color": "red", "value": 90 }
+              { "color": "yellow", "value": 0.7 },
+              { "color": "red", "value": 0.9 }
             ]
           },
-          "unit": "percentunit"
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
         },
         "overrides": []
       },
@@ -551,10 +539,8 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "(1 - (node_memory_MemAvailable_bytes{instance=\"$instance\"} / node_memory_MemTotal_bytes{instance=\"$instance\"})) * 100",
-          "format": "time_series",
-          "intervalFactor": 2,
-          "legendFormat": "Memory Usage %",
+          "expr": "1 - (node_memory_MemAvailable_bytes{instance=~\"$instance\"} / node_memory_MemTotal_bytes{instance=~\"$instance\"})",
+          "legendFormat": "Memory Usage",
           "refId": "A"
         }
       ],
@@ -563,21 +549,21 @@
     }
   ],
   "refresh": "30s",
-  "schemaVersion": 16,
+  "schemaVersion": 33,
   "style": "dark",
   "tags": ["iona", "validator", "blockchain", "production"],
   "templating": {
     "list": [
       {
-        "allValue": null,
+        "allValue": ".*",
         "current": {
           "selected": true,
           "text": "All",
           "value": "$__all"
         },
         "datasource": "Prometheus",
-        "definition": "label_values(iona_peer_count, instance)",
-        "description": "Select the IONA validator instance to monitor",
+        "definition": "label_values(iona_p2p_peer_count, instance)",
+        "description": "IONA validator instance to monitor. \"All\" aggregates every instance.",
         "error": null,
         "hide": 0,
         "includeAll": true,
@@ -586,7 +572,7 @@
         "name": "instance",
         "options": [],
         "query": {
-          "query": "label_values(iona_peer_count, instance)",
+          "query": "label_values(iona_p2p_peer_count, instance)",
           "refId": "Prometheus-instance-Variable-Query"
         },
         "refresh": 1,
