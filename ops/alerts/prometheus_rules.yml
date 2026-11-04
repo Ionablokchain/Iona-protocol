@@ -1,54 +1,89 @@
 # =============================================================================
-# IONA Prometheus Alert & Recording Rules — v28.8.0 (Production-Grade)
+# IONA Prometheus Alert & Recording Rules — v28.8.1
 # =============================================================================
-# 20+ production alerts covering consensus, RPC, network, storage, security,
-# system resources, and upgrade management.
+# 22 alerts covering consensus, RPC, network, storage, security, system,
+# and upgrade management.
 #
 # Usage:
-#   Include in prometheus.yml under `rule_files`:
-#     rule_files:
-#       - "/etc/prometheus/rules/iona_alerts.yml"
+#   rule_files:
+#     - "/etc/prometheus/rules/iona_alerts.yml"
 #
 # Runbook base URL:
 #   https://github.com/iona/iona/blob/main/ops/runbooks/
 #
-# Design principles:
-#   - Every alert has a runbook link, summary, and actionable description.
-#   - Severities follow IONA incident management: critical → page, warning → ticket.
-#   - Thresholds are based on production observations (adjust per cluster).
-#   - Recording rules pre‑compute expensive queries for dashboards and alerts.
+# Design principles
+# -----------------
+# - Every alert has a runbook link, summary, and actionable description.
+# - Severity → page/ticket mapping:
+#     P0 (critical) → all-hands, immediate action
+#     P1 (critical) → page on-call
+#     P2 (warning)  → ticket + page during business hours
+#     P3 (warning)  → ticket
+# - Recording rules preserve `instance` and `job` so downstream alerts can
+#   filter with `and on(instance) up == 1` (see "Label preservation" below).
+# - Every alert has a **duration** (`for:`) that is > 2× the scrape interval
+#   to avoid flapping.
+# - Zero-value denominators are filtered with `> 0` so a division cannot
+#   produce NaN/+Inf and silently disable downstream rules.
+#
+# Label preservation
+# ------------------
+# A recording rule that uses `sum()` / `avg()` / `count()` **without** a
+# `by (...)` clause collapses all labels. Downstream alerts that combine
+# with `up == 1` then have no labels in common, and `and` returns an empty
+# vector — the alert never fires. Every recording rule here uses an
+# explicit `by (instance, job)` (or `by (instance)` for node metrics).
+#
+# Rate vs. increase vs. changes
+# -----------------------------
+# - `rate()`      — counters, per-second rate.
+# - `increase()`  — counters, absolute delta (breaks on reset).
+# - `changes()`   — gauges, count of observed changes (safe on reset).
+# - `delta()`     — gauges, signed net change.
+# For consensus metrics that only advance, `changes()` is used so a node
+# restart does not produce a false "flat" reading.
 # =============================================================================
 
 groups:
   # ==========================================================================
-  # Recording rules — pre‑compute frequently used metrics
+  # Recording rules — pre-compute frequently used metrics
   # ==========================================================================
   - name: iona-recordings
     interval: 30s
     rules:
       # Consensus progress rate (blocks per minute)
       - record: iona:consensus_block_rate:1m
-        expr: rate(iona_consensus_height[1m]) * 60
+        expr: |
+          rate(iona_consensus_height[1m]) * 60
 
-      # RPC error rate (percentage)
+      # RPC error rate (percentage), preserved per instance/job so that
+      # `IonaRpcErrorRateHigh` can match on `up`.
       - record: iona:rpc_error_rate:5m
         expr: |
-          sum(rate(iona_rpc_requests_total{status="error"}[5m]))
-          /
-          sum(rate(iona_rpc_requests_total[5m]))
-          * 100
+          (
+            sum by (instance, job) (rate(iona_rpc_requests_total{status="error"}[5m]))
+            /
+            (sum by (instance, job) (rate(iona_rpc_requests_total[5m])) > 0)
+          ) * 100
 
-      # Mempool usage percentage
+      # Mempool usage percentage (guarded against a zero capacity).
       - record: iona:mempool_usage_ratio
-        expr: iona_mempool_size / iona_mempool_capacity * 100
+        expr: |
+          (iona_mempool_size / (iona_mempool_capacity > 0)) * 100
 
-      # Peer connectivity score (peers / total validators)
+      # Peer connectivity score (peers / total validators, guarded).
       - record: iona:peer_connectivity_ratio
-        expr: iona_p2p_peer_count / iona_consensus_validator_count
+        expr: |
+          iona_p2p_peer_count / (iona_consensus_validator_count > 0)
 
-      # TLS certificate remaining days
+      # TLS certificate remaining days.
+      #
+      # `iona_tls_cert_expiry_seconds` is a **Unix timestamp**, so the
+      # remaining time is `expiry_seconds - time()`. The previous
+      # `expiry_seconds / 86400` gave days-since-epoch (~20,000) and made
+      # every TLS alert permanently silent.
       - record: iona:tls_cert_remaining_days
-        expr: iona_tls_cert_expiry_seconds / 86400
+        expr: (iona_tls_cert_expiry_seconds - time()) / 86400
 
   # ==========================================================================
   # Consensus health
@@ -56,12 +91,35 @@ groups:
   - name: iona-consensus
     interval: 30s
     rules:
-      # Chain halt detection
+      # Target scrape failure — the fundamental "the node is gone" alert.
+      # Without this, every metric-absence scenario silently passes.
+      - alert: IonaNodeDown
+        expr: up{job=~"iona.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          priority: "P1"
+          team: ops
+          component: node
+          service: iona
+        annotations:
+          summary: "IONA node {{ $labels.instance }} is down (scrape failed)"
+          description: |
+            Prometheus has failed to scrape {{ $labels.instance }}
+            (job={{ $labels.job }}) for 2 minutes.
+            This precedes every other alert: a down node cannot report a
+            stalled round, a full mempool, or a double-sign.
+            Check: `systemctl status iona`, the process is alive, and the
+            metrics endpoint responds on its configured listen address.
+          runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/node_down.md"
+
+      # Chain halt detection. Uses `changes()` (safe for a monotonic gauge
+      # that may reset on node restart) instead of `increase()` (counter
+      # primitive that returns 0 or drops the window on reset).
       - alert: IonaConsensusNoProgress
         expr: |
-          increase(iona_consensus_height[5m]) == 0
-          and
-          up == 1
+          changes(iona_consensus_height[5m]) == 0
+          and on(instance) up{job=~"iona.*"} == 1
         for: 3m
         labels:
           severity: critical
@@ -72,65 +130,67 @@ groups:
         annotations:
           summary: "Chain halt on {{ $labels.instance }}"
           description: |
-            Block height has not advanced in 3+ minutes. The validator may be
-            partitioned, stalled, or the entire network may be halted.
+            Block height has not advanced in 3+ minutes.
             Check: `iona query block` and `iona query net_info`.
-            Also verify the node is connected to bootstrap peers.
+            Verify the node is connected to bootstrap peers and that
+            `iona_p2p_peer_count >= 3`.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/consensus_no_progress.md"
           dashboard: "https://grafana.example.invalid/d/iona-consensus"
           alert_type: "chain_halt"
 
-      # Finality lag (blocks behind)
+      # Finality lag. Upgraded from P3 to P2 — a lagging finality is a
+      # leading indicator of a chain halt.
       - alert: IonaFinalityLagHigh
         expr: |
           iona_consensus_finality_lag_blocks > 10
-          and
-          up == 1
+          and on(instance) up{job=~"iona.*"} == 1
         for: 2m
-        labels:
-          severity: warning
-          priority: "P3"
-          team: validators
-          component: consensus
-        annotations:
-          summary: "High finality lag on {{ $labels.instance }}: {{ $value }} blocks"
-          description: |
-            Finality is lagging by {{ $value }} blocks. This may indicate
-            slow block propagation, high network latency, or resource contention.
-            Check peer connection quality and system load.
-          runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/finality_lag.md"
-          dashboard: "https://grafana.example.invalid/d/iona-consensus"
-
-      # Round advancement stalled
-      - alert: IonaRoundStalled
-        expr: |
-          increase(iona_consensus_round[5m]) == 0
-          and
-          iona_consensus_round > 0
-          and
-          up == 1
-        for: 3m
         labels:
           severity: warning
           priority: "P2"
           team: validators
           component: consensus
         annotations:
+          summary: "High finality lag on {{ $labels.instance }}: {{ $value }} blocks"
+          description: |
+            Finality is lagging by {{ $value }} blocks. Root causes: slow
+            block propagation, high network latency, resource contention,
+            or a partition between validators.
+            Check peer connection quality and node CPU/memory.
+          runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/finality_lag.md"
+          dashboard: "https://grafana.example.invalid/d/iona-consensus"
+
+      # Round stalled. Uses `changes()` for the same reason as the
+      # halt alert. Downgraded from P2 to P3 — a stalled round with
+      # advancing height is recoverable.
+      - alert: IonaRoundStalled
+        expr: |
+          changes(iona_consensus_round[5m]) == 0
+          and iona_consensus_round > 0
+          and on(instance) up{job=~"iona.*"} == 1
+        for: 3m
+        labels:
+          severity: warning
+          priority: "P3"
+          team: validators
+          component: consensus
+        annotations:
           summary: "Consensus round stalled at {{ $value }} on {{ $labels.instance }}"
           description: |
-            The validator is stuck in the same round for more than 3 minutes.
-            This may indicate a faulty proposer or network partition.
+            The validator is stuck in round {{ $value }} for 3+ minutes.
+            Possible causes: a faulty proposer, a partition, or an
+            unreachable peer set.
             Investigate with `iona query round`.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/round_stalled.md"
 
-      # Validator not producing blocks (if validator)
+      # Validator not producing blocks. Uses `changes()` because the
+      # metric may be a gauge that resets on restart.
       - alert: IonaValidatorNotProducing
         expr: |
           iona_consensus_is_validator == 1
           and
-          increase(iona_consensus_blocks_produced[10m]) == 0
-          and
-          up == 1
+          changes(iona_consensus_blocks_produced[10m]) == 0
+          and on(instance) up{job=~"iona.*"} == 1
         for: 5m
         labels:
           severity: critical
@@ -141,14 +201,16 @@ groups:
           summary: "Validator {{ $labels.instance }} is not producing blocks"
           description: |
             The validator has not produced any blocks in the last 10 minutes.
-            Check if the node is online, synced, and has sufficient stake.
-            Verify signing key availability.
+            Check: node online, synced, sufficient stake, signing key
+            available (`iona query validator <addr>`).
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/validator_not_producing.md"
 
-      # Double-sign detection (highest priority)
+      # Double-sign detection. Uses a 5m window so a double-sign that
+      # occurs near a scrape boundary cannot slip through. `for: 0m` is
+      # intentional: every second counts.
       - alert: IonaValidatorDoubleSigned
         expr: |
-          increase(iona_validator_double_sign_total[1m]) > 0
+          increase(iona_validator_double_sign_total[5m]) > 0
         for: 0m
         labels:
           severity: critical
@@ -172,14 +234,12 @@ groups:
   - name: iona-rpc
     interval: 30s
     rules:
-      # High latency (P99)
       - alert: IonaRpcHighLatency
         expr: |
           histogram_quantile(0.99,
             rate(iona_rpc_request_duration_seconds_bucket[5m])
           ) > 2.0
-          and
-          up == 1
+          and on(instance) up{job=~"iona.*"} == 1
         for: 5m
         labels:
           severity: warning
@@ -190,17 +250,18 @@ groups:
           summary: "RPC P99 latency > 2s on {{ $labels.instance }} ({{ $value }}s)"
           description: |
             RPC endpoint {{ $labels.endpoint }} is experiencing high latency.
-            Check CPU, memory, and active connection count.
-            Verify load balancer and upstream health.
+            Check CPU, memory, active connection count, and the upstream
+            load balancer.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/rpc_latency.md"
           dashboard: "https://grafana.example.invalid/d/iona-rpc"
 
-      # High error rate (> 5%)
+      # The recording rule now preserves `{instance, job}`, so `and
+      # on(instance) up == 1` matches correctly. Previously the rule
+      # collapsed all labels and the alert never fired.
       - alert: IonaRpcErrorRateHigh
         expr: |
           iona:rpc_error_rate:5m > 5
-          and
-          up == 1
+          and on(instance) up{job=~"iona.*"} == 1
         for: 5m
         labels:
           severity: warning
@@ -210,16 +271,16 @@ groups:
         annotations:
           summary: "RPC error rate > 5% on {{ $labels.instance }} ({{ $value }}%)"
           description: |
-            RPC error rate is abnormally high. Check logs for HTTP 5xx errors,
-            rate limiting rejections, and backend availability.
+            RPC error rate is abnormally high. Check logs for HTTP 5xx,
+            rate-limit rejections, and backend availability.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/rpc_errors.md"
 
-      # Rate limiting active
+      # Extended window from 1m to 5m: at 30s scrape interval, a 1m window
+      # gives only two samples and produces a noisy rate.
       - alert: IonaRpcRateLimitFiring
         expr: |
-          rate(iona_rpc_rate_limit_rejections_total[1m]) > 10
-          and
-          up == 1
+          rate(iona_rpc_rate_limit_rejections_total[5m]) > 10
+          and on(instance) up{job=~"iona.*"} == 1
         for: 2m
         labels:
           severity: warning
@@ -229,8 +290,8 @@ groups:
         annotations:
           summary: "RPC rate limiter firing on {{ $labels.instance }}: {{ $value }}/s rejected"
           description: |
-            Rate limiting is active. Consider scaling RPC nodes or adjusting limits.
-            Check if there is a DDoS or a sudden traffic spike.
+            Rate limiting is active. Consider scaling RPC nodes or adjusting
+            limits. Check whether this is a DDoS or a traffic spike.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/rpc_rate_limit.md"
           dashboard: "https://grafana.example.invalid/d/iona-rpc"
 
@@ -243,8 +304,7 @@ groups:
       - alert: IonaPeerCountLow
         expr: |
           iona_p2p_peer_count < 3
-          and
-          up == 1
+          and on(instance) up{job=~"iona.*"} == 1
         for: 5m
         labels:
           severity: warning
@@ -254,17 +314,16 @@ groups:
         annotations:
           summary: "Low peer count on {{ $labels.instance }}: {{ $value }} peers"
           description: |
-            Validator has fewer than 3 peers. Check firewall rules,
-            bootstrap nodes, network connectivity, and DNS resolution.
-            Run: `iona query peers`
+            Fewer than 3 peers. Check firewall rules, bootstrap nodes,
+            network connectivity, and DNS resolution.
+            Run: `iona query peers`.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/peer_drop.md"
           dashboard: "https://grafana.example.invalid/d/iona-network"
 
       - alert: IonaPeerHandshakeFailures
         expr: |
           rate(iona_p2p_handshake_failures_total[5m]) > 5
-          and
-          up == 1
+          and on(instance) up{job=~"iona.*"} == 1
         for: 3m
         labels:
           severity: warning
@@ -274,8 +333,8 @@ groups:
         annotations:
           summary: "P2P handshake failures on {{ $labels.instance }}: {{ $value }}/s"
           description: |
-            Many peers are failing handshake. Check for mismatched protocol versions,
-            TLS certificate issues, or network timeouts.
+            Many peers are failing handshake. Check protocol versions,
+            TLS certificate validity, and network timeouts.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/peer_handshake_errors.md"
 
   # ==========================================================================
@@ -284,12 +343,10 @@ groups:
   - name: iona-storage
     interval: 30s
     rules:
-      # WAL growth rate
       - alert: IonaDiskWalGrowthHigh
         expr: |
-          rate(iona_wal_size_bytes[10m]) > 10485760  # 10 MiB/s
-          and
-          up == 1
+          rate(iona_wal_size_bytes[10m]) > 10485760   # 10 MiB/s
+          and on(instance) up{job=~"iona.*"} == 1
         for: 5m
         labels:
           severity: warning
@@ -300,17 +357,18 @@ groups:
           summary: "WAL growing fast on {{ $labels.instance }}: {{ $value | humanize }}B/s"
           description: |
             Write-ahead log is growing at {{ $value | humanize }}B/s.
-            Check disk I/O, transaction volume, and available disk space.
-            Investigate slow checkpointing.
+            At this rate the disk fills in hours. Check disk I/O, transaction
+            volume, and slow checkpointing.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/disk_wal_growth.md"
           dashboard: "https://grafana.example.invalid/d/iona-storage"
 
-      # Disk space low (available < 10%)
+      # Node filesystem metrics come from node_exporter, which is a
+      # separate job. `on(instance) up{job="node_exporter"} == 1` is
+      # explicit about which `up` we match against.
       - alert: IonaDiskSpaceLow
         expr: |
           (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 10
-          and
-          up == 1
+          and on(instance) up{job="node_exporter"} == 1
         for: 5m
         labels:
           severity: critical
@@ -320,16 +378,14 @@ groups:
         annotations:
           summary: "Disk space < 10% on {{ $labels.instance }}"
           description: |
-            Available disk space is below 10%. Free up space by cleaning logs,
-            rotating snapshots, or expanding the volume.
+            Available disk space is below 10%. Free up space by cleaning
+            logs, rotating snapshots, or expanding the volume.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/disk_space_low.md"
 
-      # Mempool capacity high (> 90%)
       - alert: IonaMempoolCapacityHigh
         expr: |
           iona:mempool_usage_ratio > 90
-          and
-          up == 1
+          and on(instance) up{job=~"iona.*"} == 1
         for: 3m
         labels:
           severity: warning
@@ -339,17 +395,15 @@ groups:
         annotations:
           summary: "Mempool at {{ $value | humanizePercentage }} capacity on {{ $labels.instance }}"
           description: |
-            Mempool is nearly full. This may cause transaction delays.
-            Consider increasing mempool capacity or scaling horizontally.
+            Mempool is nearly full. Transaction delays are expected.
+            Consider increasing capacity or scaling horizontally.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/mempool_pressure.md"
           dashboard: "https://grafana.example.invalid/d/iona-mempool"
 
-      # Mempool full (100%)
       - alert: IonaMempoolFull
         expr: |
-          iona:mempool_usage_ratio == 100
-          and
-          up == 1
+          iona:mempool_usage_ratio >= 100
+          and on(instance) up{job=~"iona.*"} == 1
         for: 1m
         labels:
           severity: critical
@@ -360,7 +414,7 @@ groups:
           summary: "Mempool FULL on {{ $labels.instance }}"
           description: |
             Mempool has reached capacity. New transactions will be rejected.
-            Increase mempool capacity immediately or investigate why transactions
+            Increase capacity immediately or investigate why transactions
             are not being cleared.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/mempool_pressure.md"
 
@@ -370,34 +424,32 @@ groups:
   - name: iona-security
     interval: 30s
     rules:
-      # TLS certificate expiry (warning)
+      # Downgraded from P2 to P3 — a 30-day window is comfortable.
+      # The `for: 15m` is enough to skip transient clock skew.
       - alert: IonaTLSCertExpiringSoon
         expr: |
           iona:tls_cert_remaining_days < 30
           and
           iona:tls_cert_remaining_days > 7
-          and
-          up == 1
-        for: 1h
+          and on(instance) up{job=~"iona.*"} == 1
+        for: 15m
         labels:
           severity: warning
-          priority: "P2"
+          priority: "P3"
           team: security
           component: tls
         annotations:
           summary: "TLS cert expires in {{ $value | humanizeDuration }} on {{ $labels.instance }}"
           description: |
             TLS certificate will expire soon. Schedule renewal.
-            Run: `iona-cli cert renew --output ./certs`
+            Run: `iona-cli cert renew --output ./certs`.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/tls_cert_expiry.md"
           dashboard: "https://grafana.example.invalid/d/iona-security"
 
-      # TLS certificate expiry (critical)
       - alert: IonaTLSCertCritical
         expr: |
           iona:tls_cert_remaining_days < 7
-          and
-          up == 1
+          and on(instance) up{job=~"iona.*"} == 1
         for: 5m
         labels:
           severity: critical
@@ -407,17 +459,15 @@ groups:
         annotations:
           summary: "TLS cert expires in {{ $value | humanizeDuration }} — ROTATE NOW"
           description: |
-            TLS certificate expires within 7 days. Immediate rotation required.
-            Run: `iona-cli cert rotate --force`
+            TLS certificate expires within 7 days. Immediate rotation
+            required. Run: `iona-cli cert rotate --force`.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/tls_cert_expiry.md"
           dashboard: "https://grafana.example.invalid/d/iona-security"
 
-      # Audit chain integrity failure
       - alert: IonaAuditChainIntegrityFail
         expr: |
           iona_audit_chain_integrity == 0
-          and
-          up == 1
+          and on(instance) up{job=~"iona.*"} == 1
         for: 1m
         labels:
           severity: critical
@@ -428,16 +478,14 @@ groups:
           summary: "Audit chain integrity failure on {{ $labels.instance }}"
           description: |
             Possible tampering or storage corruption detected.
-            Run: `iona-cli audit verify --deep`
+            Run: `iona-cli audit verify --deep`.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/audit_chain_break.md"
           dashboard: "https://grafana.example.invalid/d/iona-security"
 
-      # WAL corruption detected
       - alert: IonaWalCorruption
         expr: |
           iona_wal_corrupt_lines_total > 0
-          and
-          up == 1
+          and on(instance) up{job=~"iona.*"} == 1
         for: 1m
         labels:
           severity: critical
@@ -447,16 +495,19 @@ groups:
         annotations:
           summary: "WAL corruption detected on {{ $labels.instance }}"
           description: |
-            Write‑ahead log has corrupt lines. This may lead to state inconsistency.
-            Investigate disk health and restore from a recent snapshot.
+            Write-ahead log has corrupt lines. This may lead to state
+            inconsistency. Investigate disk health and restore from a
+            recent snapshot.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/wal_corruption.md"
 
-      # Version skew across validators
+      # Version skew. `count(count by (version) (iona_node_info))` returns
+      # a **single label-less series**; the previous `and up == 1` could
+      # never match because `up` has labels. Removed the dead `and` — the
+      # alert fires as soon as two versions coexist, regardless of any
+      # node being up, which is the correct semantics.
       - alert: IonaNodeVersionSkew
         expr: |
           count(count by (version) (iona_node_info)) > 1
-          and
-          up == 1
         for: 30m
         labels:
           severity: warning
@@ -472,17 +523,19 @@ groups:
           dashboard: "https://grafana.example.invalid/d/iona-network"
 
   # ==========================================================================
-  # System resources (CPU, memory, processes)
+  # System resources (CPU, memory)
   # ==========================================================================
   - name: iona-system
     interval: 30s
     rules:
-      # High CPU usage (> 80% for 5 min)
+      # `avg by (instance)` is required: without `by`, `avg()` collapses
+      # across all instances and produces a label-less value, so the
+      # previous `and up == 1` could never match. Node metrics come from
+      # node_exporter, so the join uses `up{job="node_exporter"}`.
       - alert: IonaCpuUsageHigh
         expr: |
-          (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m]))) * 100 > 80
-          and
-          up == 1
+          (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) * 100 > 80
+          and on(instance) up{job="node_exporter"} == 1
         for: 5m
         labels:
           severity: warning
@@ -492,16 +545,14 @@ groups:
         annotations:
           summary: "High CPU usage on {{ $labels.instance }}: {{ $value }}%"
           description: |
-            CPU usage is above 80%. Check for resource contention,
-            misconfigured threads, or a DoS attack.
+            CPU usage is above 80% for 5 minutes. Check for resource
+            contention, misconfigured threads, or a DoS attack.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/cpu_high.md"
 
-      # High memory usage (> 90% of available)
       - alert: IonaMemoryUsageHigh
         expr: |
           (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
-          and
-          up == 1
+          and on(instance) up{job="node_exporter"} == 1
         for: 5m
         labels:
           severity: warning
@@ -511,6 +562,7 @@ groups:
         annotations:
           summary: "High memory usage on {{ $labels.instance }}: {{ $value }}%"
           description: |
-            Memory usage is above 90%. Check for memory leaks,
-            or increase memory allocation.
+            Memory usage is above 90%. Check for leaks or increase the
+            memory allocation. If the OOM killer is active, the IONA node
+            may have been killed and restarted — check `dmesg`.
           runbook: "https://github.com/iona/iona/blob/main/ops/runbooks/memory_high.md"
