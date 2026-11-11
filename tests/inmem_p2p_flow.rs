@@ -1,125 +1,52 @@
-//! Integration test — In‑memory network delivers consensus messages.
+//! Integration test — in-memory network delivers consensus messages.
 //!
-//! # Quantum Network Model
+//! Verifies that the in-memory network used by consensus:
 //!
-//! The in‑memory network is modelled as a **quantum channel** Φ_net that
-//! transmits consensus states between validators.  Each message delivery
-//! is a **Kraus operator** K_deliver that projects the state onto the
-//! recipient's Hilbert space with high fidelity.
+//! * delivers a proposal from the designated proposer to an observer node;
+//! * does not echo a broadcast back to its sender;
+//! * hands the observer exactly the same proposal the proposer emitted;
+//! * identifies the proposer deterministically from `(height, round)`;
+//! * tracks broadcast counts so tests can assert on message flow.
 //!
-//! # Test Coverage
-//!
-//! - Validator setup and round‑robin proposer selection
-//! - Proposal broadcast via InMemNet
-//! - Asynchronous message delivery verification
-//! - Quantum coherence tracking after transmission
+//! The in-memory network is a transport double, not a model of a quantum
+//! channel. Determinism of consensus is verified by comparing the
+//! observable state of proposer and observer, not by "coherence" metrics.
 
 use iona::consensus::{
-    BlockStore, Config, ConsensusMsg, Engine, Outbox, SimpleBlockProducer, SimpleProducerCfg, Step,
-    Validator, ValidatorSet,
+    BlockStore, Config, ConsensusMsg, Engine, Outbox, Proposal, SimpleBlockProducer,
+    SimpleProducerCfg, Step, Validator, ValidatorSet,
 };
 use iona::crypto::ed25519::{Ed25519Keypair, Ed25519Verifier};
 use iona::crypto::Signer;
 use iona::execution::KvState;
-use iona::net::inmem::{InMemNet, NodeId};
+use iona::net::inmem::InMemNet;
 use iona::slashing::StakeLedger;
 use iona::types::{Block, Hash32};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-// -----------------------------------------------------------------------------
-// Quantum Constants
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
-/// Reduced Planck constant (natural units).
-const HBAR: f64 = 1.0;
-
-/// Default quantum coherence for a fresh network state.
-const DEFAULT_NETWORK_COHERENCE: f64 = 1.0;
-
-/// Decoherence rate per message transmission.
-const TRANSMISSION_DECOHERENCE_RATE: f64 = 0.0001;
-
-/// Minimum coherence threshold for a healthy network.
-const MIN_NETWORK_COHERENCE: f64 = 0.99;
-
-/// Kraus rank for network quantum channels.
-const NETWORK_KRAUS_RANK: usize = 4;
-
-// -----------------------------------------------------------------------------
-// Classical Constants
-// -----------------------------------------------------------------------------
-
-const DEFAULT_SEED_1: u8 = 1;
-const DEFAULT_SEED_2: u8 = 2;
+const SEED_1: u8 = 1;
+const SEED_2: u8 = 2;
 const INITIAL_HEIGHT: u64 = 1;
 const VALIDATOR_POWER: u64 = 1;
-const NETWORK_DELAY_MS: u64 = 20;
 
-// -----------------------------------------------------------------------------
-// Quantum Network Test State
-// -----------------------------------------------------------------------------
+/// Upper bound on how long the observer may take to see the proposal.
+/// Generous enough to absorb CI load, short enough to fail fast on bugs.
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Quantum state tracker for network integration tests.
-///
-/// Tracks the density matrix properties during message transmission
-/// and verifies that the network maintains quantum coherence.
-#[derive(Debug, Clone)]
-struct QuantumNetworkTestState {
-    /// Purity γ = Tr(ρ²) of the network state.
-    purity: f64,
-    /// Von Neumann entropy S = -Tr(ρ ln ρ).
-    entropy: f64,
-    /// Coherence of the message transmission.
-    transmission_coherence: f64,
-    /// Number of messages transmitted.
-    message_count: u64,
-    /// Whether the network is healthy.
-    is_healthy: bool,
-}
+/// Polling interval while waiting for the observer.
+const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
-impl QuantumNetworkTestState {
-    fn new() -> Self {
-        Self {
-            purity: DEFAULT_NETWORK_COHERENCE,
-            entropy: 0.0,
-            transmission_coherence: DEFAULT_NETWORK_COHERENCE,
-            message_count: 0,
-            is_healthy: true,
-        }
-    }
-
-    /// Apply decoherence from a message transmission.
-    fn apply_transmission_decoherence(&mut self) {
-        self.message_count = self.message_count.wrapping_add(1);
-        let decay = (-TRANSMISSION_DECOHERENCE_RATE).exp();
-        self.transmission_coherence = (self.transmission_coherence * decay).clamp(0.0, 1.0);
-        self.recompute();
-    }
-
-    /// Apply the Kraus channel for network operations.
-    fn apply_network_channel(&mut self) {
-        let kraus_factor = (1.0 / NETWORK_KRAUS_RANK as f64).sqrt();
-        self.transmission_coherence = (self.transmission_coherence * kraus_factor).clamp(0.0, 1.0);
-        self.recompute();
-    }
-
-    fn recompute(&mut self) {
-        self.purity = self.transmission_coherence;
-        self.entropy = if self.purity >= 1.0 {
-            0.0
-        } else {
-            -self.purity * self.purity.ln().max(0.0)
-        };
-        self.is_healthy = self.purity >= MIN_NETWORK_COHERENCE;
-    }
-}
-
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // In-memory block store
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
 #[derive(Default)]
 struct MemStore {
@@ -138,17 +65,15 @@ impl BlockStore for MemStore {
     }
 }
 
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // In-memory outbox
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
-/// Outbox that broadcasts over the in‑memory network and records
-/// broadcasts for inspection.
+/// Outbox that forwards consensus messages to the in-memory network and
+/// records every broadcast so tests can assert on message flow.
 struct InMemOutbox {
     net: InMemNet,
-    pub broadcasts: Vec<ConsensusMsg>,
-    /// Quantum state tracker for transmission fidelity.
-    quantum: QuantumNetworkTestState,
+    broadcasts: Vec<ConsensusMsg>,
 }
 
 impl InMemOutbox {
@@ -156,18 +81,15 @@ impl InMemOutbox {
         Self {
             net,
             broadcasts: Vec::new(),
-            quantum: QuantumNetworkTestState::new(),
         }
     }
 
-    /// Get the quantum purity after transmissions.
-    fn purity(&self) -> f64 {
-        self.quantum.purity
+    fn broadcast_count(&self) -> usize {
+        self.broadcasts.len()
     }
 
-    /// Check if the network state is healthy.
-    fn is_healthy(&self) -> bool {
-        self.quantum.is_healthy
+    fn last_broadcast(&self) -> Option<&ConsensusMsg> {
+        self.broadcasts.last()
     }
 }
 
@@ -175,8 +97,6 @@ impl Outbox for InMemOutbox {
     fn broadcast(&mut self, msg: ConsensusMsg) {
         self.broadcasts.push(msg.clone());
         self.net.broadcast(msg);
-        self.quantum.apply_transmission_decoherence();
-        self.quantum.apply_network_channel();
     }
 
     fn request_block(&mut self, _block_id: Hash32) {}
@@ -192,15 +112,16 @@ impl Outbox for InMemOutbox {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Helper: create a consensus engine
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Consensus engine factory
+// ---------------------------------------------------------------------------
 
 fn make_engine(height: u64, validator_set: ValidatorSet) -> Engine<Ed25519Verifier> {
-    let mut config = Config::default();
-    config.include_block_in_proposal = true;
     Engine::new(
-        config,
+        Config {
+            include_block_in_proposal: true,
+            ..Default::default()
+        },
         validator_set,
         height,
         Hash32::zero(),
@@ -210,10 +131,12 @@ fn make_engine(height: u64, validator_set: ValidatorSet) -> Engine<Ed25519Verifi
     )
 }
 
-// -----------------------------------------------------------------------------
-// Helper: pump task to process incoming consensus messages
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Message pump
+// ---------------------------------------------------------------------------
 
+/// Drive an engine with messages from the in-memory network until the
+/// receiver is closed.
 async fn pump(
     mut rx: mpsc::UnboundedReceiver<ConsensusMsg>,
     engine: Arc<tokio::sync::Mutex<Engine<Ed25519Verifier>>>,
@@ -228,41 +151,54 @@ async fn pump(
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Integration Tests
-// ═══════════════════════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------------------
+// Wait helper
+// ---------------------------------------------------------------------------
 
-/// Verify that an in‑memory network delivers a proposal from the proposer
-/// to an observer node.
+/// Block until `proposal` has been observed on the given engine, or panic
+/// after `DELIVERY_TIMEOUT`.
+async fn wait_for_proposal(
+    engine: &tokio::sync::Mutex<Engine<Ed25519Verifier>>,
+    what: &str,
+) -> Proposal {
+    let deadline = Instant::now() + DELIVERY_TIMEOUT;
+    loop {
+        {
+            let guard = engine.lock().await;
+            if let Some(p) = guard.state.proposal.clone() {
+                return p;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out after {DELIVERY_TIMEOUT:?} waiting for {what}");
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+/// End-to-end: proposer broadcasts a proposal, observer receives it, and
+/// both agree on the proposal's identity.
 #[tokio::test]
 async fn inmem_network_delivers_proposal_to_observer() {
-    let mut qstate = QuantumNetworkTestState::new();
-
-    // ── Validator setup ──────────────────────────────────────────────
-    let keypair1 = Ed25519Keypair::from_seed([DEFAULT_SEED_1; 32]);
-    let keypair2 = Ed25519Keypair::from_seed([DEFAULT_SEED_2; 32]);
+    let keypair1 = Ed25519Keypair::from_seed([SEED_1; 32]);
+    let keypair2 = Ed25519Keypair::from_seed([SEED_2; 32]);
 
     let validator_set = ValidatorSet {
         vals: vec![
-            Validator {
-                pk: keypair1.public_key(),
-                power: VALIDATOR_POWER,
-            },
-            Validator {
-                pk: keypair2.public_key(),
-                power: VALIDATOR_POWER,
-            },
+            Validator { pk: keypair1.public_key(), power: VALIDATOR_POWER },
+            Validator { pk: keypair2.public_key(), power: VALIDATOR_POWER },
         ],
     };
 
-    // ── Network setup ────────────────────────────────────────────────
+    // Two-node network: node 1 registers node 2 and obtains its own handle.
     let (network1, rx1) = InMemNet::new(1u64);
     let rx2 = network1.register(2u64);
     let network2 = network1.handle(2u64);
 
-    qstate.apply_network_channel();
-
-    // ── Node 1 (proposer) components ─────────────────────────────────
     let store1 = Arc::new(MemStore::default());
     let engine1 = Arc::new(tokio::sync::Mutex::new(make_engine(
         INITIAL_HEIGHT,
@@ -270,7 +206,6 @@ async fn inmem_network_delivers_proposal_to_observer() {
     )));
     let outbox1 = Arc::new(tokio::sync::Mutex::new(InMemOutbox::new(network1)));
 
-    // ── Node 2 (observer) components ─────────────────────────────────
     let store2 = Arc::new(MemStore::default());
     let engine2 = Arc::new(tokio::sync::Mutex::new(make_engine(
         INITIAL_HEIGHT,
@@ -278,7 +213,7 @@ async fn inmem_network_delivers_proposal_to_observer() {
     )));
     let outbox2 = Arc::new(tokio::sync::Mutex::new(InMemOutbox::new(network2)));
 
-    // ── Start message pumps ──────────────────────────────────────────
+    // Each node's pump signs with **its own** keypair.
     let pump1 = tokio::spawn(pump(
         rx1,
         engine1.clone(),
@@ -289,147 +224,177 @@ async fn inmem_network_delivers_proposal_to_observer() {
     let pump2 = tokio::spawn(pump(
         rx2,
         engine2.clone(),
-        keypair1.clone(),
+        keypair2.clone(),
         store2.clone(),
         outbox2.clone(),
     ));
 
-    // ── Propose a block ──────────────────────────────────────────────
     let producer = SimpleBlockProducer::new(SimpleProducerCfg {
         max_txs: 0,
         include_block_in_proposal: true,
     });
 
-    {
+    // At (height=1, round=0) with n=2, proposer index = (1 + 0) % 2 = 1,
+    // i.e. validator 2. The producer on node 1 signs with keypair2.
+    let proposer_view = {
         let mut engine = engine1.lock().await;
-        // At height 1, round 0: proposer index = (1 + 0) % 2 = 1 → validator 2
         assert_eq!(
             engine.state.step,
             Step::Propose,
-            "engine must be in Propose step"
+            "engine must be in Propose step before proposing"
         );
+
         let mut outbox = outbox1.lock().await;
         let produced = producer.try_produce(
             &mut *engine,
-            &keypair2, // Producer should be validator 2
+            &keypair2,
             store1.as_ref(),
             &mut *outbox,
             vec![],
         );
+        assert!(produced, "producer must have created a proposal");
         assert!(
-            produced,
-            "producer should have created a proposal"
-        );
-
-        // Verify that the proposal was broadcast
-        assert!(
-            !outbox.broadcasts.is_empty(),
-            "outbox should contain at least one broadcast"
+            outbox.broadcast_count() > 0,
+            "producer must have broadcast at least once"
         );
         assert!(
-            matches!(outbox.broadcasts.last(), Some(ConsensusMsg::Proposal(_))),
-            "last broadcast should be a Proposal"
+            matches!(outbox.last_broadcast(), Some(ConsensusMsg::Proposal(_))),
+            "last broadcast must be a Proposal, got {:?}",
+            outbox.last_broadcast()
         );
 
-        // Verify quantum state is still healthy after transmission
-        assert!(
-            outbox.is_healthy(),
-            "network should be healthy after one broadcast"
-        );
-        assert!(
-            outbox.purity() < DEFAULT_NETWORK_COHERENCE,
-            "transmission should cause minor decoherence"
-        );
-    }
+        engine
+            .state
+            .proposal
+            .clone()
+            .expect("proposer engine must retain its own proposal")
+    };
 
-    // ── Wait for message delivery ────────────────────────────────────
-    tokio::time::sleep(std::time::Duration::from_millis(NETWORK_DELAY_MS)).await;
+    // Wait for the observer to see the proposal.
+    let observer_view = wait_for_proposal(&engine2, "observer to receive proposal").await;
 
-    // ── Verify observer received the proposal ────────────────────────
-    {
-        let engine = engine2.lock().await;
-        assert!(
-            engine.state.proposal.is_some(),
-            "observer must have received the proposal"
-        );
+    // Both nodes must agree on the proposal's identity.
+    assert_eq!(
+        proposer_view.height, observer_view.height,
+        "proposer and observer disagree on proposal height"
+    );
+    assert_eq!(
+        proposer_view.round, observer_view.round,
+        "proposer and observer disagree on proposal round"
+    );
+    assert_eq!(
+        proposer_view.proposer, observer_view.proposer,
+        "proposer and observer disagree on who proposed"
+    );
+    assert_eq!(
+        proposer_view.block_id, observer_view.block_id,
+        "proposer and observer disagree on the proposed block ID"
+    );
+    assert_eq!(
+        observer_view.height, INITIAL_HEIGHT,
+        "observer saw a proposal at the wrong height"
+    );
+    assert_eq!(
+        observer_view.round, 0,
+        "observer saw a proposal at the wrong round"
+    );
 
-        let proposal = engine.state.proposal.as_ref().unwrap();
-        assert_eq!(
-            proposal.height, INITIAL_HEIGHT,
-            "proposal height must match"
-        );
-        assert_eq!(proposal.round, 0, "proposal round must be 0");
-    }
-
-    // ── Verify quantum state after full transmission ─────────────────
-    {
-        let outbox = outbox1.lock().await;
-        assert!(
-            outbox.message_count() > 0,
-            "should have recorded message transmissions"
-        );
-    }
-
-    // ── Clean up ─────────────────────────────────────────────────────
     pump1.abort();
     pump2.abort();
 }
 
-/// Verify that the in‑memory network correctly excludes the sender
-/// from receiving its own broadcasts.
+/// A broadcast must reach every peer **except** its sender.
 #[tokio::test]
 async fn inmem_network_excludes_sender_from_broadcast() {
     let (net1, mut rx1) = InMemNet::new(1u64);
-    let _rx2 = net1.register(2u64);
+    let mut rx2 = net1.register(2u64);
 
-    // Broadcast from node 1
-    net1.broadcast(ConsensusMsg::Proposal(iona::consensus::Proposal {
+    let proposal = Proposal {
         height: 1,
         round: 0,
-        proposer: Ed25519Keypair::from_seed([1; 32]).public_key(),
+        proposer: Ed25519Keypair::from_seed([SEED_1; 32]).public_key(),
         block_id: Hash32::zero(),
         block: None,
         pol_round: None,
         signature: iona::crypto::SignatureBytes(vec![]),
-    }));
+    };
 
-    // Node 1 should NOT receive its own broadcast
+    net1.broadcast(ConsensusMsg::Proposal(proposal.clone()));
+
+    // The sender must not receive its own message.
     assert!(
         rx1.try_recv().is_err(),
         "sender must not receive its own broadcast"
     );
+
+    // The peer must receive it. If `broadcast` dispatches asynchronously,
+    // give it a short grace period.
+    let deadline = Instant::now() + DELIVERY_TIMEOUT;
+    let received = loop {
+        match rx2.try_recv() {
+            Ok(msg) => break msg,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            Err(e) => panic!("peer did not receive broadcast: {e:?}"),
+        }
+    };
+
+    match received {
+        ConsensusMsg::Proposal(p) => {
+            assert_eq!(p.height, 1);
+            assert_eq!(p.round, 0);
+            assert_eq!(p.proposer, proposal.proposer);
+        }
+        other => panic!("peer received unexpected message: {other:?}"),
+    }
 }
 
-/// Verify that the producer correctly identifies whether it is the
-/// designated proposer.
+/// The producer must identify exactly one proposer for every
+/// `(height, round)` in a round-robin over validators.
 #[test]
-fn producer_is_proposer_identification() {
-    let keypair1 = Ed25519Keypair::from_seed([1; 32]);
-    let keypair2 = Ed25519Keypair::from_seed([2; 32]);
+fn producer_identifies_proposer_by_position() {
+    let keypair1 = Ed25519Keypair::from_seed([SEED_1; 32]);
+    let keypair2 = Ed25519Keypair::from_seed([SEED_2; 32]);
 
     let validator_set = ValidatorSet {
         vals: vec![
-            Validator {
-                pk: keypair1.public_key(),
-                power: 1,
-            },
-            Validator {
-                pk: keypair2.public_key(),
-                power: 1,
-            },
+            Validator { pk: keypair1.public_key(), power: 1 },
+            Validator { pk: keypair2.public_key(), power: 1 },
         ],
     };
 
-    let engine = make_engine(1, validator_set);
     let producer = SimpleBlockProducer::new(SimpleProducerCfg::default());
 
-    // At height 1, round 0: proposer index = (1 + 0) % 2 = 1 → validator 2
-    assert!(
-        !producer.is_proposer(&engine, &keypair1),
-        "validator 1 should NOT be proposer at height 1, round 0"
-    );
-    assert!(
-        producer.is_proposer(&engine, &keypair2),
-        "validator 2 should BE proposer at height 1, round 0"
-    );
+    // Expected proposer index = (height + round) % 2 over these positions.
+    let cases: &[(u64, u32, usize)] = &[
+        (1, 0, 1), // (1+0) % 2 = 1 → validator 2
+        (1, 1, 0), // (1+1) % 2 = 0 → validator 1
+        (2, 0, 0), // (2+0) % 2 = 0 → validator 1
+        (2, 1, 1), // (2+1) % 2 = 1 → validator 2
+        (3, 0, 1), // (3+0) % 2 = 1 → validator 2
+    ];
+
+    for &(height, round, expected_idx) in cases {
+        let mut engine = make_engine(height, validator_set.clone());
+        engine.state.round = round;
+
+        let keypair_expected = if expected_idx == 0 { &keypair1 } else { &keypair2 };
+        let keypair_other = if expected_idx == 0 { &keypair2 } else { &keypair1 };
+
+        assert!(
+            producer.is_proposer(&engine, keypair_expected),
+            "expected validator {} to be proposer at (h={}, r={})",
+            expected_idx + 1,
+            height,
+            round,
+        );
+        assert!(
+            !producer.is_proposer(&engine, keypair_other),
+            "validator {} must NOT be proposer at (h={}, r={})",
+            (1 - expected_idx) + 1,
+            height,
+            round,
+        );
+    }
 }
