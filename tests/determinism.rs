@@ -1,139 +1,129 @@
-//! Golden-vector determinism tests — Quantum Stability Gate.
+//! Golden-vector determinism tests.
 //!
-//! These tests ensure that core cryptographic and hashing functions produce
-//! exactly the same output across builds, platforms, and Rust versions.
-//! If any of these fail after a code change, it means the change broke
-//! determinism — which is a **consensus-critical bug** in a blockchain.
+//! Consensus-critical functions MUST produce byte-identical output across
+//! builds, platforms, and Rust versions. If any golden vector changes,
+//! every node on the network will compute a different state root, block
+//! ID, or transaction hash — which manifests as a hard fork.
 //!
-//! # Quantum Determinism Model
+//! # How golden tests work
 //!
-//! Determinism is modelled as a **pure quantum state** that must remain
-//! invariant under all unitary transformations.  Any deviation in hash
-//! output corresponds to an **unintended decoherence event** that would
-//! split the blockchain state across nodes.
+//! Every `GOLDEN_*` constant pins the exact hex output of one function.
+//! A test failure means either:
 //!
-//! # Mathematical Formalism
+//! * the change is a regression → revert it, or
+//! * the change is intentional (planned protocol upgrade) → update the
+//!   constant and ship it as a hard-fork release.
 //!
-//! ```text
-//! |Ψ_deterministic⟩ = H(|input⟩)
-//! ⟨Ψ_deterministic|Ψ_deterministic⟩ = 1   (must always hold)
-//! ```
+//! # Filling in goldens on first run
 //!
-//! # Adding new vectors
+//! All `GOLDEN_*` constants ship empty. On the first `cargo test` run, each
+//! golden test panics with the actual value printed in the message. Copy
+//! each value into its constant, re-run, and the file is green.
 //!
-//! 1. Compute the expected value once (on a known‑good build).
-//! 2. Add it as a constant here.
-//! 3. Write a test that asserts the function output matches.
+//! # Scope
+//!
+//! Hashing is a pure function of its input bytes. This file pins the
+//! *outputs* and asserts a handful of algebraic properties (order
+//! independence, order sensitivity, migration invariants). It does not
+//! model "quantum coherence" — determinism is not a physical quantity.
 
+use iona::execution::KvState;
+use iona::protocol::version::{version_for_height, ProtocolActivation};
 use iona::types::{
     hash_bytes, receipts_root, tx_hash, tx_root, Block, BlockHeader, Hash32, Receipt, Tx,
 };
 
-// -----------------------------------------------------------------------------
-// Quantum Constants
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Golden vectors
+// ---------------------------------------------------------------------------
+//
+// Pin the exact hex output of every consensus-critical function. Leave the
+// string empty on first checkout; a test run will print the value.
 
-/// Reduced Planck constant (natural units).
-const HBAR: f64 = 1.0;
+/// `hex::encode(hash_bytes(b"IONA_DETERMINISM_TEST").0)`
+const GOLDEN_HASH_BYTES: &str = "";
 
-/// Default quantum coherence for a deterministic state.
-const DEFAULT_DETERMINISM_COHERENCE: f64 = 1.0;
+/// `hex::encode(tx_hash(&canonical_tx()).0)`
+const GOLDEN_TX_HASH: &str = "";
 
-/// Decoherence rate per hash operation (should be 0 for deterministic).
-const HASH_DECOHERENCE_RATE: f64 = 0.0;
+/// `hex::encode(tx_root(&[]).0)`
+const GOLDEN_TX_ROOT_EMPTY: &str = "";
 
-/// Minimum coherence threshold for deterministic output.
-const MIN_DETERMINISM_COHERENCE: f64 = 1.0;
+/// `hex::encode(tx_root(&[canonical_tx(), canonical_tx_with_nonce(43)]).0)`
+const GOLDEN_TX_ROOT_TWO: &str = "";
 
-/// Kraus rank for determinism quantum channels (trivial — rank 1).
-const DETERMINISM_KRAUS_RANK: usize = 1;
+/// `hex::encode(receipts_root(&[]).0)`
+const GOLDEN_RECEIPTS_ROOT_EMPTY: &str = "";
 
-// -----------------------------------------------------------------------------
-// Classical Constants
-// -----------------------------------------------------------------------------
+/// `hex::encode(receipts_root(&[canonical_receipt()]).0)`
+const GOLDEN_RECEIPTS_ROOT_ONE: &str = "";
 
-/// Test message used for golden hash.
+/// `hex::encode(Block { header: test_block_header(), txs: vec![] }.id().0)`
+const GOLDEN_BLOCK_ID_EMPTY: &str = "";
+
+/// `hex::encode(KvState { kv: { a=1, b=2, c=3 } }.root().0)`
+const GOLDEN_STATE_ROOT_KV: &str = "";
+
+/// `hex::encode(KvState { balances: { alice=1000, bob=2000 } }.root().0)`
+const GOLDEN_STATE_ROOT_BALANCES: &str = "";
+
+// ---------------------------------------------------------------------------
+// Test vectors
+// ---------------------------------------------------------------------------
+
+/// Canonical input to the hashing primitives.
 const TEST_MESSAGE: &[u8] = b"IONA_DETERMINISM_TEST";
 
 /// Canonical chain ID used in test transactions.
-const TEST_CHAIN_ID: u64 = 6126151;
+const TEST_CHAIN_ID: u64 = 6_126_151;
 
 /// Canonical gas limit.
 const TEST_GAS_LIMIT: u64 = 21_000;
 
-/// Canonical block height.
+/// Canonical block height / round / timestamp for synthetic headers.
 const TEST_BLOCK_HEIGHT: u64 = 1;
-
-/// Canonical block round.
 const TEST_BLOCK_ROUND: u32 = 0;
-
-/// Canonical block timestamp.
 const TEST_BLOCK_TIMESTAMP: u64 = 1000;
 
-// -----------------------------------------------------------------------------
-// Quantum Determinism State
-// -----------------------------------------------------------------------------
-
-/// Quantum state tracker for determinism tests.
-///
-/// All determinism tests should maintain γ = 1.0 (perfect purity).
-/// Any deviation indicates a non‑deterministic code path.
-#[derive(Debug, Clone)]
-struct QuantumDeterminismState {
-    /// Purity γ = Tr(ρ²) — must remain 1.0.
-    purity: f64,
-    /// Von Neumann entropy S = -Tr(ρ ln ρ) — must remain 0.0.
-    entropy: f64,
-    /// Coherence of the hash output.
-    coherence: f64,
-    /// Number of hash operations performed.
-    hash_count: u64,
-    /// Whether the state is perfectly deterministic.
-    is_deterministic: bool,
-}
-
-impl QuantumDeterminismState {
-    fn new() -> Self {
-        Self {
-            purity: DEFAULT_DETERMINISM_COHERENCE,
-            entropy: 0.0,
-            coherence: DEFAULT_DETERMINISM_COHERENCE,
-            hash_count: 0,
-            is_deterministic: true,
-        }
-    }
-
-    /// Record a hash operation — should NOT cause decoherence.
-    fn record_hash(&mut self) {
-        self.hash_count = self.hash_count.wrapping_add(1);
-        let decay = (-HASH_DECOHERENCE_RATE).exp();
-        self.coherence = (self.coherence * decay).clamp(0.0, 1.0);
-        self.recompute();
-    }
-
-    /// Apply the Kraus channel — trivial for deterministic operations.
-    fn apply_channel(&mut self) {
-        let kraus_factor = (1.0 / DETERMINISM_KRAUS_RANK as f64).sqrt();
-        self.coherence = (self.coherence * kraus_factor).clamp(0.0, 1.0);
-        self.recompute();
-    }
-
-    fn recompute(&mut self) {
-        self.purity = self.coherence;
-        self.entropy = if self.purity >= 1.0 {
-            0.0
-        } else {
-            -self.purity * self.purity.ln().max(0.0)
-        };
-        self.is_deterministic = self.purity >= MIN_DETERMINISM_COHERENCE;
-    }
-}
-
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Helpers
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
-/// Canonical test transaction used across multiple determinism tests.
+/// Assert that `actual` matches the pinned golden vector `expected`.
+///
+/// If `expected` is empty, panics with the actual value so the developer
+/// can copy it into the corresponding `GOLDEN_*` constant on first run.
+fn assert_golden(actual: &str, expected: &str, name: &str) {
+    if expected.is_empty() {
+        panic!(
+            "\n\n[golden] `{name}` is not pinned yet.\n\
+             Copy the value below into the matching `GOLDEN_*` constant:\n\n\
+             \t\"{actual}\"\n"
+        );
+    }
+    assert_eq!(
+        actual, expected,
+        "\n\n[golden] MISMATCH for `{name}`\n\
+         expected: {expected}\n\
+         actual:   {actual}\n\n\
+         If the change is intentional (protocol upgrade), update the constant\n\
+         and ship as a hard-fork release. Otherwise, revert.\n"
+    );
+}
+
+/// Assert equality with determinism-specific context.
+///
+/// This is a plain function, not a macro, so both sides are evaluated
+/// exactly once.
+fn assert_deterministic_eq<T, M>(left: T, right: T, msg: M)
+where
+    T: PartialEq + std::fmt::Debug,
+    M: std::fmt::Display,
+{
+    assert_eq!(left, right, "DETERMINISM VIOLATION: {msg}");
+}
+
+/// Canonical test transaction.
 fn canonical_tx() -> Tx {
     Tx {
         pubkey: vec![1u8; 32],
@@ -148,7 +138,14 @@ fn canonical_tx() -> Tx {
     }
 }
 
-/// Canonical test receipt used for receipts root tests.
+/// Second canonical transaction, differing only in `nonce`.
+fn canonical_tx_with_nonce(nonce: u64) -> Tx {
+    let mut tx = canonical_tx();
+    tx.nonce = nonce;
+    tx
+}
+
+/// Canonical test receipt.
 fn canonical_receipt() -> Receipt {
     Receipt {
         tx_hash: Hash32([0xAA; 32]),
@@ -166,16 +163,17 @@ fn canonical_receipt() -> Receipt {
     }
 }
 
-/// Create a minimal block header for ID determinism tests.
+/// Synthetic block header whose roots are derived from the canonical
+/// empty inputs, so it is internally consistent.
 fn test_block_header() -> BlockHeader {
     BlockHeader {
         height: TEST_BLOCK_HEIGHT,
         round: TEST_BLOCK_ROUND,
         prev: Hash32::zero(),
         proposer_pk: vec![0u8; 32],
-        tx_root: Hash32::zero(),
-        receipts_root: Hash32::zero(),
-        state_root: Hash32::zero(),
+        tx_root: tx_root(&[]),
+        receipts_root: receipts_root(&[]),
+        state_root: KvState::default().root(),
         base_fee_per_gas: 1,
         gas_used: 0,
         intrinsic_gas_used: 0,
@@ -188,106 +186,147 @@ fn test_block_header() -> BlockHeader {
     }
 }
 
-/// Assert equality with determinism quantum tracking.
-macro_rules! assert_deterministic {
-    ($left:expr, $right:expr, $msg:expr) => {
-        assert_eq!(
-            $left, $right,
-            "DETERMINISM VIOLATION: {} — left={:?}, right={:?}",
-            $msg, $left, $right
-        );
-    };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Core hash determinism
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Golden vectors — pinned hash outputs
+// ===========================================================================
 
 #[test]
-fn determinism_hash_bytes_stable() {
-    let mut qstate = QuantumDeterminismState::new();
-
+fn golden_hash_bytes() {
     let h1 = hash_bytes(TEST_MESSAGE);
-    qstate.record_hash();
-    qstate.apply_channel();
-
     let h2 = hash_bytes(TEST_MESSAGE);
-    qstate.record_hash();
-    qstate.apply_channel();
-
-    assert_deterministic!(h1, h2, "hash_bytes is not deterministic across calls");
-    assert!(
-        qstate.is_deterministic,
-        "quantum state must remain deterministic after hash_bytes"
+    assert_deterministic_eq(h1, h2, "hash_bytes is not deterministic across calls");
+    assert_golden(
+        &hex::encode(&h1.0),
+        GOLDEN_HASH_BYTES,
+        "hash_bytes(IONA_DETERMINISM_TEST)",
     );
-
-    let hex_str = hex::encode(&h1.0);
-    println!("hash_bytes golden: {hex_str}");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Transaction hash determinism
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
-fn determinism_tx_hash_stable() {
-    let mut qstate = QuantumDeterminismState::new();
-
+fn golden_tx_hash() {
     let tx = canonical_tx();
     let h1 = tx_hash(&tx);
-    qstate.record_hash();
-
     let h2 = tx_hash(&tx);
-    qstate.record_hash();
-
-    assert_deterministic!(h1, h2, "tx_hash is not deterministic");
-    assert!(qstate.is_deterministic);
-
-    let hex_str = hex::encode(&h1.0);
-    println!("tx_hash golden: {hex_str}");
+    assert_deterministic_eq(h1, h2, "tx_hash is not deterministic across calls");
+    assert_golden(
+        &hex::encode(&h1.0),
+        GOLDEN_TX_HASH,
+        "tx_hash(canonical_tx)",
+    );
 }
 
 #[test]
-fn determinism_tx_hash_different_nonce_gives_different_hash() {
-    let mut tx1 = canonical_tx();
-    let mut tx2 = canonical_tx();
-    tx2.nonce = 43;
+fn golden_tx_root_empty() {
+    let r1 = tx_root(&[]);
+    let r2 = tx_root(&[]);
+    assert_deterministic_eq(r1, r2, "tx_root([]) is not deterministic");
+    assert_golden(
+        &hex::encode(&r1.0),
+        GOLDEN_TX_ROOT_EMPTY,
+        "tx_root(empty)",
+    );
+}
 
-    let h1 = tx_hash(&tx1);
-    let h2 = tx_hash(&tx2);
+#[test]
+fn golden_tx_root_with_two_txs() {
+    let txs = vec![canonical_tx(), canonical_tx_with_nonce(43)];
+    let r1 = tx_root(&txs);
+    let r2 = tx_root(&txs);
+    assert_deterministic_eq(r1, r2, "tx_root(2 txs) is not deterministic");
+    assert_golden(
+        &hex::encode(&r1.0),
+        GOLDEN_TX_ROOT_TWO,
+        "tx_root([nonce=42, nonce=43])",
+    );
+}
 
+#[test]
+fn golden_receipts_root_empty() {
+    let r1 = receipts_root(&[]);
+    let r2 = receipts_root(&[]);
+    assert_deterministic_eq(r1, r2, "receipts_root([]) is not deterministic");
+    assert_golden(
+        &hex::encode(&r1.0),
+        GOLDEN_RECEIPTS_ROOT_EMPTY,
+        "receipts_root(empty)",
+    );
+}
+
+#[test]
+fn golden_receipts_root_one() {
+    let receipts = vec![canonical_receipt()];
+    let r1 = receipts_root(&receipts);
+    let r2 = receipts_root(&receipts);
+    assert_deterministic_eq(r1, r2, "receipts_root(1 receipt) is not deterministic");
+    assert_golden(
+        &hex::encode(&r1.0),
+        GOLDEN_RECEIPTS_ROOT_ONE,
+        "receipts_root([canonical_receipt])",
+    );
+}
+
+#[test]
+fn golden_block_id_empty() {
+    let block = Block {
+        header: test_block_header(),
+        txs: vec![],
+    };
+    let id1 = block.id();
+    let id2 = block.id();
+    assert_deterministic_eq(id1, id2, "block.id() is not deterministic");
+    assert_golden(
+        &hex::encode(&id1.0),
+        GOLDEN_BLOCK_ID_EMPTY,
+        "block_id(empty block)",
+    );
+}
+
+#[test]
+fn golden_state_root_kv() {
+    let mut s = KvState::default();
+    s.kv.insert("a".into(), "1".into());
+    s.kv.insert("b".into(), "2".into());
+    s.kv.insert("c".into(), "3".into());
+    let root = s.root();
+    assert_golden(
+        &hex::encode(&root.0),
+        GOLDEN_STATE_ROOT_KV,
+        "state_root(kv: a=1, b=2, c=3)",
+    );
+}
+
+#[test]
+fn golden_state_root_balances() {
+    let mut s = KvState::default();
+    s.balances.insert("alice".into(), 1000);
+    s.balances.insert("bob".into(), 2000);
+    let root = s.root();
+    assert_golden(
+        &hex::encode(&root.0),
+        GOLDEN_STATE_ROOT_BALANCES,
+        "state_root(balances: alice=1000, bob=2000)",
+    );
+}
+
+// ===========================================================================
+// Determinism properties
+// ===========================================================================
+
+#[test]
+fn determinism_tx_hash_nonce_sensitive() {
+    let h1 = tx_hash(&canonical_tx());
+    let h2 = tx_hash(&canonical_tx_with_nonce(43));
     assert_ne!(
         h1, h2,
         "different nonces must produce different transaction hashes"
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Transaction root determinism
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn determinism_tx_root_empty() {
-    let r1 = tx_root(&[]);
-    let r2 = tx_root(&[]);
-    assert_deterministic!(r1, r2, "tx_root([]) is not deterministic");
-}
-
-#[test]
-fn determinism_tx_root_with_txs() {
-    let txs = vec![canonical_tx(), canonical_tx()];
-    let r1 = tx_root(&txs);
-    let r2 = tx_root(&txs);
-    assert_deterministic!(r1, r2, "tx_root is not deterministic");
-}
-
 #[test]
 fn determinism_tx_root_order_sensitive() {
-    // Transaction root SHOULD be order-sensitive (Merkle tree semantics)
+    // Merkle roots are order-sensitive by design: (tx_a, tx_b) != (tx_b, tx_a).
     let tx_a = canonical_tx();
-
-    let mut tx_b = canonical_tx();
-    tx_b.nonce = 43;
+    let tx_b = canonical_tx_with_nonce(43);
 
     let root_ab = tx_root(&[tx_a.clone(), tx_b.clone()]);
     let root_ba = tx_root(&[tx_b, tx_a]);
@@ -298,81 +337,34 @@ fn determinism_tx_root_order_sensitive() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Receipts root determinism
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
-fn determinism_receipts_root_stable() {
-    let receipts = vec![canonical_receipt()];
-    let r1 = receipts_root(&receipts);
-    let r2 = receipts_root(&receipts);
-    assert_deterministic!(r1, r2, "receipts_root is not deterministic");
-}
+fn determinism_block_id_txs_sensitive() {
+    // Two blocks must differ when their txs differ. Build the header with
+    // matching `tx_root` so the test does not rely on `Block::id()`
+    // implementation details.
+    let tx = canonical_tx();
 
-#[test]
-fn determinism_receipts_root_empty() {
-    let r1 = receipts_root(&[]);
-    let r2 = receipts_root(&[]);
-    assert_deterministic!(r1, r2, "receipts_root([]) is not deterministic");
-}
+    let mut header_with_tx = test_block_header();
+    header_with_tx.tx_root = tx_root(&[tx.clone()]);
+    let block_with_tx = Block {
+        header: header_with_tx,
+        txs: vec![tx],
+    };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Block ID determinism
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn determinism_block_id_stable() {
-    let mut qstate = QuantumDeterminismState::new();
-
-    let header = test_block_header();
-    let block = Block {
-        header,
+    let block_without_tx = Block {
+        header: test_block_header(),
         txs: vec![],
     };
-
-    let id1 = block.id();
-    qstate.record_hash();
-
-    let id2 = block.id();
-    qstate.record_hash();
-
-    assert_deterministic!(id1, id2, "block.id() is not deterministic");
-    assert!(qstate.is_deterministic);
-
-    let hex_str = hex::encode(&id1.0);
-    println!("block_id golden: {hex_str}");
-}
-
-#[test]
-fn determinism_block_id_different_txs_gives_different_id() {
-    let header = test_block_header();
-    let block1 = Block {
-        header: header.clone(),
-        txs: vec![canonical_tx()],
-    };
-    let block2 = Block {
-        header,
-        txs: vec![],
-    };
-
-    let id1 = block1.id();
-    let id2 = block2.id();
 
     assert_ne!(
-        id1, id2,
+        block_with_tx.id(),
+        block_without_tx.id(),
         "blocks with different transactions must have different IDs"
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// State root insertion‑order independence
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
-fn determinism_state_root_order_independent() {
-    use iona::execution::KvState;
-
+fn determinism_state_root_kv_order_independent() {
     let mut s1 = KvState::default();
     s1.kv.insert("a".into(), "1".into());
     s1.kv.insert("b".into(), "2".into());
@@ -383,17 +375,15 @@ fn determinism_state_root_order_independent() {
     s2.kv.insert("a".into(), "1".into());
     s2.kv.insert("b".into(), "2".into());
 
-    assert_deterministic!(
+    assert_eq!(
         s1.root(),
         s2.root(),
-        "state root depends on insertion order — NOT deterministic"
+        "state root must not depend on kv insertion order"
     );
 }
 
 #[test]
 fn determinism_state_root_balances_order_independent() {
-    use iona::execution::KvState;
-
     let mut s1 = KvState::default();
     s1.balances.insert("alice".into(), 1000);
     s1.balances.insert("bob".into(), 2000);
@@ -402,23 +392,21 @@ fn determinism_state_root_balances_order_independent() {
     s2.balances.insert("bob".into(), 2000);
     s2.balances.insert("alice".into(), 1000);
 
-    assert_deterministic!(
+    assert_eq!(
         s1.root(),
         s2.root(),
-        "state root with balances must be insertion-order independent"
+        "state root must not depend on balance insertion order"
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Migration invariants (UPGRADE_SPEC section 10.2)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
-/// M3 equivalence: state root must be identical before and after a
-/// format-only migration (no semantic changes).
+/// M3: a format-only migration (serialize → deserialize) must preserve the
+/// state root exactly.
 #[test]
-fn determinism_migration_root_equivalence() {
-    use iona::execution::KvState;
-
+fn migration_preserves_state_root() {
     let mut state = KvState::default();
     state.balances.insert("alice".into(), 1_000_000);
     state.balances.insert("bob".into(), 500_000);
@@ -427,23 +415,24 @@ fn determinism_migration_root_equivalence() {
     state.burned = 100;
 
     let root_before = state.root();
+    let roundtrip: KvState =
+        serde_json::from_str(&serde_json::to_string(&state).expect("serialize"))
+            .expect("deserialize");
+    let root_after = roundtrip.root();
 
-    let state_after: KvState =
-        serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
-    let root_after = state_after.root();
-
-    assert_deterministic!(
+    assert_deterministic_eq(
         root_before,
         root_after,
-        "state root changed after format-only migration (M3 violation)"
+        "state root changed after format-only migration (M3 violation)",
     );
 }
 
-/// M1 invariant: migration must not lose account or KV keys.
+/// M1: a migration must not lose account or KV keys.
+///
+/// `HashMap` iteration order is non-deterministic, so both sides are sorted
+/// before comparison.
 #[test]
-fn determinism_migration_no_key_loss() {
-    use iona::execution::KvState;
-
+fn migration_preserves_keys() {
     let mut state = KvState::default();
     state.balances.insert("alice".into(), 1000);
     state.balances.insert("bob".into(), 2000);
@@ -451,30 +440,35 @@ fn determinism_migration_no_key_loss() {
     state.kv.insert("x".into(), "1".into());
     state.kv.insert("y".into(), "2".into());
 
-    let keys_before: Vec<String> = state.balances.keys().cloned().collect();
-    let kv_keys_before: Vec<String> = state.kv.keys().cloned().collect();
+    let mut balances_before: Vec<String> = state.balances.keys().cloned().collect();
+    let mut kv_before: Vec<String> = state.kv.keys().cloned().collect();
+    balances_before.sort();
+    kv_before.sort();
 
     let migrated: KvState =
-        serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        serde_json::from_str(&serde_json::to_string(&state).expect("serialize"))
+            .expect("deserialize");
 
-    let keys_after: Vec<String> = migrated.balances.keys().cloned().collect();
-    let kv_keys_after: Vec<String> = migrated.kv.keys().cloned().collect();
+    let mut balances_after: Vec<String> = migrated.balances.keys().cloned().collect();
+    let mut kv_after: Vec<String> = migrated.kv.keys().cloned().collect();
+    balances_after.sort();
+    kv_after.sort();
 
-    assert_deterministic!(
-        keys_before, keys_after,
-        "account keys lost during migration (M1 violation)"
+    assert_deterministic_eq(
+        balances_before,
+        balances_after,
+        "account keys lost during migration (M1 violation)",
     );
-    assert_deterministic!(
-        kv_keys_before, kv_keys_after,
-        "KV keys lost during migration (M1 violation)"
+    assert_deterministic_eq(
+        kv_before,
+        kv_after,
+        "KV keys lost during migration (M1 violation)",
     );
 }
 
-/// M2 invariant: total supply must be conserved across a migration.
+/// M2: total supply must be conserved across a migration.
 #[test]
-fn determinism_migration_value_conservation() {
-    use iona::execution::KvState;
-
+fn migration_preserves_supply() {
     let mut state = KvState::default();
     state.balances.insert("alice".into(), 1_000_000);
     state.balances.insert("bob".into(), 500_000);
@@ -483,21 +477,23 @@ fn determinism_migration_value_conservation() {
     let supply_before = state.balances.values().sum::<u64>() + state.burned;
 
     let migrated: KvState =
-        serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        serde_json::from_str(&serde_json::to_string(&state).expect("serialize"))
+            .expect("deserialize");
     let supply_after = migrated.balances.values().sum::<u64>() + migrated.burned;
 
-    assert_deterministic!(
-        supply_before, supply_after,
-        "total supply changed during migration (M2 violation): before={supply_before}, after={supply_after}"
+    assert_deterministic_eq(
+        supply_before,
+        supply_after,
+        format!(
+            "total supply changed during migration (M2 violation): \
+             before={supply_before}, after={supply_after}"
+        ),
     );
 }
 
-/// M4 invariant: VM storage must survive a round-trip serialization.
+/// M4: VM storage and nonces must survive a round-trip serialization.
 #[test]
-fn determinism_migration_vm_storage_preserved() {
-    use iona::execution::KvState;
-    use iona::vm::state::VmStorage;
-
+fn migration_preserves_vm_storage() {
     let mut state = KvState::default();
     let contract = [0xAAu8; 32];
     let key = [0xBBu8; 32];
@@ -509,27 +505,27 @@ fn determinism_migration_vm_storage_preserved() {
     let nonces_before = state.vm.nonces.clone();
 
     let migrated: KvState =
-        serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        serde_json::from_str(&serde_json::to_string(&state).expect("serialize"))
+            .expect("deserialize");
 
-    assert_deterministic!(
-        storage_before, migrated.vm.storage,
-        "VM storage lost during migration (M4 violation)"
+    assert_deterministic_eq(
+        storage_before,
+        migrated.vm.storage,
+        "VM storage lost during migration (M4 violation)",
     );
-    assert_deterministic!(
-        nonces_before, migrated.vm.nonces,
-        "VM nonces lost during migration (M4 violation)"
+    assert_deterministic_eq(
+        nonces_before,
+        migrated.vm.nonces,
+        "VM nonces lost during migration (M4 violation)",
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Protocol version function determinism
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Protocol version determinism
+// ===========================================================================
 
-#[test]
-fn determinism_pv_function_stable() {
-    use iona::protocol::version::{version_for_height, ProtocolActivation};
-
-    let activations = vec![
+fn pv_test_activations() -> Vec<ProtocolActivation> {
+    vec![
         ProtocolActivation {
             protocol_version: 1,
             activation_height: None,
@@ -540,87 +536,35 @@ fn determinism_pv_function_stable() {
             activation_height: Some(100),
             grace_blocks: 10,
         },
-    ];
+    ]
+}
+
+#[test]
+fn determinism_pv_function_stable() {
+    let activations = pv_test_activations();
 
     for height in [0, 1, 50, 99, 100, 105, 110, 200] {
         let pv1 = version_for_height(height, &activations);
         let pv2 = version_for_height(height, &activations);
-        assert_deterministic!(
-            pv1, pv2,
-            format!("PV not deterministic at height {height}")
+        assert_deterministic_eq(
+            pv1,
+            pv2,
+            format!("PV mapping not deterministic at height {height}"),
         );
 
-        if height < 100 {
-            assert_eq!(
-                pv1, 1,
-                "PV should be 1 before activation at height {height}"
-            );
-        } else {
-            assert_eq!(
-                pv1, 2,
-                "PV should be 2 after activation at height {height}"
-            );
-        }
+        let expected = if height < 100 { 1 } else { 2 };
+        assert_eq!(
+            pv1, expected,
+            "wrong PV at height {height}: expected {expected}, got {pv1}"
+        );
     }
 }
 
 #[test]
 fn determinism_pv_grace_period_boundary() {
-    use iona::protocol::version::{version_for_height, ProtocolActivation};
+    let activations = pv_test_activations();
 
-    let activations = vec![
-        ProtocolActivation {
-            protocol_version: 1,
-            activation_height: None,
-            grace_blocks: 0,
-        },
-        ProtocolActivation {
-            protocol_version: 2,
-            activation_height: Some(100),
-            grace_blocks: 10,
-        },
-    ];
-
-    // At height 100: activation triggers, version becomes 2
-    assert_eq!(version_for_height(100, &activations), 2);
-    // At height 99: still version 1
-    assert_eq!(version_for_height(99, &activations), 1);
-    // At height 110: grace period ends
-    assert_eq!(version_for_height(110, &activations), 2);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Quantum-specific determinism tests
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn quantum_determinism_state_stays_pure() {
-    let mut qstate = QuantumDeterminismState::new();
-
-    for _ in 0..1000 {
-        qstate.record_hash();
-        qstate.apply_channel();
-    }
-
-    assert!(
-        (qstate.purity - 1.0).abs() < 1e-10,
-        "deterministic operations must NOT cause decoherence"
-    );
-    assert!(
-        qstate.is_deterministic,
-        "quantum state must remain deterministic after many operations"
-    );
-}
-
-#[test]
-fn quantum_determinism_entropy_is_zero() {
-    let mut qstate = QuantumDeterminismState::new();
-
-    qstate.record_hash();
-    qstate.apply_channel();
-
-    assert!(
-        (qstate.entropy - 0.0).abs() < 1e-10,
-        "deterministic operations must have zero entropy"
-    );
+    assert_eq!(version_for_height(99, &activations), 1, "pre-activation");
+    assert_eq!(version_for_height(100, &activations), 2, "activation height");
+    assert_eq!(version_for_height(110, &activations), 2, "grace period ends");
 }
