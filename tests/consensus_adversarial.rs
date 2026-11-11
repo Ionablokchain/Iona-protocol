@@ -1,26 +1,41 @@
-//! Consensus adversarial tests — Quantum Security Gate.
+//! Consensus adversarial tests — Double-sign guard.
 //!
-//! These tests verify that the consensus layer correctly **REJECTS**
-//! invalid, replayed, or equivocating inputs.  They are the "must‑reject"
-//! security gate for the double‑sign guard and consensus safety.
+//! These tests are the "must-reject" security gate for the double-sign
+//! guard used by the consensus layer. They assert that the guard
+//! **rejects** equivocation, conflicting inputs, and tampered on-disk
+//! state, while remaining idempotent for exact replays and independent
+//! across distinct consensus positions.
 //!
-//! # Quantum Adversarial Model
+//! # Threat model
 //!
-//! Each adversarial input is a **perturbation** of the consensus state
-//! |Ψ⟩.  The double‑sign guard acts as an **entanglement witness** that
-//! detects forbidden transitions (equivocations) and collapses the state
-//! to an error subspace.
+//! A Byzantine validator (or a buggy honest one) may attempt to:
+//!
+//! * sign two conflicting proposals at the same `(height, round)`;
+//! * sign two conflicting prevotes or precommits at the same
+//!   `(height, round)`;
+//! * flip between a block vote and a `nil` vote at the same position;
+//! * replay a previously accepted vote hoping it bypasses the guard;
+//! * tamper with the on-disk guard file to erase or rewrite prior
+//!   signatures.
+//!
+//! The guard MUST prevent every one of those, while allowing:
+//!
+//! * exact replays of an already-recorded vote or proposal
+//!   (idempotent accept);
+//! * votes / proposals at different heights or rounds;
+//! * a prevote and a precommit at the same position (they are
+//!   distinct vote types).
 //!
 //! # Categories
 //!
-//!   A. Double‑sign guard — equivocation prevention
-//!   B. Replay protection — idempotent accept
-//!   C. Independence of different positions
-//!   D. Persistence across restarts
-//!   E. Hash‑chain integrity (tamper detection)
-//!   F. Record‑count tracking
-//!   G. Quantum coherence tracking (new)
-//!   H. Edge cases (empty / zero / boundary)
+//! * **A** — Double-sign guard: equivocation prevention
+//! * **B** — Replay protection: idempotent accept
+//! * **C** — Independence of different positions
+//! * **D** — Persistence across restarts
+//! * **E** — Hash-chain integrity: tamper detection
+//! * **F** — Record-count tracking
+//! * **G** — Guard path reporting
+//! * **H** — Edge cases: empty, zero, boundary
 
 use iona::consensus::double_sign::{vote_guard_key, DoubleSignGuard};
 use iona::consensus::messages::VoteType;
@@ -29,9 +44,9 @@ use iona::types::Hash32;
 use std::fs;
 use tempfile::TempDir;
 
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Constants
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
 const TEST_HEIGHT: u64 = 10;
 const TEST_ROUND: u32 = 0;
@@ -42,57 +57,67 @@ const BLOCK_HASH_A: u8 = 0xAA;
 const BLOCK_HASH_B: u8 = 0xBB;
 const BLOCK_HASH_C: u8 = 0xCC;
 
-/// Reduced Planck constant (natural units).
-const HBAR: f64 = 1.0;
-
-/// Default quantum coherence for adversarial test state.
-const DEFAULT_ADVERSARIAL_COHERENCE: f64 = 1.0;
-
-/// Decoherence rate per adversarial operation.
-const ADVERSARIAL_DECOHERENCE_RATE: f64 = 0.0001;
-
-/// Minimum coherence threshold for healthy guard.
-const MIN_GUARD_COHERENCE: f64 = 0.99;
-
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Helpers
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
-/// Create a `Hash32` with a repeating byte.
+/// Create a `Hash32` filled with the same byte.
 fn hash(byte: u8) -> Hash32 {
     Hash32([byte; 32])
 }
 
-/// Optional hash (Some or None).
+/// Wrap a hash as `Some(_)` for vote APIs that accept nil votes.
 fn opt_hash(byte: u8) -> Option<Hash32> {
     Some(hash(byte))
 }
 
-/// Create a temporary directory and a `DoubleSignGuard` for a validator
-/// with a given key byte.
+/// Borrow the temporary directory as a UTF-8 path.
+fn temp_path(dir: &TempDir) -> &str {
+    dir.path()
+        .to_str()
+        .expect("temporary directory path must be valid UTF-8")
+}
+
+/// Create a `DoubleSignGuard` for a validator whose public key is
+/// 32 copies of `pk_byte`, rooted in the given temporary directory.
 fn make_guard(dir: &TempDir, pk_byte: u8) -> DoubleSignGuard {
     let pk = PublicKeyBytes(vec![pk_byte; 32]);
-    DoubleSignGuard::new(dir.path().to_str().unwrap(), &pk)
-        .expect("guard must load cleanly")
+    DoubleSignGuard::new(temp_path(dir), &pk)
+        .expect("guard must load cleanly from a fresh temporary directory")
 }
 
-/// Assert that `result` is `Ok` (allowed).
+/// Assert that the guard **allowed** the operation.
+///
+/// The argument is evaluated exactly once.
 macro_rules! assert_allowed {
-    ($result:expr, $msg:expr) => {
-        assert!($result.is_ok(), "{} — expected OK but got {:?}", $msg, $result.err());
-    };
+    ($result:expr, $msg:expr) => {{
+        let __result = $result;
+        assert!(
+            __result.is_ok(),
+            "{} — expected OK, but guard denied with {:?}",
+            $msg,
+            __result.err(),
+        );
+    }};
 }
 
-/// Assert that `result` is `Err` (denied).
+/// Assert that the guard **denied** the operation.
+///
+/// The argument is evaluated exactly once.
 macro_rules! assert_denied {
-    ($result:expr, $msg:expr) => {
-        assert!($result.is_err(), "{} — expected DENIED but was allowed", $msg);
-    };
+    ($result:expr, $msg:expr) => {{
+        let __result = $result;
+        assert!(
+            __result.is_err(),
+            "{} — expected DENIED, but guard allowed the operation",
+            $msg,
+        );
+    }};
 }
 
-// -----------------------------------------------------------------------------
-// A. Double‑sign guard — equivocation prevention
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// A. Double-sign guard — equivocation prevention
+// ---------------------------------------------------------------------------
 
 #[test]
 fn a_double_prevote_same_height_round() {
@@ -107,12 +132,13 @@ fn a_double_prevote_same_height_round() {
     )
     .expect("first vote should be accepted");
 
-    let result =
-        g.check_vote(VoteType::Prevote, TEST_HEIGHT, TEST_ROUND, &opt_hash(BLOCK_HASH_B));
-    assert_denied!(
-        result,
-        "double prevote for different block at same position"
+    let result = g.check_vote(
+        VoteType::Prevote,
+        TEST_HEIGHT,
+        TEST_ROUND,
+        &opt_hash(BLOCK_HASH_B),
     );
+    assert_denied!(result, "double prevote for different block at same position");
 }
 
 #[test]
@@ -163,10 +189,7 @@ fn a_vote_then_nil_vote_same_position() {
     .expect("block vote accepted");
 
     let result = g.check_vote(VoteType::Prevote, TEST_HEIGHT, TEST_ROUND, &None);
-    assert_denied!(
-        result,
-        "nil vote after block vote at same position is equivocation"
-    );
+    assert_denied!(result, "nil vote after block vote at same position is equivocation");
 }
 
 #[test]
@@ -177,44 +200,18 @@ fn a_nil_vote_then_block_vote_same_position() {
     g.record_vote(VoteType::Prevote, TEST_HEIGHT, TEST_ROUND, &None)
         .expect("nil vote accepted");
 
-    let result =
-        g.check_vote(VoteType::Prevote, TEST_HEIGHT, TEST_ROUND, &opt_hash(BLOCK_HASH_B));
-    assert_denied!(
-        result,
-        "block vote after nil vote at same position is equivocation"
-    );
-}
-
-#[test]
-fn a_double_vote_across_precommit_and_prevote_same_position() {
-    let dir = TempDir::new().unwrap();
-    let g = make_guard(&dir, 15);
-
-    // Record prevote first
-    g.record_vote(
+    let result = g.check_vote(
         VoteType::Prevote,
         TEST_HEIGHT,
         TEST_ROUND,
-        &opt_hash(BLOCK_HASH_A),
-    )
-    .expect("prevote accepted");
-
-    // Precommit at same height/round with different block should be allowed
-    // (different vote type), but we test that the guard correctly separates them.
-    assert_allowed!(
-        g.check_vote(
-            VoteType::Precommit,
-            TEST_HEIGHT,
-            TEST_ROUND,
-            &opt_hash(BLOCK_HASH_B),
-        ),
-        "precommit at same position is independent of prevote"
+        &opt_hash(BLOCK_HASH_B),
     );
+    assert_denied!(result, "block vote after nil vote at same position is equivocation");
 }
 
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // B. Replay protection — idempotent accepts
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
 #[test]
 fn b_replay_same_vote_allowed_idempotent() {
@@ -229,8 +226,12 @@ fn b_replay_same_vote_allowed_idempotent() {
     )
     .expect("first record accepted");
 
-    let result =
-        g.check_vote(VoteType::Precommit, TEST_HEIGHT, TEST_ROUND, &opt_hash(BLOCK_HASH_A));
+    let result = g.check_vote(
+        VoteType::Precommit,
+        TEST_HEIGHT,
+        TEST_ROUND,
+        &opt_hash(BLOCK_HASH_A),
+    );
     assert_allowed!(result, "idempotent replay of same vote must be allowed");
 }
 
@@ -258,9 +259,9 @@ fn b_replay_same_nil_vote_allowed_idempotent() {
     assert_allowed!(result, "idempotent nil vote replay must be allowed");
 }
 
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // C. Different positions are independent
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
 #[test]
 fn c_different_heights_are_independent() {
@@ -326,45 +327,57 @@ fn c_different_height_same_round_allowed() {
     g.record_proposal(TEST_HEIGHT, TEST_ROUND, &hash(BLOCK_HASH_A))
         .expect("proposal recorded");
 
-    // Same round, different height — independent
     assert_allowed!(
         g.check_proposal(TEST_HEIGHT + 1, TEST_ROUND, &hash(BLOCK_HASH_A)),
         "same round at different height must be allowed"
     );
 }
 
-// -----------------------------------------------------------------------------
+#[test]
+fn c_nil_prevote_and_block_precommit_are_independent() {
+    let dir = TempDir::new().unwrap();
+    let g = make_guard(&dir, 11);
+
+    g.record_vote(VoteType::Prevote, TEST_HEIGHT, TEST_ROUND, &None)
+        .expect("nil prevote accepted");
+
+    assert_allowed!(
+        g.check_vote(
+            VoteType::Precommit,
+            TEST_HEIGHT,
+            TEST_ROUND,
+            &opt_hash(BLOCK_HASH_B),
+        ),
+        "precommit is independent of a nil prevote at the same position"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // D. Guard survives restart (persistent storage)
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
 #[test]
 fn d_guard_rejects_double_sign_after_restart() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().to_str().unwrap();
+    let path = temp_path(&dir);
     let pk = PublicKeyBytes(vec![20u8; 32]);
 
-    // First instance: record a proposal.
     {
         let g = DoubleSignGuard::new(path, &pk).expect("load guard");
-        g.record_proposal(42, 0, &hash(0x42))
-            .expect("record proposal");
+        g.record_proposal(42, 0, &hash(0x42)).expect("record proposal");
     }
 
-    // Second instance (simulates restart): must reject conflicting proposal.
     {
         let g = DoubleSignGuard::new(path, &pk).expect("reload after restart");
         let result = g.check_proposal(42, 0, &hash(0xFF));
-        assert_denied!(
-            result,
-            "double-sign must be prevented even after restart"
-        );
+        assert_denied!(result, "double-sign must be prevented even after restart");
     }
 }
 
 #[test]
 fn d_guard_allows_new_heights_after_restart() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().to_str().unwrap();
+    let path = temp_path(&dir);
     let pk = PublicKeyBytes(vec![21u8; 32]);
 
     {
@@ -385,16 +398,16 @@ fn d_guard_allows_new_heights_after_restart() {
 #[test]
 fn d_guard_retains_multiple_records_after_restart() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().to_str().unwrap();
+    let path = temp_path(&dir);
     let pk = PublicKeyBytes(vec![22u8; 32]);
 
     {
         let g = DoubleSignGuard::new(path, &pk).expect("guard instance");
-        g.record_proposal(1, 0, &hash(1)).expect("record");
+        g.record_proposal(1, 0, &hash(1)).expect("record proposal");
         g.record_vote(VoteType::Prevote, 1, 0, &opt_hash(1))
-            .expect("record");
+            .expect("record prevote");
         g.record_vote(VoteType::Precommit, 1, 0, &opt_hash(1))
-            .expect("record");
+            .expect("record precommit");
     }
 
     {
@@ -403,7 +416,6 @@ fn d_guard_retains_multiple_records_after_restart() {
         assert_eq!(proposals, 1, "must retain proposal count");
         assert_eq!(votes, 2, "must retain vote count");
 
-        // Verify all positions are still protected
         assert_denied!(
             g.check_proposal(1, 0, &hash(2)),
             "must still reject double proposal after restart"
@@ -415,74 +427,118 @@ fn d_guard_retains_multiple_records_after_restart() {
     }
 }
 
-// -----------------------------------------------------------------------------
-// E. Hash chain integrity — tampered guard rejected
-// -----------------------------------------------------------------------------
+#[test]
+fn d_nil_vote_then_block_vote_rejected_after_restart() {
+    let dir = TempDir::new().unwrap();
+    let path = temp_path(&dir);
+    let pk = PublicKeyBytes(vec![23u8; 32]);
+
+    {
+        let g = DoubleSignGuard::new(path, &pk).expect("guard instance");
+        g.record_vote(VoteType::Prevote, 5, 0, &None)
+            .expect("record nil prevote");
+    }
+
+    let g = DoubleSignGuard::new(path, &pk).expect("guard after restart");
+    assert_denied!(
+        g.check_vote(VoteType::Prevote, 5, 0, &opt_hash(1)),
+        "block vote after nil vote must be rejected across restart"
+    );
+    assert_allowed!(
+        g.check_vote(VoteType::Prevote, 5, 0, &None),
+        "idempotent nil-vote replay must be allowed across restart"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// E. Hash-chain integrity — tampered guard rejected
+// ---------------------------------------------------------------------------
 
 #[test]
 fn e_tampered_guard_rejected_at_load() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().to_str().unwrap();
+    let path = temp_path(&dir);
     let pk = PublicKeyBytes(vec![30u8; 32]);
 
-    // Create a valid guard with one recorded proposal.
-    {
+    // Create a valid guard with one recorded proposal, then capture its
+    // on-disk path via the public API.
+    let guard_file = {
         let g = DoubleSignGuard::new(path, &pk).expect("initial guard");
-        g.record_proposal(1, 0, &hash(1)).expect("record");
-    }
+        g.record_proposal(1, 0, &hash(1)).expect("record proposal");
+        g.path().to_owned()
+    };
 
-    // Tamper the file: remove the proposal without updating chain hash.
-    let guard_file = format!("{}/doublesign_{}.json", path, hex::encode([30u8; 32]));
-    let raw = fs::read_to_string(&guard_file).unwrap();
-    let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    json["proposals"] = serde_json::json!({}); // erase signed values
-    fs::write(&guard_file, serde_json::to_string(&json).unwrap()).unwrap();
+    // Tamper: erase recorded proposals without updating the chain hash.
+    let raw = fs::read_to_string(&guard_file).expect("read guard file");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&raw).expect("parse guard file as JSON");
+    json["proposals"] = serde_json::json!({});
+    fs::write(
+        &guard_file,
+        serde_json::to_string(&json).expect("serialize tampered guard"),
+    )
+    .expect("write tampered guard file");
 
     let result = DoubleSignGuard::new(path, &pk);
-    assert_denied!(
-        result,
-        "tampered guard file (hash mismatch) must be rejected at load"
-    );
+    assert_denied!(result, "tampered guard file (hash mismatch) must be rejected at load");
 }
 
 #[test]
 fn e_truncated_file_rejected() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().to_str().unwrap();
+    let path = temp_path(&dir);
     let pk = PublicKeyBytes(vec![31u8; 32]);
 
-    {
+    let guard_file = {
         let g = DoubleSignGuard::new(path, &pk).expect("initial guard");
-        g.record_proposal(1, 0, &hash(1)).expect("record");
-    }
+        g.record_proposal(1, 0, &hash(1)).expect("record proposal");
+        g.path().to_owned()
+    };
 
-    let guard_file = format!("{}/doublesign_{}.json", path, hex::encode([31u8; 32]));
-    // Write garbage
-    fs::write(&guard_file, "this is not json at all").unwrap();
+    fs::write(&guard_file, "this is not json at all").expect("write garbage");
 
     let result = DoubleSignGuard::new(path, &pk);
-    assert!(
-        result.is_err(),
-        "corrupt file must be rejected at load"
-    );
+    assert_denied!(result, "corrupt guard file must be rejected at load");
 }
 
 #[test]
 fn e_missing_file_creates_fresh_guard() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().to_str().unwrap();
+    let path = temp_path(&dir);
     let pk = PublicKeyBytes(vec![32u8; 32]);
 
-    // No file exists — must create a fresh guard.
     let g = DoubleSignGuard::new(path, &pk).expect("fresh guard must load");
     let (prop, vote) = g.record_count();
     assert_eq!(prop, 0, "fresh guard has zero proposals");
     assert_eq!(vote, 0, "fresh guard has zero votes");
 }
 
-// -----------------------------------------------------------------------------
-// F. Record count tracking
-// -----------------------------------------------------------------------------
+#[test]
+fn e_guard_files_are_isolated_per_public_key() {
+    let dir = TempDir::new().unwrap();
+    let path = temp_path(&dir);
+    let pk_a = PublicKeyBytes(vec![33u8; 32]);
+    let pk_b = PublicKeyBytes(vec![34u8; 32]);
+
+    {
+        let g = DoubleSignGuard::new(path, &pk_a).expect("guard A");
+        g.record_proposal(1, 0, &hash(1)).expect("record A");
+    }
+
+    // A guard for a different validator must not observe A's state.
+    let g_b = DoubleSignGuard::new(path, &pk_b).expect("guard B");
+    let (prop, vote) = g_b.record_count();
+    assert_eq!(prop, 0, "guard B must not inherit guard A's proposals");
+    assert_eq!(vote, 0, "guard B must not inherit guard A's votes");
+    assert_allowed!(
+        g_b.check_proposal(1, 0, &hash(2)),
+        "guard B must be independent from guard A"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F. Record-count tracking
+// ---------------------------------------------------------------------------
 
 #[test]
 fn f_record_count_increments_correctly() {
@@ -514,22 +570,21 @@ fn f_record_count_stable_after_idempotent_replay() {
     let (prop1, _) = g.record_count();
     assert_eq!(prop1, 1);
 
-    // Idempotent check does NOT increase count
+    // Idempotent check must NOT increase the count.
     g.check_proposal(1, 0, &hash(1)).expect("idempotent check");
     let (prop2, _) = g.record_count();
     assert_eq!(prop2, 1, "idempotent check must not increase count");
 }
 
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // G. Guard path reporting
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
 #[test]
 fn g_guard_reports_path() {
     let dir = TempDir::new().unwrap();
     let pk = PublicKeyBytes(vec![50u8; 32]);
-    let g = DoubleSignGuard::new(dir.path().to_str().unwrap(), &pk)
-        .expect("guard created");
+    let g = DoubleSignGuard::new(temp_path(&dir), &pk).expect("guard created");
     let path = g.path();
     assert!(
         path.contains("doublesign_"),
@@ -541,22 +596,44 @@ fn g_guard_reports_path() {
     );
 }
 
-// -----------------------------------------------------------------------------
+#[test]
+fn g_guard_path_is_stable_across_reloads() {
+    let dir = TempDir::new().unwrap();
+    let path = temp_path(&dir);
+    let pk = PublicKeyBytes(vec![51u8; 32]);
+
+    let p1 = {
+        let g = DoubleSignGuard::new(path, &pk).expect("first load");
+        g.path().to_owned()
+    };
+    let p2 = {
+        let g = DoubleSignGuard::new(path, &pk).expect("second load");
+        g.path().to_owned()
+    };
+
+    assert_eq!(p1, p2, "guard path must be deterministic across reloads");
+}
+
+// ---------------------------------------------------------------------------
 // H. Edge cases
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
 #[test]
 fn h_check_before_record_always_allowed() {
     let dir = TempDir::new().unwrap();
     let g = make_guard(&dir, 60);
 
-    // Checking a position that has never been recorded must always pass.
     assert_allowed!(
         g.check_proposal(TEST_HEIGHT, TEST_ROUND, &hash(BLOCK_HASH_A)),
         "check before any record must be allowed"
     );
     assert_allowed!(
-        g.check_vote(VoteType::Prevote, TEST_HEIGHT, TEST_ROUND, &opt_hash(BLOCK_HASH_B)),
+        g.check_vote(
+            VoteType::Prevote,
+            TEST_HEIGHT,
+            TEST_ROUND,
+            &opt_hash(BLOCK_HASH_B)
+        ),
         "check before any record must be allowed"
     );
 }
