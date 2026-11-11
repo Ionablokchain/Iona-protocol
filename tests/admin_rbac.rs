@@ -1,29 +1,60 @@
 //! Integration tests for Admin RBAC + mTLS identity enforcement.
 //!
-//! Covers:
-//!   A1  — Identity with correct role is allowed
-//!   A2  — Identity with insufficient role is denied (403)
-//!   A3  — Unknown identity (no RBAC entry) is denied at any endpoint
-//!   A4  — mTLS not required (dev mode) → anonymous identity passes auditor check
-//!   A5  — Fingerprint mismatch denies even if CN matches
-//!   A6  — Role hierarchy: Maintainer passes Operator and Auditor checks
-//!   A7  — Role hierarchy: Operator passes Auditor check but not Maintainer
-//!   A8  — Hot-reload: policy changes take effect without restart
-//!   A9  — Unknown endpoint defaults to Maintainer-required
-//!   A10 — Display formatting of ClientIdentity and RbacDenial
-//!   A11 — Multi-role identity has all assigned roles
-//!   A12 — Endpoint permission map is correct
-//!   A13 — Empty policy denies all identities
-//!   A14 — Case sensitivity in CN matching
-//!   A15 — Fingerprint comparison is case-insensitive
+//! # What this file covers
+//!
+//! | Test | Contract |
+//! |------|----------|
+//! | A1  | Identity with the exact required role is allowed |
+//! | A2  | Identity with an insufficient role is denied |
+//! | A3  | Unknown identity (no RBAC entry) is denied at every endpoint |
+//! | A4  | Anonymous identity is denied under a strict policy |
+//! | A5  | Fingerprint mismatch, missing CN, or missing FP cause denial |
+//! | A6  | Maintainer subsumes Operator and Auditor |
+//! | A7  | Operator subsumes Auditor but not Maintainer |
+//! | A8  | Hot-reload takes effect without restart |
+//! | A9  | Unknown endpoints require Maintainer |
+//! | A10 | `Display` impls are stable |
+//! | A11 | Multi-role identity has exactly its declared roles |
+//! | A12 | Static endpoint → role map is correct |
+//! | A13 | Empty policy denies all |
+//! | A14 | CN matching is case-sensitive |
+//! | A15 | Fingerprint matching is case-insensitive (per module doc) |
+//! | A16 | Policy layer *can* allow anonymous if a matching entry is present |
+//!
+//! # Not tested here
+//!
+//! - **mTLS handshake** (`require_mtls = true` rejects connections without a
+//!   client cert). Tested in `tests/mtls_handshake.rs` and in the
+//!   `rpc::server` module.
+//! - **X.509 parsing** (CN extraction, fingerprint canonicalization). Tested
+//!   in `src/crypto/x509.rs`.
+//! - **Config-layer dev-mode bypass** (`require_mtls = false`). Tested in
+//!   `tests/rbac_config.rs`; the RBAC *policy* layer knows nothing about
+//!   mTLS — it only sees a `ClientIdentity` that has already been populated
+//!   (or left empty) by the TLS layer.
+//! - **Role hierarchy implementation** (`Role::subsumes`, `PartialOrd`).
+//!   A6/A7 test the *observable* behavior; the ordering itself is a unit
+//!   test in `src/rpc/rbac.rs`.
+//!
+//! # Why A4 tests denial, not bypass
+//!
+//! A4's original summary claimed "dev mode → anonymous passes auditor
+//! check". That conflates two layers. The *config layer* (`require_mtls`)
+//! decides whether a TLS handshake is allowed without a client cert. The
+//! *policy layer* (this file) decides what a `ClientIdentity` is allowed
+//! to do once it exists. A4 tests the policy layer: with a strict policy
+//! that has no anonymous entry, an empty `ClientIdentity` is denied. A16
+//! tests the complementary case: with a policy that *does* have an
+//! anonymous entry, an empty `ClientIdentity` is allowed. Dev-mode bypass
+//! is orthogonal and tested separately.
 
 use iona::rpc::rbac::{
     required_role, ClientIdentity, RbacChecker, RbacDenial, RbacPolicy, Role,
 };
-use std::collections::HashSet;
+use std::sync::LazyLock;
 
 // -----------------------------------------------------------------------------
-// Constants (standard endpoints)
+// Standard endpoints used across tests
 // -----------------------------------------------------------------------------
 
 const ENDPOINT_STATUS: &str = "/admin/status";
@@ -38,13 +69,13 @@ const ENDPOINT_UPGRADE_TRIGGER: &str = "/admin/upgrade-trigger";
 const ENDPOINT_UNKNOWN: &str = "/admin/some-new-endpoint";
 
 // -----------------------------------------------------------------------------
-// Test helpers
+// Test fixtures
 // -----------------------------------------------------------------------------
 
-/// Sample RBAC policy used across most tests.
-fn sample_policy() -> RbacPolicy {
-    toml::from_str(
-        r#"
+/// Parsed once per test binary; parsing TOML 40+ times is wasted work.
+///
+/// `LazyLock` requires Rust 1.80+, matching the crate's `rust-version = "1.81"`.
+static SAMPLE_POLICY_TOML: &str = r#"
 [[identities]]
 cn    = "alice-operator"
 roles = ["operator"]
@@ -61,12 +92,27 @@ roles       = ["maintainer"]
 [[identities]]
 cn    = "dave-multi"
 roles = ["operator", "auditor"]
-"#,
-    )
-    .expect("parse sample policy")
+"#;
+
+static SAMPLE_POLICY: LazyLock<RbacPolicy> =
+    LazyLock::new(|| toml::from_str(SAMPLE_POLICY_TOML).expect("parse sample policy"));
+
+fn sample_policy() -> RbacPolicy {
+    SAMPLE_POLICY.clone()
 }
 
-/// Identity: alice (operator)
+/// A policy with a single anonymous identity. Used by A16 to prove the
+/// policy layer *can* allow anonymous if configured to.
+static ANONYMOUS_POLICY_TOML: &str = r#"
+# Dev-mode policy: an entry with cn = "" matches a ClientIdentity with
+# `cn = None`, so an anonymous client receives the declared roles.
+[[identities]]
+cn    = ""
+roles = ["auditor"]
+"#;
+
+// ── Identity fixtures ────────────────────────────────────────────────────
+
 fn alice() -> ClientIdentity {
     ClientIdentity {
         cn: Some("alice-operator".into()),
@@ -74,7 +120,6 @@ fn alice() -> ClientIdentity {
     }
 }
 
-/// Identity: bob (auditor)
 fn bob() -> ClientIdentity {
     ClientIdentity {
         cn: Some("bob-auditor".into()),
@@ -82,7 +127,6 @@ fn bob() -> ClientIdentity {
     }
 }
 
-/// Identity: carol (maintainer with matching fingerprint)
 fn carol() -> ClientIdentity {
     ClientIdentity {
         cn: Some("carol-maintainer".into()),
@@ -90,7 +134,6 @@ fn carol() -> ClientIdentity {
     }
 }
 
-/// Identity: dave (operator + auditor)
 fn dave() -> ClientIdentity {
     ClientIdentity {
         cn: Some("dave-multi".into()),
@@ -98,7 +141,6 @@ fn dave() -> ClientIdentity {
     }
 }
 
-/// Identity: unknown (no matching entry)
 fn nobody() -> ClientIdentity {
     ClientIdentity {
         cn: Some("unknown-hacker".into()),
@@ -106,7 +148,6 @@ fn nobody() -> ClientIdentity {
     }
 }
 
-/// Identity: anonymous (no CN, no fingerprint)
 fn anonymous() -> ClientIdentity {
     ClientIdentity {
         cn: None,
@@ -114,7 +155,6 @@ fn anonymous() -> ClientIdentity {
     }
 }
 
-/// Create a `ClientIdentity` with just a CN.
 fn identity_with_cn(cn: &str) -> ClientIdentity {
     ClientIdentity {
         cn: Some(cn.to_string()),
@@ -122,7 +162,6 @@ fn identity_with_cn(cn: &str) -> ClientIdentity {
     }
 }
 
-/// Create a `ClientIdentity` with CN and fingerprint.
 fn identity_with_cn_and_fp(cn: &str, fp: &str) -> ClientIdentity {
     ClientIdentity {
         cn: Some(cn.to_string()),
@@ -130,35 +169,67 @@ fn identity_with_cn_and_fp(cn: &str, fp: &str) -> ClientIdentity {
     }
 }
 
-/// Assert that the result is `Ok` (access granted).
+// ── Assertion helpers ────────────────────────────────────────────────────
+//
+// Each macro evaluates the check **exactly once** and captures the result
+// before asserting. The previous macros called `check()` twice — once for
+// the assertion and once for the error message — so the diagnostic could
+// come from a different invocation than the one that failed.
+
+/// Assert that `checker.check(identity, endpoint)` returns `Ok(())`.
 macro_rules! assert_allowed {
-    ($checker:expr, $identity:expr, $endpoint:expr, $msg:expr) => {
+    ($checker:expr, $identity:expr, $endpoint:expr, $msg:expr) => {{
+        let result = $checker.check(&$identity, $endpoint);
         assert!(
-            $checker.check(&$identity, $endpoint).is_ok(),
+            result.is_ok(),
             "{} — expected ALLOWED but was DENIED: {:?}",
             $msg,
-            $checker.check(&$identity, $endpoint).err()
+            result.err()
         );
-    };
+    }};
 }
 
-/// Assert that the result is `Err` (access denied).
+/// Assert that `checker.check(identity, endpoint)` returns `Err(_)`.
 macro_rules! assert_denied {
-    ($checker:expr, $identity:expr, $endpoint:expr, $msg:expr) => {
+    ($checker:expr, $identity:expr, $endpoint:expr, $msg:expr) => {{
+        let result = $checker.check(&$identity, $endpoint);
         assert!(
-            $checker.check(&$identity, $endpoint).is_err(),
+            result.is_err(),
             "{} — expected DENIED but was ALLOWED",
             $msg
         );
-    };
+    }};
+}
+
+/// Assert that `checker.check(identity, endpoint)` returns `Err` with the
+/// expected required role.
+#[track_caller]
+fn assert_denied_with_role(
+    checker: &RbacChecker,
+    identity: &ClientIdentity,
+    endpoint: &str,
+    expected: Role,
+) {
+    let result = checker.check(identity, endpoint);
+    match result {
+        Ok(()) => panic!(
+            "expected denial for {} on {}, got allowed",
+            identity, endpoint
+        ),
+        Err(denial) => assert_eq!(
+            denial.required, expected,
+            "wrong required role in denial for {} on {}",
+            identity, endpoint
+        ),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// A1: Correct role is allowed
+// A1 — Correct role is allowed
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn a1_operator_allowed_on_operator_endpoint() {
+fn a1_operator_allowed_on_operator_role() {
     let policy = sample_policy();
     assert!(
         policy.is_allowed(&alice(), &Role::Operator),
@@ -167,7 +238,7 @@ fn a1_operator_allowed_on_operator_endpoint() {
 }
 
 #[test]
-fn a1_auditor_allowed_on_auditor_endpoint() {
+fn a1_auditor_allowed_on_auditor_role() {
     let policy = sample_policy();
     assert!(
         policy.is_allowed(&bob(), &Role::Auditor),
@@ -176,7 +247,7 @@ fn a1_auditor_allowed_on_auditor_endpoint() {
 }
 
 #[test]
-fn a1_maintainer_allowed_on_maintainer_endpoint() {
+fn a1_maintainer_allowed_on_maintainer_role() {
     let policy = sample_policy();
     assert!(
         policy.is_allowed(&carol(), &Role::Maintainer),
@@ -187,29 +258,46 @@ fn a1_maintainer_allowed_on_maintainer_endpoint() {
 #[test]
 fn a1_checker_allows_operator_on_operator_endpoint() {
     let checker = RbacChecker::new(sample_policy());
-    assert_allowed!(checker, alice(), ENDPOINT_SNAPSHOT, "alice should be allowed on snapshot endpoint");
+    assert_allowed!(
+        checker,
+        alice(),
+        ENDPOINT_SNAPSHOT,
+        "alice should be allowed on snapshot endpoint"
+    );
 }
 
 #[test]
 fn a1_checker_allows_auditor_on_auditor_endpoint() {
     let checker = RbacChecker::new(sample_policy());
-    assert_allowed!(checker, bob(), ENDPOINT_STATUS, "bob should be allowed on status endpoint");
+    assert_allowed!(
+        checker,
+        bob(),
+        ENDPOINT_STATUS,
+        "bob should be allowed on status endpoint"
+    );
 }
 
 #[test]
 fn a1_checker_allows_maintainer_on_all_endpoints() {
     let checker = RbacChecker::new(sample_policy());
-    assert_allowed!(checker, carol(), ENDPOINT_SNAPSHOT, "carol should be allowed on operator endpoint");
-    assert_allowed!(checker, carol(), ENDPOINT_STATUS, "carol should be allowed on auditor endpoint");
-    assert_allowed!(checker, carol(), ENDPOINT_KEY_ROTATE, "carol should be allowed on maintainer endpoint");
+    // Maintainer subsumes every lower role (A6 also tests this), so a
+    // maintainer must pass every endpoint regardless of its required role.
+    assert_allowed!(checker, carol(), ENDPOINT_SNAPSHOT, "carol on operator endpoint");
+    assert_allowed!(checker, carol(), ENDPOINT_STATUS, "carol on auditor endpoint");
+    assert_allowed!(checker, carol(), ENDPOINT_KEY_ROTATE, "carol on maintainer endpoint");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// A2: Insufficient role is denied
+// A2 — Insufficient role is denied
+//
+// Note: A2 tests exercise two APIs. `is_allowed(&id, &role)` is the policy
+// API (returns `bool`); `checker.check(&id, endpoint)` is the endpoint API
+// (returns `Result`). Both must agree: if `is_allowed` is false, `check`
+// must return `Err` for every endpoint that requires that role.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn a2_auditor_denied_on_operator_endpoint() {
+fn a2_auditor_denied_operator_role() {
     let policy = sample_policy();
     assert!(
         !policy.is_allowed(&bob(), &Role::Operator),
@@ -218,7 +306,7 @@ fn a2_auditor_denied_on_operator_endpoint() {
 }
 
 #[test]
-fn a2_operator_denied_on_maintainer_endpoint() {
+fn a2_operator_denied_maintainer_role() {
     let policy = sample_policy();
     assert!(
         !policy.is_allowed(&alice(), &Role::Maintainer),
@@ -227,7 +315,7 @@ fn a2_operator_denied_on_maintainer_endpoint() {
 }
 
 #[test]
-fn a2_auditor_denied_on_maintainer_endpoint() {
+fn a2_auditor_denied_maintainer_role() {
     let policy = sample_policy();
     assert!(
         !policy.is_allowed(&bob(), &Role::Maintainer),
@@ -238,17 +326,17 @@ fn a2_auditor_denied_on_maintainer_endpoint() {
 #[test]
 fn a2_checker_denies_auditor_on_operator_endpoint() {
     let checker = RbacChecker::new(sample_policy());
-    assert_denied!(checker, bob(), ENDPOINT_SNAPSHOT, "bob should be denied on operator endpoint");
+    assert_denied_with_role(&checker, &bob(), ENDPOINT_SNAPSHOT, Role::Operator);
 }
 
 #[test]
 fn a2_checker_denies_operator_on_maintainer_endpoint() {
     let checker = RbacChecker::new(sample_policy());
-    assert_denied!(checker, alice(), ENDPOINT_KEY_ROTATE, "alice should be denied on maintainer endpoint");
+    assert_denied_with_role(&checker, &alice(), ENDPOINT_KEY_ROTATE, Role::Maintainer);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// A3: Unknown identity denied
+// A3 — Unknown identity denied
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -272,26 +360,19 @@ fn a3_unknown_identity_denied_auditor() {
 #[test]
 fn a3_checker_returns_denial_for_unknown() {
     let checker = RbacChecker::new(sample_policy());
-    let result = checker.check(&nobody(), ENDPOINT_STATUS);
-    assert!(result.is_err(), "unknown identity must return Err(denial)");
-    let denial = result.unwrap_err();
-    assert_eq!(
-        denial.required,
-        Role::Auditor,
-        "denial must report the required role"
-    );
+    assert_denied_with_role(&checker, &nobody(), ENDPOINT_STATUS, Role::Auditor);
 }
 
 #[test]
 fn a3_unknown_denied_on_all_endpoints() {
     let checker = RbacChecker::new(sample_policy());
-    let endpoints = [
+    for endpoint in [
         ENDPOINT_STATUS,
         ENDPOINT_AUDIT,
         ENDPOINT_SNAPSHOT,
         ENDPOINT_KEY_ROTATE,
-    ];
-    for endpoint in &endpoints {
+        ENDPOINT_UNKNOWN,
+    ] {
         assert_denied!(
             checker,
             nobody(),
@@ -302,7 +383,13 @@ fn a3_unknown_denied_on_all_endpoints() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// A4: Dev mode (require_mtls=false) passes anonymous identity
+// A4 — Anonymous identity is denied under a strict policy
+//
+// The RBAC *policy* layer has no anonymous entry in `sample_policy()`, so an
+// empty `ClientIdentity` gets no roles. Dev-mode bypass (`require_mtls =
+// false`) is a **config-layer** feature and is tested in
+// `tests/rbac_config.rs`; A16 below covers the complementary policy-layer
+// case (a policy that *does* allow anonymous).
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -310,62 +397,77 @@ fn a4_anonymous_identity_has_no_roles_in_strict_policy() {
     let policy = sample_policy();
     assert!(
         policy.roles_for(&anonymous()).is_empty(),
-        "anonymous identity must get zero roles from policy"
+        "anonymous identity must get zero roles from a strict policy"
     );
 }
 
 #[test]
 fn a4_anonymous_denied_on_all_endpoints_with_strict_policy() {
     let checker = RbacChecker::new(sample_policy());
-    assert_denied!(checker, anonymous(), ENDPOINT_STATUS, "anonymous must be denied");
-    assert_denied!(checker, anonymous(), ENDPOINT_SNAPSHOT, "anonymous must be denied");
+    for endpoint in [ENDPOINT_STATUS, ENDPOINT_SNAPSHOT, ENDPOINT_KEY_ROTATE] {
+        assert_denied!(
+            checker,
+            anonymous(),
+            endpoint,
+            format!("anonymous must be denied on {endpoint} under strict policy")
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// A5: Fingerprint mismatch
+// A5 — Fingerprint / CN matching
+//
+// The policy entry for carol requires *both* a matching CN *and* a matching
+// fingerprint. Any of the three following conditions must deny:
+//   - wrong fingerprint (CN matches)
+//   - missing fingerprint (CN matches)
+//   - missing CN (fingerprint matches)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn a5_correct_cn_wrong_fp_denied() {
+fn a5_wrong_fingerprint_denied_despite_matching_cn() {
     let policy = sample_policy();
-    let bad_fingerprint = ClientIdentity {
-        cn: Some("carol-maintainer".into()),
-        fingerprint: Some("00:00:00:00".into()),
-    };
+    let bad_fp = identity_with_cn_and_fp("carol-maintainer", "00:00:00:00");
     assert!(
-        policy.roles_for(&bad_fingerprint).is_empty(),
+        policy.roles_for(&bad_fp).is_empty(),
         "correct CN but wrong fingerprint must be denied"
     );
 }
 
 #[test]
-fn a5_correct_fp_no_cn_denied_when_entry_requires_cn() {
+fn a5_missing_fingerprint_denied_despite_matching_cn() {
     let policy = sample_policy();
-    let fingerprint_only = ClientIdentity {
-        cn: None,
-        fingerprint: Some("AA:BB:CC:DD".into()),
-    };
+    let no_fp = identity_with_cn("carol-maintainer");
     assert!(
-        policy.roles_for(&fingerprint_only).is_empty(),
-        "fingerprint alone must not match entry that also requires CN"
+        policy.roles_for(&no_fp).is_empty(),
+        "missing fingerprint must not match an entry that requires one"
     );
 }
 
 #[test]
-fn a5_no_fp_when_entry_requires_fp_denied() {
+fn a5_missing_cn_denied_despite_matching_fingerprint() {
     let policy = sample_policy();
-    let no_fingerprint = ClientIdentity {
-        cn: Some("carol-maintainer".into()),
-        fingerprint: None,
+    let fp_only = ClientIdentity {
+        cn: None,
+        fingerprint: Some("AA:BB:CC:DD".into()),
     };
     assert!(
-        policy.roles_for(&no_fingerprint).is_empty(),
-        "missing fingerprint must not match entry that requires it"
+        policy.roles_for(&fp_only).is_empty(),
+        "fingerprint alone must not match an entry that also requires a CN"
+    );
+}
+
+#[test]
+fn a5_correct_cn_and_fp_allowed() {
+    let policy = sample_policy();
+    assert!(
+        policy.is_allowed(&carol(), &Role::Maintainer),
+        "carol with the exact CN and FP must be allowed"
     );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// A6: Role hierarchy — Maintainer subsumes all
+// A6 — Maintainer subsumes Operator and Auditor
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -373,7 +475,7 @@ fn a6_maintainer_passes_operator_check() {
     let policy = sample_policy();
     assert!(
         policy.is_allowed(&carol(), &Role::Operator),
-        "maintainer must subsume operator role"
+        "maintainer must subsume operator"
     );
 }
 
@@ -382,12 +484,12 @@ fn a6_maintainer_passes_auditor_check() {
     let policy = sample_policy();
     assert!(
         policy.is_allowed(&carol(), &Role::Auditor),
-        "maintainer must subsume auditor role"
+        "maintainer must subsume auditor"
     );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// A7: Operator subsumes Auditor but not Maintainer
+// A7 — Operator subsumes Auditor but not Maintainer
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -395,7 +497,7 @@ fn a7_operator_passes_auditor_check() {
     let policy = sample_policy();
     assert!(
         policy.is_allowed(&alice(), &Role::Auditor),
-        "operator must subsume auditor role"
+        "operator must subsume auditor"
     );
 }
 
@@ -404,12 +506,12 @@ fn a7_operator_fails_maintainer_check() {
     let policy = sample_policy();
     assert!(
         !policy.is_allowed(&alice(), &Role::Maintainer),
-        "operator must NOT subsume maintainer role"
+        "operator must NOT subsume maintainer"
     );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// A8: Hot-reload changes take effect
+// A8 — Hot-reload
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -422,7 +524,7 @@ fn a8_hot_reload_revokes_role() {
         "alice should be operator before reload"
     );
 
-    let new_policy: RbacPolicy = toml::from_str(
+    let demoted: RbacPolicy = toml::from_str(
         r#"
 [[identities]]
 cn    = "alice-operator"
@@ -430,13 +532,9 @@ roles = ["auditor"]
 "#,
     )
     .unwrap();
-    checker.reload_policy(new_policy);
+    checker.reload_policy(demoted);
 
-    let result = checker.check(&alice(), ENDPOINT_SNAPSHOT);
-    assert!(
-        result.is_err(),
-        "alice must be denied operator endpoint after reload demotes her to auditor"
-    );
+    assert_denied_with_role(&checker, &alice(), ENDPOINT_SNAPSHOT, Role::Operator);
 }
 
 #[test]
@@ -450,10 +548,7 @@ roles = ["auditor"]
     )
     .unwrap();
     let checker = RbacChecker::new(initial);
-    let eve = ClientIdentity {
-        cn: Some("eve".into()),
-        fingerprint: None,
-    };
+    let eve = identity_with_cn("eve");
 
     assert_denied!(
         checker,
@@ -483,16 +578,17 @@ roles = ["operator"]
 #[test]
 fn a8_hot_reload_clears_all() {
     let checker = RbacChecker::new(sample_policy());
-    assert_allowed!(checker, alice(), ENDPOINT_SNAPSHOT, "alice should be allowed before clear");
+    assert_allowed!(checker, alice(), ENDPOINT_SNAPSHOT, "alice allowed before clear");
 
     checker.reload_policy(RbacPolicy::default());
-    assert_denied!(checker, alice(), ENDPOINT_SNAPSHOT, "alice must be denied after policy cleared");
-    assert_denied!(checker, bob(), ENDPOINT_STATUS, "bob must be denied after policy cleared");
-    assert_denied!(checker, carol(), ENDPOINT_KEY_ROTATE, "carol must be denied after policy cleared");
+
+    assert_denied_with_role(&checker, &alice(), ENDPOINT_SNAPSHOT, Role::Operator);
+    assert_denied_with_role(&checker, &bob(), ENDPOINT_STATUS, Role::Auditor);
+    assert_denied_with_role(&checker, &carol(), ENDPOINT_KEY_ROTATE, Role::Maintainer);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// A9: Unknown endpoint defaults to Maintainer
+// A9 — Unknown endpoints require Maintainer
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -500,18 +596,14 @@ fn a9_unknown_admin_endpoint_requires_maintainer() {
     assert_eq!(
         required_role(ENDPOINT_UNKNOWN),
         Role::Maintainer,
-        "unknown endpoints must default to most restrictive role"
+        "unknown endpoints must default to the most restrictive role"
     );
 }
 
 #[test]
 fn a9_operator_denied_on_unknown_endpoint() {
     let checker = RbacChecker::new(sample_policy());
-    let result = checker.check(&alice(), ENDPOINT_UNKNOWN);
-    assert!(
-        result.is_err(),
-        "operator must be denied unknown admin endpoint (defaults to maintainer)"
-    );
+    assert_denied_with_role(&checker, &alice(), ENDPOINT_UNKNOWN, Role::Maintainer);
 }
 
 #[test]
@@ -526,40 +618,31 @@ fn a9_maintainer_allowed_on_unknown_endpoint() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// A10: Display formatting
+// A10 — Display formatting
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn a10_client_identity_display_cn_only() {
-    let id = ClientIdentity {
-        cn: Some("ops-alice".into()),
-        fingerprint: None,
-    };
-    assert_eq!(format!("{id}"), "CN=ops-alice");
+    assert_eq!(
+        format!("{}", identity_with_cn("ops-alice")),
+        "CN=ops-alice"
+    );
 }
 
 #[test]
-fn a10_client_identity_display_both() {
-    let id = ClientIdentity {
-        cn: Some("node-maint".into()),
-        fingerprint: Some("AA:BB:CC".into()),
-    };
-    let display = format!("{id}");
+fn a10_client_identity_display_cn_and_fingerprint() {
+    let display = format!("{}", identity_with_cn_and_fp("node-maint", "AA:BB:CC"));
     assert!(display.contains("CN=node-maint"), "display must include CN");
     assert!(display.contains("fp=AA:BB:CC"), "display must include fingerprint");
 }
 
 #[test]
-fn a10_client_identity_display_unknown() {
-    let id = ClientIdentity {
-        cn: None,
-        fingerprint: None,
-    };
-    assert_eq!(format!("{id}"), "<unknown>");
+fn a10_client_identity_display_anonymous() {
+    assert_eq!(format!("{}", anonymous()), "<unknown>");
 }
 
 #[test]
-fn a10_client_identity_display_fp_only() {
+fn a10_client_identity_display_fingerprint_only() {
     let id = ClientIdentity {
         cn: None,
         fingerprint: Some("AA:BB:CC".into()),
@@ -571,25 +654,25 @@ fn a10_client_identity_display_fp_only() {
 #[test]
 fn a10_rbac_denial_display() {
     let checker = RbacChecker::new(sample_policy());
-    let denial = checker.check(&bob(), ENDPOINT_SNAPSHOT).unwrap_err();
+    let denial: RbacDenial = checker.check(&bob(), ENDPOINT_SNAPSHOT).unwrap_err();
     let s = format!("{denial}");
-    assert!(s.contains("RBAC denied"), "denial string must contain 'RBAC denied'");
-    assert!(s.contains("bob-auditor"), "denial string must name the identity");
-    assert!(s.contains(ENDPOINT_SNAPSHOT), "denial string must name the endpoint");
-    assert!(s.contains("Operator"), "denial string must name the required role");
+    assert!(s.contains("RBAC denied"), "denial must say 'RBAC denied': {s}");
+    assert!(s.contains("bob-auditor"), "denial must name the identity: {s}");
+    assert!(s.contains(ENDPOINT_SNAPSHOT), "denial must name the endpoint: {s}");
+    assert!(s.contains("Operator"), "denial must name the required role: {s}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// A11: Multi-role identity
+// A11 — Multi-role identity
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn a11_dave_multi_role_has_both() {
+fn a11_dave_multi_role_has_both_declared_roles() {
     let policy = sample_policy();
     let roles = policy.roles_for(&dave());
     assert!(roles.contains(&Role::Operator), "dave must have Operator");
     assert!(roles.contains(&Role::Auditor), "dave must have Auditor");
-    assert_eq!(roles.len(), 2, "dave must have exactly 2 roles");
+    assert_eq!(roles.len(), 2, "dave must have exactly the 2 declared roles");
 }
 
 #[test]
@@ -597,12 +680,15 @@ fn a11_dave_multi_role_still_denied_maintainer() {
     let policy = sample_policy();
     assert!(
         !policy.is_allowed(&dave(), &Role::Maintainer),
-        "dave (operator+auditor) must not pass maintainer check"
+        "dave (operator + auditor) must not pass maintainer"
     );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// A12: Endpoint permission map (unit checks)
+// A12 — Endpoint → role map (static contract)
+//
+// These are pure `required_role` lookups: they document the endpoint
+// classification. A9 covers the checker-level consequence.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -629,13 +715,12 @@ fn a12_endpoint_map_destructive_is_maintainer() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// A13: Empty policy denies all identities
+// A13 — Empty policy denies all
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn a13_empty_policy_denies_all() {
-    let empty_policy = RbacPolicy::default();
-    let checker = RbacChecker::new(empty_policy);
+    let checker = RbacChecker::new(RbacPolicy::default());
 
     assert_denied!(checker, alice(), ENDPOINT_STATUS, "alice denied with empty policy");
     assert_denied!(checker, bob(), ENDPOINT_SNAPSHOT, "bob denied with empty policy");
@@ -644,38 +729,87 @@ fn a13_empty_policy_denies_all() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// A14: Case sensitivity in CN matching
+// A14 — CN matching is case-sensitive
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn a14_cn_matching_is_case_sensitive() {
-    let policy = sample_policy();
-    let checker = RbacChecker::new(policy);
+    let checker = RbacChecker::new(sample_policy());
 
-    // Original CN: "alice-operator" (lowercase)
-    assert_allowed!(checker, identity_with_cn("alice-operator"), ENDPOINT_SNAPSHOT, "exact CN must match");
+    // Policy entry is "alice-operator" (all lowercase).
+    assert_allowed!(
+        checker,
+        identity_with_cn("alice-operator"),
+        ENDPOINT_SNAPSHOT,
+        "exact-case CN must match"
+    );
 
-    // Different case CN should not match
-    assert_denied!(checker, identity_with_cn("Alice-Operator"), ENDPOINT_SNAPSHOT, "different case CN must not match");
-    assert_denied!(checker, identity_with_cn("ALICE-OPERATOR"), ENDPOINT_SNAPSHOT, "uppercase CN must not match");
+    // Any different case must NOT match.
+    for cn in ["Alice-Operator", "ALICE-OPERATOR", "alice-Operator"] {
+        assert_denied!(
+            checker,
+            identity_with_cn(cn),
+            ENDPOINT_SNAPSHOT,
+            format!("case-changed CN {cn:?} must not match")
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// A15: Fingerprint comparison is case-insensitive
+// A15 — Fingerprint matching is case-insensitive (per module doc)
+//
+// The module doc states that fingerprints are compared case-insensitively.
+// This test asserts that behavior. If it fails, the implementation is
+// case-sensitive and either the code must be fixed (normalize on both sides
+// before comparison) or the module doc must be updated to say the comparison
+// is case-sensitive.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn a15_fingerprint_matching_is_case_insensitive() {
-    // Policy has fingerprint "AA:BB:CC:DD"
-    let policy = sample_policy();
+    let checker = RbacChecker::new(sample_policy());
+
+    // Policy entry declares "AA:BB:CC:DD".
+    // All case variants must be accepted.
+    for fp in ["AA:BB:CC:DD", "aa:bb:cc:dd", "Aa:Bb:Cc:Dd"] {
+        assert_allowed!(
+            checker,
+            identity_with_cn_and_fp("carol-maintainer", fp),
+            ENDPOINT_KEY_ROTATE,
+            format!("case-variant fingerprint {fp:?} must match")
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// A16 — Policy layer *can* allow anonymous (complement to A4)
+//
+// A4 shows that a strict policy with no anonymous entry denies anonymous
+// clients. A16 shows that the *policy layer* itself has no hardcoded rule
+// against anonymous identities: if a policy entry matches, the anonymous
+// client is allowed. Dev-mode bypass (`require_mtls = false`) lives in the
+// config layer and is tested in `tests/rbac_config.rs`; this test covers
+// only the policy layer's view of the world.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn a16_policy_with_anonymous_entry_allows_anonymous() {
+    let policy: RbacPolicy = toml::from_str(ANONYMOUS_POLICY_TOML)
+        .expect("parse anonymous policy");
     let checker = RbacChecker::new(policy);
 
-    // Same fingerprint, different case
-    let lower_fp = identity_with_cn_and_fp("carol-maintainer", "aa:bb:cc:dd");
-    let mixed_fp = identity_with_cn_and_fp("carol-maintainer", "Aa:Bb:Cc:Dd");
+    assert_allowed!(
+        checker,
+        anonymous(),
+        ENDPOINT_STATUS,
+        "anonymous must be allowed on auditor endpoint when policy grants it"
+    );
 
-    // These should match because fingerprint comparison is case-insensitive
-    // (Uncomment if the implementation supports case-insensitive comparison)
-    // assert_allowed!(checker, lower_fp, ENDPOINT_KEY_ROTATE, "lowercase fingerprint must match");
-    // assert_allowed!(checker, mixed_fp, ENDPOINT_KEY_ROTATE, "mixed case fingerprint must match");
+    // The anonymous client should *not* inherit roles above Auditor.
+    assert_denied!(
+        checker,
+        anonymous(),
+        ENDPOINT_SNAPSHOT,
+        "anonymous must still be denied on operator endpoint"
+    );
 }
