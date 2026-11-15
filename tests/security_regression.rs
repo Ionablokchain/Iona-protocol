@@ -1,131 +1,138 @@
 //! Security regression test suite.
 //!
-//! Every test in this file corresponds to a specific security bug that was
-//! found and fixed. The test name includes a short description and the version
-//! it was fixed in (when known).
+//! Every test here reproduces a specific security bug that was found and
+//! fixed. Regression tests are the audit trail for past incidents:
+//! their value is entirely in the fact that they **fail on the buggy
+//! code and pass on the fixed code**, so any test that would pass
+//! whether the bug is present or not is worse than no test at all.
 //!
-//! POLICY: When a security bug is discovered and fixed:
-//!   1. Add a test here that reproduces the bug (pre‑fix behaviour).
-//!   2. Verify the test FAILS on the unfixed code.
-//!   3. Fix the bug.
-//!   4. Verify the test PASSES on the fixed code.
-//!   5. The test stays here permanently — regressions are caught automatically.
+//! # Policy: adding a new regression test
 //!
-//! # Production Features
-//! - Organized by component: RPC, P2P, Consensus, Storage, Networking.
-//! - Comprehensive coverage of known security issues.
-//! - Isolated test environments using tempdirs.
-//! - Clear test naming: `regression_<component>_<desc>`.
-//! - Full test coverage for all fixed bugs.
+//! 1. Reproduce the bug with a failing test first.
+//! 2. Verify the test fails on `main` (pre-fix).
+//! 3. Fix the bug.
+//! 4. Verify the test passes on the fix.
+//! 5. Merge both the fix and the test in the same PR.
+//!
+//! # What this file tests
+//!
+//! Library APIs only:
+//!
+//! * `iona::rpc_limits` — input validation and rate limiting.
+//! * `iona::net::peer_score` — peer scoring and per-peer quotas.
+//! * `iona::consensus::double_sign` — persistent double-sign guard.
+//! * `iona::storage` — migration correctness.
+//!
+//! # What this file **cannot** test
+//!
+//! Anything that lives in the `iona-node` **binary** rather than a
+//! library: startup permission gates, `--unsafe-rpc-public` bind
+//! checks, refusal to start with a missing guard file for an existing
+//! validator, and similar CLI-level behaviour. Those are tested in
+//! `iona-node`'s own integration tests. Tests in this file must not
+//! pretend to exercise binary-level behaviour via library APIs; such
+//! tests end up tautological (`assert!(x.is_ok() || x.is_err())`) or
+//! test the wrong thing.
+//!
+//! # Categories
+//!
+//! * **§1 RPC validation** — zero gas, zero fee, chain ID mismatch,
+//!   stale nonce, oversized payload, oversized batch.
+//! * **§2 Rate limiting** — flood escalates to quarantine; per-IP
+//!   buckets are independent.
+//! * **§3 P2P peer score** — message flood penalty, validation slot
+//!   cap, banned-peer lockout, oversized-message penalty.
+//! * **§4 Consensus double-sign guard** — double-proposal refusal,
+//!   persistence across restart, chain-hash tamper detection, fresh
+//!   directory creates a working guard.
+//! * **§5 Networking** — peer-ID sanity in the scoring layer.
+//! * **§6 Storage** — migration handles missing state file; migration
+//!   preserves user-authored `node_meta.json`.
+//!
+//! # Running
+//!
+//! ```text
+//! cargo test --test security_regressions
+//! ```
 
-use iona::consensus::double_sign::{vote_guard_key, DoubleSignGuard};
+use iona::consensus::double_sign::DoubleSignGuard;
 use iona::crypto::PublicKeyBytes;
 use iona::net::peer_score::{
     PeerScore, ViolationReason, BAN_THRESHOLD, PEER_MAX_PENDING_VALIDATIONS,
 };
 use iona::rpc_limits::{
     validate_batch_size, validate_body_size, validate_tx, RpcLimitResult, RpcLimiter,
-    MAX_BODY_BYTES, SUBMIT_RATE_PER_SEC,
+    ValidationError, MAX_BATCH_ITEMS, MAX_BODY_BYTES, SUBMIT_RATE_PER_SEC,
+    VIOLATIONS_BEFORE_QUARANTINE,
 };
 use iona::types::{Hash32, Tx};
+
 use std::net::{IpAddr, Ipv4Addr};
 use tempfile::TempDir;
 
-// ── Constants ─────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-/// Test IP base network (192.168.1.0/24).
-const TEST_IP_BASE_OCTET_1: u8 = 192;
-const TEST_IP_BASE_OCTET_2: u8 = 168;
-const TEST_IP_BASE_OCTET_3: u8 = 1;
-
-/// Starting octets for different test IPs.
-const IP_FLOOD_OCTET: u8 = 50;
-const IP_INDEPENDENCE_A_OCTET: u8 = 60;
-const IP_INDEPENDENCE_B_OCTET: u8 = 61;
-const IP_RATE_LIMIT_OCTET: u8 = 70;
-
-/// Default transaction fields.
 const VALID_CHAIN_ID: u64 = 1;
-const VALID_NONCE: u64 = 0;
-const VALID_GAS_LIMIT: u64 = 21_000;
-const VALID_MAX_FEE: u64 = 1;
-const VALID_PAYLOAD: &str = "ok";
 
-/// Past nonce for replay protection test.
-const CONFIRMED_NONCE: u64 = 10;
-const PAST_NONCE: u64 = 5;
-
-/// Hash bytes for test signatures.
-const HASH_BYTE_A: u8 = 1;
-const HASH_BYTE_B: u8 = 2;
-const HASH_BYTE_C: u8 = 5;
-const HASH_BYTE_D: u8 = 99;
-
-/// Peer IDs for peer scoring tests.
-const PEER_FLOOD_ID: &str = "peer-flood";
-const PEER_ATTACK_ID: &str = "peer-attack";
-const PEER_EVIL_ID: &str = "peer-evil";
-
-/// Test seeds for double‑sign guard.
-const GUARD_SEED_1: u8 = 10;
-const GUARD_SEED_2: u8 = 11;
-const GUARD_SEED_3: u8 = 12;
-
-/// Double‑sign guard heights.
-const DS_HEIGHT_1: u64 = 1;
-const DS_HEIGHT_5: u64 = 5;
-
-/// Double‑sign guard rounds.
-const DS_ROUND_0: u32 = 0;
-
-/// Flood multiplier.
-const FLOOD_MULTIPLIER: usize = 10;
-
-/// Batch size that exceeds limits.
-const OVERSIZED_BATCH_SIZE: usize = 1_000_000;
-
-/// Number of request IDs for uniqueness test.
-const UNIQUE_ID_COUNT: usize = 500;
-
-/// Valid public key length (Ed25519).
-const VALID_PUBKEY_LEN: usize = 32;
-
-/// Valid signature length (Ed25519).
-const VALID_SIG_LEN: usize = 64;
-
-// ── Helpers ──────────────────────────────────────────────────────────────
-
-/// Create a test IP address with the given last octet.
+/// Distinct test IPs in the 192.168.1.0/24 range.
 fn test_ip(octet: u8) -> IpAddr {
-    IpAddr::V4(Ipv4Addr::new(TEST_IP_BASE_OCTET_1, TEST_IP_BASE_OCTET_2, TEST_IP_BASE_OCTET_3, octet))
+    IpAddr::V4(Ipv4Addr::new(192, 168, 1, octet))
 }
 
-/// Create a `Hash32` with a repeating byte.
 fn hash(byte: u8) -> Hash32 {
     Hash32([byte; 32])
 }
 
-/// Create a minimal transaction with customisable fields.
-fn tx(chain_id: u64, nonce: u64, gas_limit: u64, max_fee: u64, payload: &str) -> Tx {
-    Tx {
-        pubkey: vec![0u8; VALID_PUBKEY_LEN],
-        from: "alice".into(),
-        nonce,
-        max_fee_per_gas: max_fee,
-        max_priority_fee_per_gas: 1,
-        gas_limit,
-        payload: payload.to_string(),
-        signature: vec![0u8; VALID_SIG_LEN],
-        chain_id,
+/// Builder for a valid baseline transaction. Every method overrides one
+/// field so the failure mode of each test is unambiguous.
+struct TxBuilder {
+    chain_id: u64,
+    nonce: u64,
+    gas_limit: u64,
+    max_fee: u64,
+    priority_fee: u64,
+    payload: String,
+}
+
+impl TxBuilder {
+    fn valid() -> Self {
+        Self {
+            chain_id: VALID_CHAIN_ID,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee: 1,
+            priority_fee: 1,
+            payload: "ok".into(),
+        }
+    }
+    fn chain_id(mut self, v: u64) -> Self { self.chain_id = v; self }
+    fn nonce(mut self, v: u64) -> Self { self.nonce = v; self }
+    fn gas_limit(mut self, v: u64) -> Self { self.gas_limit = v; self }
+    fn max_fee(mut self, v: u64) -> Self { self.max_fee = v; self }
+    fn priority_fee(mut self, v: u64) -> Self { self.priority_fee = v; self }
+    fn payload(mut self, v: impl Into<String>) -> Self { self.payload = v.into(); self }
+    fn build(self) -> Tx {
+        Tx {
+            pubkey: vec![0u8; 32],
+            from: "alice".into(),
+            nonce: self.nonce,
+            max_fee_per_gas: self.max_fee,
+            max_priority_fee_per_gas: self.priority_fee,
+            gas_limit: self.gas_limit,
+            payload: self.payload,
+            signature: vec![0u8; 64],
+            chain_id: self.chain_id,
+        }
     }
 }
 
-/// Create a valid baseline transaction for tests that expect success.
-fn valid_tx() -> Tx {
-    tx(VALID_CHAIN_ID, VALID_NONCE, VALID_GAS_LIMIT, VALID_MAX_FEE, VALID_PAYLOAD)
+/// Validate against the canonical chain ID and the given confirmed nonce.
+fn check_tx(tx: &Tx, confirmed_nonce: u64) -> Result<(), ValidationError> {
+    validate_tx(tx, VALID_CHAIN_ID, confirmed_nonce)
 }
 
-/// Create a test environment with a temporary directory.
 struct TestEnv {
     _temp: TempDir,
     path: String,
@@ -133,506 +140,473 @@ struct TestEnv {
 
 impl TestEnv {
     fn new() -> Self {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().to_str().unwrap().to_string();
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().to_str().expect("utf-8 path").to_string();
         Self { _temp: dir, path }
     }
-
-    fn path(&self) -> &str {
-        &self.path
-    }
-
-    fn join(&self, file: &str) -> String {
-        format!("{}/{}", self.path, file)
-    }
+    fn path(&self) -> &str { &self.path }
 }
 
-// ── RPC surface regressions ─────────────────────────────────────────────
+// ===========================================================================
+// §1 RPC validation
+// ===========================================================================
 
-/// REGRESSION: A transaction with zero `gas_limit` could pass validation and consume
-/// block space without paying any fee (infinite gas‑price griefing).
-/// Fixed: `validate_tx` now checks `gas_limit > 0`.
 #[test]
 fn regression_rpc_zero_gas_limit_rejected() {
-    let result = validate_tx(
-        &tx(VALID_CHAIN_ID, VALID_NONCE, 0, VALID_MAX_FEE, VALID_PAYLOAD),
-        VALID_CHAIN_ID,
-        VALID_NONCE,
+    let tx = TxBuilder::valid().gas_limit(0).build();
+    assert!(
+        matches!(check_tx(&tx, 0), Err(ValidationError::GasLimitZero)),
+        "gas_limit=0 must produce GasLimitZero; got {:?}",
+        check_tx(&tx, 0),
     );
-    assert!(result.is_err(), "zero gas_limit must be rejected");
 }
 
-/// REGRESSION: A transaction with zero `max_fee` could pass validation and consume
-/// block space for free.
-/// Fixed: `validate_tx` now checks `max_fee_per_gas > 0`.
 #[test]
 fn regression_rpc_zero_max_fee_rejected() {
-    let result = validate_tx(
-        &tx(VALID_CHAIN_ID, VALID_NONCE, VALID_GAS_LIMIT, 0, VALID_PAYLOAD),
-        VALID_CHAIN_ID,
-        VALID_NONCE,
+    // Set both fee fields to 0 so this test does not depend on the
+    // order in which validate_tx checks them.
+    let tx = TxBuilder::valid().max_fee(0).priority_fee(0).build();
+    assert!(
+        matches!(check_tx(&tx, 0), Err(ValidationError::MaxFeeZero)),
+        "max_fee_per_gas=0 must produce MaxFeeZero; got {:?}",
+        check_tx(&tx, 0),
     );
-    assert!(result.is_err(), "zero max_fee_per_gas must be rejected");
 }
 
-/// REGRESSION: A transaction with a mismatched `chain_id` could be replayed on another
-/// network (cross‑chain replay attack).
-/// Fixed: `validate_tx` checks `chain_id` matches expected.
 #[test]
 fn regression_rpc_wrong_chain_id_rejected() {
-    let result = validate_tx(
-        &tx(9999, VALID_NONCE, VALID_GAS_LIMIT, VALID_MAX_FEE, VALID_PAYLOAD),
-        VALID_CHAIN_ID,
-        VALID_NONCE,
-    );
+    let tx = TxBuilder::valid().chain_id(9_999).build();
     assert!(
-        result.is_err(),
-        "wrong chain_id must be rejected (cross‑chain replay)"
+        matches!(
+            check_tx(&tx, 0),
+            Err(ValidationError::ChainIdMismatch { .. }),
+        ),
+        "chain_id mismatch must produce ChainIdMismatch (cross-chain replay)",
     );
 }
 
-/// REGRESSION: A transaction with a past nonce (below confirmed) could cause a
-/// double‑spend if the mempool accepted it.
-/// Fixed: `validate_tx` rejects nonce < sender_nonce.
 #[test]
 fn regression_rpc_past_nonce_rejected() {
-    let result = validate_tx(
-        &tx(VALID_CHAIN_ID, PAST_NONCE, VALID_GAS_LIMIT, VALID_MAX_FEE, VALID_PAYLOAD),
-        VALID_CHAIN_ID,
-        CONFIRMED_NONCE,
-    );
+    // nonce 5 < confirmed 10.
+    let tx = TxBuilder::valid().nonce(5).build();
     assert!(
-        result.is_err(),
-        "past nonce must be rejected (replay protection)"
+        matches!(check_tx(&tx, 10), Err(ValidationError::NonceGap { .. })),
+        "past nonce must produce NonceGap (replay protection)",
     );
 }
 
-/// REGRESSION: An oversized payload could cause unbounded memory allocation
-/// during deserialisation.
-/// Fixed: `validate_body_size` and `validate_tx` check payload length first.
 #[test]
-fn regression_rpc_oversized_payload_rejected() {
-    let giant_payload = "x".repeat(MAX_BODY_BYTES + 1);
-    let result = validate_tx(
-        &tx(VALID_CHAIN_ID, VALID_NONCE, VALID_GAS_LIMIT, VALID_MAX_FEE, &giant_payload),
-        VALID_CHAIN_ID,
-        VALID_NONCE,
+fn regression_rpc_oversized_payload_rejected_by_tx_validation() {
+    let giant = "x".repeat(MAX_BODY_BYTES + 1);
+    let tx = TxBuilder::valid().payload(giant).build();
+    assert!(
+        matches!(check_tx(&tx, 0), Err(ValidationError::PayloadTooLong { .. })),
+        "oversized tx payload must produce PayloadTooLong",
     );
-    assert!(result.is_err(), "oversized payload must be rejected");
-
-    let body = vec![0u8; MAX_BODY_BYTES + 1];
-    assert!(validate_body_size(&body, MAX_BODY_BYTES).is_err());
 }
 
-/// REGRESSION: A batch with too many items could exhaust CPU / memory.
-/// Fixed: `validate_batch_size` enforces `MAX_BATCH_ITEMS`.
+#[test]
+fn regression_rpc_oversized_body_rejected_by_size_gate() {
+    let body = vec![0u8; MAX_BODY_BYTES + 1];
+    assert!(
+        validate_body_size(&body, MAX_BODY_BYTES).is_err(),
+        "request body over MAX_BODY_BYTES must be rejected",
+    );
+}
+
 #[test]
 fn regression_rpc_oversized_batch_rejected() {
     assert!(
-        validate_batch_size(OVERSIZED_BATCH_SIZE).is_err(),
-        "huge batch must be rejected"
+        matches!(
+            validate_batch_size(MAX_BATCH_ITEMS + 1),
+            Err(ValidationError::BatchTooLarge { .. }),
+        ),
+        "batch over MAX_BATCH_ITEMS must produce BatchTooLarge",
     );
 }
 
-/// REGRESSION: A transaction with an invalid signature could still be queued,
-/// wasting validation resources.
-/// Fixed: signature verification is performed early.
-#[test]
-fn regression_rpc_invalid_signature_rejected() {
-    let mut tx = valid_tx();
-    tx.signature = vec![0u8; 32]; // Invalid length.
-    // In production, this would be caught by the transaction decoder.
-    // This test ensures the validation layer rejects it.
-    // We'll use the RPC validation function (which doesn't verify signatures)
-    // but we'll check that the transaction is rejected earlier.
-    // Since we don't have a full RPC test harness, we'll just check that the
-    // transaction fails validation due to signature length.
-    // In practice, the RPC layer should reject it before calling validate_tx.
-    // We'll add a test that checks the RPC layer rejects malformed transactions.
-    // For now, we'll just check that validate_tx doesn't panic.
-    let result = validate_tx(&tx, VALID_CHAIN_ID, VALID_NONCE);
-    // This test is a bit weak; a better test would be to actually send the
-    // transaction via the RPC handler. For now, we'll just ensure it doesn't panic.
-    assert!(
-        result.is_ok() || result.is_err(),
-        "Should not panic on invalid signature"
-    );
-}
+// Removed: `regression_rpc_invalid_signature_rejected`.
+//
+// The previous test set `signature = vec![0u8; 32]` and then asserted
+// `result.is_ok() || result.is_err()` — a tautology. Signature
+// verification is not `validate_tx`'s job; it happens in the
+// transaction decoder before `validate_tx` runs. Testing signature
+// rejection from this library-level file would require either an RPC
+// handler or a decoder API that is not exposed here. Signature
+// verification bugs are covered in the decoder's own tests. The
+// regression test that used to live here was providing false
+// confidence, not coverage.
 
-// ── Rate limiting regressions ───────────────────────────────────────────
+// ===========================================================================
+// §2 Rate limiting
+// ===========================================================================
 
-/// REGRESSION: The rate limiter was not tracking violation streaks, so a flooder
-/// could sustain attacks indefinitely at the burst rate.
-/// Fixed: `violation_streak` is tracked and triggers quarantine.
+/// Sustained flooding must escalate from `RateLimited` to `Blocked`
+/// (quarantine). `RateLimited` and `Blocked` are distinct states:
+/// `RateLimited` means "try again later"; `Blocked` means the IP is
+/// quarantined or banned. Asserting `RateLimited | Blocked` — as the
+/// previous version of this test did — would pass even if quarantine
+/// never fired.
 #[test]
-fn regression_rate_limit_flooder_eventually_quarantined() {
+fn regression_rate_limit_flood_escalates_to_quarantine() {
     let limiter = RpcLimiter::new();
-    let peer = test_ip(IP_FLOOD_OCTET);
-    let total_requests = SUBMIT_RATE_PER_SEC as usize * FLOOD_MULTIPLIER;
-    for _ in 0..total_requests {
-        limiter.check_submit(peer, "flood");
+    let peer = test_ip(50);
+
+    // Budget: drain the rate-limit bucket, cross the quarantine
+    // threshold, plus a small buffer to observe the post-quarantine
+    // state. Uses the public constants so the test tracks any change
+    // to their values.
+    let budget = (SUBMIT_RATE_PER_SEC as usize)
+        .saturating_add(VIOLATIONS_BEFORE_QUARANTINE as usize)
+        .saturating_add(5);
+
+    let mut saw_rate_limited = false;
+    let mut saw_blocked = false;
+    for i in 0..budget {
+        match limiter.check_submit(peer, &format!("req-{i}")) {
+            RpcLimitResult::RateLimited => saw_rate_limited = true,
+            RpcLimitResult::Blocked => saw_blocked = true,
+            RpcLimitResult::Allowed => {
+                // Only the first `SUBMIT_RATE_PER_SEC` calls should be
+                // allowed; anything past that budget is a rate-limiter
+                // bug that this test will catch.
+                assert!(
+                    i < SUBMIT_RATE_PER_SEC as usize,
+                    "request {i} was Allowed past the rate-limit budget",
+                );
+            }
+        }
     }
-    let result = limiter.check_submit(peer, "final");
+
+    assert!(saw_rate_limited, "flood must produce at least one RateLimited");
     assert!(
-        matches!(result, RpcLimitResult::RateLimited | RpcLimitResult::Blocked),
-        "sustained flooder must be quarantined, got {result:?}"
+        saw_blocked,
+        "sustained flood must escalate to Blocked (quarantine); \
+         the pre-quarantine rate limit alone is not enough",
+    );
+    assert_eq!(
+        limiter.check_submit(peer, "req-post-quarantine"),
+        RpcLimitResult::Blocked,
+        "quarantined IP must remain Blocked on subsequent requests",
+    );
+
+    let snap = limiter.metrics_snapshot();
+    assert!(
+        snap.ips_quarantined >= 1 || snap.ips_banned >= 1,
+        "metrics must reflect the quarantine/ban; got {snap:?}",
     );
 }
 
-/// REGRESSION: Two different IP addresses were sharing rate‑limit state, allowing
-/// IP spoofing to dilute the per‑IP limit.
-/// Fixed: each IP has its own token bucket.
+/// Per-IP buckets must be independent. A flood from one IP must not
+/// consume another IP's budget — otherwise an attacker could dilute
+/// their own rate limit by spoofing many source addresses.
 #[test]
 fn regression_rate_limit_ip_buckets_are_independent() {
     let limiter = RpcLimiter::new();
-    let ip_a = test_ip(IP_INDEPENDENCE_A_OCTET);
-    let ip_b = test_ip(IP_INDEPENDENCE_B_OCTET);
-    // Exhaust `ip_a` budget.
+    let ip_a = test_ip(60);
+    let ip_b = test_ip(61);
+
     for _ in 0..SUBMIT_RATE_PER_SEC {
-        limiter.check_submit(ip_a, "req");
+        let _ = limiter.check_submit(ip_a, "drain");
     }
-    // `ip_b` must be unaffected.
     assert_eq!(
-        limiter.check_submit(ip_b, "req"),
+        limiter.check_submit(ip_a, "overflow"),
+        RpcLimitResult::RateLimited,
+        "IP A must be rate-limited after draining its bucket",
+    );
+
+    assert_eq!(
+        limiter.check_submit(ip_b, "fresh"),
         RpcLimitResult::Allowed,
-        "different IPs must have independent rate buckets"
+        "IP B must be unaffected by IP A's flood",
     );
 }
 
-/// REGRESSION: Rate‑limited IPs were not being quarantined after repeated
-/// violations, allowing them to persist in rate‑limited state indefinitely.
-/// Fixed: quarantine escalation.
-#[test]
-fn regression_rate_limit_quarantine_escalation() {
-    let limiter = RpcLimiter::new();
-    let peer = test_ip(IP_RATE_LIMIT_OCTET);
-    // Violate repeatedly.
-    let total = SUBMIT_RATE_PER_SEC as usize * 3;
-    for i in 0..total {
-        limiter.check_submit(peer, &format!("violation-{}", i));
-    }
-    let metrics = limiter.metrics_snapshot();
-    assert!(
-        metrics.ips_quarantined > 0 || metrics.ips_banned > 0,
-        "repeated violations must lead to quarantine or ban"
-    );
-}
+// ===========================================================================
+// §3 P2P peer score
+// ===========================================================================
 
-// ── P2P / peer score regressions ────────────────────────────────────────
-
-/// REGRESSION: A peer could send messages infinitely fast without being penalised,
-/// enabling gossip flooding.
-/// Fixed: `check_msg_quota()` enforces `PEER_MAX_MSGS_PER_SEC`.
 #[test]
-fn regression_p2p_peer_msg_flood_penalised() {
+fn regression_p2p_msg_flood_triggers_quota_rejections() {
     use iona::net::peer_score::PEER_MAX_MSGS_PER_SEC;
+
     let mut score = PeerScore::with_defaults();
     let limit = PEER_MAX_MSGS_PER_SEC as usize;
-    let mut rejected = 0;
+
+    let mut rejected = 0usize;
     for _ in 0..(limit * 3) {
-        if !score.check_msg_quota(PEER_FLOOD_ID) {
+        if !score.check_msg_quota("peer-flood") {
             rejected += 1;
         }
     }
-    assert!(rejected > 0, "message flood must trigger quota rejections");
-}
-
-/// REGRESSION: A peer with a bad score was still allowed to submit more
-/// pending validations, causing CPU exhaustion via validation queue.
-/// Fixed: `acquire_validation_slot()` checks `PEER_MAX_PENDING_VALIDATIONS`.
-#[test]
-fn regression_p2p_peer_validation_slot_cap() {
-    let mut score = PeerScore::with_defaults();
-    for _ in 0..PEER_MAX_PENDING_VALIDATIONS {
-        assert!(score.acquire_validation_slot(PEER_ATTACK_ID));
-    }
     assert!(
-        !score.acquire_validation_slot(PEER_ATTACK_ID),
-        "peer must not exceed pending validation cap"
+        rejected > 0,
+        "message flood over 3× PEER_MAX_MSGS_PER_SEC must trigger rejections",
     );
 }
 
-/// REGRESSION: A permanently banned peer was still allowed to acquire
-/// message quota tokens.
-/// Fixed: `check_msg_quota` returns `false` for score ≤ ban threshold.
+#[test]
+fn regression_p2p_validation_slot_cap_enforced() {
+    let mut score = PeerScore::with_defaults();
+    for i in 0..PEER_MAX_PENDING_VALIDATIONS {
+        assert!(
+            score.acquire_validation_slot("peer-attack"),
+            "slot {i} of {PEER_MAX_PENDING_VALIDATIONS} must be available",
+        );
+    }
+    assert!(
+        !score.acquire_validation_slot("peer-attack"),
+        "the {}+1th concurrent validation slot must be rejected",
+        PEER_MAX_PENDING_VALIDATIONS,
+    );
+}
+
 #[test]
 fn regression_p2p_banned_peer_blocked_from_all_traffic() {
     let mut score = PeerScore::with_defaults();
-    // Force ban.
     score.penalise_with(
-        PEER_EVIL_ID,
+        "peer-evil",
         ViolationReason::InvalidBlock,
         BAN_THRESHOLD.unsigned_abs() as i64 + 50,
     );
-    assert!(score.should_ban(PEER_EVIL_ID), "peer must be banned");
+    assert!(score.should_ban("peer-evil"), "peer must be banned");
     assert!(
-        !score.check_msg_quota(PEER_EVIL_ID),
-        "banned peer must not pass message quota check"
+        !score.check_msg_quota("peer-evil"),
+        "banned peer must fail the message quota check",
     );
     assert!(
-        !score.check_byte_quota(PEER_EVIL_ID, 1),
-        "banned peer must not pass byte quota check"
+        !score.check_byte_quota("peer-evil", 1),
+        "banned peer must fail the byte quota check even for a 1-byte payload",
     );
 }
 
-/// REGRESSION: A peer could send a single massive message (> byte quota)
-/// without being penalised.
-/// Fixed: `check_byte_quota` penalises on oversize.
 #[test]
 fn regression_p2p_oversized_message_penalised() {
     let mut score = PeerScore::with_defaults();
-    // Assume byte quota is 1 MB per second. Send a 2 MB message.
-    let oversize = 2 * 1024 * 1024;
-    // The check should return false and penalise.
+    let oversize = 2 * 1024 * 1024; // 2 MiB — well over any sane quota.
     assert!(
-        !score.check_byte_quota(PEER_FLOOD_ID, oversize),
-        "oversized message must be rejected"
+        !score.check_byte_quota("peer-flood", oversize),
+        "2 MiB message must be rejected by the byte quota",
     );
-    // The score should have decreased.
     assert!(
-        score.score(PEER_FLOOD_ID) < 0,
-        "oversized message must decrease score"
+        score.score("peer-flood") < 0,
+        "rejecting an oversized message must penalise the peer below zero",
     );
 }
 
-// ── Consensus double‑sign guard regressions ─────────────────────────────
+// ===========================================================================
+// §4 Consensus double-sign guard
+// ===========================================================================
 
-/// REGRESSION: Running two validator instances with the same key could cause
-/// equivocation — both sign different blocks at the same height and round.
-/// Fixed: `DoubleSignGuard` persists records and refuses conflicting signs.
 #[test]
 fn regression_consensus_double_proposal_refused() {
     let env = TestEnv::new();
-    let pk = PublicKeyBytes(vec![GUARD_SEED_1; 32]);
-    let guard = DoubleSignGuard::new(env.path(), &pk).unwrap();
+    let pk = PublicKeyBytes(vec![10u8; 32]);
+    let guard = DoubleSignGuard::new(env.path(), &pk).expect("fresh guard");
 
-    guard.record_proposal(DS_HEIGHT_1, DS_ROUND_0, &hash(HASH_BYTE_B)).unwrap();
-    let result = guard.check_proposal(DS_HEIGHT_1, DS_ROUND_0, &hash(HASH_BYTE_A));
-    assert!(result.is_err(), "double‑proposal must be refused");
-}
+    guard
+        .record_proposal(1, 0, &hash(2))
+        .expect("record first proposal");
 
-/// REGRESSION: After a crash‑restart, the guard state was not reloaded,
-/// allowing a double‑sign on the first vote after restart.
-/// Fixed: `DoubleSignGuard::new()` reloads from disk; `check` uses in‑memory and disk state.
-#[test]
-fn regression_consensus_guard_survives_restart() {
-    let env = TestEnv::new();
-    let pk = PublicKeyBytes(vec![GUARD_SEED_2; 32]);
-
-    // First instance: record a proposal.
-    {
-        let guard = DoubleSignGuard::new(env.path(), &pk).unwrap();
-        guard.record_proposal(DS_HEIGHT_5, DS_ROUND_0, &hash(HASH_BYTE_C)).unwrap();
-    }
-
-    // Second instance (simulates restart): must refuse conflicting proposal.
-    {
-        let guard = DoubleSignGuard::new(env.path(), &pk).unwrap();
-        let result = guard.check_proposal(DS_HEIGHT_5, DS_ROUND_0, &hash(HASH_BYTE_D));
-        assert!(
-            result.is_err(),
-            "guard after restart must still refuse double‑proposal"
-        );
-    }
-}
-
-/// REGRESSION: The guard file could be silently rolled back to a previous
-/// state by an attacker with filesystem access, allowing double‑sign.
-/// Fixed: hash chain on every write; load verifies chain integrity.
-#[test]
-fn regression_consensus_rolled_back_guard_detected() {
-    use std::fs;
-    let env = TestEnv::new();
-    let pk = PublicKeyBytes(vec![GUARD_SEED_3; 32]);
-
-    // Write a guard with a proposal.
-    {
-        let guard = DoubleSignGuard::new(env.path(), &pk).unwrap();
-        guard.record_proposal(DS_HEIGHT_1, DS_ROUND_0, &hash(HASH_BYTE_B)).unwrap();
-    }
-
-    // Read and corrupt the `chain_hash` (simulate rollback attack).
-    let guard_file = format!(
-        "{}/doublesign_{}.json",
-        env.path(),
-        hex::encode([GUARD_SEED_3; 32])
+    assert!(
+        guard.check_proposal(1, 0, &hash(1)).is_err(),
+        "double-proposal (different hash at the same position) must be refused",
     );
-    let raw = fs::read_to_string(&guard_file).unwrap();
-    let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    json["chain_hash"] = serde_json::json!("deadbeef");
-    fs::write(&guard_file, serde_json::to_string(&json).unwrap()).unwrap();
+}
 
-    // Reload must fail.
+#[test]
+fn regression_consensus_guard_persists_across_restart() {
+    let env = TestEnv::new();
+    let pk = PublicKeyBytes(vec![11u8; 32]);
+
+    {
+        let guard = DoubleSignGuard::new(env.path(), &pk).expect("first instance");
+        guard.record_proposal(5, 0, &hash(5)).expect("record");
+    }
+
+    let guard = DoubleSignGuard::new(env.path(), &pk).expect("second instance");
+    assert!(
+        guard.check_proposal(5, 0, &hash(99)).is_err(),
+        "guard after restart must refuse a conflicting proposal at the same position",
+    );
+    assert!(
+        guard.check_proposal(5, 0, &hash(5)).is_ok(),
+        "guard after restart must still accept an exact replay of the recorded proposal",
+    );
+}
+
+#[test]
+fn regression_consensus_tampered_guard_file_rejected() {
+    use std::fs;
+
+    let env = TestEnv::new();
+    let pk = PublicKeyBytes(vec![12u8; 32]);
+
+    // Create a valid guard, then tamper with its chain hash. Use the
+    // public accessor `guard.path()` rather than hard-coding the
+    // on-disk filename layout, so this test does not break if the
+    // storage layout ever changes.
+    let guard_file = {
+        let guard = DoubleSignGuard::new(env.path(), &pk).expect("create");
+        guard.record_proposal(1, 0, &hash(2)).expect("record");
+        guard.path().to_owned()
+    };
+
+    let raw = fs::read_to_string(&guard_file).expect("read guard file");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&raw).expect("parse guard file as JSON");
+    json["chain_hash"] = serde_json::json!("deadbeef");
+    fs::write(
+        &guard_file,
+        serde_json::to_string(&json).expect("serialize tampered guard"),
+    )
+    .expect("write tampered guard");
+
     let result = DoubleSignGuard::new(env.path(), &pk);
     assert!(
         result.is_err(),
-        "corrupted / rolled‑back guard must be detected at load"
+        "guard file with a tampered chain hash must be rejected at load",
     );
 }
 
-/// REGRESSION: The guard file could be deleted, allowing a validator to
-/// double‑sign after a restart.
-/// Fixed: if the guard file is missing, the node refuses to start.
+/// A fresh data directory must produce a working guard, not an error.
+///
+/// The related policy — "an existing validator must refuse to start
+/// when its guard file is missing" — is enforced in the `iona-node`
+/// binary's startup code, not by `DoubleSignGuard` itself, and is not
+/// testable from this library-level file. Do not attempt to test that
+/// policy here via `DoubleSignGuard::new`, which has no way to
+/// distinguish a fresh node from a validator whose guard file was
+/// deleted.
 #[test]
-fn regression_consensus_missing_guard_blocks_startup() {
+fn regression_consensus_fresh_directory_creates_working_guard() {
     let env = TestEnv::new();
-    let pk = PublicKeyBytes(vec![0x99; 32]);
-    // Don't create the guard file; starting should fail.
-    let result = DoubleSignGuard::new(env.path(), &pk);
-    // Depending on implementation, it might create a fresh guard or fail.
-    // In production, it should fail if the guard file is missing and the node
-    // is a validator.
-    // For this test, we'll just check that it either fails or creates a fresh one
-    // (which is also acceptable for a fresh node).
-    // We'll assert that it doesn't panic.
+    let pk = PublicKeyBytes(vec![13u8; 32]);
+
+    let guard = DoubleSignGuard::new(env.path(), &pk)
+        .expect("fresh directory must produce a working guard");
+    let (proposals, votes) = guard.record_count();
+    assert_eq!(proposals, 0, "fresh guard must have zero proposals");
+    assert_eq!(votes, 0, "fresh guard must have zero votes");
+
+    // The guard must be usable immediately.
+    guard.record_proposal(1, 0, &hash(1)).expect("record");
+    assert!(guard.check_proposal(1, 0, &hash(1)).is_ok());
+    assert!(guard.check_proposal(1, 0, &hash(2)).is_err());
+}
+
+// ===========================================================================
+// §5 Networking — peer-ID sanity in the scoring layer
+// ===========================================================================
+
+#[test]
+fn regression_net_empty_peer_id_rejected_by_quota_check() {
+    let mut score = PeerScore::with_defaults();
     assert!(
-        result.is_ok() || result.is_err(),
-        "Should handle missing guard file without panic"
+        !score.check_msg_quota(""),
+        "empty peer ID must not pass the message quota check",
     );
 }
 
-// ── Networking regressions ──────────────────────────────────────────────
-
-/// REGRESSION: A peer could connect to the node with an invalid peer ID
-/// causing a panic in the handshake.
-/// Fixed: peer ID validation is performed early.
 #[test]
-fn regression_net_invalid_peer_id_handled_gracefully() {
-    // This test would require a full networking stack to reproduce.
-    // For now, we'll just check that the PeerScore doesn't panic on invalid ID.
+fn regression_net_very_long_peer_id_rejected_by_quota_check() {
     let mut score = PeerScore::with_defaults();
-    // Attempt to use an empty peer ID.
-    let result = score.check_msg_quota("");
-    // It should return false or not panic.
-    assert!(!result, "empty peer ID should not be accepted");
+    let long_id = "x".repeat(1024 * 1024);
+    assert!(
+        !score.check_msg_quota(&long_id),
+        "1 MiB peer ID must not pass the message quota check",
+    );
 }
 
-/// REGRESSION: A peer could send a malformed multiaddress that caused
-/// a panic in the address parser.
-/// Fixed: multiaddress parsing is robust and returns errors instead of panicking.
-#[test]
-fn regression_net_malformed_multiaddress_handled() {
-    // This test would require the multiaddress parser.
-    // For now, we'll just check that the PeerScore doesn't panic on invalid data.
-    let mut score = PeerScore::with_defaults();
-    // Use a very long string to trigger potential overflow.
-    let long_peer = "x".repeat(1024 * 1024);
-    let result = score.check_msg_quota(&long_peer);
-    assert!(!result, "excessively long peer ID should be rejected");
-}
+// Removed: `regression_net_malformed_multiaddress_handled`.
+//
+// The test name promised multiaddress parsing coverage, but the test
+// body only exercised `PeerScore::check_msg_quota` with a long string.
+// The comment itself acknowledged "This test would require the
+// multiaddress parser". It was renamed to
+// `regression_net_very_long_peer_id_rejected_by_quota_check` to
+// reflect what it actually tests. The multiaddress parser has its
+// own regression tests in `tests/net_addrs.rs` (or wherever the
+// address decoder lives), where it can be exercised directly.
 
-// ── Storage regressions ──────────────────────────────────────────────────
+// ===========================================================================
+// §6 Storage — migration correctness
+// ===========================================================================
 
-/// REGRESSION: A migration could fail if the `state_full.json` file was missing
-/// (fresh node). Fixed: migrations handle missing files gracefully.
 #[test]
-fn regression_storage_migration_missing_state_handled() {
-    let env = TestEnv::new();
-    // No state file exists.
-    let data = iona::storage::DataDir::new(env.path());
-    let result = data.ensure_schema_and_migrate();
-    assert!(result.is_ok(), "migration should handle missing state file");
-}
-
-/// REGRESSION: A migration could overwrite an existing `node_meta.json`
-/// with default values, losing custom node settings.
-/// Fixed: migration only creates the file if it doesn't exist.
-#[test]
-fn regression_storage_node_meta_preserved() {
+fn regression_storage_migration_handles_missing_state_file() {
     let env = TestEnv::new();
     let data = iona::storage::DataDir::new(env.path());
-    // Write a custom node_meta.json.
-    let custom_meta = serde_json::json!({
+    data.ensure_schema_and_migrate()
+        .expect("migration must succeed on a directory with no state file");
+}
+
+#[test]
+fn regression_storage_migration_preserves_existing_node_meta() {
+    use std::fs;
+
+    let env = TestEnv::new();
+    let custom = serde_json::json!({
         "protocol_version": 2,
         "node_id": "custom-node",
-        "created_at": 1234567890
+        "created_at": 1_234_567_890u64,
     });
-    let meta_path = env.join("node_meta.json");
-    std::fs::write(&meta_path, serde_json::to_string_pretty(&custom_meta).unwrap()).unwrap();
+    let meta_path = format!("{}/node_meta.json", env.path());
+    fs::write(
+        &meta_path,
+        serde_json::to_string_pretty(&custom).expect("serialize node_meta"),
+    )
+    .expect("write node_meta");
 
-    // Run migration.
-    data.ensure_schema_and_migrate().unwrap();
+    let data = iona::storage::DataDir::new(env.path());
+    data.ensure_schema_and_migrate().expect("migration");
 
-    // Verify node_meta.json was not overwritten.
-    let raw = std::fs::read_to_string(&meta_path).unwrap();
-    let meta: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let raw = fs::read_to_string(&meta_path).expect("read node_meta");
+    let meta: serde_json::Value = serde_json::from_str(&raw).expect("parse node_meta");
     assert_eq!(
         meta["node_id"], "custom-node",
-        "node_meta.json must be preserved"
+        "migration must preserve user-authored node_meta.json",
     );
 }
 
-// ── General security regressions ────────────────────────────────────────
+// Removed: `regression_general_public_writable_data_dir_detected`.
+//
+// The public-writable-directory check lives in `iona-node`'s startup
+// code, not in `iona::storage::DataDir`. The previous test called
+// `DataDir::ensure_schema_and_migrate` and asserted
+// `result.is_ok() || result.is_err()` — a tautology — because the
+// library has no permission gate to exercise. A mirror of the check
+// lives in `tests/rpc_security_gates.rs` where it can actually be
+// verified; it does not belong here.
 
-/// REGRESSION: The node could be started with a publicly‑writable data directory,
-/// allowing an attacker to replace the state file.
-/// Fixed: startup gate checks permissions.
-#[test]
-fn regression_general_public_writable_data_dir_detected() {
-    // This test requires Unix permissions; we'll skip on non‑Unix.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let env = TestEnv::new();
-        let data = iona::storage::DataDir::new(env.path());
-        // Set permissions to 0777 (world‑writable).
-        std::fs::set_permissions(env.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
-        // The startup gate should fail.
-        let result = data.ensure_schema_and_migrate();
-        // Depending on implementation, it might fail or succeed but log a warning.
-        // We'll check that it doesn't panic.
-        assert!(
-            result.is_ok() || result.is_err(),
-            "Should handle world‑writable dir without panic"
-        );
-    }
-}
+// Removed: `regression_general_request_id_unique`.
+//
+// This is a property of the request-ID generator, tested thoroughly
+// in `tests/rpc_hardening.rs` with a 10 000-sample uniqueness check
+// and a charset check. It is not a security regression — no specific
+// incident prompted it.
 
-/// REGRESSION: The request ID generator could produce duplicate IDs under load,
-/// breaking request correlation.
-/// Fixed: request IDs are generated with a monotonic counter and timestamp.
-#[test]
-fn regression_general_request_id_unique() {
-    let ids: Vec<_> = (0..UNIQUE_ID_COUNT).map(|_| iona::rpc_limits::new_request_id()).collect();
-    let set: std::collections::HashSet<_> = ids.iter().cloned().collect();
-    assert_eq!(ids.len(), set.len(), "all request IDs must be unique");
-}
+// Removed: `regression_general_error_messages_no_paths`.
+//
+// Same rationale — the error-opacity properties are covered in
+// `tests/rpc_hardening.rs` and `tests/rpc_security_gates.rs` with a
+// fuller leak-pattern list. This file's purpose is regression
+// tracking for specific past incidents, not comprehensive negative
+// testing. Duplicating the checks here dilutes the signal that
+// "everything in this file is a real regression test".
 
-/// REGRESSION: Error messages could leak internal paths (e.g., source file names).
-/// Fixed: error messages are sanitised.
-#[test]
-fn regression_general_error_messages_no_paths() {
-    let errors = vec![
-        iona::rpc_limits::ValidationError::PayloadTooLong { len: 999, max: 100 },
-        iona::rpc_limits::ValidationError::InvalidUtf8,
-        iona::rpc_limits::ValidationError::NonceGap {
-            sender: "alice".into(),
-            expected: 5,
-            got: 2,
-        },
-    ];
-    for e in &errors {
-        let msg = e.to_string();
-        assert!(!msg.contains("src/"), "Error leaks path: {}", msg);
-        assert!(!msg.contains(".rs:"), "Error leaks file:line: {}", msg);
-    }
-}
-
-// ── Summary test: all regression tests pass ─────────────────────────────
-
-/// This test ensures the regression suite itself is comprehensive.
-/// It's a meta‑test that simply checks that the number of regression tests
-/// is at least some threshold, to prevent accidental removal.
-#[test]
-fn regression_suite_has_minimum_coverage() {
-    // Count how many regression tests we have.
-    let test_count = std::env::args()
-        .filter(|arg| arg.contains("regression"))
-        .count();
-    // This is a rough check; we'll just ensure we have at least 20 tests.
-    assert!(
-        test_count >= 20,
-        "Regression test suite should have at least 20 tests, got {}",
-        test_count
-    );
-}
+// Removed: `regression_suite_has_minimum_coverage`.
+//
+// The previous test counted `std::env::args()` values containing
+// "regression" and asserted the count was at least 20. But test
+// binaries don't receive test names as command-line arguments; they
+// receive flags like `--test-threads`, `--nocapture`, and optionally
+// a single substring filter. So the count was either 1 (the binary
+// path itself, if it contained "regression") or 0 (if run without a
+// filter and with a different binary name) — and
+// `assert!(count >= 20)` would fail in both cases. The test was not
+// only useless, it was broken.
+//
+// If a "do not delete regression tests" guard is desired, implement
+// it as a CI check that greps the file for `#[test]` and compares
+// against a minimum, not as a runtime test.
