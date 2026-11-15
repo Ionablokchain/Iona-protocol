@@ -1,673 +1,648 @@
 //! RPC hardening tests — negative/adversarial suite.
 //!
-//! Every test here represents an attack or misuse scenario.
-//! All must result in a rejection, never a panic or information leak.
+//! Every test here represents a specific attack or misuse scenario
+//! against the RPC limiter. All must result in a rejection — never a
+//! panic, never an information leak, never acceptance.
 //!
-//! Categories:
-//!   A. Body size limits
-//!   B. Input validation (encoding, field constraints)
-//!   C. Rate limiting (per-IP flood)
-//!   D. IP quarantine/ban escalation
-//!   E. Concurrency cap
-//!   F. Batch size limits
-//!   G. Error response opacity (no internal leaks)
-//!   H. Request-ID uniqueness
-//!   I. Metrics snapshot
+//! # Categories
+//!
+//! * **A. Body size limits** — the request body is rejected above
+//!   [`MAX_BODY_BYTES`] and accepted at or below it.
+//! * **B. Transaction validation** — structurally invalid
+//!   transactions (oversized fields, zero gas, zero fee, wrong chain
+//!   ID, stale nonce) are rejected with the correct variant.
+//! * **C. Rate limiting** — a single IP is limited to
+//!   [`SUBMIT_RATE_PER_SEC`] submits per second, independently of
+//!   other IPs. Exceeding the limit returns [`RpcLimitResult::RateLimited`],
+//!   **not** [`RpcLimitResult::Blocked`]. Those are distinct states:
+//!   `RateLimited` means "try again later"; `Blocked` means the IP has
+//!   been quarantined or banned.
+//! * **D. Quarantine escalation** — [`VIOLATIONS_BEFORE_QUARANTINE`]
+//!   consecutive rate-limit violations promote the IP to quarantine;
+//!   further requests return `Blocked`.
+//! * **E. Concurrency cap** — [`MAX_CONCURRENT_REQUESTS`] slots are
+//!   enforced; slots are released when the ticket is dropped.
+//! * **F. Batch size limits** — [`MAX_BATCH_ITEMS`] items are
+//!   accepted; one more is rejected with
+//!   [`ValidationError::BatchTooLarge`].
+//! * **G. Error opacity** — displayed error messages must not leak
+//!   internal paths, type names, stack traces, or debug formatting.
+//! * **H. Request-ID generation** — IDs are unique and contain only
+//!   ASCII-printable characters, no JSON metacharacters, no control
+//!   bytes, and start with `req-`.
+//! * **I. Metrics** — a freshly-constructed [`RpcLimiter`] reports
+//!   zero for every counter.
+//!
+//! # Assumptions documented by specific tests
+//!
+//! * [`empty_body_is_accepted`] — the current empty-body policy is
+//!   "allowed". If it changes to "rejected", this test and the policy
+//!   must be updated together.
+//! * [`tx_with_future_nonce_is_accepted`] — a transaction with
+//!   `nonce > confirmed_nonce` is accepted with no upper bound. If a
+//!   drip-prevention limit is added later, this test must be updated.
+//!
+//! # Running
+//!
+//! ```text
+//! cargo test --test rpc_hardening
+//! ```
+//!
+//! Tests run in parallel by default. Each test owns its own
+//! [`RpcLimiter`] instance, so there is no cross-test interference.
+//!
+//! # Why there is no custom test runner
+//!
+//! An earlier version of this file wrapped every check in a
+//! `RpcHardeningTestRunner` with its own pass/fail counters and
+//! timing. That duplicated what `cargo test` already provides —
+//! parallel execution, per-test failure reporting, per-test timing —
+//! while making failures harder to attribute ("one of 37 checks in
+//! `run_all` failed" vs. "the test `quarantine_escalates_after_
+//! repeated_violations` failed at line 214"). The current version is
+//! a plain set of `#[test]` functions; the framework does the rest.
+
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::Ordering;
 
 use iona::rpc_limits::{
     new_request_id, validate_batch_size, validate_body_size, validate_tx,
-    RpcHardeningConfig, RpcLimitResult, RpcLimiter, RpcMetrics, ValidationError,
-    MAX_BATCH_ITEMS, MAX_BODY_BYTES, MAX_CONCURRENT_REQUESTS, SUBMIT_RATE_PER_SEC,
+    RpcLimitResult, RpcLimiter, ValidationError, MAX_BATCH_ITEMS,
+    MAX_BODY_BYTES, MAX_CONCURRENT_REQUESTS, SUBMIT_RATE_PER_SEC,
     VIOLATIONS_BEFORE_QUARANTINE,
 };
 use iona::types::Tx;
-use parking_lot::Mutex;
-use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tracing::{debug, error, info, trace, warn};
 
-// ── Configuration ─────────────────────────────────────────────────────────
-
-/// Configuration for RPC hardening tests.
-#[derive(Debug, Clone)]
-pub struct RpcHardeningTestConfig {
-    /// Number of request IDs to generate for uniqueness test.
-    pub unique_id_count: usize,
-    /// Over‑sized body length for payload tests.
-    pub oversized_body_len: usize,
-    /// Duration to wait for rate limiting to reset (seconds).
-    pub rate_limit_reset_wait_secs: u64,
-    /// Whether to enable detailed logging.
-    pub verbose: bool,
-    /// Whether to enable parallel test execution.
-    pub parallel: bool,
-}
-
-impl Default for RpcHardeningTestConfig {
-    fn default() -> Self {
-        Self {
-            unique_id_count: 500,
-            oversized_body_len: 1_000_000,
-            rate_limit_reset_wait_secs: 5,
-            verbose: false,
-            parallel: false,
-        }
-    }
-}
-
-impl RpcHardeningTestConfig {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.unique_id_count == 0 {
-            return Err("unique_id_count must be > 0".into());
-        }
-        if self.oversized_body_len == 0 {
-            return Err("oversized_body_len must be > 0".into());
-        }
-        if self.rate_limit_reset_wait_secs == 0 {
-            return Err("rate_limit_reset_wait_secs must be > 0".into());
-        }
-        Ok(())
-    }
-}
-
-// ── Metrics ──────────────────────────────────────────────────────────────
-
-/// Metrics for RPC hardening tests.
-#[derive(Debug, Default)]
-pub struct RpcHardeningTestMetrics {
-    pub tests_passed: AtomicUsize,
-    pub tests_failed: AtomicUsize,
-    pub rejections: AtomicUsize,
-    pub rate_limits: AtomicUsize,
-    pub quarantines: AtomicUsize,
-    pub bans: AtomicUsize,
-}
-
-impl RpcHardeningTestMetrics {
-    pub fn record_pass(&self) {
-        self.tests_passed.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_fail(&self) {
-        self.tests_failed.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_rejection(&self) {
-        self.rejections.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_rate_limit(&self) {
-        self.rate_limits.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_quarantine(&self) {
-        self.quarantines.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_ban(&self) {
-        self.bans.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn snapshot(&self) -> RpcHardeningTestMetricsSnapshot {
-        RpcHardeningTestMetricsSnapshot {
-            tests_passed: self.tests_passed.load(Ordering::Relaxed),
-            tests_failed: self.tests_failed.load(Ordering::Relaxed),
-            rejections: self.rejections.load(Ordering::Relaxed),
-            rate_limits: self.rate_limits.load(Ordering::Relaxed),
-            quarantines: self.quarantines.load(Ordering::Relaxed),
-            bans: self.bans.load(Ordering::Relaxed),
-        }
-    }
-}
-
-/// Snapshot of RPC hardening test metrics.
-#[derive(Debug, Clone)]
-pub struct RpcHardeningTestMetricsSnapshot {
-    pub tests_passed: usize,
-    pub tests_failed: usize,
-    pub rejections: usize,
-    pub rate_limits: usize,
-    pub quarantines: usize,
-    pub bans: usize,
-}
-
-// ── Test Runner ──────────────────────────────────────────────────────────
-
-/// Runner for RPC hardening tests.
-pub struct RpcHardeningTestRunner {
-    config: RpcHardeningTestConfig,
-    metrics: Arc<RpcHardeningTestMetrics>,
-}
-
-impl RpcHardeningTestRunner {
-    pub fn new(config: RpcHardeningTestConfig) -> Result<Self, String> {
-        config.validate()?;
-        Ok(Self {
-            config,
-            metrics: Arc::new(RpcHardeningTestMetrics::default()),
-        })
-    }
-
-    pub fn run_all(&self) -> Result<RpcHardeningTestMetricsSnapshot, String> {
-        let start = Instant::now();
-        info!("Starting RPC hardening test suite");
-
-        // A. Body size limits
-        self.test_reject_body_exactly_one_byte_over_limit();
-        self.test_reject_body_far_over_limit();
-        self.test_allow_body_exactly_at_limit();
-        self.test_allow_empty_body();
-
-        // B. Input validation
-        self.test_reject_tx_payload_too_long();
-        self.test_reject_tx_zero_gas_limit();
-        self.test_reject_tx_zero_max_fee();
-        self.test_reject_tx_wrong_chain_id();
-        self.test_reject_tx_nonce_in_past();
-        self.test_allow_tx_nonce_equal_to_confirmed();
-        self.test_allow_tx_nonce_ahead_of_confirmed();
-        self.test_reject_tx_pubkey_too_long();
-
-        // C. Rate limiting
-        self.test_rate_limit_submit_after_burst_exhausted();
-        self.test_rate_limit_increments_metric();
-        self.test_independent_ips_do_not_interfere();
-
-        // D. IP quarantine/ban escalation
-        self.test_decode_error_penalises_streak();
-        self.test_payload_too_large_penalises_streak();
-        self.test_repeated_violations_escalate_to_quarantine();
-
-        // E. Concurrency cap
-        self.test_concurrency_cap_enforced();
-        self.test_concurrency_metric_increments_on_rejection();
-
-        // F. Batch size limits
-        self.test_batch_exactly_at_limit_allowed();
-        self.test_batch_one_over_limit_rejected();
-        self.test_batch_zero_allowed();
-
-        // G. Error response opacity
-        self.test_error_messages_contain_no_src_paths();
-        self.test_validation_error_display_is_safe();
-
-        // H. Request-ID uniqueness
-        self.test_request_ids_are_unique();
-        self.test_request_id_format_is_safe();
-
-        // I. Metrics snapshot
-        self.test_metrics_snapshot_starts_at_zero();
-
-        let duration = start.elapsed();
-        info!(
-            duration_ms = duration.as_millis(),
-            metrics = ?self.metrics.snapshot(),
-            "RPC hardening test suite completed"
-        );
-
-        // Check for failures.
-        let snapshot = self.metrics.snapshot();
-        if snapshot.tests_failed > 0 {
-            return Err(format!(
-                "{} tests failed out of {}",
-                snapshot.tests_failed,
-                snapshot.tests_passed + snapshot.tests_failed
-            ));
-        }
-
-        Ok(snapshot)
-    }
-
-    // ── Individual test functions ──────────────────────────────────────────
-
-    // A. Body size limits
-
-    fn test_reject_body_exactly_one_byte_over_limit(&self) {
-        let body = vec![0u8; MAX_BODY_BYTES + 1];
-        let result = validate_body_size(&body, MAX_BODY_BYTES);
-        if result.is_err() {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_reject_body_exactly_one_byte_over_limit failed");
-        }
-    }
-
-    fn test_reject_body_far_over_limit(&self) {
-        let body = vec![0u8; self.config.oversized_body_len];
-        if validate_body_size(&body, MAX_BODY_BYTES).is_err() {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_reject_body_far_over_limit failed");
-        }
-    }
-
-    fn test_allow_body_exactly_at_limit(&self) {
-        let body = vec![0u8; MAX_BODY_BYTES];
-        if validate_body_size(&body, MAX_BODY_BYTES).is_ok() {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_allow_body_exactly_at_limit failed");
-        }
-    }
-
-    fn test_allow_empty_body(&self) {
-        if validate_body_size(&[], MAX_BODY_BYTES).is_ok() {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_allow_empty_body failed");
-        }
-    }
-
-    // B. Input validation
-
-    fn test_reject_tx_payload_too_long(&self) {
-        let payload = "x".repeat(MAX_BODY_BYTES + 1);
-        let tx = minimal_tx(1, 0, 21_000, 1, &payload);
-        if matches!(validate_tx(&tx, 1, 0), Err(ValidationError::PayloadTooLong { .. })) {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_reject_tx_payload_too_long failed");
-        }
-    }
-
-    fn test_reject_tx_zero_gas_limit(&self) {
-        let tx = minimal_tx(1, 0, 0, 1, "ok");
-        if matches!(
-            validate_tx(&tx, 1, 0).unwrap_err(),
-            ValidationError::GasLimitZero
-        ) {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_reject_tx_zero_gas_limit failed");
-        }
-    }
-
-    fn test_reject_tx_zero_max_fee(&self) {
-        let tx = minimal_tx(1, 0, 21_000, 0, "ok");
-        if matches!(
-            validate_tx(&tx, 1, 0).unwrap_err(),
-            ValidationError::MaxFeeZero
-        ) {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_reject_tx_zero_max_fee failed");
-        }
-    }
-
-    fn test_reject_tx_wrong_chain_id(&self) {
-        let wrong_chain = 9998;
-        let tx = minimal_tx(wrong_chain, 0, 21_000, 1, "ok");
-        if matches!(
-            validate_tx(&tx, 1, 0).unwrap_err(),
-            ValidationError::ChainIdMismatch { .. }
-        ) {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_reject_tx_wrong_chain_id failed");
-        }
-    }
-
-    fn test_reject_tx_nonce_in_past(&self) {
-        let tx = minimal_tx(1, 2, 21_000, 1, "ok");
-        if matches!(
-            validate_tx(&tx, 1, 5).unwrap_err(),
-            ValidationError::NonceGap { .. }
-        ) {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_reject_tx_nonce_in_past failed");
-        }
-    }
-
-    fn test_allow_tx_nonce_equal_to_confirmed(&self) {
-        let tx = minimal_tx(1, 5, 21_000, 1, "ok");
-        if validate_tx(&tx, 1, 5).is_ok() {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_allow_tx_nonce_equal_to_confirmed failed");
-        }
-    }
-
-    fn test_allow_tx_nonce_ahead_of_confirmed(&self) {
-        let tx = minimal_tx(1, 10, 21_000, 1, "ok");
-        if validate_tx(&tx, 1, 5).is_ok() {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_allow_tx_nonce_ahead_of_confirmed failed");
-        }
-    }
-
-    fn test_reject_tx_pubkey_too_long(&self) {
-        let mut tx = minimal_tx(1, 0, 21_000, 1, "ok");
-        tx.pubkey = vec![0u8; 64 + 1];
-        if matches!(
-            validate_tx(&tx, 1, 0).unwrap_err(),
-            ValidationError::PubkeyTooLong
-        ) {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_reject_tx_pubkey_too_long failed");
-        }
-    }
-
-    // C. Rate limiting
-
-    fn test_rate_limit_submit_after_burst_exhausted(&self) {
-        let limiter = RpcLimiter::new();
-        let peer = test_ip(1);
-        for _ in 0..SUBMIT_RATE_PER_SEC {
-            limiter.check_submit(peer, "req");
-        }
-        let result = limiter.check_submit(peer, "req-overflow");
-        if matches!(result, RpcLimitResult::RateLimited | RpcLimitResult::Blocked) {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_rate_limit_submit_after_burst_exhausted failed");
-        }
-    }
-
-    fn test_rate_limit_increments_metric(&self) {
-        let limiter = RpcLimiter::new();
-        let peer = test_ip(2);
-        for _ in 0..SUBMIT_RATE_PER_SEC {
-            limiter.check_submit(peer, "req");
-        }
-        limiter.check_submit(peer, "req-over");
-        let metric = limiter.metric_rate_limit_hits.load(Ordering::Relaxed);
-        if metric >= 1 {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_rate_limit_increments_metric failed");
-        }
-    }
-
-    fn test_independent_ips_do_not_interfere(&self) {
-        let limiter = RpcLimiter::new();
-        let ip_a = test_ip(3);
-        let ip_b = test_ip(4);
-        for _ in 0..SUBMIT_RATE_PER_SEC {
-            limiter.check_submit(ip_a, "req");
-        }
-        if limiter.check_submit(ip_b, "req") == RpcLimitResult::Allowed {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_independent_ips_do_not_interfere failed");
-        }
-    }
-
-    // D. IP quarantine/ban escalation
-
-    fn test_decode_error_penalises_streak(&self) {
-        let limiter = RpcLimiter::new();
-        let peer = test_ip(10);
-        limiter.record_decode_error(peer, "req");
-        let metric = limiter.metric_decode_errors.load(Ordering::Relaxed);
-        if metric == 1 {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_decode_error_penalises_streak failed");
-        }
-    }
-
-    fn test_payload_too_large_penalises_streak(&self) {
-        let limiter = RpcLimiter::new();
-        let peer = test_ip(11);
-        limiter.record_payload_too_large(peer, "req", MAX_BODY_BYTES + 1024);
-        let metric = limiter.metric_payload_too_large.load(Ordering::Relaxed);
-        if metric == 1 {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_payload_too_large_penalises_streak failed");
-        }
-    }
-
-    fn test_repeated_violations_escalate_to_quarantine(&self) {
-        let limiter = RpcLimiter::new();
-        let peer = test_ip(20);
-        let total_requests = SUBMIT_RATE_PER_SEC + VIOLATIONS_BEFORE_QUARANTINE + 5;
-        for _ in 0..total_requests {
-            limiter.check_submit(peer, "req");
-        }
-        let result = limiter.check_submit(peer, "req-after");
-        if matches!(result, RpcLimitResult::RateLimited | RpcLimitResult::Blocked) {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_repeated_violations_escalate_to_quarantine failed");
-        }
-    }
-
-    // E. Concurrency cap
-
-    fn test_concurrency_cap_enforced(&self) {
-        let limiter = RpcLimiter::new();
-        let mut tickets = Vec::new();
-        for _ in 0..MAX_CONCURRENT_REQUESTS {
-            tickets.push(limiter.try_concurrency_slot("req").expect("slot must be available"));
-        }
-        let overflow = limiter.try_concurrency_slot("req-overflow");
-        drop(tickets);
-        if overflow.is_none() {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_concurrency_cap_enforced failed");
-        }
-    }
-
-    fn test_concurrency_metric_increments_on_rejection(&self) {
-        let limiter = RpcLimiter::new();
-        let mut tickets = Vec::new();
-        for _ in 0..MAX_CONCURRENT_REQUESTS {
-            tickets.push(limiter.try_concurrency_slot("req").unwrap());
-        }
-        limiter.try_concurrency_slot("req-over");
-        drop(tickets);
-        let metric = limiter.metric_concurrency_rejected.load(Ordering::Relaxed);
-        if metric == 1 {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_concurrency_metric_increments_on_rejection failed");
-        }
-    }
-
-    // F. Batch size limits
-
-    fn test_batch_exactly_at_limit_allowed(&self) {
-        if validate_batch_size(MAX_BATCH_ITEMS).is_ok() {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_batch_exactly_at_limit_allowed failed");
-        }
-    }
-
-    fn test_batch_one_over_limit_rejected(&self) {
-        if matches!(
-            validate_batch_size(MAX_BATCH_ITEMS + 1).unwrap_err(),
-            ValidationError::BatchTooLarge { .. }
-        ) {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_batch_one_over_limit_rejected failed");
-        }
-    }
-
-    fn test_batch_zero_allowed(&self) {
-        if validate_batch_size(0).is_ok() {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_batch_zero_allowed failed");
-        }
-    }
-
-    // G. Error response opacity
-
-    fn test_error_messages_contain_no_src_paths(&self) {
-        let errors: Vec<ValidationError> = vec![
-            ValidationError::PayloadTooLong {
-                len: 9999,
-                max: 4096,
-            },
-            ValidationError::InvalidUtf8,
-            ValidationError::PubkeyTooLong,
-            ValidationError::GasLimitZero,
-            ValidationError::MaxFeeZero,
-            ValidationError::ChainIdMismatch {
-                got: 2,
-                expected: 1,
-            },
-            ValidationError::NonceGap {
-                sender: "alice".into(),
-                expected: 5,
-                got: 2,
-            },
-            ValidationError::BatchTooLarge { count: 11, max: 10 },
-        ];
-        let mut all_ok = true;
-        for err in &errors {
-            let msg = err.to_string();
-            if msg.contains("src/") || msg.contains("rpc_limits") || msg.contains("unwrap") || msg.contains("panic") {
-                all_ok = false;
-                error!("error leaks internal: {}", msg);
-            }
-        }
-        if all_ok {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-        }
-    }
-
-    fn test_validation_error_display_is_safe(&self) {
-        let errors: Vec<ValidationError> = vec![
-            ValidationError::PayloadTooLong { len: 1, max: 0 },
-            ValidationError::InvalidUtf8,
-            ValidationError::PubkeyTooLong,
-            ValidationError::GasLimitZero,
-            ValidationError::MaxFeeZero,
-        ];
-        let mut all_ok = true;
-        for err in &errors {
-            let s = err.to_string();
-            if s.trim().is_empty() {
-                all_ok = false;
-                error!("error display is empty: {}", s);
-            }
-        }
-        if all_ok {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-        }
-    }
-
-    // H. Request-ID uniqueness
-
-    fn test_request_ids_are_unique(&self) {
-        let ids: Vec<_> = (0..self.config.unique_id_count)
-            .map(|_| new_request_id())
-            .collect();
-        let set: HashSet<_> = ids.iter().cloned().collect();
-        if ids.len() == set.len() {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_request_ids_are_unique failed: {} duplicate(s)", ids.len() - set.len());
-        }
-    }
-
-    fn test_request_id_format_is_safe(&self) {
-        let id = new_request_id();
-        if !id.contains('/') && !id.contains('"') && !id.contains('{') && id.starts_with("req-") {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_request_id_format_is_safe failed: {}", id);
-        }
-    }
-
-    // I. Metrics snapshot
-
-    fn test_metrics_snapshot_starts_at_zero(&self) {
-        let limiter = RpcLimiter::new();
-        let snap = limiter.metrics_snapshot();
-        if snap.rate_limit_hits == 0
-            && snap.decode_errors == 0
-            && snap.payload_too_large == 0
-            && snap.concurrency_rejected == 0
-            && snap.ips_banned == 0
-            && snap.ips_quarantined == 0
-            && snap.concurrent_requests == 0
-        {
-            self.metrics.record_pass();
-        } else {
-            self.metrics.record_fail();
-            error!("test_metrics_snapshot_starts_at_zero failed");
-        }
-    }
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────
-
-/// Create a test IP address with the given trailing octet.
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Number of request IDs to generate in the uniqueness test.
+///
+/// 10 000 is high enough that a broken counter or low-resolution
+/// timestamp would produce a detectable collision, but low enough
+/// that the test runs in a few milliseconds. For a UUID-v4 generator,
+/// the collision probability over this sample is ~2^-70.
+const REQUEST_ID_SAMPLES: usize = 10_000;
+
+/// Multiplier for the "far over limit" body test.
+const BODY_OVERSIZE_FACTOR: usize = 2;
+
+/// Size of the oversized pubkey in the pubkey-limit test. Larger than
+/// any legitimate Ed25519-derived key (which is 32 bytes).
+const OVERSIZED_PUBKEY_LEN: usize = 65;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// A test IP in the reserved 10.0.0.0/8 range, distinguished only by
+/// the trailing octet. Different tests use different octets so that a
+/// failure message can be traced back to the test that produced it.
 fn test_ip(octet: u8) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(10, 0, 0, octet))
 }
 
-/// Create a minimal valid transaction with customizable fields.
-fn minimal_tx(chain_id: u64, nonce: u64, gas_limit: u64, max_fee: u64, payload: &str) -> Tx {
-    Tx {
-        pubkey: vec![0u8; 32],
-        from: "alice".into(),
-        nonce,
-        max_fee_per_gas: max_fee,
-        max_priority_fee_per_gas: 1,
-        gas_limit,
-        payload: payload.to_string(),
-        signature: vec![0u8; 64],
-        chain_id,
+/// Builder for a minimal valid transaction.
+///
+/// `TxBuilder::valid()` produces a transaction that must pass
+/// [`validate_tx`] with `(chain_id=1, confirmed_nonce=0)`. Each method
+/// overrides a single field, so tests read as:
+///
+/// ```ignore
+/// let tx = TxBuilder::valid().gas_limit(0).build();
+/// ```
+///
+/// which is far less error-prone than a five-positional-argument
+/// constructor where three of the arguments are `u64`.
+struct TxBuilder {
+    chain_id: u64,
+    nonce: u64,
+    gas_limit: u64,
+    max_fee: u64,
+    pubkey: Vec<u8>,
+    payload: String,
+}
+
+impl TxBuilder {
+    fn valid() -> Self {
+        Self {
+            chain_id: 1,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee: 1,
+            pubkey: vec![0u8; 32],
+            payload: "ok".into(),
+        }
+    }
+    fn chain_id(mut self, v: u64) -> Self { self.chain_id = v; self }
+    fn nonce(mut self, v: u64) -> Self { self.nonce = v; self }
+    fn gas_limit(mut self, v: u64) -> Self { self.gas_limit = v; self }
+    fn max_fee(mut self, v: u64) -> Self { self.max_fee = v; self }
+    fn pubkey(mut self, v: Vec<u8>) -> Self { self.pubkey = v; self }
+    fn payload(mut self, v: impl Into<String>) -> Self { self.payload = v.into(); self }
+
+    fn build(self) -> Tx {
+        Tx {
+            pubkey: self.pubkey,
+            from: "alice".into(),
+            nonce: self.nonce,
+            max_fee_per_gas: self.max_fee,
+            max_priority_fee_per_gas: 1,
+            gas_limit: self.gas_limit,
+            payload: self.payload,
+            signature: vec![0u8; 64],
+            chain_id: self.chain_id,
+        }
     }
 }
 
-// ── Test Entry Point ─────────────────────────────────────────────────────
+// ===========================================================================
+// A. Body size limits
+// ===========================================================================
 
 #[test]
-fn run_rpc_hardening_tests_default() {
-    let config = RpcHardeningTestConfig::default();
-    let runner = RpcHardeningTestRunner::new(config).unwrap();
-    let result = runner.run_all();
-    assert!(result.is_ok(), "RPC hardening tests failed: {:?}", result.err());
+fn body_one_byte_over_limit_is_rejected() {
+    let body = vec![0u8; MAX_BODY_BYTES + 1];
+    assert!(
+        validate_body_size(&body, MAX_BODY_BYTES).is_err(),
+        "body of {} bytes must be rejected (limit is {})",
+        MAX_BODY_BYTES + 1,
+        MAX_BODY_BYTES,
+    );
 }
 
 #[test]
-fn run_rpc_hardening_tests_with_verbose() {
-    let mut config = RpcHardeningTestConfig::default();
-    config.verbose = true;
-    let runner = RpcHardeningTestRunner::new(config).unwrap();
-    let result = runner.run_all();
-    assert!(result.is_ok(), "RPC hardening tests (verbose) failed: {:?}", result.err());
+fn body_far_over_limit_is_rejected() {
+    let body = vec![0u8; MAX_BODY_BYTES * BODY_OVERSIZE_FACTOR];
+    assert!(
+        validate_body_size(&body, MAX_BODY_BYTES).is_err(),
+        "body of {} bytes ({}× the limit) must be rejected",
+        MAX_BODY_BYTES * BODY_OVERSIZE_FACTOR,
+        BODY_OVERSIZE_FACTOR,
+    );
+}
+
+#[test]
+fn body_exactly_at_limit_is_accepted() {
+    let body = vec![0u8; MAX_BODY_BYTES];
+    assert!(
+        validate_body_size(&body, MAX_BODY_BYTES).is_ok(),
+        "body of exactly {} bytes must be accepted",
+        MAX_BODY_BYTES,
+    );
+}
+
+/// Documents the current empty-body policy: empty bodies are allowed.
+///
+/// If the policy changes to "rejected", this test and the policy
+/// decision must change together. See the module header.
+#[test]
+fn empty_body_is_accepted() {
+    assert!(validate_body_size(&[], MAX_BODY_BYTES).is_ok());
+}
+
+// ===========================================================================
+// B. Transaction validation
+// ===========================================================================
+
+#[test]
+fn tx_payload_over_limit_is_rejected() {
+    // The payload limit is at most MAX_BODY_BYTES; a body-sized
+    // payload is guaranteed to trip it.
+    let tx = TxBuilder::valid()
+        .payload("x".repeat(MAX_BODY_BYTES + 1))
+        .build();
+    assert!(
+        matches!(
+            validate_tx(&tx, 1, 0),
+            Err(ValidationError::PayloadTooLong { .. }),
+        ),
+        "oversized payload must produce PayloadTooLong",
+    );
+}
+
+#[test]
+fn tx_with_zero_gas_limit_is_rejected() {
+    let tx = TxBuilder::valid().gas_limit(0).build();
+    assert!(
+        matches!(validate_tx(&tx, 1, 0), Err(ValidationError::GasLimitZero)),
+        "gas_limit=0 must produce GasLimitZero",
+    );
+}
+
+#[test]
+fn tx_with_zero_max_fee_is_rejected() {
+    let tx = TxBuilder::valid().max_fee(0).build();
+    assert!(
+        matches!(validate_tx(&tx, 1, 0), Err(ValidationError::MaxFeeZero)),
+        "max_fee=0 must produce MaxFeeZero",
+    );
+}
+
+#[test]
+fn tx_with_wrong_chain_id_is_rejected() {
+    let tx = TxBuilder::valid().chain_id(9998).build();
+    assert!(
+        matches!(
+            validate_tx(&tx, 1, 0),
+            Err(ValidationError::ChainIdMismatch { .. }),
+        ),
+        "chain_id mismatch must produce ChainIdMismatch",
+    );
+}
+
+#[test]
+fn tx_with_stale_nonce_is_rejected() {
+    // nonce 2 < confirmed 5: this nonce has already been used.
+    let tx = TxBuilder::valid().nonce(2).build();
+    assert!(
+        matches!(
+            validate_tx(&tx, 1, 5),
+            Err(ValidationError::NonceGap { .. }),
+        ),
+        "nonce below confirmed must produce NonceGap",
+    );
+}
+
+#[test]
+fn tx_with_nonce_equal_to_confirmed_is_accepted() {
+    // Idempotent replay: the next valid nonce is `confirmed`.
+    let tx = TxBuilder::valid().nonce(5).build();
+    assert!(
+        validate_tx(&tx, 1, 5).is_ok(),
+        "nonce equal to confirmed must be accepted",
+    );
+}
+
+/// Documents the current "no drip limit" policy: nonces arbitrarily
+/// far ahead of the confirmed nonce are accepted. If a drip-prevention
+/// limit is added later, this test must be updated. See the module
+/// header.
+#[test]
+fn tx_with_future_nonce_is_accepted() {
+    let tx = TxBuilder::valid().nonce(10).build();
+    assert!(
+        validate_tx(&tx, 1, 5).is_ok(),
+        "nonce ahead of confirmed must be accepted under current policy",
+    );
+}
+
+#[test]
+fn tx_with_oversized_pubkey_is_rejected() {
+    let tx = TxBuilder::valid()
+        .pubkey(vec![0u8; OVERSIZED_PUBKEY_LEN])
+        .build();
+    assert!(
+        matches!(validate_tx(&tx, 1, 0), Err(ValidationError::PubkeyTooLong)),
+        "{} byte pubkey must produce PubkeyTooLong",
+        OVERSIZED_PUBKEY_LEN,
+    );
+}
+
+// ===========================================================================
+// C. Rate limiting
+// ===========================================================================
+
+/// Exceeding the per-IP rate limit returns `RateLimited`, **not**
+/// `Blocked`. Those are distinct states: `Blocked` means quarantine or
+/// ban, which is a separate escalation path.
+#[test]
+fn exceeding_rate_limit_returns_rate_limited() {
+    let limiter = RpcLimiter::new();
+    let peer = test_ip(1);
+    for _ in 0..SUBMIT_RATE_PER_SEC {
+        let _ = limiter.check_submit(peer, "drain");
+    }
+    assert_eq!(
+        limiter.check_submit(peer, "overflow"),
+        RpcLimitResult::RateLimited,
+        "burst over the rate limit must return RateLimited, not Blocked",
+    );
+}
+
+#[test]
+fn rate_limit_hit_is_counted() {
+    let limiter = RpcLimiter::new();
+    let peer = test_ip(2);
+    for _ in 0..SUBMIT_RATE_PER_SEC {
+        let _ = limiter.check_submit(peer, "drain");
+    }
+    let _ = limiter.check_submit(peer, "overflow");
+    assert!(
+        limiter.metric_rate_limit_hits.load(Ordering::Relaxed) >= 1,
+        "rate limit hit must be reflected in the metric",
+    );
+}
+
+/// Rate limits are per-IP: exhausting one IP's bucket must not affect
+/// another IP's ability to submit.
+#[test]
+fn rate_limits_are_per_ip() {
+    let limiter = RpcLimiter::new();
+    let ip_a = test_ip(3);
+    let ip_b = test_ip(4);
+
+    // Drain IP A's bucket.
+    for _ in 0..SUBMIT_RATE_PER_SEC {
+        let _ = limiter.check_submit(ip_a, "drain");
+    }
+    assert_eq!(limiter.check_submit(ip_a, "overflow"), RpcLimitResult::RateLimited);
+
+    // IP B should be unaffected.
+    assert_eq!(
+        limiter.check_submit(ip_b, "fresh"),
+        RpcLimitResult::Allowed,
+        "rate limits must be per-IP, not global",
+    );
+}
+
+// ===========================================================================
+// D. Quarantine escalation
+// ===========================================================================
+
+#[test]
+fn decode_error_is_counted() {
+    let limiter = RpcLimiter::new();
+    let peer = test_ip(10);
+    limiter.record_decode_error(peer, "req");
+    assert_eq!(
+        limiter.metric_decode_errors.load(Ordering::Relaxed),
+        1,
+        "decode error must be counted",
+    );
+}
+
+#[test]
+fn payload_too_large_is_counted() {
+    let limiter = RpcLimiter::new();
+    let peer = test_ip(11);
+    limiter.record_payload_too_large(peer, "req", MAX_BODY_BYTES + 1024);
+    assert_eq!(
+        limiter.metric_payload_too_large.load(Ordering::Relaxed),
+        1,
+        "payload-too-large must be counted",
+    );
+}
+
+/// Repeated violations must escalate the IP from `RateLimited` to
+/// `Blocked` (quarantine). This test verifies **both** the metric and
+/// the state transition; a test that only checked
+/// `RateLimited | Blocked` would pass even if quarantine never fired.
+#[test]
+fn quarantine_escalates_after_repeated_violations() {
+    let limiter = RpcLimiter::new();
+    let peer = test_ip(20);
+
+    // Drain the rate-limit bucket.
+    for _ in 0..SUBMIT_RATE_PER_SEC {
+        let _ = limiter.check_submit(peer, "drain");
+    }
+
+    // Run enough violations to cross the quarantine threshold, plus a
+    // buffer to observe the post-quarantine state. Record the
+    // transition we observe.
+    let mut saw_rate_limited = false;
+    let mut saw_blocked = false;
+    for i in 0..(VIOLATIONS_BEFORE_QUARANTINE + 5) {
+        match limiter.check_submit(peer, &format!("violation-{i}")) {
+            RpcLimitResult::RateLimited => saw_rate_limited = true,
+            RpcLimitResult::Blocked => saw_blocked = true,
+            RpcLimitResult::Allowed => panic!(
+                "violation {i} was Allowed, expected RateLimited (pre-quarantine) \
+                 or Blocked (post-quarantine)",
+            ),
+        }
+    }
+
+    // Verify the transition happened in the expected order.
+    assert!(
+        saw_rate_limited,
+        "expected at least one RateLimited before quarantine; \
+         saw none in {} violations",
+        VIOLATIONS_BEFORE_QUARANTINE + 5,
+    );
+    assert!(
+        saw_blocked,
+        "expected at least one Blocked after quarantine; \
+         quarantine never fired despite {} violations \
+         (VIOLATIONS_BEFORE_QUARANTINE = {})",
+        VIOLATIONS_BEFORE_QUARANTINE + 5,
+        VIOLATIONS_BEFORE_QUARANTINE,
+    );
+
+    // Verify the metric agrees with the observed state.
+    let snap = limiter.metrics_snapshot();
+    assert!(
+        snap.ips_quarantined >= 1,
+        "metrics report 0 quarantined IPs, but the behavior indicates \
+         quarantine fired",
+    );
+
+    // Verify the state persists.
+    assert_eq!(
+        limiter.check_submit(peer, "post-quarantine"),
+        RpcLimitResult::Blocked,
+        "quarantined IP must return Blocked on subsequent requests",
+    );
+}
+
+// ===========================================================================
+// E. Concurrency cap
+// ===========================================================================
+
+#[test]
+fn concurrency_cap_is_enforced() {
+    let limiter = RpcLimiter::new();
+
+    // Hold all slots.
+    let _tickets: Vec<_> = (0..MAX_CONCURRENT_REQUESTS)
+        .map(|i| {
+            limiter
+                .try_concurrency_slot(&format!("req-{i}"))
+                .expect("slot must be available below the cap")
+        })
+        .collect();
+
+    // The next request must be rejected.
+    assert!(
+        limiter.try_concurrency_slot("overflow").is_none(),
+        "the {}+1th concurrent request must be rejected",
+        MAX_CONCURRENT_REQUESTS,
+    );
+    assert_eq!(
+        limiter.metric_concurrency_rejected.load(Ordering::Relaxed),
+        1,
+        "concurrency rejection must be counted",
+    );
+}
+
+#[test]
+fn concurrency_slots_are_released_on_drop() {
+    let limiter = RpcLimiter::new();
+
+    let tickets: Vec<_> = (0..MAX_CONCURRENT_REQUESTS)
+        .map(|i| limiter.try_concurrency_slot(&format!("req-{i}")).unwrap())
+        .collect();
+
+    assert!(limiter.try_concurrency_slot("overflow").is_none());
+
+    // Dropping the tickets must release the slots.
+    drop(tickets);
+    assert!(
+        limiter.try_concurrency_slot("after-drop").is_some(),
+        "dropping the tickets must release the slots",
+    );
+}
+
+// ===========================================================================
+// F. Batch size limits
+// ===========================================================================
+
+#[test]
+fn batch_at_limit_is_accepted() {
+    assert!(validate_batch_size(MAX_BATCH_ITEMS).is_ok());
+}
+
+#[test]
+fn batch_over_limit_is_rejected() {
+    assert!(matches!(
+        validate_batch_size(MAX_BATCH_ITEMS + 1),
+        Err(ValidationError::BatchTooLarge { .. }),
+    ));
+}
+
+#[test]
+fn empty_batch_is_accepted() {
+    assert!(validate_batch_size(0).is_ok());
+}
+
+// ===========================================================================
+// G. Error opacity
+// ===========================================================================
+
+/// Error messages reach external callers. They must not leak source
+/// paths, internal module names, Rust `Debug` formatting, stack
+/// traces, or control characters.
+#[test]
+fn error_display_does_not_leak_internals() {
+    let cases: &[ValidationError] = &[
+        ValidationError::PayloadTooLong { len: 9999, max: 4096 },
+        ValidationError::InvalidUtf8,
+        ValidationError::PubkeyTooLong,
+        ValidationError::GasLimitZero,
+        ValidationError::MaxFeeZero,
+        ValidationError::ChainIdMismatch { got: 2, expected: 1 },
+        ValidationError::NonceGap { sender: "alice".into(), expected: 5, got: 2 },
+        ValidationError::BatchTooLarge { count: 11, max: 10 },
+    ];
+
+    // Substrings that indicate an information leak from internal
+    // state: paths, module names, `Debug` formatting, or stack-trace
+    // markers.
+    const LEAK_PATTERNS: &[&str] = &[
+        "src/",            // source path
+        "rpc_limits",      // internal module name
+        "unwrap",          // Result::unwrap
+        "expect",          // Result::expect
+        "panic",           // panic message
+        "ValidationError", // enum name via `{:?}`
+        "Err(",            // `Debug` of Result
+        "Ok(",             // `Debug` of Result
+        "Some(",           // `Debug` of Option
+        "\\",              // Windows path separator
+    ];
+
+    for err in cases {
+        let msg = err.to_string();
+
+        assert!(!msg.is_empty(), "error display is empty for {err:?}");
+
+        for &pat in LEAK_PATTERNS {
+            assert!(
+                !msg.contains(pat),
+                "error {err:?} display leaks {pat:?}: {msg:?}",
+            );
+        }
+
+        // No control characters (space is allowed).
+        assert!(
+            !msg.chars().any(|c| c.is_control() && c != ' '),
+            "error {err:?} display contains control characters: {msg:?}",
+        );
+    }
+}
+
+// ===========================================================================
+// H. Request-ID generation
+// ===========================================================================
+
+#[test]
+fn request_ids_are_unique() {
+    let mut seen = HashSet::with_capacity(REQUEST_ID_SAMPLES);
+    for _ in 0..REQUEST_ID_SAMPLES {
+        let id = new_request_id();
+        assert!(
+            seen.insert(id.clone()),
+            "duplicate request ID after {} samples: {id:?}",
+            seen.len(),
+        );
+    }
+}
+
+/// Request IDs end up in HTTP headers, JSON fields, and log lines. They
+/// must be safe in all three contexts: no JSON metacharacters, no shell
+/// metacharacters, no ANSI escapes, no control bytes.
+#[test]
+fn request_ids_contain_only_safe_characters() {
+    for _ in 0..256 {
+        let id = new_request_id();
+
+        // Prefix.
+        assert!(
+            id.starts_with("req-"),
+            "request ID must start with req-: {id:?}",
+        );
+
+        // Charset: only ASCII alphanumerics, dash, underscore.
+        for c in id.chars() {
+            assert!(
+                c.is_ascii_alphanumeric() || c == '-' || c == '_',
+                "request ID {id:?} contains disallowed character {c:?}",
+            );
+        }
+
+        // Belt-and-suspenders: characters that break JSON, HTTP, ANSI
+        // terminals, or shell quoting. The charset check above already
+        // rejects all of these, but listing them explicitly makes the
+        // intent of the test clear and catches future changes to the
+        // charset.
+        for banned in [
+            '/', '\\', '"', '\'', '{', '}', '[', ']', '<', '>', '&', '?', '#',
+            '\0', '\n', '\r', '\t', '\x1b',
+        ] {
+            assert!(
+                !id.contains(banned),
+                "request ID {id:?} contains banned character {banned:?}",
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// I. Metrics
+// ===========================================================================
+
+#[test]
+fn fresh_limiter_has_zero_metrics() {
+    let limiter = RpcLimiter::new();
+    let snap = limiter.metrics_snapshot();
+    assert_eq!(snap.rate_limit_hits, 0);
+    assert_eq!(snap.decode_errors, 0);
+    assert_eq!(snap.payload_too_large, 0);
+    assert_eq!(snap.concurrency_rejected, 0);
+    assert_eq!(snap.ips_banned, 0);
+    assert_eq!(snap.ips_quarantined, 0);
+    assert_eq!(snap.concurrent_requests, 0);
 }
