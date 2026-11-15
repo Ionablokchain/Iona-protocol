@@ -1,11 +1,3 @@
-//! Security regression test suite.
-//!
-//! Every test here reproduces a specific security bug that was found and
-//! fixed. Regression tests are the audit trail for past incidents:
-//! their value is entirely in the fact that they **fail on the buggy
-//! code and pass on the fixed code**, so any test that would pass
-//! whether the bug is present or not is worse than no test at all.
-//!
 //! # Policy: adding a new regression test
 //!
 //! 1. Reproduce the bug with a failing test first.
