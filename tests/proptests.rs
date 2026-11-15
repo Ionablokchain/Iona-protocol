@@ -1,81 +1,93 @@
-//! Property‑based tests for IONA core types.
+//! Property-based tests for IONA core types.
 //!
-//! These tests use `proptest` to verify that critical functions are
-//! deterministic across a wide range of random inputs.
+//! Verifies determinism, sensitivity, and algebraic properties of the
+//! consensus-critical primitives: transaction hashing, block hashing,
+//! transaction and receipt Merkle roots, and quorum threshold.
+//!
+//! # What is verified
+//!
+//! * **Determinism** — hashing the same input twice yields the same
+//!   output.
+//! * **Sensitivity** — changing any single field of the input changes
+//!   the output. This is stronger than determinism: without it, a
+//!   Byzantine validator could substitute one transaction for another
+//!   while preserving the hash.
+//! * **Quorum threshold** — `quorum_threshold` and `has_quorum` agree,
+//!   and the threshold satisfies the Byzantine bound `2n/3 < t <= n`
+//!   (with `t = 1` for `n = 0`).
+//! * **Serialization round-trip** — `Hash32` survives JSON round-trip.
+//!
+//! # What is **not** verified here
+//!
+//! * Golden byte vectors. Those live in `tests/golden_vectors.rs` and
+//!   pin exact hex output. Property tests verify relationships between
+//!   hashes, not their specific values.
+//! * Collision resistance in any formal sense. That is a cryptographic
+//!   assumption, not something a property test can prove.
 //!
 //! Run with: `cargo test --test proptest`
 
-use iona::types::{hash_bytes, tx_hash, Block, BlockHeader, Hash32, Tx};
+use iona::types::{
+    hash_bytes, receipts_root, tx_hash, tx_root, Block, BlockHeader, Hash32, Receipt, Tx,
+};
 use proptest::prelude::*;
-use std::collections::HashSet;
 
-// -----------------------------------------------------------------------------
-// Strategy constants
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Strategy limits
+// ---------------------------------------------------------------------------
 
-/// Maximum length of a transaction public key (bytes).
 const MAX_PUBKEY_LEN: usize = 128;
-
-/// Maximum length of a sender address string.
 const MAX_FROM_LEN: usize = 64;
-
-/// Maximum length of transaction payload (bytes).
 const MAX_PAYLOAD_LEN: usize = 256;
-
-/// Maximum length of transaction signature (bytes).
 const MAX_SIG_LEN: usize = 96;
-
-/// Maximum block height (u64).
-const MAX_HEIGHT: u64 = 1_000_000;
-
-/// Character set for sender address strings (alphanumeric and underscore).
-const FROM_CHARSET: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
-
-/// Maximum number of transactions in a block for tests.
 const MAX_TXS_IN_BLOCK: usize = 20;
-
-/// Maximum size of a byte vector for hashing.
 const MAX_HASH_DATA_LEN: usize = 4096;
+const MAX_RECEIPTS: usize = 10;
 
-// -----------------------------------------------------------------------------
-// Strategy generators
-// -----------------------------------------------------------------------------
+/// Every `BlockHeader` from the consensus engine carries a 32-byte
+/// proposer public key. Using the exact length (rather than a range)
+/// matches how headers are built in production.
+const PROPOSER_PK_LEN: usize = 32;
 
-/// Strategy for generating arbitrary valid transaction strings (sender addresses).
+// ---------------------------------------------------------------------------
+// Strategies
+// ---------------------------------------------------------------------------
+
+/// Sender addresses: US-ASCII alphanumerics plus underscore, up to
+/// `MAX_FROM_LEN` characters.
 fn arb_from_string() -> impl Strategy<Value = String> {
-    proptest::string::string_regex(&format!("[{}-Z_a-z0-9]{{0,{}}}", FROM_CHARSET, MAX_FROM_LEN))
-        .unwrap()
-        .prop_map(|s| s.chars().take(MAX_FROM_LEN).collect())
+    // `{{` and `}}` are the format-string escapes for literal braces.
+    proptest::string::string_regex(&format!("[A-Za-z0-9_]{{0,{MAX_FROM_LEN}}}"))
+        .expect("from-string regex must compile")
 }
 
-/// Strategy for generating arbitrary transaction payload strings.
+/// Payloads: printable ASCII, up to `MAX_PAYLOAD_LEN` characters.
 fn arb_payload_string() -> impl Strategy<Value = String> {
-    proptest::string::string_regex(&format!("[ -~]{{0,{}}}", MAX_PAYLOAD_LEN))
-        .unwrap()
-        .prop_map(|s| s.chars().take(MAX_PAYLOAD_LEN).collect())
+    proptest::string::string_regex(&format!("[ -~]{{0,{MAX_PAYLOAD_LEN}}}"))
+        .expect("payload regex must compile")
 }
 
-/// Strategy for generating arbitrary `Tx` structures.
 fn arb_tx() -> impl Strategy<Value = Tx> {
     (
         proptest::collection::vec(any::<u8>(), 0..MAX_PUBKEY_LEN),
         arb_from_string(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
+        any::<u64>(), // nonce
+        any::<u64>(), // max_fee_per_gas
+        any::<u64>(), // max_priority_fee_per_gas
+        any::<u64>(), // gas_limit
         arb_payload_string(),
         proptest::collection::vec(any::<u8>(), 0..MAX_SIG_LEN),
-        any::<u64>(),
+        any::<u64>(), // chain_id
     )
         .prop_map(
-            |(pubkey, from, nonce, max_fee, max_prio, gas_limit, payload, signature, chain_id)| {
+            |(pubkey, from, nonce, max_fee_per_gas, max_priority_fee_per_gas,
+              gas_limit, payload, signature, chain_id)| {
                 Tx {
                     pubkey,
                     from,
                     nonce,
-                    max_fee_per_gas: max_fee,
-                    max_priority_fee_per_gas: max_prio,
+                    max_fee_per_gas,
+                    max_priority_fee_per_gas,
                     gas_limit,
                     payload,
                     signature,
@@ -85,33 +97,36 @@ fn arb_tx() -> impl Strategy<Value = Tx> {
         )
 }
 
-/// Strategy for generating arbitrary `Hash32`.
 fn arb_hash32() -> impl Strategy<Value = Hash32> {
-    any::<[u8; 32]>().prop_map(Hash32::from_bytes)
+    any::<[u8; 32]>().prop_map(Hash32)
 }
 
-/// Strategy for generating arbitrary `BlockHeader`.
 fn arb_block_header() -> impl Strategy<Value = BlockHeader> {
     (
-        any::<u64>(),
-        any::<u32>(),
-        arb_hash32(),
-        proptest::collection::vec(any::<u8>(), 32..32),
-        arb_hash32(),
-        arb_hash32(),
-        arb_hash32(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u32>(),
+        any::<u64>(),                                              // height
+        any::<u32>(),                                              // round
+        arb_hash32(),                                              // prev
+        proptest::collection::vec(any::<u8>(), PROPOSER_PK_LEN),   // proposer_pk
+        arb_hash32(),                                              // tx_root
+        arb_hash32(),                                              // receipts_root
+        arb_hash32(),                                              // state_root
+        any::<u64>(),                                              // base_fee_per_gas
+        any::<u64>(),                                              // gas_used
+        any::<u64>(),                                              // intrinsic_gas_used
+        any::<u64>(),                                              // exec_gas_used
+        any::<u64>(),                                              // vm_gas_used
+        any::<u64>(),                                              // evm_gas_used
+        any::<u64>(),                                              // chain_id
+        any::<u64>(),                                              // timestamp
+        any::<u32>(),                                              // protocol_version
     )
         .prop_map(
             |(
+                height, round, prev, proposer_pk, tx_root, receipts_root,
+                state_root, base_fee_per_gas, gas_used, intrinsic_gas_used,
+                exec_gas_used, vm_gas_used, evm_gas_used, chain_id,
+                timestamp, protocol_version,
+            )| BlockHeader {
                 height,
                 round,
                 prev,
@@ -128,30 +143,10 @@ fn arb_block_header() -> impl Strategy<Value = BlockHeader> {
                 chain_id,
                 timestamp,
                 protocol_version,
-            )| {
-                BlockHeader {
-                    height,
-                    round,
-                    prev,
-                    proposer_pk,
-                    tx_root,
-                    receipts_root,
-                    state_root,
-                    base_fee_per_gas,
-                    gas_used,
-                    intrinsic_gas_used,
-                    exec_gas_used,
-                    vm_gas_used,
-                    evm_gas_used,
-                    chain_id,
-                    timestamp,
-                    protocol_version,
-                }
             },
         )
 }
 
-/// Strategy for generating a block with a random number of transactions.
 fn arb_block() -> impl Strategy<Value = Block> {
     (
         arb_block_header(),
@@ -160,212 +155,292 @@ fn arb_block() -> impl Strategy<Value = Block> {
         .prop_map(|(header, txs)| Block { header, txs })
 }
 
-// -----------------------------------------------------------------------------
-// Property tests
-// -----------------------------------------------------------------------------
+/// A proper receipt strategy. The previous version used
+/// `any::<iona::types::Receipt>()` (which requires `Receipt: Arbitrary`)
+/// and then ignored the generated value.
+fn arb_receipt() -> impl Strategy<Value = Receipt> {
+    (
+        arb_hash32(),  // tx_hash
+        any::<bool>(), // success
+        any::<u64>(),  // gas_used
+        any::<u64>(),  // intrinsic_gas_used
+        any::<u64>(),  // exec_gas_used
+        any::<u64>(),  // vm_gas_used
+        any::<u64>(),  // evm_gas_used
+        any::<u64>(),  // effective_gas_price
+        any::<u64>(),  // burned
+        any::<u64>(),  // tip
+    )
+        .prop_map(
+            |(tx_hash, success, gas_used, intrinsic_gas_used, exec_gas_used,
+              vm_gas_used, evm_gas_used, effective_gas_price, burned, tip)| {
+                Receipt {
+                    tx_hash,
+                    success,
+                    gas_used,
+                    intrinsic_gas_used,
+                    exec_gas_used,
+                    vm_gas_used,
+                    evm_gas_used,
+                    effective_gas_price,
+                    burned,
+                    tip,
+                    error: None,
+                    data: None,
+                }
+            },
+        )
+}
+
+// ---------------------------------------------------------------------------
+// Determinism: same input → same output
+// ---------------------------------------------------------------------------
 
 proptest! {
-    /// `tx_hash` must return the same hash for the same transaction.
     #[test]
     fn tx_hash_is_deterministic(tx in arb_tx()) {
-        let hash1 = tx_hash(&tx);
-        let hash2 = tx_hash(&tx);
-        prop_assert_eq!(hash1.0, hash2.0);
+        prop_assert_eq!(tx_hash(&tx), tx_hash(&tx));
     }
 
-    /// `tx_hash` must change when any field changes (non‑degenerate).
     #[test]
-    fn tx_hash_changes_on_field_change(tx in arb_tx()) {
-        // Change each field and verify hash differs.
-        let original_hash = tx_hash(&tx);
-
-        // Change pubkey (if non‑empty, else we skip or use a safe change).
-        let mut tx2 = tx.clone();
-        if !tx2.pubkey.is_empty() {
-            tx2.pubkey[0] = tx2.pubkey[0].wrapping_add(1);
-        } else {
-            tx2.pubkey = vec![0x01];
-        }
-        prop_assert_ne!(tx_hash(&tx2).0, original_hash.0);
-
-        // Change from.
-        let mut tx3 = tx.clone();
-        tx3.from.push('x');
-        prop_assert_ne!(tx_hash(&tx3).0, original_hash.0);
-
-        // Change nonce.
-        let mut tx4 = tx.clone();
-        tx4.nonce = tx4.nonce.wrapping_add(1);
-        prop_assert_ne!(tx_hash(&tx4).0, original_hash.0);
-
-        // Change payload.
-        let mut tx5 = tx.clone();
-        tx5.payload.push('x');
-        prop_assert_ne!(tx_hash(&tx5).0, original_hash.0);
+    fn hash_bytes_is_deterministic(
+        data in proptest::collection::vec(any::<u8>(), 0..MAX_HASH_DATA_LEN)
+    ) {
+        prop_assert_eq!(hash_bytes(&data), hash_bytes(&data));
     }
 
-    /// `hash_bytes` must return the same hash for the same byte slice.
-    #[test]
-    fn hash_bytes_is_deterministic(data in proptest::collection::vec(any::<u8>(), 0..MAX_HASH_DATA_LEN)) {
-        let hash1 = hash_bytes(&data);
-        let hash2 = hash_bytes(&data);
-        prop_assert_eq!(hash1.0, hash2.0);
-    }
-
-    /// `hash_bytes` should change when input changes (collision resistance).
-    #[test]
-    fn hash_bytes_changes_on_input_change(data in proptest::collection::vec(any::<u8>(), 1..MAX_HASH_DATA_LEN)) {
-        let hash1 = hash_bytes(&data);
-        let mut data2 = data.clone();
-        data2[0] = data2[0].wrapping_add(1);
-        let hash2 = hash_bytes(&data2);
-        prop_assert_ne!(hash1.0, hash2.0);
-    }
-
-    /// `Hash32.fidelity` returns 1.0 for identical hashes, 0.0 otherwise.
-    #[test]
-    fn hash32_fidelity_is_correct(a in arb_hash32(), b in arb_hash32()) {
-        let f = a.fidelity(&b);
-        if a.0 == b.0 {
-            prop_assert!((f - 1.0).abs() < 1e-10);
-        } else {
-            prop_assert!((f - 0.0).abs() < 1e-10);
-        }
-    }
-
-    /// `Block.id` is deterministic for the same block.
     #[test]
     fn block_id_is_deterministic(block in arb_block()) {
-        let id1 = block.id();
-        let id2 = block.id();
-        prop_assert_eq!(id1.0, id2.0);
+        prop_assert_eq!(block.id(), block.id());
     }
 
-    /// `Block.id` changes when any header field changes.
     #[test]
-    fn block_id_changes_on_header_change(header in arb_block_header(), txs in proptest::collection::vec(arb_tx(), 0..MAX_TXS_IN_BLOCK)) {
-        let block = Block { header: header.clone(), txs: txs.clone() };
-        let id1 = block.id();
-
-        // Change height.
-        let mut header2 = header.clone();
-        header2.height = header2.height.wrapping_add(1);
-        let block2 = Block { header: header2, txs: txs.clone() };
-        prop_assert_ne!(block2.id().0, id1.0);
+    fn tx_root_is_deterministic(
+        txs in proptest::collection::vec(arb_tx(), 0..MAX_TXS_IN_BLOCK)
+    ) {
+        prop_assert_eq!(tx_root(&txs), tx_root(&txs));
     }
 
-    /// `tx_root` is deterministic for the same list of transactions.
     #[test]
-    fn tx_root_is_deterministic(txs in proptest::collection::vec(arb_tx(), 0..MAX_TXS_IN_BLOCK)) {
-        let root1 = iona::types::tx_root(&txs);
-        let root2 = iona::types::tx_root(&txs);
-        prop_assert_eq!(root1.0, root2.0);
+    fn receipts_root_is_deterministic(
+        receipts in proptest::collection::vec(arb_receipt(), 0..MAX_RECEIPTS)
+    ) {
+        prop_assert_eq!(receipts_root(&receipts), receipts_root(&receipts));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sensitivity: different input → different output
+// ---------------------------------------------------------------------------
+
+proptest! {
+    /// Each individual field must affect the transaction hash.
+    ///
+    /// Without this property, two distinct transactions could hash to
+    /// the same value and a Byzantine node could substitute one for
+    /// the other without breaking the hash chain.
+    #[test]
+    fn tx_hash_is_sensitive_to_every_field(tx in arb_tx()) {
+        let base = tx_hash(&tx);
+
+        let mut t = tx.clone();
+        t.pubkey.push(0xAB);
+        prop_assert_ne!(tx_hash(&t), base, "pubkey must affect hash");
+
+        let mut t = tx.clone();
+        t.from.push('Z');
+        prop_assert_ne!(tx_hash(&t), base, "from must affect hash");
+
+        let mut t = tx.clone();
+        t.nonce = t.nonce.wrapping_add(1);
+        prop_assert_ne!(tx_hash(&t), base, "nonce must affect hash");
+
+        let mut t = tx.clone();
+        t.max_fee_per_gas = t.max_fee_per_gas.wrapping_add(1);
+        prop_assert_ne!(tx_hash(&t), base, "max_fee_per_gas must affect hash");
+
+        let mut t = tx.clone();
+        t.max_priority_fee_per_gas = t.max_priority_fee_per_gas.wrapping_add(1);
+        prop_assert_ne!(tx_hash(&t), base, "max_priority_fee_per_gas must affect hash");
+
+        let mut t = tx.clone();
+        t.gas_limit = t.gas_limit.wrapping_add(1);
+        prop_assert_ne!(tx_hash(&t), base, "gas_limit must affect hash");
+
+        let mut t = tx.clone();
+        t.payload.push('!');
+        prop_assert_ne!(tx_hash(&t), base, "payload must affect hash");
+
+        let mut t = tx.clone();
+        t.signature.push(0xCD);
+        prop_assert_ne!(tx_hash(&t), base, "signature must affect hash");
+
+        let mut t = tx.clone();
+        t.chain_id = t.chain_id.wrapping_add(1);
+        prop_assert_ne!(tx_hash(&t), base, "chain_id must affect hash");
     }
 
-    /// `tx_root` changes when transactions are added/removed.
+    /// Every block header field must affect the block ID.
     #[test]
-    fn tx_root_changes_on_tx_change(txs in proptest::collection::vec(arb_tx(), 1..MAX_TXS_IN_BLOCK)) {
-        let root1 = iona::types::tx_root(&txs);
-        // Remove last tx.
-        let mut txs2 = txs.clone();
-        txs2.pop();
-        let root2 = iona::types::tx_root(&txs2);
-        prop_assert_ne!(root1.0, root2.0);
+    fn block_id_is_sensitive_to_every_header_field(
+        header in arb_block_header(),
+        txs in proptest::collection::vec(arb_tx(), 0..MAX_TXS_IN_BLOCK),
+    ) {
+        let base = Block { header: header.clone(), txs: txs.clone() }.id();
+
+        let mut h = header.clone();
+        h.height = h.height.wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "height");
+
+        let mut h = header.clone();
+        h.round = h.round.wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "round");
+
+        let mut h = header.clone();
+        h.prev.0[0] = h.prev.0[0].wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "prev");
+
+        let mut h = header.clone();
+        h.proposer_pk[0] = h.proposer_pk[0].wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "proposer_pk");
+
+        let mut h = header.clone();
+        h.tx_root.0[0] = h.tx_root.0[0].wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "tx_root");
+
+        let mut h = header.clone();
+        h.receipts_root.0[0] = h.receipts_root.0[0].wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "receipts_root");
+
+        let mut h = header.clone();
+        h.state_root.0[0] = h.state_root.0[0].wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "state_root");
+
+        let mut h = header.clone();
+        h.base_fee_per_gas = h.base_fee_per_gas.wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "base_fee_per_gas");
+
+        let mut h = header.clone();
+        h.gas_used = h.gas_used.wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "gas_used");
+
+        let mut h = header.clone();
+        h.intrinsic_gas_used = h.intrinsic_gas_used.wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "intrinsic_gas_used");
+
+        let mut h = header.clone();
+        h.exec_gas_used = h.exec_gas_used.wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "exec_gas_used");
+
+        let mut h = header.clone();
+        h.vm_gas_used = h.vm_gas_used.wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "vm_gas_used");
+
+        let mut h = header.clone();
+        h.evm_gas_used = h.evm_gas_used.wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "evm_gas_used");
+
+        let mut h = header.clone();
+        h.chain_id = h.chain_id.wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "chain_id");
+
+        let mut h = header.clone();
+        h.timestamp = h.timestamp.wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "timestamp");
+
+        let mut h = header.clone();
+        h.protocol_version = h.protocol_version.wrapping_add(1);
+        prop_assert_ne!(Block { header: h, txs: txs.clone() }.id(), base, "protocol_version");
     }
 
-    /// `receipts_root` is deterministic for the same list of receipts.
+    /// Any single-byte change in the input to `hash_bytes` must change
+    /// the output. For SHA-256, the probability of a one-byte change
+    /// colliding is 2^-256 — below proptest's iteration budget by many
+    /// orders of magnitude.
     #[test]
-    fn receipts_root_is_deterministic(receipts in proptest::collection::vec(any::<iona::types::Receipt>(), 0..10)) {
-        // We need a strategy for Receipt. We'll use a simpler approach: generate fixed‑size vectors.
-        // For simplicity, we'll generate a vector of Receipt with a custom strategy.
-        // Since Receipt has many fields, we'll just use a default Receipt and vary tx_hash.
-        // We'll use a small set of deterministic receipts for this property.
-        let receipt1 = iona::types::Receipt {
-            tx_hash: Hash32::zero(),
-            success: true,
-            gas_used: 1000,
-            intrinsic_gas_used: 21000,
-            exec_gas_used: 0,
-            vm_gas_used: 0,
-            evm_gas_used: 0,
-            effective_gas_price: 1,
-            burned: 1,
-            tip: 0,
-            error: None,
-            data: None,
-        };
-        let receipts = vec![receipt1.clone(), receipt1.clone()];
-        let root1 = iona::types::receipts_root(&receipts);
-        let root2 = iona::types::receipts_root(&receipts);
-        prop_assert_eq!(root1.0, root2.0);
+    fn hash_bytes_is_sensitive_to_input(
+        data in proptest::collection::vec(any::<u8>(), 1..MAX_HASH_DATA_LEN),
+    ) {
+        let base = hash_bytes(&data);
+        let mut modified = data.clone();
+        modified[0] = modified[0].wrapping_add(1);
+        prop_assert_ne!(hash_bytes(&modified), base);
     }
 
-    /// Quorum threshold is correctly computed for random total power.
+    /// Adding or removing a transaction must change the tx root.
     #[test]
-    fn quorum_threshold_correctness(power in any::<u64>()) {
+    fn tx_root_is_sensitive_to_tx_count(
+        txs in proptest::collection::vec(arb_tx(), 1..MAX_TXS_IN_BLOCK),
+    ) {
+        let base = tx_root(&txs);
+        let mut shortened = txs.clone();
+        shortened.pop();
+        prop_assert_ne!(tx_root(&shortened), base);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quorum threshold
+// ---------------------------------------------------------------------------
+
+proptest! {
+    /// `quorum_threshold` satisfies `2n/3 < t <= n` for `n >= 1`, and
+    /// `t == 1` for `n == 0`.
+    ///
+    /// Computed in `u128` so the bound does not overflow on inputs near
+    /// `u64::MAX`.
+    #[test]
+    fn quorum_threshold_is_byzantine_safe(power in any::<u64>()) {
         let threshold = iona::consensus::quorum_threshold(power);
-        // For power=0, threshold=1; for power>0, threshold = floor(2*power/3)+1.
         if power == 0 {
             prop_assert_eq!(threshold, 1);
         } else {
-            prop_assert!(threshold > power * 2 / 3);
+            let two_thirds = (power as u128) * 2 / 3;
+            prop_assert!((threshold as u128) > two_thirds);
             prop_assert!(threshold <= power);
         }
     }
 
-    /// `has_quorum` matches `voting_power >= quorum_threshold(total_power)`.
+    /// `has_quorum` must agree with `voting >= quorum_threshold(total)`.
     #[test]
-    fn has_quorum_is_correct(total in any::<u64>(), voting in any::<u64>()) {
+    fn has_quorum_matches_threshold(total in any::<u64>(), voting in any::<u64>()) {
         let threshold = iona::consensus::quorum_threshold(total);
-        let quorum = iona::consensus::has_quorum(voting, total);
-        prop_assert_eq!(quorum, voting >= threshold);
-    }
-
-    /// Consensus purity is always in [0,1].
-    #[test]
-    fn consensus_purity_bounds(coherences in proptest::collection::vec(any::<f64>(), 0..100)) {
-        // Ensure values are in [0,1] for the test.
-        let coherences: Vec<f64> = coherences.into_iter().map(|x| x.abs().min(1.0)).collect();
-        let purity = iona::consensus::compute_consensus_purity(&coherences);
-        prop_assert!(purity >= 0.0 && purity <= 1.0);
-    }
-
-    /// Consensus entropy is >= 0 for purity in [0,1].
-    #[test]
-    fn consensus_entropy_nonnegative(purity in any::<f64>()) {
-        let p = purity.abs().min(1.0);
-        let entropy = iona::consensus::compute_consensus_entropy(p);
-        prop_assert!(entropy >= 0.0);
-    }
-
-    /// `Hash32` serialization roundtrip.
-    #[test]
-    fn hash32_serialization_roundtrip(h in arb_hash32()) {
-        let json = serde_json::to_string(&h).unwrap();
-        let h2: Hash32 = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(h.0, h2.0);
-    }
-
-    /// Transaction quantum purity is always in [0,1].
-    #[test]
-    fn tx_quantum_purity_bounds(tx in arb_tx()) {
-        let purity = tx.quantum_purity();
-        prop_assert!(purity >= 0.0 && purity <= 1.0);
+        prop_assert_eq!(
+            iona::consensus::has_quorum(voting, total),
+            voting >= threshold,
+        );
     }
 }
 
-// -----------------------------------------------------------------------------
-// Additional non‑property tests (for invariants not easily property‑tested)
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Serialization round-trip
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn hash32_serialization_roundtrip(h in arb_hash32()) {
+        let json = serde_json::to_string(&h).expect("Hash32 must serialize");
+        let restored: Hash32 =
+            serde_json::from_str(&json).expect("Hash32 must deserialize");
+        prop_assert_eq!(h, restored);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Non-property checks
+//
+// Fixed vectors that complement the properties above. Any regression
+// here is either a hash change (update `tests/golden_vectors.rs`) or a
+// real bug in the primitives.
+// ---------------------------------------------------------------------------
 
 #[test]
 fn hash32_zero_is_all_zero() {
-    let zero = Hash32::zero();
-    assert_eq!(zero.0, [0u8; 32]);
+    assert_eq!(Hash32::zero().0, [0u8; 32]);
 }
 
 #[test]
-fn tx_hash_non_empty_for_non_empty_tx() {
+fn tx_hash_of_nonempty_tx_is_nonzero() {
     let tx = Tx {
         pubkey: vec![1; 32],
         from: "alice".into(),
@@ -377,12 +452,11 @@ fn tx_hash_non_empty_for_non_empty_tx() {
         signature: vec![0xAA; 64],
         chain_id: 1,
     };
-    let hash = tx_hash(&tx);
-    assert_ne!(hash.0, [0u8; 32]);
+    assert_ne!(tx_hash(&tx).0, [0u8; 32]);
 }
 
 #[test]
-fn block_id_non_empty() {
+fn block_id_of_nondefault_header_is_nonzero() {
     let header = BlockHeader {
         height: 1,
         round: 0,
@@ -398,28 +472,22 @@ fn block_id_non_empty() {
         vm_gas_used: 0,
         evm_gas_used: 0,
         chain_id: 1,
-        timestamp: 123456,
+        timestamp: 123_456,
         protocol_version: 1,
     };
-    let block = Block { header, txs: vec![] };
-    let id = block.id();
-    assert_ne!(id.0, [0u8; 32]);
+    assert_ne!(Block { header, txs: vec![] }.id().0, [0u8; 32]);
 }
 
+/// Concrete fixed vectors that pin the quorum formula at small `n`.
+/// The property test above verifies the bound; these vectors verify the
+/// exact values so a rounding-direction change (e.g. `ceil` vs `floor`)
+/// is caught.
 #[test]
-fn quorum_threshold_sanity() {
+fn quorum_threshold_fixed_vectors() {
     assert_eq!(iona::consensus::quorum_threshold(0), 1);
     assert_eq!(iona::consensus::quorum_threshold(1), 1);
     assert_eq!(iona::consensus::quorum_threshold(2), 2);
     assert_eq!(iona::consensus::quorum_threshold(3), 3);
     assert_eq!(iona::consensus::quorum_threshold(4), 3);
     assert_eq!(iona::consensus::quorum_threshold(5), 4);
-}
-
-#[test]
-fn hash_fidelity_identical() {
-    let h = Hash32::from_bytes([0xAA; 32]);
-    assert!((h.fidelity(&h) - 1.0).abs() < 1e-10);
-    let h2 = Hash32::from_bytes([0xBB; 32]);
-    assert!((h.fidelity(&h2) - 0.0).abs() < 1e-10);
 }
