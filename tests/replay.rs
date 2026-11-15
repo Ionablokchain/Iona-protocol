@@ -1,64 +1,105 @@
 //! Replay test: execute a chain of blocks from a snapshot and verify state roots.
 //!
-//! This tests that block execution is fully deterministic and that replaying
-//! the same sequence of transactions from the same initial state produces
-//! identical state roots every time.
+//! Verifies that block execution is deterministic and — the deeper
+//! property — that state evolution is **Markovian**: the state produced
+//! by executing blocks N+1..=M from the state at N depends only on that
+//! state, not on the history that produced it, and not on whether the
+//! state was carried in memory or serialized to disk and reloaded.
 //!
-//! # Production Features
-//! - Configurable via `ReplayTestConfig` (block count, accounts, senders per block, etc.).
-//! - `ReplayMetrics` for tracking test progress, pass/fail, and timing.
-//! - Structured logging with `tracing`.
-//! - Support for parallel replay (optional, via rayon).
-//! - Snapshot serialization roundtrip with validation.
-//! - Comprehensive error reporting.
+//! # What is verified
+//!
+//! * **Determinism** — the same chain, executed twice, produces the
+//!   same per-height state roots.
+//! * **Intermediate-state replay** — executing blocks 1..=N then N+1..=M
+//!   produces the same final state as executing 1..=M in one pass.
+//! * **Serialized-snapshot replay** — serializing the state at N,
+//!   reloading it, and executing N+1..=M produces the same roots as the
+//!   in-memory path. This is the actual crash-recovery test.
+//! * **Empty-block determinism** — empty blocks don't perturb the state
+//!   root differently across runs.
+//! * **Receipt determinism** — receipts are byte-identical across two
+//!   runs of the same chain.
+//!
+//! # What is **not** verified here
+//!
+//! * Cross-machine determinism (e.g., between x86-64 and aarch64).
+//!   That is the responsibility of `tests/golden_vectors.rs`, which
+//!   pins exact hashes.
+//! * Fee/gas arithmetic beyond what `execute_block` computes internally.
+//!   Covered in `tests/integration.rs`.
+//!
+//! # Verbose output
+//!
+//! `ReplayTestConfig::verbose` gates `tracing::trace!` calls. **No
+//! tracing subscriber is installed by this file.** A caller that wants
+//! the trace output must install one (e.g.
+//! `tracing_subscriber::fmt::init()`) before invoking any `#[test]` in
+//! this module. Otherwise `verbose = true` has no visible effect.
+//!
+//! Run with: `cargo test --test replay`
+//! Run with trace output:
+//!     `RUST_LOG=trace cargo test --test replay -- --nocapture`
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use iona::crypto::ed25519::Ed25519Keypair;
 use iona::crypto::tx::{derive_address, tx_sign_bytes};
 use iona::crypto::Signer;
 use iona::execution::{execute_block, KvState};
-use iona::types::{receipts_root, tx_root, Block, BlockHeader, Hash32, Tx};
+use iona::types::{Hash32, Tx};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{info, trace};
 
-// ── Configuration ─────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
-/// Configuration for the replay test.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayTestConfig {
-    /// Number of test accounts (seeds 1..=num_accounts).
+    /// Number of funded test accounts (seeds `1..=num_accounts`).
     pub num_accounts: u64,
-    /// Number of senders per block.
+
+    /// Senders per block. Must not exceed `num_accounts`.
     pub num_senders_per_block: u64,
-    /// Number of blocks in the test chain.
+
+    /// Number of blocks in the primary determinism chain.
     pub num_blocks: usize,
-    /// Number of blocks to skip for snapshot replay.
+
+    /// Blocks to execute before the "snapshot" point. Must be
+    /// `0 < snapshot_skip_blocks < num_blocks`.
     pub snapshot_skip_blocks: usize,
-    /// Number of empty blocks to test.
+
+    /// Number of empty blocks to exercise.
     pub num_empty_blocks: usize,
-    /// Number of blocks for receipt determinism test.
+
+    /// Number of blocks for the receipt-determinism chain.
     pub num_receipt_blocks: usize,
-    /// Number of blocks for serialization roundtrip test.
-    pub num_serialization_blocks: usize,
+
     /// Chain ID used in test transactions.
     pub chain_id: u64,
+
     /// Gas limit per transaction.
     pub gas_limit: u64,
-    /// Max fee per gas.
+
+    /// Maximum fee per gas.
     pub max_fee: u64,
-    /// Max priority fee per gas.
+
+    /// Maximum priority fee per gas; must not exceed `max_fee`.
     pub max_priority_fee: u64,
-    /// Base fee per gas used in block execution.
+
+    /// Base fee per gas used during execution.
     pub base_fee_per_gas: u64,
-    /// Proposer address for block building.
+
+    /// Proposer address used during block execution.
     pub proposer_addr: String,
-    /// Initial funding amount for each test account.
+
+    /// Starting balance for each funded account.
     pub initial_balance: u64,
-    /// Whether to enable parallel replay.
-    pub parallel: bool,
-    /// Whether to log detailed progress.
+
+    /// Gate `tracing::trace!` calls. **Requires a tracing subscriber
+    /// to be installed by the caller** for the logs to be visible.
     pub verbose: bool,
 }
 
@@ -71,7 +112,6 @@ impl Default for ReplayTestConfig {
             snapshot_skip_blocks: 10,
             num_empty_blocks: 5,
             num_receipt_blocks: 10,
-            num_serialization_blocks: 5,
             chain_id: 1,
             gas_limit: 100_000,
             max_fee: 10,
@@ -79,23 +119,44 @@ impl Default for ReplayTestConfig {
             base_fee_per_gas: 1,
             proposer_addr: "proposer_addr".into(),
             initial_balance: 10_000_000,
-            parallel: false,
             verbose: false,
         }
     }
 }
 
 impl ReplayTestConfig {
-    /// Validate the configuration.
     pub fn validate(&self) -> Result<(), String> {
-        if self.num_accounts == 0 {
-            return Err("num_accounts must be > 0".into());
+        let must_be_positive = [
+            ("num_accounts", self.num_accounts),
+            ("num_senders_per_block", self.num_senders_per_block),
+            ("chain_id", self.chain_id),
+            ("gas_limit", self.gas_limit),
+            ("max_fee", self.max_fee),
+            ("base_fee_per_gas", self.base_fee_per_gas),
+            ("initial_balance", self.initial_balance),
+        ];
+        for (name, value) in must_be_positive {
+            if value == 0 {
+                return Err(format!("{name} must be > 0"));
+            }
         }
-        if self.num_senders_per_block == 0 {
-            return Err("num_senders_per_block must be > 0".into());
+
+        // Senders must be a subset of the funded accounts, otherwise
+        // block execution silently fails every transaction from an
+        // unfunded sender and the determinism test passes on
+        // garbage.
+        if self.num_senders_per_block > self.num_accounts {
+            return Err(format!(
+                "num_senders_per_block ({}) must not exceed num_accounts ({})",
+                self.num_senders_per_block, self.num_accounts,
+            ));
         }
+
         if self.num_blocks == 0 {
             return Err("num_blocks must be > 0".into());
+        }
+        if self.snapshot_skip_blocks == 0 {
+            return Err("snapshot_skip_blocks must be > 0".into());
         }
         if self.snapshot_skip_blocks >= self.num_blocks {
             return Err("snapshot_skip_blocks must be < num_blocks".into());
@@ -106,68 +167,45 @@ impl ReplayTestConfig {
         if self.num_receipt_blocks == 0 {
             return Err("num_receipt_blocks must be > 0".into());
         }
-        if self.num_serialization_blocks == 0 {
-            return Err("num_serialization_blocks must be > 0".into());
-        }
-        if self.chain_id == 0 {
-            return Err("chain_id must be > 0".into());
-        }
-        if self.gas_limit == 0 {
-            return Err("gas_limit must be > 0".into());
-        }
-        if self.max_fee == 0 {
-            return Err("max_fee must be > 0".into());
-        }
         if self.max_priority_fee > self.max_fee {
             return Err("max_priority_fee must be <= max_fee".into());
         }
-        if self.base_fee_per_gas == 0 {
-            return Err("base_fee_per_gas must be > 0".into());
-        }
         if self.proposer_addr.is_empty() {
             return Err("proposer_addr must not be empty".into());
-        }
-        if self.initial_balance == 0 {
-            return Err("initial_balance must be > 0".into());
         }
         Ok(())
     }
 }
 
-// ── Metrics ──────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
 
-/// Metrics for the replay test.
 #[derive(Debug, Default)]
 pub struct ReplayMetrics {
-    pub blocks_executed: AtomicU64,
-    pub roots_verified: AtomicU64,
-    pub serialization_roundtrips: AtomicU64,
-    pub failures: AtomicU64,
-    pub total_duration_ns: AtomicU64,
+    blocks_executed:        AtomicU64,
+    roots_verified:         AtomicU64,
+    serialization_roundtrips: AtomicU64,
+    failures:               AtomicU64,
+    total_duration_ns:      AtomicU64,
 }
 
 impl ReplayMetrics {
-    pub fn record_block_execution(&self) {
+    pub fn record_block(&self) {
         self.blocks_executed.fetch_add(1, Ordering::Relaxed);
     }
-
-    pub fn record_root_verification(&self) {
+    pub fn record_root(&self) {
         self.roots_verified.fetch_add(1, Ordering::Relaxed);
     }
-
-    pub fn record_serialization_roundtrip(&self) {
+    pub fn record_serialization(&self) {
         self.serialization_roundtrips.fetch_add(1, Ordering::Relaxed);
     }
-
     pub fn record_failure(&self) {
         self.failures.fetch_add(1, Ordering::Relaxed);
     }
-
-    pub fn record_duration(&self, duration: Duration) {
-        self.total_duration_ns
-            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    pub fn record_duration(&self, d: Duration) {
+        self.total_duration_ns.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
     }
-
     pub fn snapshot(&self) -> ReplayMetricsSnapshot {
         ReplayMetricsSnapshot {
             blocks_executed: self.blocks_executed.load(Ordering::Relaxed),
@@ -179,7 +217,6 @@ impl ReplayMetrics {
     }
 }
 
-/// Snapshot of replay metrics.
 #[derive(Debug, Clone)]
 pub struct ReplayMetricsSnapshot {
     pub blocks_executed: u64,
@@ -189,9 +226,10 @@ pub struct ReplayMetricsSnapshot {
     pub total_duration_ns: u64,
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Fixture construction
+// ---------------------------------------------------------------------------
 
-/// Create a keypair, its public key bytes, and derived address from a seed.
 fn make_keypair(seed: u64) -> (Ed25519Keypair, Vec<u8>, String) {
     let mut seed_bytes = [0u8; 32];
     seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
@@ -201,7 +239,6 @@ fn make_keypair(seed: u64) -> (Ed25519Keypair, Vec<u8>, String) {
     (signer, pubkey, address)
 }
 
-/// Create a signed transaction with the given parameters.
 fn make_signed_tx(
     signer: &Ed25519Keypair,
     pubkey: &[u8],
@@ -226,7 +263,6 @@ fn make_signed_tx(
     tx
 }
 
-/// Create the genesis state with funded test accounts.
 fn genesis_state(config: &ReplayTestConfig) -> KvState {
     let mut state = KvState::default();
     for seed in 1..=config.num_accounts {
@@ -236,71 +272,58 @@ fn genesis_state(config: &ReplayTestConfig) -> KvState {
     state
 }
 
-/// Build a chain of `n` blocks with transactions from multiple senders.
-/// Returns `(initial_state, vector of (transactions, expected_state_root))`.
+/// Build a chain of `n` blocks. Returns the genesis state and, for each
+/// block, its transactions plus the state root produced by executing it
+/// from the running chain state.
+///
+/// Nonce per sender increases by exactly one per block, which is
+/// correct because every sender in `1..=num_senders_per_block` submits
+/// exactly one transaction per block.
 fn build_chain(n: usize, config: &ReplayTestConfig) -> (KvState, Vec<(Vec<Tx>, Hash32)>) {
     let initial_state = genesis_state(config);
     let mut state = initial_state.clone();
     let mut chain = Vec::with_capacity(n);
 
     for height in 1..=n {
-        let mut txs = Vec::new();
+        let mut txs = Vec::with_capacity(config.num_senders_per_block as usize);
         for sender_seed in 1..=config.num_senders_per_block {
             let (signer, pubkey, address) = make_keypair(sender_seed);
-            // Each sender sends one transaction per block, nonce increases by height.
+            // Sender's transaction count before this block.
             let nonce = (height - 1) as u64;
             let payload = format!("set block_{height}_sender_{sender_seed} value_{height}");
             txs.push(make_signed_tx(
-                &signer,
-                &pubkey,
-                &address,
-                nonce,
-                &payload,
-                config,
+                &signer, &pubkey, &address, nonce, &payload, config,
             ));
         }
-
-        let (new_state, _gas, _receipts) = execute_block(
-            &state,
-            &txs,
-            config.base_fee_per_gas,
-            &config.proposer_addr,
-        );
-        let root = new_state.root();
-        chain.push((txs, root));
+        let (new_state, _gas, _receipts) =
+            execute_block(&state, &txs, config.base_fee_per_gas, &config.proposer_addr);
+        chain.push((txs, new_state.root()));
         state = new_state;
     }
 
     (initial_state, chain)
 }
 
-// ── Core Test Runner ─────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Entry point (runs all sub-tests sequentially)
+//
+// Kept for callers that want to run the whole suite in one shot. Each
+// sub-test also exists as its own `#[test]` below, so `cargo test` will
+// run them in parallel.
+// ---------------------------------------------------------------------------
 
-/// Run the full replay test suite with the given configuration.
 pub fn run_replay_tests(config: ReplayTestConfig) -> Result<ReplayMetricsSnapshot, String> {
     config.validate()?;
     let start = Instant::now();
     let metrics = Arc::new(ReplayMetrics::default());
 
-    info!(
-        config = ?config,
-        "Starting replay test suite"
-    );
+    info!(config = ?config, "starting replay test suite");
 
-    // 1. Replay chain deterministic.
     replay_chain_deterministic(&config, &metrics)?;
-
-    // 2. Replay from snapshot.
-    replay_from_snapshot(&config, &metrics)?;
-
-    // 3. Replay empty blocks.
+    replay_from_intermediate_state(&config, &metrics)?;
+    replay_from_serialized_snapshot(&config, &metrics)?;
     replay_empty_blocks(&config, &metrics)?;
-
-    // 4. Replay receipts deterministic.
     replay_receipts_deterministic(&config, &metrics)?;
-
-    // 5. State serialization roundtrip.
-    replay_state_serialization_roundtrip(&config, &metrics)?;
 
     let duration = start.elapsed();
     metrics.record_duration(duration);
@@ -308,15 +331,18 @@ pub fn run_replay_tests(config: ReplayTestConfig) -> Result<ReplayMetricsSnapsho
     info!(
         duration_ms = duration.as_millis(),
         metrics = ?metrics.snapshot(),
-        "Replay test suite completed successfully"
+        "replay test suite completed"
     );
 
     Ok(metrics.snapshot())
 }
 
-// ── Individual Test Functions ────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Sub-tests
+// ---------------------------------------------------------------------------
 
-/// Replay the exact same chain twice and verify all state roots match.
+/// Execute the chain twice from genesis and verify every per-height root
+/// matches. Fails if `execute_block` is non-deterministic in-process.
 fn replay_chain_deterministic(
     config: &ReplayTestConfig,
     metrics: &Arc<ReplayMetrics>,
@@ -325,258 +351,343 @@ fn replay_chain_deterministic(
 
     let mut state = initial_state;
     for (i, (txs, expected_root)) in chain.iter().enumerate() {
-        let (new_state, _gas, _receipts) = execute_block(
-            &state,
-            txs,
-            config.base_fee_per_gas,
-            &config.proposer_addr,
-        );
+        let (new_state, _gas, _receipts) =
+            execute_block(&state, txs, config.base_fee_per_gas, &config.proposer_addr);
         let got_root = new_state.root();
         if got_root != *expected_root {
             metrics.record_failure();
             return Err(format!(
-                "State root mismatch at height {}: expected {}, got {}",
+                "state root mismatch at height {}: expected {}, got {}",
                 i + 1,
-                hex::encode(&expected_root.0[..8]),
-                hex::encode(&got_root.0[..8])
+                hex_prefix(&expected_root),
+                hex_prefix(&got_root),
             ));
         }
-        metrics.record_root_verification();
+        metrics.record_root();
+        metrics.record_block();
         state = new_state;
-        metrics.record_block_execution();
         if config.verbose {
             trace!(height = i + 1, "block executed and verified");
         }
     }
-
     Ok(())
 }
 
-/// Replay from a mid‑chain snapshot (simulate crash recovery).
-fn replay_from_snapshot(
+/// Execute blocks 1..=N, then continue from the resulting state through
+/// blocks N+1..=M. Verifies that the state at each height is identical
+/// to what a single-pass execution produces — the Markov property.
+fn replay_from_intermediate_state(
     config: &ReplayTestConfig,
     metrics: &Arc<ReplayMetrics>,
 ) -> Result<(), String> {
     let (initial_state, chain) = build_chain(config.num_blocks, config);
 
-    // Execute first N blocks to get snapshot state.
-    let mut snapshot_state = initial_state;
+    // First pass: execute up to and including the snapshot point.
+    let mut intermediate = initial_state;
     for (txs, _) in chain.iter().take(config.snapshot_skip_blocks) {
-        let (new_state, _gas, _receipts) = execute_block(
-            &snapshot_state,
-            txs,
-            config.base_fee_per_gas,
-            &config.proposer_addr,
-        );
-        snapshot_state = new_state;
+        let (new_state, _gas, _receipts) =
+            execute_block(&intermediate, txs, config.base_fee_per_gas, &config.proposer_addr);
+        intermediate = new_state;
     }
 
-    // Replay blocks from snapshot.
-    let mut state = snapshot_state;
+    // Second pass: continue from the intermediate state.
+    let mut state = intermediate;
     for (i, (txs, expected_root)) in chain
         .iter()
         .skip(config.snapshot_skip_blocks)
         .enumerate()
     {
         let height = i + config.snapshot_skip_blocks + 1;
-        let (new_state, _gas, _receipts) = execute_block(
-            &state,
-            txs,
-            config.base_fee_per_gas,
-            &config.proposer_addr,
-        );
+        let (new_state, _gas, _receipts) =
+            execute_block(&state, txs, config.base_fee_per_gas, &config.proposer_addr);
         let got_root = new_state.root();
         if got_root != *expected_root {
             metrics.record_failure();
             return Err(format!(
-                "State root mismatch at height {} on replay from snapshot: expected {}, got {}",
-                height,
-                hex::encode(&expected_root.0[..8]),
-                hex::encode(&got_root.0[..8])
+                "state root mismatch at height {height} after intermediate-state replay: \
+                 expected {}, got {}",
+                hex_prefix(&expected_root),
+                hex_prefix(&got_root),
             ));
         }
-        metrics.record_root_verification();
+        metrics.record_root();
+        metrics.record_block();
         state = new_state;
-        metrics.record_block_execution();
         if config.verbose {
-            trace!(height, "replay from snapshot successful");
+            trace!(height, "intermediate-state replay verified");
         }
     }
-
     Ok(())
 }
 
-/// Verify that empty blocks (no transactions) produce deterministic state roots.
+/// The crash-recovery test: execute blocks 1..=N, serialize the state,
+/// reload it, and execute N+1..=M from the reloaded state. Verifies
+/// that (a) the serialized form is faithful and (b) continuing from it
+/// produces the same roots as the in-memory path.
+fn replay_from_serialized_snapshot(
+    config: &ReplayTestConfig,
+    metrics: &Arc<ReplayMetrics>,
+) -> Result<(), String> {
+    let (initial_state, chain) = build_chain(config.num_blocks, config);
+
+    // First pass: execute up to the snapshot point.
+    let mut state = initial_state;
+    for (txs, _) in chain.iter().take(config.snapshot_skip_blocks) {
+        let (new_state, _gas, _receipts) =
+            execute_block(&state, txs, config.base_fee_per_gas, &config.proposer_addr);
+        state = new_state;
+    }
+
+    // Serialize the state. This is what a crash-recovery snapshot would
+    // persist to disk.
+    let snapshot_bytes = serde_json::to_vec(&state).map_err(|e| {
+        metrics.record_failure();
+        format!("snapshot serialization failed at height {}: {e}", config.snapshot_skip_blocks)
+    })?;
+
+    // Reload. This is what a restarted node would read back.
+    let mut reloaded: KvState = serde_json::from_slice(&snapshot_bytes).map_err(|e| {
+        metrics.record_failure();
+        format!("snapshot deserialization failed: {e}")
+    })?;
+
+    // The reloaded state must have the same root as the in-memory state
+    // it was serialized from.
+    if reloaded.root() != state.root() {
+        metrics.record_failure();
+        return Err(format!(
+            "state root changed across snapshot round-trip at height {}: \
+             before {}, after {}",
+            config.snapshot_skip_blocks,
+            hex_prefix(&state.root()),
+            hex_prefix(&reloaded.root()),
+        ));
+    }
+    metrics.record_serialization();
+
+    // Continue executing from the reloaded state and verify roots.
+    for (i, (txs, expected_root)) in chain
+        .iter()
+        .skip(config.snapshot_skip_blocks)
+        .enumerate()
+    {
+        let height = i + config.snapshot_skip_blocks + 1;
+        let (new_state, _gas, _receipts) =
+            execute_block(&reloaded, txs, config.base_fee_per_gas, &config.proposer_addr);
+        let got_root = new_state.root();
+        if got_root != *expected_root {
+            metrics.record_failure();
+            return Err(format!(
+                "state root mismatch at height {height} after serialized-snapshot replay: \
+                 expected {}, got {}",
+                hex_prefix(&expected_root),
+                hex_prefix(&got_root),
+            ));
+        }
+        metrics.record_root();
+        metrics.record_block();
+        reloaded = new_state;
+        if config.verbose {
+            trace!(height, "serialized-snapshot replay verified");
+        }
+    }
+    Ok(())
+}
+
 fn replay_empty_blocks(
     config: &ReplayTestConfig,
     metrics: &Arc<ReplayMetrics>,
 ) -> Result<(), String> {
-    let state = genesis_state(config);
+    let initial = genesis_state(config);
 
-    let mut roots = Vec::new();
-    let mut current_state = state.clone();
-    for i in 0..config.num_empty_blocks {
-        let (new_state, _gas, _receipts) = execute_block(
-            &current_state,
-            &[],
-            config.base_fee_per_gas,
-            &config.proposer_addr,
-        );
-        roots.push(new_state.root());
-        current_state = new_state;
-        if config.verbose {
-            trace!(height = i + 1, "empty block executed");
-        }
+    // First pass: collect roots from executing empty blocks.
+    let mut expected_roots = Vec::with_capacity(config.num_empty_blocks);
+    let mut state = initial.clone();
+    for _ in 0..config.num_empty_blocks {
+        let (new_state, _gas, _receipts) =
+            execute_block(&state, &[], config.base_fee_per_gas, &config.proposer_addr);
+        expected_roots.push(new_state.root());
+        state = new_state;
     }
 
-    // Replay and compare.
-    let mut replay_state = state;
-    for (i, expected) in roots.iter().enumerate() {
-        let (new_state, _gas, _receipts) = execute_block(
-            &replay_state,
-            &[],
-            config.base_fee_per_gas,
-            &config.proposer_addr,
-        );
-        let got_root = new_state.root();
-        if got_root != *expected {
+    // Second pass: replay from genesis and compare.
+    let mut state = initial;
+    for (i, expected) in expected_roots.iter().enumerate() {
+        let (new_state, _gas, _receipts) =
+            execute_block(&state, &[], config.base_fee_per_gas, &config.proposer_addr);
+        let got = new_state.root();
+        if got != *expected {
             metrics.record_failure();
             return Err(format!(
-                "Empty block root mismatch at height {}: expected {}, got {}",
+                "empty block root mismatch at height {}: expected {}, got {}",
                 i + 1,
-                hex::encode(&expected.0[..8]),
-                hex::encode(&got_root.0[..8])
+                hex_prefix(expected),
+                hex_prefix(&got),
             ));
         }
-        metrics.record_root_verification();
-        replay_state = new_state;
-        metrics.record_block_execution();
-        if config.verbose {
-            trace!(height = i + 1, "empty block replay verified");
-        }
+        metrics.record_root();
+        metrics.record_block();
+        state = new_state;
     }
-
     Ok(())
 }
 
-/// Verify receipts are deterministic across replays.
 fn replay_receipts_deterministic(
     config: &ReplayTestConfig,
     metrics: &Arc<ReplayMetrics>,
 ) -> Result<(), String> {
     let (initial_state, chain) = build_chain(config.num_receipt_blocks, config);
 
-    // First pass: collect receipts.
-    let mut state1 = initial_state.clone();
-    let mut all_receipts1 = Vec::new();
+    // Pass 1: collect receipts.
+    let mut state = initial_state.clone();
+    let mut first_pass = Vec::with_capacity(chain.len());
     for (txs, _) in &chain {
-        let (new_state, _gas, receipts) = execute_block(
-            &state1,
-            txs,
-            config.base_fee_per_gas,
-            &config.proposer_addr,
-        );
-        all_receipts1.push(receipts);
-        state1 = new_state;
-        metrics.record_block_execution();
+        let (new_state, _gas, receipts) =
+            execute_block(&state, txs, config.base_fee_per_gas, &config.proposer_addr);
+        first_pass.push(receipts);
+        state = new_state;
+        metrics.record_block();
     }
 
-    // Second pass: verify receipts match.
-    let mut state2 = initial_state;
-    for (i, (txs, _)) in chain.iter().enumerate() {
-        let (new_state, _gas, receipts) = execute_block(
-            &state2,
-            txs,
-            config.base_fee_per_gas,
-            &config.proposer_addr,
-        );
-        if receipts.len() != all_receipts1[i].len() {
-            metrics.record_failure();
-            return Err(format!(
-                "Receipt count mismatch at height {}: expected {}, got {}",
-                i + 1,
-                all_receipts1[i].len(),
-                receipts.len()
-            ));
-        }
-        for (j, (r1, r2)) in all_receipts1[i].iter().zip(receipts.iter()).enumerate() {
-            if r1.tx_hash != r2.tx_hash {
-                metrics.record_failure();
-                return Err(format!(
-                    "tx_hash mismatch height={} tx={}: expected {}, got {}",
-                    i + 1,
-                    j,
-                    hex::encode(&r1.tx_hash.0[..4]),
-                    hex::encode(&r2.tx_hash.0[..4])
-                ));
-            }
-            if r1.success != r2.success {
-                metrics.record_failure();
-                return Err(format!(
-                    "success mismatch height={} tx={}: expected {}, got {}",
-                    i + 1, j, r1.success, r2.success
-                ));
-            }
-            if r1.gas_used != r2.gas_used {
-                metrics.record_failure();
-                return Err(format!(
-                    "gas_used mismatch height={} tx={}: expected {}, got {}",
-                    i + 1, j, r1.gas_used, r2.gas_used
-                ));
-            }
-        }
-        state2 = new_state;
-        metrics.record_block_execution();
-        if config.verbose {
-            trace!(height = i + 1, "receipts verified");
-        }
-    }
-
-    Ok(())
-}
-
-/// Verify state serialisation roundtrip preserves the root.
-fn replay_state_serialization_roundtrip(
-    config: &ReplayTestConfig,
-    metrics: &Arc<ReplayMetrics>,
-) -> Result<(), String> {
-    let (initial_state, chain) = build_chain(config.num_serialization_blocks, config);
-
+    // Pass 2: recompute and compare.
     let mut state = initial_state;
     for (i, (txs, _)) in chain.iter().enumerate() {
-        let (new_state, _gas, _receipts) = execute_block(
-            &state,
-            txs,
-            config.base_fee_per_gas,
-            &config.proposer_addr,
-        );
-        let json = serde_json::to_vec(&new_state)
-            .map_err(|e| format!("serialization error at height {}: {}", i + 1, e))?;
-        let deserialized: KvState = serde_json::from_slice(&json)
-            .map_err(|e| format!("deserialization error at height {}: {}", i + 1, e))?;
-        if new_state.root() != deserialized.root() {
+        let (new_state, _gas, receipts) =
+            execute_block(&state, txs, config.base_fee_per_gas, &config.proposer_addr);
+
+        let expected = &first_pass[i];
+        if receipts.len() != expected.len() {
             metrics.record_failure();
             return Err(format!(
-                "State root changed after serialisation roundtrip at height {}",
-                i + 1
+                "receipt count mismatch at height {}: expected {}, got {}",
+                i + 1, expected.len(), receipts.len(),
             ));
         }
-        metrics.record_serialization_roundtrip();
-        state = new_state;
-        metrics.record_block_execution();
-        if config.verbose {
-            trace!(height = i + 1, "serialization roundtrip verified");
+        for (j, (e, g)) in expected.iter().zip(receipts.iter()).enumerate() {
+            if e.tx_hash != g.tx_hash {
+                metrics.record_failure();
+                return Err(format!(
+                    "tx_hash mismatch at height {} tx {}: expected {}, got {}",
+                    i + 1, j, hex_prefix(&e.tx_hash), hex_prefix(&g.tx_hash),
+                ));
+            }
+            if e.success != g.success {
+                metrics.record_failure();
+                return Err(format!(
+                    "success mismatch at height {} tx {}: expected {}, got {}",
+                    i + 1, j, e.success, g.success,
+                ));
+            }
+            if e.gas_used != g.gas_used {
+                metrics.record_failure();
+                return Err(format!(
+                    "gas_used mismatch at height {} tx {}: expected {}, got {}",
+                    i + 1, j, e.gas_used, g.gas_used,
+                ));
+            }
         }
+        state = new_state;
+        metrics.record_block();
     }
-
     Ok(())
 }
 
-// ── Standalone test entry point ─────────────────────────────────────────
+fn hex_prefix(h: &Hash32) -> String {
+    hex::encode(&h.0[..8])
+}
+
+// ---------------------------------------------------------------------------
+// #[test] entry points
+//
+// Each sub-test gets its own `#[test]` so `cargo test` can run them in
+// parallel and so a failure names the property it broke without needing
+// to decode the error string.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_config_validates_default() {
+    ReplayTestConfig::default()
+        .validate()
+        .expect("default config must be valid");
+}
+
+#[test]
+fn test_config_rejects_oversized_sender_set() {
+    let mut config = ReplayTestConfig::default();
+    config.num_senders_per_block = config.num_accounts + 1;
+    assert!(
+        config.validate().is_err(),
+        "config with more senders than accounts must be rejected",
+    );
+}
+
+#[test]
+fn test_config_rejects_zero_snapshot_skip() {
+    let mut config = ReplayTestConfig::default();
+    config.snapshot_skip_blocks = 0;
+    assert!(config.validate().is_err(), "zero snapshot_skip must be rejected");
+}
+
+#[test]
+fn test_config_rejects_skip_beyond_chain() {
+    let mut config = ReplayTestConfig::default();
+    config.snapshot_skip_blocks = config.num_blocks;
+    assert!(
+        config.validate().is_err(),
+        "snapshot_skip_blocks >= num_blocks must be rejected",
+    );
+}
+
+#[test]
+fn test_replay_chain_deterministic() {
+    let config = ReplayTestConfig::default();
+    config.validate().unwrap();
+    let metrics = Arc::new(ReplayMetrics::default());
+    replay_chain_deterministic(&config, &metrics).expect("chain must be deterministic");
+    assert!(metrics.snapshot().failures == 0);
+}
+
+#[test]
+fn test_replay_from_intermediate_state() {
+    let config = ReplayTestConfig::default();
+    config.validate().unwrap();
+    let metrics = Arc::new(ReplayMetrics::default());
+    replay_from_intermediate_state(&config, &metrics)
+        .expect("intermediate-state replay must succeed");
+}
+
+#[test]
+fn test_replay_from_serialized_snapshot() {
+    let config = ReplayTestConfig::default();
+    config.validate().unwrap();
+    let metrics = Arc::new(ReplayMetrics::default());
+    replay_from_serialized_snapshot(&config, &metrics)
+        .expect("serialized-snapshot replay must succeed");
+    let snap = metrics.snapshot();
+    assert!(snap.serialization_roundtrips >= 1, "must have done a round-trip");
+}
+
+#[test]
+fn test_replay_empty_blocks() {
+    let config = ReplayTestConfig::default();
+    config.validate().unwrap();
+    let metrics = Arc::new(ReplayMetrics::default());
+    replay_empty_blocks(&config, &metrics).expect("empty-block replay must succeed");
+}
+
+#[test]
+fn test_replay_receipts_deterministic() {
+    let config = ReplayTestConfig::default();
+    config.validate().unwrap();
+    let metrics = Arc::new(ReplayMetrics::default());
+    replay_receipts_deterministic(&config, &metrics).expect("receipts must be deterministic");
+}
 
 #[test]
 fn run_replay_tests_default() {
     let config = ReplayTestConfig::default();
     let result = run_replay_tests(config);
-    assert!(result.is_ok(), "Replay tests failed: {:?}", result.err());
+    assert!(result.is_ok(), "replay test suite failed: {:?}", result.err());
+    let snap = result.unwrap();
+    assert_eq!(snap.failures, 0, "no failures expected in default run");
 }
