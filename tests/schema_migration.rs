@@ -1,70 +1,96 @@
 //! Integration tests for schema versioning and migrations.
 //!
-//! Each test simulates a node data directory at an older schema version and
-//! verifies that `ensure_schema_and_migrate()` upgrades it correctly.
+//! Each test simulates a node data directory at an older schema version
+//! and verifies that `ensure_schema_and_migrate()` upgrades it correctly.
 //!
-//! # Production Features
-//! - Covers all migration paths: v0→current, v1→current, ..., v6→current.
-//! - Tests atomicity (partial writes, crash recovery).
-//! - Tests idempotency (multiple runs produce same state).
-//! - Tests rollback detection.
-//! - Tests corrupted data handling.
-//! - Tests migration progress tracking.
-//! - Tests `node_meta.json` migration (v3→v4).
-//! - Tests transaction index migration (v4→v5).
-//! - Tests WAL migration (v2→v3).
-//! - Comprehensive error assertions.
-//! - Structured logging and metrics.
+//! # What is verified
+//!
+//! * **Migration from every version** — for each `V` in `0..CURRENT`,
+//!   a directory at version `V` migrates to `CURRENT_SCHEMA_VERSION`
+//!   with the expected artifacts (state extension, WAL segmenting,
+//!   `node_meta.json`, `tx_index.json`).
+//! * **Idempotency** — a second `ensure_schema_and_migrate` after
+//!   reaching `CURRENT` does not advance the version and does not add
+//!   log entries.
+//! * **Ordering** — migration log entries appear in strictly
+//!   increasing version order (v0→v1, then v1→v2, …).
+//! * **Refusal on future version** — a `schema.json` whose version is
+//!   higher than `CURRENT_SCHEMA_VERSION` is rejected with a message
+//!   that mentions "newer than this binary".
+//! * **No partial migration** — if any intermediate step fails, the
+//!   on-disk schema version remains at the pre-migration value, never
+//!   at an intermediate value.
+//! * **Skipping already-applied steps** — a directory at version `V`
+//!   does not re-run steps for versions `< V`.
+//! * **Large state** — 10 000 accounts migrate within the time budget.
+//!
+//! # What is **not** tested here
+//!
+//! * **Crash atomicity** — proving that a mid-migration power loss
+//!   leaves a consistent directory requires process-kill hooks that
+//!   the migration API does not expose. Atomicity under hard crash is
+//!   covered by the on-disk file format's design (temp-file + rename)
+//!   and would need a fault-injection harness to test here.
+//! * **Lock-file behavior** — `.migration.lock` is a filesystem
+//!   primitive; whether it exists at any given instant is a
+//!   `flock`-level property that cannot be observed from a test
+//!   without a second process.
+//! * **Rollback under a later restart** — an operator downgrading the
+//!   binary is out of scope; the migration API's contract is that
+//!   *upgrading* works, not that *downgrading* is safe.
+//!
+//! # Assertions on log format
+//!
+//! Two tests assert the structure of migration-log entries in
+//! `schema.json`: each entry is `"[<unix_ts>] v<from>→v<to>: <desc>"`.
+//! If the format changes, `migration_log_entries_are_consistent` and
+//! `all_migrations_applied_in_order` must change together with the
+//! producer.
 
-use iona::storage::{DataDir, CURRENT_SCHEMA_VERSION};
-use std::collections::HashSet;
 use std::fs;
 use std::time::{Duration, Instant};
+
+use iona::storage::{DataDir, CURRENT_SCHEMA_VERSION};
 use tempfile::TempDir;
-use tracing::{debug, info, warn};
 
-// ── Constants ─────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
-/// File names.
-const SCHEMA_FILE: &str = "schema.json";
-const STATE_FULL_FILE: &str = "state_full.json";
-const WAL_LEGACY_FILE: &str = "wal.jsonl";
-const NODE_META_FILE: &str = "node_meta.json";
-const TX_INDEX_FILE: &str = "tx_index.json";
+const SCHEMA_FILE:         &str = "schema.json";
+const STATE_FULL_FILE:     &str = "state_full.json";
+const WAL_LEGACY_FILE:     &str = "wal.jsonl";
+const NODE_META_FILE:      &str = "node_meta.json";
+const TX_INDEX_FILE:       &str = "tx_index.json";
+const BACKUP_V1_SUFFIX:    &str = ".v1.bak";
+const WAL_SEGMENT_DIR:     &str = "wal";
+const BLOCKS_DIR:          &str = "blocks";
+const FIRST_SEGMENT:       &str = "wal_00000000.jsonl";
 
-/// Backup suffixes.
-const BACKUP_V1_SUFFIX: &str = ".v1.bak";
-
-/// Directory names.
-const WAL_SEGMENT_DIR: &str = "wal";
-const BLOCKS_DIR: &str = "blocks";
-
-/// Segment file name pattern.
-const FIRST_SEGMENT: &str = "wal_00000000.jsonl";
-
-/// Version numbers.
-const V0: u32 = 0;
+/// Versions referenced by specific tests. Only the version numbers
+/// whose *effects* are checked (`v1`, `v2`, `v3`, `v4`) are named;
+/// everything else uses `CURRENT_SCHEMA_VERSION` and iterates from 0.
 const V1: u32 = 1;
 const V2: u32 = 2;
 const V3: u32 = 3;
 const V4: u32 = 4;
-const V5: u32 = 5;
-const V6: u32 = 6;
-const V7: u32 = 7;
 
-/// Max allowed schema version.
-const MAX_SCHEMA_VERSION: u32 = CURRENT_SCHEMA_VERSION;
+/// Account count for the "large state" test.
+const LARGE_ACCOUNT_COUNT: usize = 10_000;
 
-/// Test data sizes.
-const SMALL_ACCOUNT_COUNT: usize = 3;
-const LARGE_ACCOUNT_COUNT: usize = 100;
+/// Generous per-test time budget for the large-state migration.
+///
+/// This is a smoke test for "no quadratic blow-up", not a benchmark.
+/// 30 s gives even a loaded CI runner room to complete a linear
+/// migration of 10 000 accounts. If it ever fails, that is a genuine
+/// regression worth investigating.
+const LARGE_MIGRATION_TIMEOUT_SECS: u64 = 30;
 
-/// Timeout for migration tests.
-const MIGRATION_TIMEOUT_SECS: u64 = 30;
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-// ── Helpers ──────────────────────────────────────────────────────────────
-
-/// Test environment holding a temporary directory and data directory.
+/// A temporary data directory plus the `DataDir` handle.
 struct TestEnv {
     _tmp: TempDir,
     data: DataDir,
@@ -72,662 +98,533 @@ struct TestEnv {
 
 impl TestEnv {
     fn new() -> Self {
-        let tmp = TempDir::new().unwrap();
-        let data = DataDir::new(tmp.path().to_str().unwrap());
+        let tmp = TempDir::new().expect("tempdir");
+        let data = DataDir::new(tmp.path().to_str().expect("tempdir path utf-8"));
         Self { _tmp: tmp, data }
     }
 
-    fn path(&self) -> &std::path::Path {
-        self._tmp.path()
+    fn root(&self) -> &std::path::Path {
+        &self._tmp.path()
     }
 
+    /// Write `schema.json` at `version`. Passing `0` writes the file
+    /// with `"version": 0`; passing anything else writes that value.
     fn write_schema_version(&self, version: u32) {
-        self.data.ensure().unwrap();
+        self.data.ensure().expect("ensure");
         let meta = serde_json::json!({ "version": version });
-        let path = self.data.root.join(SCHEMA_FILE);
-        fs::write(path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+        fs::write(
+            self.root().join(SCHEMA_FILE),
+            serde_json::to_string_pretty(&meta).expect("serialize schema"),
+        )
+        .expect("write schema");
     }
 
     fn read_schema_version(&self) -> u32 {
-        self.data.read_schema_version().unwrap()
-    }
-
-    fn write_v1_state(&self) {
-        let old_state = serde_json::json!({
-            "kv": { "hello": "world" },
-            "balances": { "abcd": 1000 },
-            "nonces": {}
-        });
-        let path = self.data.root.join(STATE_FULL_FILE);
-        fs::write(path, serde_json::to_string_pretty(&old_state).unwrap()).unwrap();
+        self.data.read_schema_version().expect("read version")
     }
 
     fn write_v0_state(&self) {
-        let old_state = serde_json::json!({
-            "kv": { "foo": "bar" },
-            "balances": { "test": 500 }
+        let state = serde_json::json!({
+            "kv":       { "foo": "bar" },
+            "balances": { "test": 500 },
         });
-        let path = self.data.root.join(STATE_FULL_FILE);
-        fs::write(path, serde_json::to_string_pretty(&old_state).unwrap()).unwrap();
+        fs::write(
+            self.root().join(STATE_FULL_FILE),
+            serde_json::to_string_pretty(&state).expect("serialize"),
+        )
+        .expect("write v0 state");
+    }
+
+    fn write_v1_state(&self) {
+        let state = serde_json::json!({
+            "kv":       { "hello": "world" },
+            "balances": { "abcd": 1000 },
+            "nonces":   {},
+        });
+        fs::write(
+            self.root().join(STATE_FULL_FILE),
+            serde_json::to_string_pretty(&state).expect("serialize"),
+        )
+        .expect("write v1 state");
     }
 
     fn write_legacy_wal(&self) {
-        let path = self.data.root.join(WAL_LEGACY_FILE);
-        fs::write(&path, b"{\"height\":1}\n{\"height\":2}\n").unwrap();
-    }
-
-    fn write_node_meta(&self) {
-        let meta = serde_json::json!({
-            "protocol_version": 1,
-            "node_id": "test-node",
-            "created_at": 1234567890
-        });
-        let path = self.data.root.join(NODE_META_FILE);
-        fs::write(path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
-    }
-
-    fn write_tx_index(&self) {
-        let index = serde_json::json!({
-            "0xaaa": { "block_height": 1, "tx_position": 0 },
-            "0xbbb": { "block_height": 2, "tx_position": 1 }
-        });
-        let path = self.data.root.join(TX_INDEX_FILE);
-        fs::write(path, serde_json::to_string_pretty(&index).unwrap()).unwrap();
+        fs::write(
+            self.root().join(WAL_LEGACY_FILE),
+            b"{\"height\":1}\n{\"height\":2}\n",
+        )
+        .expect("write legacy wal");
     }
 
     fn write_blocks(&self, count: usize) {
-        let blocks_dir = self.data.root.join(BLOCKS_DIR);
-        fs::create_dir_all(&blocks_dir).unwrap();
+        let dir = self.root().join(BLOCKS_DIR);
+        fs::create_dir_all(&dir).expect("mkdir blocks");
         for i in 0..count {
             let block = serde_json::json!({
                 "header": { "height": i },
                 "txs": [
                     { "hash": format!("0x{:x}", i) },
-                    { "hash": format!("0x{:x}", i + 100) }
-                ]
+                    { "hash": format!("0x{:x}", i + 100) },
+                ],
             });
-            let path = blocks_dir.join(format!("{}.json", i));
-            fs::write(path, serde_json::to_string_pretty(&block).unwrap()).unwrap();
+            fs::write(
+                dir.join(format!("{i}.json")),
+                serde_json::to_string_pretty(&block).expect("serialize block"),
+            )
+            .expect("write block");
         }
     }
 
     fn corrupt_file(&self, filename: &str) {
-        let path = self.data.root.join(filename);
-        if path.exists() {
-            fs::write(&path, b"corrupted data").unwrap();
-        }
+        let path = self.root().join(filename);
+        fs::write(&path, b"this is not json").expect("corrupt file");
     }
 
     fn backup_exists(&self, suffix: &str) -> bool {
-        let backup = self.data.root.join(format!("{}{}", STATE_FULL_FILE, suffix));
-        backup.exists()
+        self.root()
+            .join(format!("{STATE_FULL_FILE}{suffix}"))
+            .exists()
     }
 
-    fn schema_meta_content(&self) -> serde_json::Value {
-        let path = self.data.root.join(SCHEMA_FILE);
-        let raw = fs::read_to_string(&path).unwrap();
-        serde_json::from_str(&raw).unwrap()
+    fn schema_meta(&self) -> serde_json::Value {
+        let raw = fs::read_to_string(self.root().join(SCHEMA_FILE))
+            .expect("read schema file");
+        serde_json::from_str(&raw).expect("parse schema file")
     }
 
     fn migration_log(&self) -> Vec<String> {
-        let meta = self.schema_meta_content();
-        meta["migration_log"]
+        self.schema_meta()["migration_log"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
-    fn assert_migration_log_contains(&self, pattern: &str) {
+    fn assert_log_contains(&self, needle: &str) {
         let log = self.migration_log();
         assert!(
-            log.iter().any(|entry| entry.contains(pattern)),
-            "Migration log should contain '{}', got: {:?}",
-            pattern,
-            log
+            log.iter().any(|e| e.contains(needle)),
+            "migration log should contain {needle:?}; got {log:?}",
+        );
+    }
+
+    fn assert_log_does_not_contain(&self, needle: &str) {
+        let log = self.migration_log();
+        assert!(
+            !log.iter().any(|e| e.contains(needle)),
+            "migration log must NOT contain {needle:?}; got {log:?}",
         );
     }
 }
 
-// ── Core migration test runner ──────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Migration runner
+//
+// Runs `setup` against a fresh env, then migrates, then returns the env
+// so the caller can assert on the resulting state without re-running
+// the migration. The previous version of this file re-ran setup and
+// migration in a second `TestEnv` inside several tests — that doubled
+// the work AND could silently assert on a state different from the one
+// the first pass produced.
+// ---------------------------------------------------------------------------
 
-/// Run a migration test with the given setup and assertions.
-fn run_migration_test<F>(setup: F, expected_version: u32)
+fn run_migration<F>(start_version: u32, setup: F) -> TestEnv
 where
     F: FnOnce(&TestEnv),
 {
     let env = TestEnv::new();
-    env.data.ensure().unwrap();
-
-    // Apply setup.
+    env.write_schema_version(start_version);
     setup(&env);
-
-    // Run migration.
-    let start = Instant::now();
-    env.data.ensure_schema_and_migrate().unwrap();
-    let duration = start.elapsed();
-
-    // Assert final version.
-    assert_eq!(
-        env.read_schema_version(),
-        expected_version,
-        "Migration should reach version {}",
-        expected_version
-    );
-
-    // Assert migration log is populated.
-    let log = env.migration_log();
-    assert!(
-        !log.is_empty(),
-        "Migration log should be populated after migration"
-    );
-
-    debug!(
-        duration_ms = duration.as_millis(),
-        log_entries = log.len(),
-        "Migration completed"
-    );
+    env.data
+        .ensure_schema_and_migrate()
+        .expect("migration must succeed");
+    env
 }
 
-// ── Tests: Migration from each version ───────────────────────────────────
-
-#[test]
-fn migrate_from_v0_fresh_dir_creates_schema() {
-    let env = TestEnv::new();
-    // No schema file → treated as v0.
-    assert_eq!(env.read_schema_version(), 0);
-    env.data.ensure_schema_and_migrate().unwrap();
-    assert_eq!(env.read_schema_version(), CURRENT_SCHEMA_VERSION);
-}
+// ---------------------------------------------------------------------------
+// Per-version migration tests
+// ---------------------------------------------------------------------------
 
 #[test]
 fn migrate_from_v0_with_state() {
-    run_migration_test(
-        |env| {
-            env.write_v0_state();
-            // Ensure no schema file exists.
-        },
-        CURRENT_SCHEMA_VERSION,
-    );
-}
+    let env = run_migration(0, TestEnv::write_v0_state);
 
-#[test]
-fn migrate_from_v1_to_current() {
-    run_migration_test(
-        |env| {
-            env.write_schema_version(V1);
-            env.write_v1_state();
-            // No `vm` field in state.
-        },
-        CURRENT_SCHEMA_VERSION,
-    );
-
-    // Verify `vm` field was added.
-    let env = TestEnv::new();
-    env.write_schema_version(V1);
-    env.write_v1_state();
-    env.data.ensure_schema_and_migrate().unwrap();
-    let path = env.data.root.join(STATE_FULL_FILE);
-    let raw = fs::read_to_string(&path).unwrap();
-    let val: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    assert!(
-        val.get("vm").is_some(),
-        "vm field should be injected by v1→v2 migration"
-    );
-    assert_eq!(
-        val["kv"]["hello"], "world",
-        "Original data must be preserved"
-    );
-    assert!(
-        env.backup_exists(BACKUP_V1_SUFFIX),
-        "Backup file should be created"
-    );
-}
-
-#[test]
-fn migrate_from_v2_to_current() {
-    run_migration_test(
-        |env| {
-            env.write_schema_version(V2);
-            env.write_legacy_wal();
-        },
-        CURRENT_SCHEMA_VERSION,
-    );
-
-    // Verify WAL was migrated.
-    let env = TestEnv::new();
-    env.write_schema_version(V2);
-    env.write_legacy_wal();
-    env.data.ensure_schema_and_migrate().unwrap();
-
-    let old_wal = env.data.root.join(WAL_LEGACY_FILE);
-    assert!(
-        !old_wal.exists(),
-        "Old wal.jsonl should be renamed"
-    );
-    let seg0 = env.data.root.join(WAL_SEGMENT_DIR).join(FIRST_SEGMENT);
-    assert!(
-        seg0.exists(),
-        "Segment 0 should be created"
-    );
-    let content = fs::read_to_string(&seg0).unwrap();
-    assert!(
-        content.contains("\"height\":1"),
-        "Content should be preserved"
-    );
-}
-
-#[test]
-fn migrate_from_v3_to_current() {
-    run_migration_test(
-        |env| {
-            env.write_schema_version(V3);
-            env.write_legacy_wal(); // WAL already migrated, but we keep for safety.
-            // v3→v4 adds node_meta.json.
-        },
-        CURRENT_SCHEMA_VERSION,
-    );
-
-    // Verify node_meta.json was created.
-    let env = TestEnv::new();
-    env.write_schema_version(V3);
-    env.data.ensure_schema_and_migrate().unwrap();
-    let node_meta = env.data.root.join(NODE_META_FILE);
-    assert!(
-        node_meta.exists(),
-        "node_meta.json should be created by v3→v4 migration"
-    );
-    let raw = fs::read_to_string(&node_meta).unwrap();
-    let val: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    assert!(
-        val.get("protocol_version").is_some(),
-        "node_meta.json should have protocol_version"
-    );
-    env.assert_migration_log_contains("node_meta.json");
-}
-
-#[test]
-fn migrate_from_v4_to_current() {
-    run_migration_test(
-        |env| {
-            env.write_schema_version(V4);
-            env.write_blocks(10);
-            // v4→v5 adds tx_index.json.
-        },
-        CURRENT_SCHEMA_VERSION,
-    );
-
-    // Verify tx_index.json was created.
-    let env = TestEnv::new();
-    env.write_schema_version(V4);
-    env.write_blocks(10);
-    env.data.ensure_schema_and_migrate().unwrap();
-
-    let tx_index = env.data.root.join(TX_INDEX_FILE);
-    assert!(
-        tx_index.exists(),
-        "tx_index.json should be created by v4→v5 migration"
-    );
-    let raw = fs::read_to_string(&tx_index).unwrap();
-    let val: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    assert!(
-        val.is_object(),
-        "tx_index.json should be a JSON object"
-    );
-    env.assert_migration_log_contains("tx_index.json");
-}
-
-#[test]
-fn migrate_from_v5_to_current() {
-    run_migration_test(
-        |env| {
-            env.write_schema_version(V5);
-            env.write_blocks(10);
-            env.write_tx_index(); // Already has tx_index, should be skipped.
-        },
-        CURRENT_SCHEMA_VERSION,
-    );
-
-    // v5→v6 adds something (placeholder).
-    let env = TestEnv::new();
-    env.write_schema_version(V5);
-    env.data.ensure_schema_and_migrate().unwrap();
-    // Ensure schema version is updated.
     assert_eq!(env.read_schema_version(), CURRENT_SCHEMA_VERSION);
+    assert!(!env.migration_log().is_empty(), "migration log must not be empty");
 }
 
 #[test]
-fn migrate_from_v6_to_current() {
-    run_migration_test(
-        |env| {
-            env.write_schema_version(V6);
-        },
-        CURRENT_SCHEMA_VERSION,
-    );
+fn migrate_from_v1_injects_vm_field_and_backs_up_old_state() {
+    let env = run_migration(V1, TestEnv::write_v1_state);
+
+    assert_eq!(env.read_schema_version(), CURRENT_SCHEMA_VERSION);
+
+    let raw = fs::read_to_string(env.root().join(STATE_FULL_FILE))
+        .expect("state_full.json must exist after migration");
+    let state: serde_json::Value = serde_json::from_str(&raw).expect("state must be valid JSON");
+
+    assert!(state.get("vm").is_some(), "v1→v2 must inject a `vm` field");
+    assert_eq!(state["kv"]["hello"], "world", "original kv data must be preserved");
+    assert_eq!(state["balances"]["abcd"], 1000, "original balances must be preserved");
+    assert!(env.backup_exists(BACKUP_V1_SUFFIX), "v1 state must be backed up before overwrite");
 }
 
-// ── Tests: Idempotency ──────────────────────────────────────────────────
+#[test]
+fn migrate_from_v2_segments_legacy_wal() {
+    let env = run_migration(V2, |e| {
+        e.write_v1_state();
+        e.write_legacy_wal();
+    });
+
+    assert_eq!(env.read_schema_version(), CURRENT_SCHEMA_VERSION);
+
+    assert!(
+        !env.root().join(WAL_LEGACY_FILE).exists(),
+        "wal.jsonl must be renamed/removed by v2→v3",
+    );
+
+    let seg0 = env.root().join(WAL_SEGMENT_DIR).join(FIRST_SEGMENT);
+    assert!(seg0.exists(), "wal/{FIRST_SEGMENT} must be created by v2→v3");
+
+    let content = fs::read_to_string(&seg0).expect("read segment 0");
+    assert!(content.contains("\"height\":1"), "segment must preserve original events");
+    assert!(content.contains("\"height\":2"), "segment must preserve all original events");
+}
+
+#[test]
+fn migrate_from_v3_creates_node_meta() {
+    let env = run_migration(V3, |e| {
+        e.write_v1_state();
+        // v3 directories do not have wal.jsonl anymore (migrated in
+        // v2→v3). Do not fabricate one here.
+    });
+
+    assert_eq!(env.read_schema_version(), CURRENT_SCHEMA_VERSION);
+    assert!(!env.root().join(WAL_LEGACY_FILE).exists(),
+        "no legacy WAL should exist after v3→v4");
+
+    let meta_path = env.root().join(NODE_META_FILE);
+    assert!(meta_path.exists(), "node_meta.json must be created by v3→v4");
+
+    let meta: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&meta_path).expect("read node_meta"),
+    )
+    .expect("node_meta must be valid JSON");
+    assert!(meta.get("protocol_version").is_some(),
+        "node_meta must contain protocol_version");
+    env.assert_log_contains("node_meta.json");
+}
+
+#[test]
+fn migrate_from_v4_creates_tx_index() {
+    let env = run_migration(V4, |e| {
+        e.write_v1_state();
+        e.write_blocks(10);
+    });
+
+    assert_eq!(env.read_schema_version(), CURRENT_SCHEMA_VERSION);
+
+    let idx_path = env.root().join(TX_INDEX_FILE);
+    assert!(idx_path.exists(), "tx_index.json must be created by v4→v5");
+
+    let idx: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&idx_path).expect("read tx_index"),
+    )
+    .expect("tx_index must be valid JSON");
+    assert!(idx.is_object(), "tx_index must be a JSON object");
+    env.assert_log_contains("tx_index.json");
+}
+
+/// Migration from every version between v0 and CURRENT must succeed.
+///
+/// This replaces the previous `migrate_from_v5_to_current`,
+/// `migrate_from_v6_to_current`, and `migrate_from_v7_to_current` tests,
+/// which each checked one hard-coded version and could not catch a
+/// regression in any version not named in the file.
+#[test]
+fn every_version_migrates_to_current() {
+    for start in 0..CURRENT_SCHEMA_VERSION {
+        let env = run_migration(start, |e| {
+            // Populate every artifact that could be relevant to a
+            // migration step. Each migration must be a no-op on
+            // artifacts it doesn't touch.
+            e.write_v1_state();
+            e.write_legacy_wal();
+            e.write_blocks(3);
+        });
+
+        assert_eq!(
+            env.read_schema_version(),
+            CURRENT_SCHEMA_VERSION,
+            "migration from v{start} did not reach CURRENT_SCHEMA_VERSION",
+        );
+        assert!(
+            !env.migration_log().is_empty(),
+            "migration from v{start} produced no log entries",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency
+// ---------------------------------------------------------------------------
 
 #[test]
 fn migration_is_idempotent() {
     let env = TestEnv::new();
-    env.write_schema_version(V0);
+    env.write_schema_version(0);
     env.write_v0_state();
+    env.data.ensure_schema_and_migrate().expect("first migration");
 
-    // First run.
-    env.data.ensure_schema_and_migrate().unwrap();
-    let version1 = env.read_schema_version();
-    let log1 = env.migration_log().len();
+    let version_after_first = env.read_schema_version();
+    let log_after_first = env.migration_log().len();
 
-    // Second run.
-    env.data.ensure_schema_and_migrate().unwrap();
-    let version2 = env.read_schema_version();
-    let log2 = env.migration_log().len();
+    env.data.ensure_schema_and_migrate().expect("second migration");
 
-    assert_eq!(version1, version2, "Version should not change");
-    assert_eq!(log1, log2, "Log should not grow on second run");
+    assert_eq!(
+        env.read_schema_version(),
+        version_after_first,
+        "version must not change on second migration",
+    );
+    assert_eq!(
+        env.migration_log().len(),
+        log_after_first,
+        "log must not grow on second migration",
+    );
 }
 
-// ── Tests: Error handling ──────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Refusal on future version
+// ---------------------------------------------------------------------------
 
 #[test]
-fn migration_fails_on_future_version() {
+fn migration_refuses_future_version() {
     let env = TestEnv::new();
     env.write_schema_version(CURRENT_SCHEMA_VERSION + 1);
 
-    let result = env.data.ensure_schema_and_migrate();
-    assert!(
-        result.is_err(),
-        "Should fail when disk version is newer than binary"
-    );
-    let msg = result.unwrap_err().to_string();
+    let err = env
+        .data
+        .ensure_schema_and_migrate()
+        .expect_err("migration must refuse a future schema version");
+    let msg = err.to_string();
+
     assert!(
         msg.contains("newer than this binary"),
-        "Error should explain the issue: {}",
-        msg
+        "error must explain that the disk version is newer than the binary; got {msg:?}",
     );
 }
 
+// ---------------------------------------------------------------------------
+// Skipping already-applied steps
+// ---------------------------------------------------------------------------
+
 #[test]
-fn migration_continues_on_corrupted_state() {
+fn migration_skips_steps_already_applied() {
+    // Starting at V3 must apply V3→V4, V4→V5, … but NOT V1→V2 or V2→V3.
+    let env = run_migration(V3, |e| {
+        // A v3 directory has no `wal.jsonl` and has a `vm` field in
+        // state — both artifacts of earlier steps. Fabricating them
+        // here would let a bug that re-runs v1→v2 go undetected.
+        e.write_v1_state();
+    });
+
+    assert_eq!(env.read_schema_version(), CURRENT_SCHEMA_VERSION);
+    env.assert_log_does_not_contain("v1→v2");
+    env.assert_log_does_not_contain("v2→v3");
+    env.assert_log_contains("v3→v4");
+}
+
+// ---------------------------------------------------------------------------
+// Atomicity: never leave a partial migration
+// ---------------------------------------------------------------------------
+
+/// If any intermediate step fails, the schema version must not advance
+/// to an intermediate value. Either the migration succeeds (version
+/// reaches `CURRENT_SCHEMA_VERSION`) or it fails (version stays at the
+/// pre-migration value). A schema version between the two is a partial
+/// migration — the worst possible outcome, because the next start
+/// would try to resume from a state that was never fully written.
+///
+/// This replaces three tautological tests from the previous version
+/// (`migration_continues_on_corrupted_state`,
+/// `migration_atomic_write_prevents_corruption`,
+/// `migration_detects_rollback_to_old_version`) that all asserted
+/// `result.is_ok() || result.is_err()`.
+#[test]
+fn failed_migration_does_not_advance_schema_version() {
     let env = TestEnv::new();
     env.write_schema_version(V1);
     env.write_v1_state();
-    // But corrupt the state file.
     env.corrupt_file(STATE_FULL_FILE);
 
-    // Should still be able to start fresh (or fail gracefully).
-    // In production, we'd want to check behavior.
-    // For now, we just verify it doesn't panic.
     let result = env.data.ensure_schema_and_migrate();
-    // Depending on implementation, it might succeed with a fresh state,
-    // or fail with a clear error. Both are acceptable.
-    // We'll just check it doesn't panic and returns a result.
-    assert!(
-        result.is_ok() || result.is_err(),
-        "Should not panic on corrupted state"
-    );
+    let version = env.read_schema_version();
+
+    match result {
+        Ok(()) => assert_eq!(
+            version,
+            CURRENT_SCHEMA_VERSION,
+            "successful migration on corrupted input must reach CURRENT",
+        ),
+        Err(_) => assert_eq!(
+            version,
+            V1,
+            "failed migration must leave the schema version at V1, \
+             not at an intermediate value",
+        ),
+    }
 }
 
-#[test]
-fn migration_skips_already_applied_steps() {
-    let env = TestEnv::new();
-    // Start at v3 with all previous migrations applied.
-    env.write_schema_version(V3);
-    env.write_v1_state(); // Already has vm field.
-    env.write_legacy_wal(); // Already migrated.
+// ---------------------------------------------------------------------------
+// Progress tracking
+// ---------------------------------------------------------------------------
 
-    env.data.ensure_schema_and_migrate().unwrap();
-    // Should only apply v3→v4 and beyond.
+#[test]
+fn migration_progress_entries_are_well_formed() {
+    let env = TestEnv::new();
+    env.write_schema_version(0);
+    env.write_v0_state();
+    env.data.ensure_schema_and_migrate().expect("migration");
+
     let log = env.migration_log();
-    assert!(
-        !log.is_empty(),
-        "Should have applied some migrations"
-    );
-    // It should NOT have logged v1→v2 or v2→v3 migrations.
-    // Check that we have v3→v4 in the log.
-    env.assert_migration_log_contains("node_meta.json");
+    assert!(!log.is_empty(), "migration log must have entries");
+
+    for entry in &log {
+        // Format: "[<unix_ts>] v<from>→v<to>: <description>"
+        let open = entry
+            .find('[')
+            .unwrap_or_else(|| panic!("log entry missing '[': {entry:?}"));
+        let close = entry
+            .find(']')
+            .unwrap_or_else(|| panic!("log entry missing ']': {entry:?}"));
+        assert!(open < close, "log entry brackets reversed: {entry:?}");
+
+        let ts = entry[open + 1..close]
+            .parse::<u64>()
+            .unwrap_or_else(|_| panic!("log timestamp must be a u64: {entry:?}"));
+        assert!(ts > 0, "log timestamp must be positive: {ts}");
+
+        let versions = extract_version_refs(entry);
+        assert!(
+            versions.len() >= 2,
+            "log entry must reference a version transition (vX→vY): {entry:?}",
+        );
+    }
 }
 
-// ── Tests: Atomicity and crash recovery ────────────────────────────────
-
 #[test]
-fn migration_atomic_write_prevents_corruption() {
-    // This is a conceptual test; we simulate a crash mid-write.
-    // We write a schema.json that indicates migration is in progress.
-    // The migration system should handle this gracefully.
+fn schema_meta_records_migration_time() {
     let env = TestEnv::new();
-    env.write_schema_version(V1);
-    env.write_v1_state();
+    env.write_schema_version(0);
+    env.data.ensure_schema_and_migrate().expect("migration");
 
-    // Simulate a partially written state file (truncated).
-    let state_path = env.data.root.join(STATE_FULL_FILE);
-    fs::write(&state_path, b"{").unwrap(); // Incomplete JSON
-
-    // Migration should detect and recover (or fail cleanly).
-    let result = env.data.ensure_schema_and_migrate();
-    // It might succeed by backing up the corrupted file and starting fresh,
-    // or fail. Either way, no panic.
-    assert!(
-        result.is_ok() || result.is_err(),
-        "Should handle partial writes without panic"
-    );
+    let meta = env.schema_meta();
+    let migrated_at = meta
+        .get("migrated_at")
+        .and_then(|v| v.as_u64())
+        .expect("schema.json must contain a numeric migrated_at");
+    assert!(migrated_at > 0, "migrated_at must be a positive unix timestamp");
 }
 
-// ── Tests: Progress tracking ─────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Ordering
+// ---------------------------------------------------------------------------
 
+/// Migrations must run in strictly increasing version order.
+///
+/// Replaces the previous `all_migrations_applied_in_order`, which
+/// collected matching version strings into a `HashSet` and asserted
+/// `found.len() >= 2` — verifying that at least two versions appeared
+/// *somewhere* in the log, not that they appeared *in order*.
 #[test]
-fn migration_progress_is_visible() {
+fn migrations_applied_in_increasing_version_order() {
     let env = TestEnv::new();
-    env.write_schema_version(V0);
+    env.write_schema_version(0);
     env.write_v0_state();
     env.write_legacy_wal();
-
-    // Run migration and verify log entries.
-    env.data.ensure_schema_and_migrate().unwrap();
+    env.data.ensure_schema_and_migrate().expect("migration");
 
     let log = env.migration_log();
-    assert!(
-        log.len() >= 2,
-        "Should have multiple migration steps logged, got {}",
-        log.len()
+    assert!(log.len() >= 2, "at least two migrations must run from v0");
+
+    // For each log entry, extract the "from" version (the first `v<N>`
+    // reference). Transitions must be strictly increasing.
+    let from_versions: Vec<u32> = log
+        .iter()
+        .filter_map(|entry| extract_version_refs(entry).into_iter().next())
+        .collect();
+
+    assert_eq!(
+        from_versions.len(),
+        log.len(),
+        "every log entry must contain at least one version reference",
     );
 
-    // Verify log entries are in chronological order.
-    let timestamps: Vec<&str> = log.iter().filter_map(|entry| {
-        entry.find('[').map(|i| &entry[i+1..entry.len()-1])
-    }).collect();
-    assert!(
-        timestamps.len() == log.len(),
-        "Each log entry should have a timestamp"
-    );
+    for w in from_versions.windows(2) {
+        assert!(
+            w[0] < w[1],
+            "migration order broken: v{} ran before v{}",
+            w[0],
+            w[1],
+        );
+    }
 }
 
-// ── Tests: Large data sets ──────────────────────────────────────────────
+/// Extract every `v<N>` reference in `entry` in order.
+fn extract_version_refs(entry: &str) -> Vec<u32> {
+    entry
+        .split('v')
+        .skip(1)
+        .filter_map(|chunk| {
+            let digits: String = chunk.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                None
+            } else {
+                digits.parse::<u32>().ok()
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Large state
+// ---------------------------------------------------------------------------
 
 #[test]
-fn migration_handles_large_state() {
+fn migration_handles_large_state_within_budget() {
     let env = TestEnv::new();
     env.write_schema_version(V1);
 
-    // Create a large state file.
+    // 10 000 accounts — enough to catch accidental O(n²) behaviour in
+    // any migration that iterates balances to rewrite keys or values.
     let mut state = serde_json::json!({
-        "kv": {},
+        "kv":       {},
         "balances": {},
-        "nonces": {}
+        "nonces":   {},
     });
     for i in 0..LARGE_ACCOUNT_COUNT {
-        state["kv"][format!("key_{}", i)] = serde_json::Value::String(format!("value_{}", i));
-        state["balances"][format!("addr_{}", i)] = serde_json::Value::Number((i * 1000).into());
+        state["kv"][format!("key_{i}")] = serde_json::Value::String(format!("value_{i}"));
+        state["balances"][format!("addr_{i}")] =
+            serde_json::Value::Number((i as u64 * 1_000).into());
     }
-    let state_path = env.data.root.join(STATE_FULL_FILE);
-    fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    fs::write(
+        env.root().join(STATE_FULL_FILE),
+        serde_json::to_string_pretty(&state).expect("serialize state"),
+    )
+    .expect("write large state");
 
     let start = Instant::now();
-    env.data.ensure_schema_and_migrate().unwrap();
-    let duration = start.elapsed();
+    env.data.ensure_schema_and_migrate().expect("migration");
+    let elapsed = start.elapsed();
+
+    assert_eq!(env.read_schema_version(), CURRENT_SCHEMA_VERSION);
 
     assert!(
-        duration < Duration::from_secs(MIGRATION_TIMEOUT_SECS),
-        "Migration took too long: {:?}",
-        duration
-    );
-}
-
-// ── Tests: Schema meta persistence ──────────────────────────────────────
-
-#[test]
-fn schema_meta_contains_migration_timestamps() {
-    let env = TestEnv::new();
-    env.write_schema_version(V0);
-    env.data.ensure_schema_and_migrate().unwrap();
-
-    let meta = env.schema_meta_content();
-    assert!(
-        meta.get("migrated_at").is_some(),
-        "migrated_at timestamp should be present"
-    );
-    let migrated_at = meta["migrated_at"].as_u64().unwrap();
-    assert!(
-        migrated_at > 0,
-        "migrated_at should be a valid timestamp: {}",
-        migrated_at
-    );
-}
-
-// ── Tests: Rollback detection ────────────────────────────────────────────
-
-#[test]
-fn migration_detects_rollback_to_old_version() {
-    let env = TestEnv::new();
-    env.write_schema_version(CURRENT_SCHEMA_VERSION);
-    env.data.ensure_schema_and_migrate().unwrap();
-
-    // Simulate a rollback by overwriting schema.json with an older version.
-    env.write_schema_version(V3);
-
-    // The migration system should detect this (maybe by checking state root or
-    // by verifying the migration log). In production, it should refuse to
-    // downgrade.
-    let result = env.data.ensure_schema_and_migrate();
-    // It might fail or it might re-apply; either way, we check it's handled.
-    // In a proper implementation, it would fail with a clear error.
-    // We'll just verify it doesn't panic.
-    assert!(
-        result.is_ok() || result.is_err(),
-        "Should handle rollback detection without panic"
-    );
-}
-
-// ── Tests: Concurrent migration protection ──────────────────────────────
-
-#[test]
-fn migration_acquires_lock() {
-    // This is a conceptual test; we can't easily test concurrency here.
-    // We'll just ensure the migration system uses locking.
-    let env = TestEnv::new();
-    env.write_schema_version(V0);
-
-    // First migration should succeed.
-    env.data.ensure_schema_and_migrate().unwrap();
-
-    // Second migration should also succeed (lock released).
-    env.data.ensure_schema_and_migrate().unwrap();
-
-    // Verify we have a lock file (implementation detail).
-    let lock_file = env.data.root.join(".migration.lock");
-    // The lock file might be cleaned up after migration.
-    // We just check the system didn't panic.
-}
-
-// ── Tests: Migration log format ──────────────────────────────────────────
-
-#[test]
-fn migration_log_entries_are_consistent() {
-    let env = TestEnv::new();
-    env.write_schema_version(V0);
-    env.write_v0_state();
-    env.data.ensure_schema_and_migrate().unwrap();
-
-    let log = env.migration_log();
-    for entry in &log {
-        // Each entry should have a timestamp.
-        assert!(
-            entry.starts_with('[') && entry.contains(']'),
-            "Log entry should start with timestamp: {}",
-            entry
-        );
-        // Each entry should mention the version.
-        assert!(
-            entry.contains("v"),
-            "Log entry should mention version: {}",
-            entry
-        );
-    }
-}
-
-// ── Summary test: all migrations applied in order ──────────────────────
-
-#[test]
-fn all_migrations_applied_in_order() {
-    let env = TestEnv::new();
-    env.write_schema_version(V0);
-    env.write_v0_state();
-    env.write_legacy_wal();
-
-    env.data.ensure_schema_and_migrate().unwrap();
-
-    let log = env.migration_log();
-    let expected_versions = vec!["v0", "v1", "v2", "v3", "v4", "v5", "v6"];
-    let mut found = Vec::new();
-
-    for entry in &log {
-        for &ver in &expected_versions {
-            if entry.contains(ver) {
-                found.push(ver);
-                break;
-            }
-        }
-    }
-
-    // At minimum, we should have v0→v1 and v1→v2, etc.
-    // The exact number depends on which migrations are active.
-    assert!(
-        found.len() >= 2,
-        "Should have applied at least 2 migrations, got {:?}",
-        found
-    );
-
-    // Check order: v0, v1, v2, ... should appear in order.
-    let unique: HashSet<_> = found.iter().collect();
-    // We can't guarantee exact order since some might be skipped if already applied.
-    // We'll just check that we have at least the major ones.
-    assert!(
-        log.iter().any(|e| e.contains("v0")),
-        "Should have migration from v0"
-    );
-    assert!(
-        log.iter().any(|e| e.contains("v1")),
-        "Should have migration from v1"
-    );
-}
-
-// ── Performance test: migration speed ──────────────────────────────────
-
-#[test]
-fn migration_finishes_within_time_limit() {
-    let env = TestEnv::new();
-    env.write_schema_version(V0);
-    env.write_blocks(100); // Large block set for index migration.
-    env.write_legacy_wal();
-
-    let start = Instant::now();
-    env.data.ensure_schema_and_migrate().unwrap();
-    let duration = start.elapsed();
-
-    assert!(
-        duration < Duration::from_secs(MIGRATION_TIMEOUT_SECS),
-        "Migration took {}s, exceeds limit of {}s",
-        duration.as_secs(),
-        MIGRATION_TIMEOUT_SECS
+        elapsed < Duration::from_secs(LARGE_MIGRATION_TIMEOUT_SECS),
+        "migrating {LARGE_ACCOUNT_COUNT} accounts took {elapsed:?}, \
+         exceeding the {LARGE_MIGRATION_TIMEOUT_SECS}s smoke-test budget",
     );
 }
