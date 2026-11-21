@@ -67,11 +67,7 @@ unsound = "workspace"
 ignore = [
     # 2026 batch tolerated until upstreams are updated
     "RUSTSEC-2026-0002", # lru unsound
-    "RUSTSEC-2026-0044",
     "RUSTSEC-2026-0045",
-    "RUSTSEC-2026-0046",
-    "RUSTSEC-2026-0047",
-    "RUSTSEC-2026-0048",
     "RUSTSEC-2026-0049",
 
     # Older transitive issues temporarily tolerated
